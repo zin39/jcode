@@ -1098,18 +1098,29 @@ impl App {
                 continue;
             }
             let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
-            if !Self::remote_openai_compatible_profile_models(&resolved, profile)
-                .iter()
-                .any(|candidate| candidate == model)
-            {
+            let Some(from_live_catalog) =
+                Self::remote_openai_compatible_profile_models(&resolved, profile)
+                    .iter()
+                    .find_map(|candidate| (candidate.0 == model).then_some(candidate.1))
+            else {
                 continue;
-            }
+            };
+            let detail = if from_live_catalog {
+                resolved.api_base.clone()
+            } else if resolved.api_base.trim().is_empty() {
+                "fallback: static provider model list".to_string()
+            } else {
+                format!(
+                    "{}; fallback: static provider model list",
+                    resolved.api_base
+                )
+            };
             return Some(crate::provider::ModelRoute {
                 model: model.to_string(),
                 provider: resolved.display_name,
                 api_method: format!("openai-compatible:{}", resolved.id),
                 available: true,
-                detail: resolved.api_base,
+                detail,
                 cheapness: None,
             });
         }
@@ -1119,16 +1130,17 @@ impl App {
     fn remote_openai_compatible_profile_models(
         resolved: &crate::provider_catalog::ResolvedOpenAiCompatibleProfile,
         profile: crate::provider_catalog::OpenAiCompatibleProfile,
-    ) -> Vec<String> {
+    ) -> Vec<(String, bool)> {
         let mut models = Vec::new();
-        let mut push = |model: String| {
+        let mut push = |model: String, from_live_catalog: bool| {
             let model = model.trim().to_string();
-            if !model.is_empty() && !models.iter().any(|existing| existing == &model) {
-                models.push(model);
+            if !model.is_empty() && !models.iter().any(|(existing, _)| existing == &model) {
+                models.push((model, from_live_catalog));
             }
         };
 
-        if let Some(cache) = jcode_provider_openrouter::load_disk_cache_entry_for_namespace(&resolved.id)
+        if let Some(cache) =
+            jcode_provider_openrouter::load_disk_cache_entry_for_namespace(&resolved.id)
         {
             let source_matches = cache
                 .source_api_base
@@ -1137,13 +1149,13 @@ impl App {
                 == crate::provider_catalog::normalize_api_base(&resolved.api_base);
             if source_matches {
                 for model in cache.models {
-                    push(model.id);
+                    push(model.id, true);
                 }
             }
         }
 
         for model in crate::provider_catalog::openai_compatible_profile_static_models(profile) {
-            push(model);
+            push(model, false);
         }
 
         models
@@ -2175,5 +2187,109 @@ impl App {
             picker.filter = first_original[..prefix_len].to_string();
             Self::apply_inline_interactive_filter(picker);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _temp: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = crate::storage::lock_test_env();
+            let temp = tempfile::tempdir().expect("tempdir");
+            let vars = vec![
+                ("JCODE_HOME", std::env::var_os("JCODE_HOME")),
+                ("OPENCODE_API_KEY", std::env::var_os("OPENCODE_API_KEY")),
+            ];
+            crate::env::set_var("JCODE_HOME", temp.path());
+            crate::env::set_var("OPENCODE_API_KEY", "sk-test-opencode");
+            Self {
+                vars,
+                _temp: temp,
+                _lock: lock,
+            }
+        }
+
+        fn save_opencode_cache(&self, source_api_base: &str, model_ids: &[&str]) {
+            let jcode_home = std::env::var_os("JCODE_HOME").expect("JCODE_HOME set");
+            let cache_dir = std::path::PathBuf::from(jcode_home).join("cache");
+            std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+            let cache = jcode_provider_openrouter::DiskCache {
+                cached_at: jcode_provider_openrouter::current_unix_secs()
+                    .expect("current unix time"),
+                source_api_base: Some(source_api_base.to_string()),
+                models: model_ids
+                    .iter()
+                    .map(|id| jcode_provider_openrouter::ModelInfo {
+                        id: (*id).to_string(),
+                        name: String::new(),
+                        context_length: None,
+                        pricing: jcode_provider_openrouter::ModelPricing::default(),
+                        created: None,
+                    })
+                    .collect(),
+            };
+            std::fs::write(
+                cache_dir.join("opencode_models.json"),
+                serde_json::to_string(&cache).expect("serialize cache"),
+            )
+            .expect("write cache");
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.vars.drain(..) {
+                if let Some(value) = value {
+                    crate::env::set_var(key, value);
+                } else {
+                    crate::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remote_compatible_route_uses_live_cache_and_does_not_mark_fallback() {
+        let guard = EnvGuard::new();
+        guard.save_opencode_cache("https://opencode.ai/zen/v1", &["qwen3.6-plus"]);
+
+        let route = App::remote_openai_compatible_route_for_model("qwen3.6-plus")
+            .expect("live-cache-only OpenCode model should be routed");
+
+        assert_eq!(route.provider, "OpenCode Zen");
+        assert_eq!(route.api_method, "openai-compatible:opencode");
+        assert_eq!(route.detail, "https://opencode.ai/zen/v1");
+        assert!(!route.detail.contains("fallback"));
+    }
+
+    #[test]
+    fn remote_compatible_route_marks_static_model_list_fallback() {
+        let _guard = EnvGuard::new();
+
+        let route = App::remote_openai_compatible_route_for_model("glm-4.7")
+            .expect("static OpenCode fallback model should be routed");
+
+        assert_eq!(route.provider, "OpenCode Zen");
+        assert!(
+            route
+                .detail
+                .contains("fallback: static provider model list")
+        );
+    }
+
+    #[test]
+    fn remote_compatible_route_ignores_live_cache_from_wrong_api_base() {
+        let guard = EnvGuard::new();
+        guard.save_opencode_cache("https://wrong.example.test/v1", &["qwen3.6-plus"]);
+
+        assert!(App::remote_openai_compatible_route_for_model("qwen3.6-plus").is_none());
     }
 }
