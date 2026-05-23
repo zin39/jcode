@@ -116,7 +116,7 @@ fn load_recent_session_cards_with_limit(limit: usize) -> Result<Vec<SessionCard>
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
 
     let mut cards = Vec::new();
-    for candidate in candidates.into_iter().take(limit.saturating_mul(3)) {
+    for candidate in candidates {
         match load_session_card(&candidate.path, candidate.modified) {
             Ok(Some(card)) => cards.push(card),
             Ok(None) => {}
@@ -621,6 +621,50 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    #[test]
+    fn recent_session_loader_scans_past_many_invalid_recent_files() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!(
+            "jcode-desktop-session-loader-test-{}-{unique}",
+            std::process::id()
+        ));
+        let sessions_dir = temp_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        fs::write(
+            sessions_dir.join("valid_old.json"),
+            r#"{"id":"valid_old","title":"valid old","status":"Closed","messages":[{"role":"user","content":[{"type":"text","text":"hello from valid session"}]}]}"#,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        for index in 0..100 {
+            fs::write(
+                sessions_dir.join(format!("invalid_new_{index:03}.json")),
+                "{ not valid json",
+            )
+            .unwrap();
+        }
+
+        let previous_home = std::env::var_os("JCODE_HOME");
+        unsafe { std::env::set_var("JCODE_HOME", &temp_home) };
+        let cards = load_recent_session_cards().unwrap();
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("JCODE_HOME", value) },
+            None => unsafe { std::env::remove_var("JCODE_HOME") },
+        }
+        let _ = fs::remove_dir_all(&temp_home);
+
+        assert!(
+            cards.iter().any(|card| card.session_id == "valid_old"),
+            "loader should keep scanning after invalid recent files: {cards:?}"
+        );
     }
 
     #[test]
