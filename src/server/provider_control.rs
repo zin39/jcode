@@ -28,25 +28,16 @@ fn available_models_snapshot_into_event(snapshot: ModelCatalogSnapshot) -> Serve
 }
 
 fn available_models_updated_event_from_agent(agent: &Agent) -> ServerEvent {
-    available_models_snapshot_into_event(model_catalog_snapshot_from_agent(agent))
+    available_models_snapshot_into_event(agent.model_catalog_snapshot())
 }
 
 async fn available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> ModelCatalogSnapshot {
     let agent_guard = agent.lock().await;
-    model_catalog_snapshot_from_agent(&agent_guard)
+    agent_guard.model_catalog_snapshot()
 }
 
 fn available_models_snapshot_from_provider(provider: &Arc<dyn Provider>) -> ModelCatalogSnapshot {
     ModelCatalogSnapshot::from_provider(provider.as_ref())
-}
-
-fn model_catalog_snapshot_from_agent(agent: &Agent) -> ModelCatalogSnapshot {
-    ModelCatalogSnapshot::new(
-        Some(agent.provider_name()),
-        Some(agent.provider_model()),
-        agent.available_models_display(),
-        agent.model_routes(),
-    )
 }
 
 pub(super) async fn available_models_updated_event(agent: &Arc<Mutex<Agent>>) -> ServerEvent {
@@ -804,7 +795,7 @@ pub(super) async fn handle_notify_auth_changed(
     let (session_id, before_snapshot) = if let Ok(agent_guard) = agent.try_lock() {
         (
             agent_guard.session_id().to_string(),
-            model_catalog_snapshot_from_agent(&agent_guard),
+            agent_guard.model_catalog_snapshot(),
         )
     } else {
         crate::logging::event_warn(

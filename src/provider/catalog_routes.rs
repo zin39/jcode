@@ -1,12 +1,16 @@
 use crate::auth::{AuthState, AuthStatus};
 
+use super::pricing::cheapness_for_route;
 use super::{
-    ALL_OPENAI_MODELS, AccountModelAvailabilityState, ModelRoute,
-    anthropic_oauth_route_availability, build_anthropic_oauth_route, build_copilot_route,
+    ALL_OPENAI_MODELS, AccountModelAvailabilityState, ModelRoute, MultiProvider, Provider,
+    anthropic_api_key_route_availability, anthropic_oauth_route_availability, bedrock,
+    build_anthropic_oauth_route, build_copilot_route, build_openai_api_key_route,
     build_openai_oauth_route, build_openrouter_auto_route, build_openrouter_endpoint_route,
-    build_openrouter_fallback_provider_route, format_account_model_availability_detail,
-    is_listable_model_name, model_availability_for_account, openrouter,
-    openrouter_catalog_model_id, provider_for_model,
+    build_openrouter_fallback_provider_route, configured_standard_openrouter_profile_routes,
+    copilot, dedupe_model_routes, direct_openai_compatible_profile_routes,
+    format_account_model_availability_detail, is_listable_model_name, known_anthropic_model_ids,
+    known_openai_model_ids, model_availability_for_account, openrouter,
+    openrouter_catalog_model_id, provider_for_model, standard_openrouter_profile_configured,
 };
 
 /// Build the fast local route snapshot used by the TUI model picker while the
@@ -172,6 +176,377 @@ pub fn append_simplified_anthropic_model_routes(
             cheapness: None,
         });
     }
+}
+
+pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelRoute> {
+    let routes_started = std::time::Instant::now();
+    provider.spawn_anthropic_catalog_refresh_if_needed();
+    provider.spawn_openai_catalog_refresh_if_needed();
+
+    let mut routes = Vec::new();
+    let mut openrouter_models = 0usize;
+    let mut openrouter_endpoint_cache_hits = 0usize;
+    let mut openrouter_endpoint_routes = 0usize;
+    let mut openrouter_scheduled_endpoint_refreshes = 0usize;
+    let has_oauth = provider.has_claude_runtime();
+    let has_api_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
+    let anthropic_models = if let Some(anthropic) = provider.anthropic_provider() {
+        anthropic.available_models_for_switching()
+    } else if let Some(claude) = provider.claude_provider() {
+        claude.available_models_for_switching()
+    } else {
+        known_anthropic_model_ids()
+    };
+    let openai_models = if let Some(openai) = provider.openai_provider() {
+        openai.available_models_for_switching()
+    } else {
+        known_openai_model_ids()
+    };
+
+    // Anthropic models (oauth and/or api-key)
+    for model in anthropic_models {
+        let (available, detail) = if has_oauth && !has_api_key {
+            anthropic_oauth_route_availability(&model)
+        } else {
+            (true, String::new())
+        };
+
+        if has_oauth {
+            routes.push(build_anthropic_oauth_route(
+                &model,
+                available,
+                detail.clone(),
+            ));
+        }
+        if has_api_key {
+            let (ak_available, ak_detail) = anthropic_api_key_route_availability(&model);
+            routes.push(ModelRoute {
+                model: model.to_string(),
+                provider: "Anthropic".to_string(),
+                api_method: "api-key".to_string(),
+                available: ak_available,
+                detail: ak_detail,
+                cheapness: cheapness_for_route(&model, "Anthropic", "api-key"),
+            });
+        }
+        if !has_oauth && !has_api_key {
+            routes.push(ModelRoute {
+                model: model.to_string(),
+                provider: "Anthropic".to_string(),
+                api_method: "claude-oauth".to_string(),
+                available: false,
+                detail: "no credentials".to_string(),
+                cheapness: cheapness_for_route(&model, "Anthropic", "claude-oauth"),
+            });
+        }
+    }
+
+    // OpenAI models
+    let openai_auth = crate::auth::AuthStatus::check_fast();
+    for model in openai_models {
+        let availability = model_availability_for_account(&model);
+        let (available, detail) = if provider.openai_provider().is_none() {
+            (false, "no credentials".to_string())
+        } else {
+            match availability.state {
+                AccountModelAvailabilityState::Available => (true, String::new()),
+                AccountModelAvailabilityState::Unavailable => (
+                    false,
+                    format_account_model_availability_detail(&availability)
+                        .unwrap_or_else(|| "not available".to_string()),
+                ),
+                AccountModelAvailabilityState::Unknown => {
+                    let detail = format_account_model_availability_detail(&availability)
+                        .unwrap_or_else(|| "availability unknown".to_string());
+                    (true, detail)
+                }
+            }
+        };
+        if openai_auth.openai_has_oauth {
+            routes.push(build_openai_oauth_route(&model, available, detail.clone()));
+        }
+        if openai_auth.openai_has_api_key {
+            routes.push(build_openai_api_key_route(
+                &model,
+                provider.openai_provider().is_some(),
+                String::new(),
+            ));
+        }
+        if !openai_auth.openai_has_oauth && !openai_auth.openai_has_api_key {
+            routes.push(build_openai_oauth_route(&model, false, detail));
+        }
+    }
+
+    let active_direct_openai_compatible_api_method = provider
+        .openrouter_provider()
+        .and_then(|openrouter| openrouter.direct_openai_compatible_route_parts())
+        .map(|(_, api_method, _)| api_method);
+    let mut added_direct_openai_compatible_routes = false;
+    for profile in crate::provider_catalog::openai_compatible_profiles()
+        .iter()
+        .copied()
+    {
+        if !crate::provider_catalog::openai_compatible_profile_is_configured(profile) {
+            continue;
+        }
+        let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
+        let api_method = format!("openai-compatible:{}", resolved.id);
+
+        // The active OpenRouter/OpenAI-compatible provider contributes its own
+        // live memory/disk catalog below. Do not preempt it with the generic
+        // configured-profile path, because its in-memory catalog may be newer
+        // than the disk snapshot that this non-active profile path can read.
+        if active_direct_openai_compatible_api_method.as_deref() == Some(api_method.as_str()) {
+            continue;
+        }
+
+        let profile_routes = direct_openai_compatible_profile_routes(profile);
+        added_direct_openai_compatible_routes |= !profile_routes.is_empty();
+        routes.extend(profile_routes);
+    }
+
+    // GitHub Copilot models
+    {
+        if let Some(copilot) = provider.copilot_provider() {
+            let copilot_models = copilot.available_models_display();
+            let detail = copilot.model_catalog_detail();
+            let copilot_models_empty = copilot_models.is_empty();
+            for model in copilot_models {
+                routes.push(build_copilot_route(&model, true, detail.clone()));
+            }
+            if copilot_models_empty && copilot::CopilotApiProvider::has_credentials() {
+                routes.push(build_copilot_route("copilot models", false, detail));
+            }
+        } else if copilot::CopilotApiProvider::has_credentials() {
+            routes.push(build_copilot_route(
+                "copilot models",
+                false,
+                "not initialized yet",
+            ));
+        }
+    }
+
+    // Gemini models
+    {
+        if let Some(gemini) = provider.gemini_provider() {
+            for model in gemini.available_models_display() {
+                routes.push(ModelRoute {
+                    model,
+                    provider: "Gemini".to_string(),
+                    api_method: "code-assist-oauth".to_string(),
+                    available: true,
+                    detail: String::new(),
+                    cheapness: None,
+                });
+            }
+        }
+    }
+
+    // Antigravity models
+    {
+        if let Some(antigravity) = provider.antigravity_provider() {
+            routes.extend(antigravity.model_routes());
+        }
+    }
+
+    // Cursor models
+    {
+        if let Some(cursor) = provider.cursor_provider() {
+            for model in cursor.available_models_display() {
+                routes.push(ModelRoute {
+                    model,
+                    provider: "Cursor".to_string(),
+                    api_method: "cursor".to_string(),
+                    available: true,
+                    detail: String::new(),
+                    cheapness: None,
+                });
+            }
+        }
+    }
+
+    // AWS Bedrock models and inference profiles
+    {
+        if let Some(bedrock) = provider.bedrock_provider() {
+            routes.extend(bedrock.model_routes());
+        } else if bedrock::BedrockProvider::has_credentials() {
+            let bedrock = bedrock::BedrockProvider::new();
+            routes.extend(bedrock.model_routes().into_iter().map(|mut route| {
+                if route.detail.trim().is_empty() {
+                    route.detail =
+                        "credentials configured; provider will initialize on selection".to_string();
+                }
+                route
+            }));
+        }
+    }
+
+    // OpenRouter models (with per-provider endpoints)
+    let openrouter_provider = provider.openrouter_provider();
+    let has_openrouter = openrouter_provider.is_some();
+    let has_openrouter_provider_features = openrouter_provider
+        .as_ref()
+        .map(|openrouter| openrouter.supports_provider_routing_features())
+        .unwrap_or(false);
+    if let Some(openrouter) = openrouter_provider {
+        let current_openrouter_model = openrouter.model();
+        let supports_openrouter_provider_features = openrouter.supports_provider_routing_features();
+        let mut scheduled_endpoint_refreshes = 0usize;
+        for model in openrouter.available_models_display() {
+            openrouter_models += 1;
+            let cached = if supports_openrouter_provider_features {
+                openrouter::load_endpoints_disk_cache_public(&model)
+            } else {
+                None
+            };
+            let cache_age = cached.as_ref().map(|(_, age)| *age);
+            if supports_openrouter_provider_features
+                && (model == current_openrouter_model || scheduled_endpoint_refreshes < 8)
+                && openrouter.maybe_schedule_endpoint_refresh_for_display(
+                    &model,
+                    cache_age,
+                    "model picker route hydration",
+                )
+            {
+                scheduled_endpoint_refreshes += 1;
+                openrouter_scheduled_endpoint_refreshes += 1;
+            }
+            let age_str = cached.as_ref().map(|(_, age)| {
+                if *age < 3600 {
+                    format!("{}m ago", age / 60)
+                } else if *age < 86400 {
+                    format!("{}h ago", age / 3600)
+                } else {
+                    format!("{}d ago", age / 86400)
+                }
+            });
+            // Auto route: hint which provider it would likely pick
+            let auto_detail = cached
+                .as_ref()
+                .and_then(|(eps, _)| {
+                    eps.first().map(|ep| {
+                        let endpoint_detail = ep.detail_string();
+                        if endpoint_detail.trim().is_empty() {
+                            format!("→ {}", ep.provider_name)
+                        } else {
+                            format!("→ {} · {}", ep.provider_name, endpoint_detail)
+                        }
+                    })
+                })
+                .unwrap_or_default();
+            if supports_openrouter_provider_features {
+                routes.push(build_openrouter_auto_route(
+                    &model,
+                    has_openrouter,
+                    auto_detail,
+                ));
+            } else {
+                let (provider, api_method, detail) = openrouter
+                    .direct_openai_compatible_route_parts()
+                    .unwrap_or_else(|| {
+                        (
+                            "OpenAI-compatible".to_string(),
+                            "openai-compatible".to_string(),
+                            "custom endpoint".to_string(),
+                        )
+                    });
+                routes.push(ModelRoute {
+                    model: model.clone(),
+                    provider,
+                    api_method,
+                    available: has_openrouter,
+                    detail,
+                    cheapness: None,
+                });
+            }
+            // Add per-provider routes from endpoints cache
+            if supports_openrouter_provider_features && let Some((ref endpoints, _)) = cached {
+                openrouter_endpoint_cache_hits += 1;
+                let stale_suffix = age_str.as_deref().unwrap_or("");
+                for ep in endpoints {
+                    openrouter_endpoint_routes += 1;
+                    routes.push(build_openrouter_endpoint_route(
+                        &model,
+                        ep,
+                        has_openrouter,
+                        Some(stale_suffix),
+                    ));
+                }
+            }
+        }
+
+        // A direct OpenAI-compatible runtime (NVIDIA NIM, Groq, etc.) shares the
+        // OpenRouter/OpenAI-compatible transport, but it is a distinct profile
+        // from standard OpenRouter. Keep standard OpenRouter's catalog scoped to
+        // the `openrouter` cache namespace so `/model` can switch back to it
+        // without relabeling OpenRouter models as the active direct profile.
+        if !supports_openrouter_provider_features && standard_openrouter_profile_configured() {
+            routes.extend(configured_standard_openrouter_profile_routes());
+        }
+    }
+
+    if !has_openrouter && !added_direct_openai_compatible_routes {
+        // OpenRouter not configured - show a few popular models as unavailable
+        routes.push(ModelRoute {
+            model: "openrouter models".to_string(),
+            provider: "—".to_string(),
+            api_method: "openrouter".to_string(),
+            available: false,
+            detail: "OPENROUTER_API_KEY not set".to_string(),
+            cheapness: None,
+        });
+    }
+
+    // Also add Claude/OpenAI models via openrouter as alternative routes
+    if has_openrouter_provider_features {
+        for model in known_anthropic_model_ids() {
+            let or_model = format!("anthropic/{}", model);
+            if let Some((endpoints, _)) = openrouter::load_endpoints_disk_cache_public(&or_model) {
+                openrouter_endpoint_cache_hits += 1;
+                for ep in &endpoints {
+                    openrouter_endpoint_routes += 1;
+                    routes.push(build_openrouter_endpoint_route(&model, ep, true, None));
+                }
+            } else {
+                routes.push(build_openrouter_fallback_provider_route(
+                    &model,
+                    &or_model,
+                    "Anthropic",
+                ));
+            }
+        }
+
+        for model in ALL_OPENAI_MODELS {
+            let or_model = format!("openai/{}", model);
+            if let Some((endpoints, _)) = openrouter::load_endpoints_disk_cache_public(&or_model) {
+                openrouter_endpoint_cache_hits += 1;
+                for ep in &endpoints {
+                    openrouter_endpoint_routes += 1;
+                    routes.push(build_openrouter_endpoint_route(model, ep, true, None));
+                }
+            } else {
+                routes.push(build_openrouter_fallback_provider_route(
+                    model, &or_model, "OpenAI",
+                ));
+            }
+        }
+    }
+
+    let total_ms = routes_started.elapsed().as_millis();
+    if total_ms >= 250 || std::env::var("JCODE_LOG_MODEL_PICKER_TIMING").is_ok() {
+        crate::logging::info(&format!(
+            "[TIMING] model_routes: routes={}, openrouter_configured={}, openrouter_models={}, openrouter_endpoint_cache_hits={}, openrouter_endpoint_routes={}, openrouter_scheduled_endpoint_refreshes={}, total={}ms",
+            routes.len(),
+            has_openrouter,
+            openrouter_models,
+            openrouter_endpoint_cache_hits,
+            openrouter_endpoint_routes,
+            openrouter_scheduled_endpoint_refreshes,
+            total_ms,
+        ));
+    }
+
+    dedupe_model_routes(routes)
 }
 
 pub fn remote_model_routes_fallback(

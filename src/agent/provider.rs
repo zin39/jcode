@@ -33,6 +33,15 @@ impl Agent {
         self.provider.model_routes()
     }
 
+    pub fn model_catalog_snapshot(&self) -> jcode_provider_core::ModelCatalogSnapshot {
+        jcode_provider_core::ModelCatalogSnapshot::new(
+            Some(self.provider_name()),
+            Some(self.provider_model()),
+            self.available_models_display(),
+            self.model_routes(),
+        )
+    }
+
     pub fn registry(&self) -> Registry {
         self.registry.clone()
     }
