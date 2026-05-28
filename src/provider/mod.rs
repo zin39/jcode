@@ -1331,6 +1331,7 @@ impl Provider for MultiProvider {
         );
 
         let mut errors = Vec::new();
+        let mut optional_errors = Vec::new();
         for (provider_name, result) in [
             ("anthropic", anthropic_result),
             ("claude", claude_result),
@@ -1343,8 +1344,19 @@ impl Provider for MultiProvider {
             ("bedrock", bedrock_result),
         ] {
             if let Err(err) = result {
-                errors.push(format!("{provider_name}: {err}"));
+                if matches!(provider_name, "bedrock") {
+                    optional_errors.push(format!("{provider_name}: {err}"));
+                } else {
+                    errors.push(format!("{provider_name}: {err}"));
+                }
             }
+        }
+
+        if !optional_errors.is_empty() {
+            crate::logging::warn(&format!(
+                "Optional model catalog refresh failed: {}",
+                optional_errors.join("; ")
+            ));
         }
 
         if !errors.is_empty() {
