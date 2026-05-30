@@ -268,6 +268,61 @@ pub fn is_enabled() -> bool {
     true
 }
 
+/// Marker file recording that the user opted in to sharing prompt and
+/// transcript content with telemetry. This is a separate, more sensitive
+/// consent than the anonymous usage metrics gated by [`is_enabled`], so it is
+/// off by default and only enabled when the user explicitly opts in (e.g. via
+/// the first-run onboarding flow).
+fn share_content_marker_path() -> Option<std::path::PathBuf> {
+    storage::jcode_dir().ok().map(|d| d.join("telemetry_share_content"))
+}
+
+/// Whether the user has opted in to sharing prompt/transcript content.
+/// Always false when base telemetry is disabled.
+pub fn content_sharing_enabled() -> bool {
+    if !is_enabled() {
+        return false;
+    }
+    if std::env::var("JCODE_NO_TELEMETRY").is_ok() || std::env::var("DO_NOT_TRACK").is_ok() {
+        return false;
+    }
+    share_content_marker_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Persist the user's prompt/transcript content-sharing choice. Writing the
+/// marker opts in; removing it opts out. Returns whether the write succeeded.
+pub fn set_content_sharing_enabled(enabled: bool) -> bool {
+    let Some(path) = share_content_marker_path() else {
+        return false;
+    };
+    if enabled {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, b"1") {
+            Ok(()) => {
+                logging::debug("telemetry content sharing opted in");
+                true
+            }
+            Err(err) => {
+                logging::debug(&format!("failed to write content-sharing marker: {err}"));
+                false
+            }
+        }
+    } else {
+        match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                logging::debug(&format!("failed to remove content-sharing marker: {err}"));
+                false
+            }
+        }
+    }
+}
+
 fn telemetry_envelope() -> (u32, String, bool, bool, bool) {
     (
         TELEMETRY_SCHEMA_VERSION,
