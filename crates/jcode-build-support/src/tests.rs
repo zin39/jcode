@@ -392,3 +392,65 @@ fn normal_shared_server_candidate_allows_shared_channel_matching_stable() {
         assert_eq!(candidate.1, "shared-server");
     });
 }
+
+#[test]
+fn normal_shared_server_candidate_ignores_shared_channel_with_missing_marker() {
+    with_temp_jcode_home(|| {
+        let shared_version = "0.14.2";
+        let installed_version = "0.17.0";
+        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), shared_version)
+            .expect("install shared version");
+        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), installed_version)
+            .expect("install installed version");
+        update_shared_server_symlink(shared_version).expect("update shared server");
+        std::fs::remove_file(shared_server_version_file().unwrap()).expect("remove marker");
+        update_stable_symlink(installed_version).expect("update stable");
+
+        let candidate = shared_server_update_candidate(false)
+            .expect("expected stable candidate when shared marker is missing");
+        assert_eq!(candidate.1, "stable");
+    });
+}
+
+#[test]
+fn normal_shared_server_candidate_ignores_shared_channel_with_corrupt_marker() {
+    with_temp_jcode_home(|| {
+        let shared_version = "0.14.2";
+        let installed_version = "0.17.0";
+        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), shared_version)
+            .expect("install shared version");
+        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), installed_version)
+            .expect("install installed version");
+        update_shared_server_symlink(shared_version).expect("update shared server");
+        std::fs::write(
+            shared_server_version_file().unwrap(),
+            "not-the-installed-version",
+        )
+        .expect("write corrupt marker");
+        update_stable_symlink(installed_version).expect("update stable");
+
+        let candidate = shared_server_update_candidate(false)
+            .expect("expected stable candidate when shared marker is corrupt");
+        assert_eq!(candidate.1, "stable");
+    });
+}
+
+#[test]
+fn version_match_detects_installed_channel_by_semver_or_git_hash() {
+    with_temp_jcode_home(|| {
+        std::fs::create_dir_all(builds_dir().unwrap()).expect("create builds dir");
+        std::fs::write(stable_version_file().unwrap(), "0.17.0").expect("write stable marker");
+        assert!(version_matches_installed_channel(
+            "v0.17.0 (abc1234)",
+            "different"
+        ));
+        assert!(!version_matches_installed_channel("v0.14.2", "different"));
+
+        std::fs::write(stable_version_file().unwrap(), "abc1234-dirty-build")
+            .expect("write git marker");
+        assert!(version_matches_installed_channel(
+            "v0.14.2-dev (abc1234)",
+            "abc1234"
+        ));
+    });
+}

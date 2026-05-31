@@ -426,6 +426,43 @@ fn shared_server_channel_is_current_enough() -> bool {
         .is_some_and(|current| current == shared)
 }
 
+fn normalize_version_marker(value: &str) -> String {
+    let value = value.trim();
+    let value = value.strip_prefix('v').unwrap_or(value);
+    value
+        .split([' ', '(', ')'])
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_string()
+}
+
+pub fn version_matches_installed_channel(version: &str, git_hash: &str) -> bool {
+    let version = normalize_version_marker(version);
+    let git_hash = git_hash.trim();
+    let mut saw_marker = false;
+    for marker in [read_stable_version(), read_current_version()] {
+        let Some(marker) = marker.ok().flatten() else {
+            continue;
+        };
+        let marker_trimmed = marker.trim();
+        if marker_trimmed.is_empty() {
+            continue;
+        }
+        saw_marker = true;
+        if normalize_version_marker(marker_trimmed) == version {
+            return true;
+        }
+        if !git_hash.is_empty()
+            && git_hash != "unknown"
+            && (marker_trimmed == git_hash || marker_trimmed.starts_with(git_hash))
+        {
+            return true;
+        }
+    }
+    !saw_marker
+}
+
 /// Resolve the best binary to use for `/reload`.
 ///
 /// This mostly follows `client_update_candidate`, but if a freshly built repo
