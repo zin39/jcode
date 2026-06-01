@@ -6722,10 +6722,12 @@ fn single_session_model_picker_loads_filters_and_selects_model() {
         .map(|line| line.text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(picker.contains("Choose model  ·  current Claude · claude-sonnet-4-5"));
+    assert!(picker.contains("Choose model"));
+    assert!(picker.contains("Current  Claude · claude-sonnet-4-5"));
     assert!(picker.contains("type to filter"));
     assert!(picker.contains("2 models"));
-    assert!(picker.contains("claude-sonnet-4-5"));
+    assert!(picker.contains("      claude-sonnet-4-5"));
+    assert!(picker.contains("      claude-opus-4-5"));
     assert!(picker.contains("Anthropic"));
     assert!(picker.contains("claude-oauth"));
 
@@ -7606,7 +7608,7 @@ fn single_session_model_picker_updates_current_model_after_switch() {
             .map(|line| line.text)
             .collect::<Vec<_>>()
             .join("\n")
-            .contains("Choose model  ·  current OpenAI · gpt-5.4")
+            .contains("Current  OpenAI · gpt-5.4")
     );
 }
 

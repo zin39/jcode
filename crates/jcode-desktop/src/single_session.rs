@@ -7000,16 +7000,18 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
     } else {
         format!("filter \"{}\"", truncate_chars(picker.filter.trim(), 28))
     };
+    let current_label = model_picker_current_label(
+        picker.provider_name.as_deref(),
+        picker.current_model.as_deref(),
+    );
     let mut lines = vec![
         styled_line(
-            format!(
-                "Choose model  ·  current {}",
-                model_picker_current_label(
-                    picker.provider_name.as_deref(),
-                    picker.current_model.as_deref(),
-                )
-            ),
+            "Choose model".to_string(),
             SingleSessionLineStyle::OverlayTitle,
+        ),
+        styled_line(
+            format!("Current  {current_label}"),
+            SingleSessionLineStyle::Overlay,
         ),
         styled_line(
             format!("{filter}  ·  {count}"),
@@ -7043,7 +7045,6 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
         return lines;
     }
 
-    let current = picker.current_model.as_deref();
     let (window_start, window) = picker.visible_row_window(MODEL_PICKER_INLINE_ROW_LIMIT);
     for (row_offset, index) in window.iter().enumerate() {
         let Some(choice) = picker.choices.get(*index) else {
@@ -7052,11 +7053,6 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
         let visible_position = window_start + row_offset;
         let provider = choice.provider.as_deref().unwrap_or("auto");
         let method = choice.api_method.as_deref().unwrap_or("auto");
-        let current_badge = if Some(choice.model.as_str()) == current {
-            "  Current"
-        } else {
-            ""
-        };
         let availability = if choice.available {
             "available"
         } else {
@@ -7073,19 +7069,15 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
             SingleSessionLineStyle::Overlay
         };
         lines.push(styled_line(
-            format!(
-                "     {}{}",
-                truncate_chars(&choice.model, 49),
-                current_badge,
-            ),
+            format!("       {}", truncate_chars(&choice.model, 46)),
             row_style,
         ));
         lines.push(styled_line(
             format!(
                 "       {} · {} · {}",
-                truncate_chars(provider, 22),
-                truncate_chars(method, 18),
-                truncate_chars(detail, 42),
+                truncate_chars(provider, 18),
+                truncate_chars(method, 16),
+                truncate_chars(detail, 24),
             ),
             SingleSessionLineStyle::Meta,
         ));
@@ -7111,7 +7103,7 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
 
 fn model_picker_inline_line_count(picker: &ModelPickerState) -> usize {
     let visible_len = picker.filtered_indices().len();
-    let mut count = 2;
+    let mut count = 3;
     if picker.loading {
         count += 1;
     }

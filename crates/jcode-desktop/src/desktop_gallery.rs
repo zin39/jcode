@@ -178,6 +178,7 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
         "model-picker" => {
             app.messages
                 .push(SingleSessionMessage::user("Show model catalog/status."));
+            app.handle_key(KeyInput::OpenModelPicker);
             app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
                 current_model: Some("gpt-5.1".to_string()),
                 provider_name: Some("openai".to_string()),
@@ -186,7 +187,6 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
                 service_tier: Some("priority".to_string()),
                 compaction_mode: Some("auto".to_string()),
             });
-            app.draft = "/model".to_string();
         }
         "session-info" => {
             app.messages.push(SingleSessionMessage::user(
@@ -263,6 +263,20 @@ fn temporary_gallery_models() -> Vec<session_launch::DesktopModelChoice> {
             api_method: Some("messages".to_string()),
             detail: Some("fixture alternative".to_string()),
             available: true,
+        },
+        session_launch::DesktopModelChoice {
+            model: "gemini-2.5-pro".to_string(),
+            provider: Some("google".to_string()),
+            api_method: Some("generate".to_string()),
+            detail: Some("preview tier".to_string()),
+            available: true,
+        },
+        session_launch::DesktopModelChoice {
+            model: "gpt-5.1-codex".to_string(),
+            provider: Some("openai".to_string()),
+            api_method: Some("responses".to_string()),
+            detail: Some("coding optimized".to_string()),
+            available: false,
         },
     ]
 }
