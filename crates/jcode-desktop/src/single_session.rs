@@ -608,10 +608,21 @@ impl SingleSessionWelcomeState {
     fn new(has_session: bool) -> Self {
         let name = desktop_welcome_name();
         let hero_phrase_index = welcome_phrase_index(&name);
+        // The continuation suggestion is only rendered on the fresh welcome
+        // screen (when there is no session). Scanning external CLI history
+        // (`~/.codex`, `~/.claude`) is expensive, so skip it entirely when a
+        // session is present. This keeps workspace pane construction cheap,
+        // which matters because workspace rendering builds one ephemeral
+        // `SingleSessionApp` per visible surface every frame.
+        let continuation_suggestion = if has_session {
+            None
+        } else {
+            latest_external_cli_continuation_suggestion()
+        };
         Self {
             name,
             recovery_session_count: 0,
-            continuation_suggestion: latest_external_cli_continuation_suggestion(),
+            continuation_suggestion,
             timeline: !has_session,
             hero_phrase_index,
         }
@@ -6035,7 +6046,14 @@ struct ExternalCliSessionCandidate {
     context: Option<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXTERNAL_CLI_SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn latest_external_cli_continuation_suggestion() -> Option<String> {
+    #[cfg(test)]
+    EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Tests must stay hermetic: scanning the real ~/.codex/~/.claude history makes
     // the welcome-hint layout depend on the developer's machine state and breaks
     // deterministic rendering assertions. Skip the scan under test.
@@ -9416,6 +9434,40 @@ mod tests {
             app.render_inline_widget_line_count(),
             app.render_inline_widget_styled_lines().len(),
             "render line count should match styled-line rendering"
+        );
+    }
+
+    #[test]
+    fn session_backed_app_skips_external_cli_scan() {
+        // Constructing an app for a workspace surface (session present) must not
+        // walk external CLI history: workspace rendering builds one ephemeral
+        // app per visible surface every frame, so this scan would be hot.
+        let card = workspace::SessionCard {
+            session_id: "scan-guard".to_string(),
+            title: "scan guard".to_string(),
+            subtitle: String::new(),
+            detail: String::new(),
+            preview_lines: Vec::new(),
+            detail_lines: Vec::new(),
+            transcript_messages: Vec::new(),
+        };
+
+        let before = EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.get());
+        let _app = SingleSessionApp::new(Some(card));
+        let after_session = EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.get());
+        assert_eq!(
+            after_session, before,
+            "session-backed app construction must not scan external CLI history"
+        );
+
+        // The fresh welcome (no session) still performs the scan so the
+        // continuation suggestion can be rendered.
+        let _fresh = SingleSessionApp::new(None);
+        let after_fresh = EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.get());
+        assert_eq!(
+            after_fresh,
+            after_session + 1,
+            "fresh welcome construction should perform exactly one external CLI scan"
         );
     }
 
