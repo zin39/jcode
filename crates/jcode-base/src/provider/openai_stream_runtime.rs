@@ -31,7 +31,18 @@ pub(super) async fn openai_access_token(
         return Ok(access_token);
     }
 
-    let refreshed = oauth::refresh_openai_tokens(&refresh_token).await?;
+    force_refresh_openai_token(credentials, &refresh_token).await
+}
+
+/// Unconditionally refresh the OpenAI access token using the stored refresh
+/// token, persisting the rotated credentials in place. Used when the server
+/// rejects the current access token (401/403) even though it had not yet hit
+/// its local expiry window.
+pub(super) async fn force_refresh_openai_token(
+    credentials: &Arc<RwLock<CodexCredentials>>,
+    refresh_token: &str,
+) -> anyhow::Result<String> {
+    let refreshed = oauth::refresh_openai_tokens(refresh_token).await?;
     let mut tokens = credentials.write().await;
     let account_id = tokens.account_id.clone();
     let id_token = refreshed
@@ -169,11 +180,39 @@ pub(super) async fn stream_response(
 
         // Check if we need to refresh token
         if should_refresh_token(status, &body) {
-            // Token refresh needed - this is a retryable error
-            return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
-                "Token refresh needed: {}",
-                body
-            )));
+            // The server rejected our access token (401/403). Proactively
+            // refresh it in place so the retry loop reconnects with a fresh
+            // token instead of surfacing a raw "Token refresh needed" error.
+            let refresh_token = {
+                let creds = credentials.read().await;
+                creds.refresh_token.clone()
+            };
+
+            if refresh_token.is_empty() {
+                return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                    "OpenAI rejected the access token and no refresh token is available; run /login to re-authenticate: {}",
+                    body
+                )));
+            }
+
+            match force_refresh_openai_token(&credentials, &refresh_token).await {
+                Ok(_) => {
+                    crate::logging::info(
+                        "OpenAI access token rejected; refreshed credentials and will retry",
+                    );
+                    // Surface a retryable error so the retry loop reconnects
+                    // with the freshly refreshed token.
+                    return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                        "openai token refreshed, retrying: {}",
+                        body
+                    )));
+                }
+                Err(refresh_err) => {
+                    return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                        "OpenAI token refresh failed; run /login to re-authenticate: {refresh_err:#}"
+                    )));
+                }
+            }
         }
 
         // For rate limits, include retry info in the error
@@ -1503,4 +1542,48 @@ pub(super) fn is_retryable_error(error_str: &str) -> bool {
         || error_str.contains("internal server error")
         || error_str.contains("an error occurred while processing your request")
         || error_str.contains("please include the request id")
+        // Auth: we just force-refreshed the OpenAI token in place and want the
+        // retry loop to reconnect with the fresh credentials.
+        || error_str.contains("openai token refreshed, retrying")
+}
+
+#[cfg(test)]
+mod stream_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn unauthorized_triggers_token_refresh() {
+        assert!(should_refresh_token(StatusCode::UNAUTHORIZED, ""));
+    }
+
+    #[test]
+    fn forbidden_triggers_refresh_only_for_token_bodies() {
+        assert!(should_refresh_token(
+            StatusCode::FORBIDDEN,
+            "access token expired"
+        ));
+        assert!(!should_refresh_token(
+            StatusCode::FORBIDDEN,
+            "region not allowed"
+        ));
+    }
+
+    #[test]
+    fn refreshed_token_marker_is_retryable() {
+        // After a 401/403 we force-refresh the OpenAI token and surface this
+        // marker so the retry loop reconnects with the new credentials.
+        assert!(is_retryable_error(
+            "openai token refreshed, retrying: 401 unauthorized"
+        ));
+    }
+
+    #[test]
+    fn missing_or_failed_refresh_is_not_retryable() {
+        assert!(!is_retryable_error(
+            "openai rejected the access token and no refresh token is available; run /login to re-authenticate: 401"
+        ));
+        assert!(!is_retryable_error(
+            "openai token refresh failed; run /login to re-authenticate: network error"
+        ));
+    }
 }
