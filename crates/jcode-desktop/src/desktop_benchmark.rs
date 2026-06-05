@@ -59,6 +59,22 @@ pub(super) fn real_transcript_scroll_benchmark_frames(args: &[String]) -> Option
     })
 }
 
+/// Parse `--real-transcript-action-benchmark[=N]`, the per-phase frame count for
+/// the multi-action interaction benchmark run against real on-disk transcripts.
+pub(super) fn real_transcript_action_benchmark_frames(args: &[String]) -> Option<usize> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        arg.strip_prefix("--real-transcript-action-benchmark=")
+            .and_then(|value| value.parse::<usize>().ok())
+            .or_else(|| {
+                (arg == "--real-transcript-action-benchmark").then(|| {
+                    args.get(index + 1)
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(400)
+                })
+            })
+    })
+}
+
 pub(super) fn benchmark_phase(
     mut frames: usize,
     mut run_frame: impl FnMut(usize) -> usize,
