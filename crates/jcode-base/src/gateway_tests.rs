@@ -120,3 +120,13 @@ fn test_extract_ws_auth_rejects_conflicting_sources() {
         .expect("request");
     assert!(extract_ws_auth(&request).is_err());
 }
+
+#[test]
+fn test_find_header_end() {
+    assert_eq!(
+        super::find_header_end(b"POST /pair HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"),
+        Some(38)
+    );
+    assert_eq!(super::find_header_end(b"POST /pair HTTP/1.1\r\nContent-"), None);
+    assert_eq!(super::find_header_end(b""), None);
+}

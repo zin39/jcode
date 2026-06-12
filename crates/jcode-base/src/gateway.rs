@@ -320,6 +320,12 @@ async fn handle_ws_connection(
     Ok(())
 }
 
+/// Finds the end of HTTP headers (`\r\n\r\n`), returning the offset of the
+/// terminator start.
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
 fn http_response(status: u16, status_text: &str, body: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n{}",
@@ -338,8 +344,55 @@ async fn handle_http(
     registry: Arc<tokio::sync::RwLock<DeviceRegistry>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 8192];
-    let n = tcp_stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let mut filled = 0usize;
+    // Read until end of headers. Clients like URLSession may deliver headers
+    // and body in separate TCP segments, so a single read is not enough.
+    let header_end = loop {
+        if filled == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+        let n = tcp_stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break None;
+        }
+        filled += n;
+        if let Some(pos) = find_header_end(&buf[..filled]) {
+            break Some(pos);
+        }
+        if filled > 64 * 1024 {
+            anyhow::bail!("HTTP request headers too large from {}", peer_addr);
+        }
+    };
+    let Some(header_end) = header_end else {
+        anyhow::bail!("HTTP connection closed before headers from {}", peer_addr);
+    };
+
+    // Read the remaining body bytes per Content-Length, if any.
+    let headers_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let content_length = headers_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    let expected_total = body_start.saturating_add(content_length.min(1024 * 1024));
+    while filled < expected_total {
+        if filled == buf.len() {
+            buf.resize(expected_total.max(buf.len() * 2), 0);
+        }
+        let n = tcp_stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let request = String::from_utf8_lossy(&buf[..filled]);
 
     let first_line = request.lines().next().unwrap_or("");
     let (method, path) = {
