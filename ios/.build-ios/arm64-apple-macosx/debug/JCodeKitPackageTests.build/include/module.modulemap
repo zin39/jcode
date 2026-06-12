@@ -1,0 +1,3 @@
+module JCodeKitPackageTests {
+    header "/Users/jeremy/jcode-github/ios/.build-ios/arm64-apple-macosx/debug/JCodeKitPackageTests.build/include/JCodeKitPackageTests-Swift.h"
+}

@@ -1,0 +1,3 @@
+module JCodeKit {
+    header "/Users/jeremy/jcode-github/ios/.build-ios/arm64-apple-macosx/debug/JCodeKit.build/include/JCodeKit-Swift.h"
+}
