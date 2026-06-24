@@ -406,6 +406,42 @@ impl Agent {
                                 usage_cache_creation.unwrap_or(0)
                             );
                         }
+                        // Record spend for budget tracking (no-op when no budget configured).
+                        {
+                            let provider_name = self.provider.name().to_string();
+                            let model = self.provider.model();
+                            let service_tier = self.provider.service_tier();
+                            let source_key = crate::provider_activity::source_key_for_provider_label(
+                                &provider_name,
+                                Some(&provider_name),
+                            );
+                            if let Some(estimate) =
+                                crate::provider::pricing::metered_pricing_for_source_with_tier(
+                                    &source_key,
+                                    &model,
+                                    service_tier.as_deref(),
+                                )
+                            {
+                                let is_anthropic = provider_name.to_ascii_lowercase().contains("anthropic")
+                                    || provider_name.to_ascii_lowercase().contains("claude");
+                                let micros = crate::budget::usage_cost_micros(
+                                    estimate.input_price_per_mtok_micros,
+                                    estimate.output_price_per_mtok_micros,
+                                    estimate.cache_read_price_per_mtok_micros,
+                                    usage_input.unwrap_or(0),
+                                    usage_output.unwrap_or(0),
+                                    usage_cache_read.unwrap_or(0),
+                                    usage_cache_creation.unwrap_or(0),
+                                    is_anthropic,
+                                );
+                                if micros > 0 {
+                                    crate::budget::record_spend(
+                                        self.session.effective_budget_root(),
+                                        micros,
+                                    );
+                                }
+                            }
+                        }
                     }
                     StreamEvent::ConnectionType { connection } => {
                         if trace {
