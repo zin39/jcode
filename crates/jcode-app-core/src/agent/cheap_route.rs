@@ -32,6 +32,9 @@ pub struct SubtaskResult {
     pub description: String,
     pub output: String,
     pub review: String,
+    /// The model that actually produced `output` (may differ from the
+    /// recommended model when cheaper routes errored and we fell back).
+    pub model_used: String,
 }
 
 /// Full outcome of an auto cheap-routing run.
@@ -177,15 +180,50 @@ pub async fn run_cheap_route(
         .await?;
     let recommended_model = parse_recommended_model(&recommend, &menu)?;
 
-    // 4. Spawn each subtask on the chosen model; 5. parent reviews each result.
+    // 4. Build candidate models cheapest-first: the recommended model first, then
+    //    the rest of the menu. Each subtask tries them in order, falling back to
+    //    the next on any error (e.g. a dead-quota / unauthorized route) until one
+    //    succeeds. This keeps a single broken route from sinking the whole run.
+    let mut candidates: Vec<String> = vec![recommended_model.clone()];
+    for candidate in &menu {
+        if candidate.route.model != recommended_model {
+            candidates.push(candidate.route.model.clone());
+        }
+    }
+
+    // 5. Run each subtask (with fallback) and have the parent review each result.
     let mut results = Vec::with_capacity(subtasks.len());
     for subtask in &subtasks {
-        let output = backend.run_subtask(subtask, &recommended_model).await?;
-        let review = backend.ask_parent(&build_review_prompt(subtask, &output)).await?;
+        let mut chosen: Option<(String, String)> = None; // (model_used, output)
+        let mut errors: Vec<String> = Vec::new();
+        for model in &candidates {
+            match backend.run_subtask(subtask, model).await {
+                Ok(output) => {
+                    chosen = Some((model.clone(), output));
+                    break;
+                }
+                Err(err) => errors.push(format!("{model}: {err}")),
+            }
+        }
+        let (model_used, output) = chosen.ok_or_else(|| {
+            anyhow!(
+                "all {} candidate model(s) failed for subtask '{}': {}",
+                candidates.len(),
+                subtask.description,
+                errors.join("; ")
+            )
+        })?;
+        // Review is best-effort: a parent-review error must not discard a
+        // subtask that already completed successfully.
+        let review = match backend.ask_parent(&build_review_prompt(subtask, &output)).await {
+            Ok(review) => review,
+            Err(err) => format!("(review unavailable: {err})"),
+        };
         results.push(SubtaskResult {
             description: subtask.description.clone(),
             output,
             review,
+            model_used,
         });
     }
 
@@ -404,6 +442,77 @@ mod tests {
         };
         let err = run_cheap_route(&backend, "task").await.unwrap_err();
         assert!(err.to_string().contains("no available model routes"));
+    }
+
+    /// Backend where `run_subtask` errors for any model in `dead_models`,
+    /// simulating a dead-quota / unauthorized route.
+    struct FallbackBackend {
+        parent_responses: Mutex<VecDeque<String>>,
+        routes: Vec<ModelRoute>,
+        dead_models: std::collections::HashSet<String>,
+        attempts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CheapRouteBackend for FallbackBackend {
+        async fn ask_parent(&self, _prompt: &str) -> Result<String> {
+            Ok(self.parent_responses.lock().unwrap().pop_front().unwrap_or_default())
+        }
+
+        async fn run_subtask(&self, _subtask: &Subtask, model: &str) -> Result<String> {
+            self.attempts.lock().unwrap().push(model.to_string());
+            if self.dead_models.contains(model) {
+                Err(anyhow!("insufficient_quota"))
+            } else {
+                Ok(format!("done via {model}"))
+            }
+        }
+
+        fn routes(&self) -> Vec<ModelRoute> {
+            self.routes.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_cheap_route_falls_back_when_cheapest_model_errors() {
+        // Menu: cheapo (cheapest, DEAD) + pricey (works). Recommend -> cheapo.
+        let backend = FallbackBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"do x","prompt":"p","difficulty":1}]"#.to_string(), // decompose
+                "use cheapo".to_string(), // recommend the dead one
+                "OK".to_string(),         // review
+            ])),
+            routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
+            dead_models: ["cheapo".to_string()].into_iter().collect(),
+            attempts: Mutex::new(Vec::new()),
+        };
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        // Fell back from the dead cheapo to the working pricey.
+        assert_eq!(outcome.results[0].model_used, "pricey");
+        assert!(outcome.results[0].output.contains("done via pricey"));
+        assert_eq!(outcome.results[0].review, "OK");
+        // It tried cheapo first, then pricey.
+        let attempts = backend.attempts.lock().unwrap();
+        assert_eq!(*attempts, vec!["cheapo".to_string(), "pricey".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_cheap_route_errors_when_all_candidates_dead() {
+        let backend = FallbackBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"do x","prompt":"p","difficulty":1}]"#.to_string(),
+                "use cheapo".to_string(),
+            ])),
+            routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
+            dead_models: ["cheapo".to_string(), "pricey".to_string()].into_iter().collect(),
+            attempts: Mutex::new(Vec::new()),
+        };
+
+        let err = run_cheap_route(&backend, "task").await.unwrap_err();
+        assert!(err.to_string().contains("all 2 candidate model(s) failed"));
     }
 
     // --- minimal provider mock (mirrors agent_tests::DelayedProvider) ---

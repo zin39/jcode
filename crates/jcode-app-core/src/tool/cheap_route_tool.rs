@@ -81,9 +81,10 @@ fn format_cheap_outcome(outcome: &CheapRouteOutcome) -> String {
     );
     for (index, result) in outcome.results.iter().enumerate() {
         out.push_str(&format!(
-            "### {}. {}\n\n{}\n\nReview: {}\n\n",
+            "### {}. {} _(ran on {})_\n\n{}\n\nReview: {}\n\n",
             index + 1,
             result.description,
+            result.model_used,
             result.output.trim(),
             result.review.trim()
         ));
@@ -105,6 +106,7 @@ mod tests {
                 description: "edit auth".to_string(),
                 output: "did it".to_string(),
                 review: "OK".to_string(),
+                model_used: "deepseek-v4-flash".to_string(),
             }],
         };
 
@@ -113,5 +115,6 @@ mod tests {
         assert!(rendered.contains("edit auth"));
         assert!(rendered.contains("did it"));
         assert!(rendered.contains("Review: OK"));
+        assert!(rendered.contains("deepseek-v4-flash"));
     }
 }
