@@ -57,6 +57,9 @@ pub trait CheapRouteBackend: Send + Sync {
     async fn run_subtask(&self, subtask: &Subtask, model: &str) -> Result<String>;
     /// Routes available for ranking into the cheapest-first menu.
     fn routes(&self) -> Vec<ModelRoute>;
+    /// The parent's own current model — a known-working last-resort fallback
+    /// when every ranked cheap route errors (e.g. all dead-quota).
+    fn current_model(&self) -> String;
 }
 
 /// Strip a single surrounding markdown code fence (```json ... ```), returning
@@ -190,6 +193,14 @@ pub async fn run_cheap_route(
             candidates.push(candidate.route.model.clone());
         }
     }
+    // Guaranteed last resort: the parent's own current model, which is known to
+    // work (it just answered the decompose/recommend calls). This rescues runs
+    // where every ranked cheap route is dead-quota — common when the cheapest
+    // priced routes all belong to one exhausted key.
+    let current_model = backend.current_model();
+    if !current_model.is_empty() && !candidates.contains(&current_model) {
+        candidates.push(current_model);
+    }
 
     // 5. Run each subtask (with fallback) and have the parent review each result.
     let mut results = Vec::with_capacity(subtasks.len());
@@ -292,6 +303,10 @@ impl CheapRouteBackend for ProviderCheapBackend {
 
     fn routes(&self) -> Vec<ModelRoute> {
         self.provider.model_routes()
+    }
+
+    fn current_model(&self) -> String {
+        self.provider.model()
     }
 }
 
@@ -398,6 +413,10 @@ mod tests {
         fn routes(&self) -> Vec<ModelRoute> {
             self.routes.clone()
         }
+
+        fn current_model(&self) -> String {
+            String::new()
+        }
     }
 
     #[tokio::test]
@@ -451,6 +470,7 @@ mod tests {
         routes: Vec<ModelRoute>,
         dead_models: std::collections::HashSet<String>,
         attempts: Mutex<Vec<String>>,
+        current: String,
     }
 
     #[async_trait]
@@ -471,6 +491,10 @@ mod tests {
         fn routes(&self) -> Vec<ModelRoute> {
             self.routes.clone()
         }
+
+        fn current_model(&self) -> String {
+            self.current.clone()
+        }
     }
 
     #[tokio::test]
@@ -485,6 +509,7 @@ mod tests {
             routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
             dead_models: ["cheapo".to_string()].into_iter().collect(),
             attempts: Mutex::new(Vec::new()),
+            current: "qwen-current".to_string(),
         };
 
         let outcome = run_cheap_route(&backend, "task").await.unwrap();
@@ -509,10 +534,39 @@ mod tests {
             routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
             dead_models: ["cheapo".to_string(), "pricey".to_string()].into_iter().collect(),
             attempts: Mutex::new(Vec::new()),
+            current: String::new(), // no last-resort model available
         };
 
         let err = run_cheap_route(&backend, "task").await.unwrap_err();
         assert!(err.to_string().contains("all 2 candidate model(s) failed"));
+    }
+
+    #[tokio::test]
+    async fn run_cheap_route_rescues_via_current_model_when_all_ranked_dead() {
+        // Every ranked route is dead (mirrors the real case: all 6 cheapest are
+        // one exhausted key). The parent's own current model still works.
+        let backend = FallbackBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"do x","prompt":"p","difficulty":1}]"#.to_string(),
+                "use cheapo".to_string(),
+                "OK".to_string(),
+            ])),
+            routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
+            dead_models: ["cheapo".to_string(), "pricey".to_string()].into_iter().collect(),
+            attempts: Mutex::new(Vec::new()),
+            current: "qwen-live".to_string(),
+        };
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.results[0].model_used, "qwen-live");
+        assert!(outcome.results[0].output.contains("done via qwen-live"));
+        // Tried both dead ranked routes, then rescued via the current model.
+        let attempts = backend.attempts.lock().unwrap();
+        assert_eq!(
+            *attempts,
+            vec!["cheapo".to_string(), "pricey".to_string(), "qwen-live".to_string()]
+        );
     }
 
     // --- minimal provider mock (mirrors agent_tests::DelayedProvider) ---
