@@ -239,7 +239,7 @@ impl CheapRouteBackend for ProviderCheapBackend {
 
         let mut allowed: std::collections::HashSet<String> =
             self.registry.tool_names().await.into_iter().collect();
-        for blocked in ["subagent", "task", "todo", "todowrite", "todoread"] {
+        for blocked in ["subagent", "task", "todo", "todowrite", "todoread", "cheap_route"] {
             allowed.remove(blocked);
         }
 

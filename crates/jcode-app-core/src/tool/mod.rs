@@ -30,6 +30,7 @@ pub(crate) mod serde_coerce;
 mod session_search;
 mod side_panel;
 mod skill;
+mod cheap_route_tool;
 mod task;
 mod todo;
 mod webfetch;
@@ -292,7 +293,12 @@ impl Registry {
         Self::insert_tool(
             &mut tools_map,
             "subagent",
-            task::SubagentTool::new(provider, registry.clone()),
+            task::SubagentTool::new(provider.clone(), registry.clone()),
+        );
+        Self::insert_tool(
+            &mut tools_map,
+            "cheap_route",
+            cheap_route_tool::CheapRouteTool::new(provider, registry.clone()),
         );
         Self::insert_tool(
             &mut tools_map,

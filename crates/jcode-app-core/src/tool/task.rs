@@ -161,7 +161,7 @@ impl Tool for SubagentTool {
         session.save()?;
 
         let mut allowed: HashSet<String> = self.registry.tool_names().await.into_iter().collect();
-        for blocked in ["subagent", "task", "todo", "todowrite", "todoread"] {
+        for blocked in ["subagent", "task", "todo", "todowrite", "todoread", "cheap_route"] {
             allowed.remove(blocked);
         }
         crate::config::config()
