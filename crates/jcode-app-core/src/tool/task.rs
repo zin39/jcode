@@ -55,6 +55,8 @@ struct SubagentInput {
     session_id: Option<String>,
     #[serde(default)]
     output_mode: SubagentOutputMode,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
     #[serde(rename = "command", default)]
     _command: Option<String>,
 }
@@ -115,6 +117,11 @@ impl Tool for SubagentTool {
                     "enum": ["answer", "compact", "full_transcript"],
                     "description": "Return mode. 'answer' returns the final answer only, 'compact' adds a user-visible transcript, and 'full_transcript' adds raw persisted messages. Defaults to 'answer'."
                 },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional subset of tool names this subagent may use. When set, the subagent's tools are intersected with this list (can only remove tools, never grant new ones)."
+                },
                 "command": {
                     "type": "string",
                     "description": "Source command."
@@ -160,6 +167,7 @@ impl Tool for SubagentTool {
         crate::config::config()
             .tools
             .apply_to_allowed_set(&mut allowed);
+        let allowed = prune_allowed_tools(allowed, params.allowed_tools.as_deref());
 
         let summary_map: Arc<Mutex<HashMap<String, ToolSummary>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -398,6 +406,7 @@ mod tests {
             model: None,
             session_id: None,
             output_mode: SubagentOutputMode::Answer,
+            allowed_tools: None,
             _command: None,
         };
 
