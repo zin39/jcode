@@ -245,6 +245,38 @@ pub async fn run_cheap_route(
     })
 }
 
+/// Build cheap-routing candidate routes for one configured named provider.
+/// `static_ids` come from the config block's `models[]`; `cached_ids` from the
+/// provider's discovered disk catalog. The union (deduped) becomes routes, each
+/// priced via `price` and marked available per `key_present`.
+fn build_named_provider_routes(
+    name: &str,
+    base_url: &str,
+    static_ids: &[String],
+    cached_ids: &[String],
+    key_present: bool,
+    price: impl Fn(&str, &str) -> Option<jcode_provider_core::RouteCheapnessEstimate>,
+) -> Vec<ModelRoute> {
+    let api_method = format!("openai-compatible:{name}");
+    let mut seen = std::collections::HashSet::new();
+    let mut routes = Vec::new();
+    for id in static_ids.iter().chain(cached_ids.iter()) {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let cheapness = price(&api_method, id);
+        routes.push(ModelRoute {
+            model: id.clone(),
+            provider: name.to_string(),
+            api_method: api_method.clone(),
+            available: key_present,
+            detail: base_url.to_string(),
+            cheapness,
+        });
+    }
+    routes
+}
+
 use std::sync::Arc;
 
 /// Production [`CheapRouteBackend`] backed by a real provider and tool registry.
@@ -539,6 +571,44 @@ mod tests {
 
         let err = run_cheap_route(&backend, "task").await.unwrap_err();
         assert!(err.to_string().contains("all 2 candidate model(s) failed"));
+    }
+
+    #[test]
+    fn build_named_provider_routes_unions_static_and_cached_models_with_availability() {
+        // name="modelscope", static model deepseek-v4-flash, cached model qwen-x.
+        let routes = build_named_provider_routes(
+            "modelscope",
+            "https://api-inference.modelscope.cn/v1",
+            &["deepseek-v4-flash".to_string()],   // static (config) ids
+            &["qwen-x".to_string(), "deepseek-v4-flash".to_string()], // discovered (cache) ids
+            true,                                  // key present -> available
+            |_source, _model| None,                // pricing lookup stub
+        );
+
+        let models: std::collections::BTreeSet<&str> =
+            routes.iter().map(|r| r.model.as_str()).collect();
+        // union, deduped
+        assert!(models.contains("deepseek-v4-flash"));
+        assert!(models.contains("qwen-x"));
+        assert_eq!(routes.len(), 2);
+        // all carry the named-provider api_method + availability + base url detail
+        assert!(routes.iter().all(|r| r.api_method == "openai-compatible:modelscope"));
+        assert!(routes.iter().all(|r| r.available));
+        assert!(routes.iter().all(|r| r.detail.contains("modelscope")));
+    }
+
+    #[test]
+    fn build_named_provider_routes_marks_unavailable_when_no_key() {
+        let routes = build_named_provider_routes(
+            "deepseek",
+            "https://api.deepseek.com/v1",
+            &["deepseek-chat".to_string()],
+            &[],
+            false, // no key
+            |_s, _m| None,
+        );
+        assert_eq!(routes.len(), 1);
+        assert!(!routes[0].available);
     }
 
     #[tokio::test]
