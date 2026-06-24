@@ -146,12 +146,20 @@ impl Tool for SubagentTool {
         };
         let parent_subagent_model = Self::preferred_parent_subagent_model(&ctx.session_id);
         let provider_model = self.provider.model();
-        let resolved_model = Self::resolve_model(
+        let mut resolved_model = Self::resolve_model(
             params.model.as_deref(),
             session.model.as_deref(),
             parent_subagent_model.as_deref(),
             &provider_model,
         );
+        // Resolve the "cheapest" sentinel (from agents.swarm_model or an explicit
+        // model) to the dynamically-cheapest available route, so "spawn an agent"
+        // routes cheap without the caller naming a model.
+        if resolved_model.eq_ignore_ascii_case(crate::agent::cheap_route::CHEAPEST_SENTINEL) {
+            resolved_model =
+                crate::agent::cheap_route::cheapest_available_model(self.provider.as_ref())
+                    .unwrap_or_else(|| provider_model.clone());
+        }
         session.model = Some(resolved_model.clone());
 
         if let Some(ref working_dir) = ctx.working_dir {

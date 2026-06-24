@@ -360,6 +360,24 @@ fn configured_named_provider_routes() -> Vec<ModelRoute> {
     routes
 }
 
+/// The sentinel value users put in `agents.swarm_model` (or pass as a subagent
+/// `model`) to mean "pick the cheapest available model dynamically".
+pub const CHEAPEST_SENTINEL: &str = "cheapest";
+
+/// The cheapest currently-available model across the provider's own routes and
+/// all configured named providers (deduped, ranked cheapest-first). Resolves the
+/// [`CHEAPEST_SENTINEL`] used by agent/swarm spawns. Returns `None` when no
+/// priced/available route exists.
+pub fn cheapest_available_model(provider: &dyn crate::provider::Provider) -> Option<String> {
+    let mut routes = provider.model_routes();
+    routes.extend(configured_named_provider_routes());
+    let routes = jcode_provider_core::selection::dedupe_model_routes(routes);
+    rank_routes_by_cost(routes)
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.route.model)
+}
+
 use std::sync::Arc;
 
 /// Production [`CheapRouteBackend`] backed by a real provider and tool registry.
@@ -860,5 +878,20 @@ mod tests {
         let routes = backend.routes();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].model, "cheapo");
+    }
+
+    #[test]
+    fn cheapest_available_model_returns_cheapest_route() {
+        let provider = ParentMock {
+            reply: String::new(),
+            routes: vec![
+                priced_route("pricey", 9_000_000),
+                priced_route("cheapo", 100_000),
+            ],
+        };
+        assert_eq!(
+            cheapest_available_model(&provider),
+            Some("cheapo".to_string())
+        );
     }
 }

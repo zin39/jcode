@@ -497,7 +497,17 @@ pub(super) async fn spawn_swarm_agent(
     let coordinator = resolve_coordinator_spawn_identity(req_session_id, sessions).await;
     let coordinator_is_canary = coordinator.is_canary;
     let agents_config = &crate::config::config().agents;
-    let configured_swarm_model = agents_config.swarm_model.clone();
+    let mut configured_swarm_model = agents_config.swarm_model.clone();
+    // Resolve the "cheapest" sentinel to the dynamically-cheapest available model
+    // so swarm spawns route cheap without naming a model. None => inherit
+    // coordinator (handled below) when no available route exists.
+    if configured_swarm_model
+        .as_deref()
+        .is_some_and(|model| model.eq_ignore_ascii_case(crate::agent::cheap_route::CHEAPEST_SENTINEL))
+    {
+        configured_swarm_model =
+            crate::agent::cheap_route::cheapest_available_model(provider_template.as_ref());
+    }
     let resolved_spawn_mode = spawn_mode.unwrap_or(agents_config.swarm_spawn_mode);
     let selection = resolve_swarm_spawn_selection(configured_swarm_model.clone(), &coordinator);
     let spawn_model = selection.model.clone();
