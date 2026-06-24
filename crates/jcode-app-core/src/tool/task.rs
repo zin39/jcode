@@ -281,6 +281,22 @@ fn subagent_title(params: &SubagentInput) -> String {
     )
 }
 
+/// Narrow an allowed-tool set to only the tools the caller requested. When
+/// `requested` is `None`, the set is returned unchanged. Requested names that
+/// are not already allowed are ignored (set intersection), so this can only ever
+/// remove tools, never grant new ones.
+fn prune_allowed_tools(
+    mut allowed: std::collections::HashSet<String>,
+    requested: Option<&[String]>,
+) -> std::collections::HashSet<String> {
+    if let Some(requested) = requested {
+        let keep: std::collections::HashSet<&str> =
+            requested.iter().map(String::as_str).collect();
+        allowed.retain(|tool| keep.contains(tool.as_str()));
+    }
+    allowed
+}
+
 fn subagent_display_title(params: &SubagentInput, model: &str) -> String {
     format!(
         "{} ({} · {})",
@@ -369,7 +385,7 @@ fn format_compact_subagent_history(messages: &[HistoryMessage]) -> String {
 mod tests {
     use super::{
         SubagentInput, SubagentOutputMode, format_compact_subagent_history, format_subagent_output,
-        subagent_display_title,
+        subagent_display_title, prune_allowed_tools,
     };
     use crate::protocol::HistoryMessage;
 
@@ -478,5 +494,45 @@ mod tests {
     #[test]
     fn compact_history_formats_empty_transcript() {
         assert_eq!(format_compact_subagent_history(&[]), "(empty transcript)\n");
+    }
+
+    #[test]
+    fn prune_allowed_tools_intersects_with_requested() {
+        use std::collections::HashSet;
+        let allowed: HashSet<String> = ["read", "grep", "bash", "write"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let requested = vec!["read".to_string(), "grep".to_string()];
+        let pruned = super::prune_allowed_tools(allowed, Some(&requested));
+
+        let mut got: Vec<String> = pruned.into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec!["grep".to_string(), "read".to_string()]);
+    }
+
+    #[test]
+    fn prune_allowed_tools_none_keeps_everything() {
+        use std::collections::HashSet;
+        let allowed: HashSet<String> =
+            ["read", "grep"].into_iter().map(String::from).collect();
+
+        let pruned = super::prune_allowed_tools(allowed.clone(), None);
+        assert_eq!(pruned, allowed);
+    }
+
+    #[test]
+    fn prune_allowed_tools_ignores_unknown_requested() {
+        use std::collections::HashSet;
+        let allowed: HashSet<String> =
+            ["read", "grep"].into_iter().map(String::from).collect();
+
+        // "bash" is not in the allowed set; intersection just ignores it.
+        let requested = vec!["read".to_string(), "bash".to_string()];
+        let pruned = super::prune_allowed_tools(allowed, Some(&requested));
+
+        let got: Vec<String> = pruned.into_iter().collect();
+        assert_eq!(got, vec!["read".to_string()]);
     }
 }
