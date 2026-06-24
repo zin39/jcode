@@ -187,13 +187,20 @@ pub async fn run_cheap_route(
         .await?;
     let recommended_model = parse_recommended_model(&recommend, &menu)?;
 
-    // 4. Candidate order: recommended first, then EVERY ranked route cheapest-
-    //    first. Each subtask tries them in order, falling back on any error
-    //    (dead-quota / unauthorized) until one succeeds.
+    // 4. Candidate order: recommended first, then the cheapest model of EACH
+    //    other provider. Quota/auth failures are per-key, so once one model of a
+    //    provider errors, its siblings will too — trying only one model per
+    //    provider avoids grinding through ~20 dead routes from a single exhausted
+    //    key while still reaching every distinct provider (incl. cheap ones like
+    //    deepseek sitting behind dead OpenAI catalog models).
     let mut candidates: Vec<String> = vec![recommended_model.clone()];
+    let mut seen_providers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(rec) = ranked.iter().find(|c| c.route.model == recommended_model) {
+        seen_providers.insert(rec.route.provider.clone());
+    }
     for candidate in &ranked {
-        if candidate.route.model != recommended_model
-            && !candidates.contains(&candidate.route.model)
+        if seen_providers.insert(candidate.route.provider.clone())
+            && candidate.route.model != recommended_model
         {
             candidates.push(candidate.route.model.clone());
         }
@@ -430,7 +437,9 @@ mod tests {
     fn priced_route(model: &str, input_micros: u64) -> ModelRoute {
         ModelRoute {
             model: model.to_string(),
-            provider: "testprov".to_string(),
+            // Distinct provider per model so the per-provider candidate dedup in
+            // run_cheap_route keeps each test model as its own fallback step.
+            provider: format!("prov-{model}"),
             api_method: "a".to_string(),
             available: true,
             detail: String::new(),
@@ -478,7 +487,7 @@ mod tests {
         let menu = build_menu(vec![priced_route("cheapo", 100_000)], MAX_MENU);
         let rendered = format_menu_for_prompt(&menu);
         assert!(rendered.contains("cheapo"));
-        assert!(rendered.contains("testprov"));
+        assert!(rendered.contains("prov-cheapo"));
     }
 
     #[test]
@@ -733,6 +742,57 @@ mod tests {
         assert_eq!(
             *attempts,
             vec!["cheapo".to_string(), "pricey".to_string(), "qwen-live".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cheap_route_tries_one_model_per_provider() {
+        fn route(model: &str, provider: &str, micros: u64) -> ModelRoute {
+            ModelRoute {
+                model: model.to_string(),
+                provider: provider.to_string(),
+                api_method: "a".to_string(),
+                available: true,
+                detail: String::new(),
+                cheapness: Some(RouteCheapnessEstimate::metered(
+                    RouteCostSource::PublicApiPricing,
+                    RouteCostConfidence::Exact,
+                    micros,
+                    micros,
+                    None,
+                    None,
+                )),
+            }
+        }
+        // 3 dead OpenAI models (one key) + a working deepseek model.
+        let backend = FallbackBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"x","prompt":"p","difficulty":1}]"#.to_string(),
+                "use gpt-nano".to_string(),
+                "OK".to_string(),
+            ])),
+            routes: vec![
+                route("gpt-nano", "openai", 10),
+                route("gpt-mini", "openai", 20),
+                route("gpt-small", "openai", 30),
+                route("deepseek-chat", "deepseek", 100),
+            ],
+            dead_models: ["gpt-nano", "gpt-mini", "gpt-small"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            attempts: Mutex::new(Vec::new()),
+            current: "qwen".to_string(),
+        };
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.results[0].model_used, "deepseek-chat");
+        // Only ONE OpenAI model tried (not all 3), then deepseek — per-provider cap.
+        let attempts = backend.attempts.lock().unwrap();
+        assert_eq!(
+            *attempts,
+            vec!["gpt-nano".to_string(), "deepseek-chat".to_string()]
         );
     }
 
