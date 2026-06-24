@@ -515,6 +515,14 @@ pub struct AgentsConfig {
     /// metadata / sanity checks). Unset = inferred from the model name.
     #[serde(default)]
     pub memory_embedding_dim: Option<usize>,
+    /// Optional per-session dollar budget cap applied across the session tree
+    /// (top-level session + all spawned subagents). When set, the total spend
+    /// for a root session and all its descendants is tracked and capped at this
+    /// value. `None` = unlimited (the default).
+    ///
+    /// Example: `session_budget_usd = 0.50` caps each session tree at $0.50.
+    #[serde(default)]
+    pub session_budget_usd: Option<f64>,
 }
 
 fn default_memory_embedding_backend() -> String {
@@ -552,6 +560,7 @@ impl Default for AgentsConfig {
             memory_embedding_model: None,
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
+            session_budget_usd: None,
         }
     }
 }
