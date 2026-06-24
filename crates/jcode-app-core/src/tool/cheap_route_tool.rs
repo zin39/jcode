@@ -74,9 +74,21 @@ impl Tool for CheapRouteTool {
 
 /// Render a cheap-routing outcome as human-readable text for the tool result.
 fn format_cheap_outcome(outcome: &CheapRouteOutcome) -> String {
+    // Report the models that ACTUALLY ran (may differ from the recommendation
+    // when cheaper routes errored and we fell back), not just the recommendation.
+    let mut models_used: Vec<&str> =
+        outcome.results.iter().map(|r| r.model_used.as_str()).collect();
+    models_used.sort_unstable();
+    models_used.dedup();
+    let ran_on = if models_used.is_empty() {
+        outcome.recommended_model.clone()
+    } else {
+        models_used.join(", ")
+    };
     let mut out = format!(
-        "Ran {} subtask(s) on '{}'.\n\n",
+        "Ran {} subtask(s) on {} (recommended: {}).\n\n",
         outcome.results.len(),
+        ran_on,
         outcome.recommended_model
     );
     for (index, result) in outcome.results.iter().enumerate() {
