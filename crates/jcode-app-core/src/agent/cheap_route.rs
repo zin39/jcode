@@ -277,6 +277,46 @@ fn build_named_provider_routes(
     routes
 }
 
+/// Collect cheap-routing candidate routes for every configured `[providers.X]`
+/// block in the user's config. Each block contributes routes from the union of
+/// its static `models[]` list and its previously-discovered disk catalog.
+fn configured_named_provider_routes() -> Vec<ModelRoute> {
+    let cfg = crate::config::config();
+    let mut routes = Vec::new();
+    for (name, provider_cfg) in &cfg.providers {
+        let static_ids: Vec<String> =
+            provider_cfg.models.iter().map(|m| m.id.clone()).collect();
+        let cached_ids: Vec<String> =
+            jcode_provider_openrouter::load_disk_cache_entry_for_namespace(name)
+                .map(|cache| cache.models.iter().map(|m| m.id.clone()).collect())
+                .unwrap_or_default();
+        if static_ids.is_empty() && cached_ids.is_empty() {
+            continue;
+        }
+        // A key is present if an inline api_key is set, or if the env-var /
+        // env-file lookup finds one. We pass empty-string defaults for None
+        // optional fields; load_api_key_from_env_or_config returns None for
+        // invalid (empty) names, which is safe.
+        let key_present = provider_cfg.api_key.is_some()
+            || crate::provider_catalog::load_api_key_from_env_or_config(
+                provider_cfg.api_key_env.as_deref().unwrap_or(""),
+                provider_cfg.env_file.as_deref().unwrap_or(""),
+            )
+            .is_some();
+        routes.extend(build_named_provider_routes(
+            name,
+            &provider_cfg.base_url,
+            &static_ids,
+            &cached_ids,
+            key_present,
+            |source, model| {
+                crate::provider::pricing::metered_pricing_for_source_with_tier(source, model, None)
+            },
+        ));
+    }
+    routes
+}
+
 use std::sync::Arc;
 
 /// Production [`CheapRouteBackend`] backed by a real provider and tool registry.
@@ -334,7 +374,9 @@ impl CheapRouteBackend for ProviderCheapBackend {
     }
 
     fn routes(&self) -> Vec<ModelRoute> {
-        self.provider.model_routes()
+        let mut routes = self.provider.model_routes();
+        routes.extend(configured_named_provider_routes());
+        jcode_provider_core::selection::dedupe_model_routes(routes)
     }
 
     fn current_model(&self) -> String {
