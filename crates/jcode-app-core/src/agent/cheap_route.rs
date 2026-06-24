@@ -196,6 +196,67 @@ pub async fn run_cheap_route(
     })
 }
 
+use std::sync::Arc;
+
+/// Production [`CheapRouteBackend`] backed by a real provider and tool registry.
+/// `ask_parent` uses the (expensive) parent provider directly; `run_subtask`
+/// spawns a one-shot subagent pinned to the chosen cheap model on an isolated
+/// provider fork, mirroring `SubagentTool::execute`.
+pub struct ProviderCheapBackend {
+    provider: Arc<dyn crate::provider::Provider>,
+    registry: crate::tool::Registry,
+    parent_system: String,
+}
+
+impl ProviderCheapBackend {
+    pub fn new(
+        provider: Arc<dyn crate::provider::Provider>,
+        registry: crate::tool::Registry,
+    ) -> Self {
+        Self {
+            provider,
+            registry,
+            parent_system:
+                "You are a cost-routing coordinator. Decompose, recommend a model, and review \
+                 subagent work. Be terse and precise; output exactly what is asked."
+                    .to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl CheapRouteBackend for ProviderCheapBackend {
+    async fn ask_parent(&self, prompt: &str) -> Result<String> {
+        self.provider.complete_simple(prompt, &self.parent_system).await
+    }
+
+    async fn run_subtask(&self, subtask: &Subtask, model: &str) -> Result<String> {
+        // Mirror SubagentTool::execute: new session pinned to `model`, blocked
+        // recursive tools removed, run on an isolated provider fork.
+        let mut session = crate::session::Session::create(None, Some(subtask.description.clone()));
+        session.model = Some(model.to_string());
+        session.save()?;
+
+        let mut allowed: std::collections::HashSet<String> =
+            self.registry.tool_names().await.into_iter().collect();
+        for blocked in ["subagent", "task", "todo", "todowrite", "todoread"] {
+            allowed.remove(blocked);
+        }
+
+        let mut agent = super::Agent::new_with_session(
+            self.provider.fork(),
+            self.registry.clone(),
+            session,
+            Some(allowed),
+        );
+        agent.run_once_capture(&subtask.prompt).await
+    }
+
+    fn routes(&self) -> Vec<ModelRoute> {
+        self.provider.model_routes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +404,71 @@ mod tests {
         };
         let err = run_cheap_route(&backend, "task").await.unwrap_err();
         assert!(err.to_string().contains("no available model routes"));
+    }
+
+    // --- minimal provider mock (mirrors agent_tests::DelayedProvider) ---
+    struct ParentMock {
+        reply: String,
+        routes: Vec<ModelRoute>,
+    }
+
+    #[async_trait]
+    impl crate::provider::Provider for ParentMock {
+        async fn complete(
+            &self,
+            _messages: &[jcode_message_types::Message],
+            _tools: &[jcode_message_types::ToolDefinition],
+            _system: &str,
+            _resume_session_id: Option<&str>,
+        ) -> Result<crate::provider::EventStream> {
+            let reply = self.reply.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<jcode_message_types::StreamEvent>>(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(jcode_message_types::StreamEvent::TextDelta(reply)))
+                    .await;
+                let _ = tx
+                    .send(Ok(jcode_message_types::StreamEvent::MessageEnd {
+                        stop_reason: Some("end_turn".to_string()),
+                    }))
+                    .await;
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        }
+
+        fn name(&self) -> &str {
+            "parentmock"
+        }
+
+        fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+            std::sync::Arc::new(Self {
+                reply: self.reply.clone(),
+                routes: self.routes.clone(),
+            })
+        }
+
+        fn model_routes(&self) -> Vec<ModelRoute> {
+            self.routes.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_backend_delegates_ask_parent_and_routes() {
+        let provider: std::sync::Arc<dyn crate::provider::Provider> =
+            std::sync::Arc::new(ParentMock {
+                reply: "PARENT_REPLY".to_string(),
+                routes: vec![priced_route("cheapo", 100_000)],
+            });
+        let registry = crate::tool::Registry::empty();
+        let backend = ProviderCheapBackend::new(provider, registry);
+
+        // ask_parent drains the provider stream into text.
+        let answer = backend.ask_parent("anything").await.unwrap();
+        assert_eq!(answer, "PARENT_REPLY");
+
+        // routes delegates to provider.model_routes().
+        let routes = backend.routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].model, "cheapo");
     }
 }
