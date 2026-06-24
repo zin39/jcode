@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 mod compaction;
+pub mod cheap_route;
 mod environment;
 mod interrupts;
 mod messages;
