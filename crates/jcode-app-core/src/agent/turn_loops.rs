@@ -92,6 +92,41 @@ impl Agent {
                 &messages_with_memory
             };
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
+            // Budget enforcement: check cap before each provider call.
+            // This covers the main session AND every subagent (all go through run_turn).
+            {
+                let budget_micros = crate::config::config()
+                    .agents
+                    .session_budget_usd
+                    .map(crate::budget::usd_to_micros);
+                if let Some(cap) = budget_micros {
+                    let root_id = self.session.effective_budget_root();
+                    let spent = crate::budget::spent_micros(root_id);
+                    match crate::budget::budget_decision(spent, cap) {
+                        crate::budget::BudgetDecision::Stop => {
+                            let spent_usd = spent as f64 / 1_000_000.0;
+                            let cap_usd = cap as f64 / 1_000_000.0;
+                            return Err(anyhow::anyhow!(
+                                "Session budget of ${:.2} exceeded (spent ${:.2}). \
+                                 Configure a higher agents.session_budget_usd to continue.",
+                                cap_usd,
+                                spent_usd
+                            ));
+                        }
+                        crate::budget::BudgetDecision::Warn => {
+                            let spent_usd = spent as f64 / 1_000_000.0;
+                            let cap_usd = cap as f64 / 1_000_000.0;
+                            // Log once per run_turn call; not rate-limited further since
+                            // run_turn is called once per assistant turn.
+                            crate::logging::warn(&format!(
+                                "Budget warning: spent ${:.2} of ${:.2} cap (≥80%)",
+                                spent_usd, cap_usd
+                            ));
+                        }
+                        crate::budget::BudgetDecision::Allow => {}
+                    }
+                }
+            }
             self.last_status_detail = None;
             let mut stream = match self
                 .provider
