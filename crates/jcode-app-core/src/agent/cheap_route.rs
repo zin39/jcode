@@ -170,11 +170,15 @@ pub async fn run_cheap_route(
     let decompose = backend.ask_parent(&build_decompose_prompt(task)).await?;
     let subtasks = parse_subtasks(&decompose)?;
 
-    // 2. Code ranks routes into a cheapest-first menu.
-    let menu = build_menu(backend.routes(), MAX_MENU);
-    if menu.is_empty() {
+    // 2. Rank ALL available routes cheapest-first. The top slice is the recommend
+    //    menu; the FULL ranked list is the fallback candidate order, so a working
+    //    route that isn't in the cheapest 6 (e.g. deepseek sitting behind dead
+    //    OpenAI nano/mini) still gets reached instead of being skipped.
+    let ranked = rank_routes_by_cost(backend.routes());
+    if ranked.is_empty() {
         return Err(anyhow!("no available model routes to route work to"));
     }
+    let menu: Vec<CheapRouteCandidate> = ranked.iter().take(MAX_MENU).cloned().collect();
 
     // 3. Parent recommends one model from the menu.
     let menu_str = format_menu_for_prompt(&menu);
@@ -183,13 +187,14 @@ pub async fn run_cheap_route(
         .await?;
     let recommended_model = parse_recommended_model(&recommend, &menu)?;
 
-    // 4. Build candidate models cheapest-first: the recommended model first, then
-    //    the rest of the menu. Each subtask tries them in order, falling back to
-    //    the next on any error (e.g. a dead-quota / unauthorized route) until one
-    //    succeeds. This keeps a single broken route from sinking the whole run.
+    // 4. Candidate order: recommended first, then EVERY ranked route cheapest-
+    //    first. Each subtask tries them in order, falling back on any error
+    //    (dead-quota / unauthorized) until one succeeds.
     let mut candidates: Vec<String> = vec![recommended_model.clone()];
-    for candidate in &menu {
-        if candidate.route.model != recommended_model {
+    for candidate in &ranked {
+        if candidate.route.model != recommended_model
+            && !candidates.contains(&candidate.route.model)
+        {
             candidates.push(candidate.route.model.clone());
         }
     }
@@ -280,6 +285,27 @@ fn build_named_provider_routes(
 /// Collect cheap-routing candidate routes for every configured `[providers.X]`
 /// block in the user's config. Each block contributes routes from the union of
 /// its static `models[]` list and its previously-discovered disk catalog.
+/// Whether an ABSOLUTE `env_file` path (the form used in config `[providers.X]`
+/// blocks) contains a non-empty `{env_key}=...` line. jcode's standard
+/// config-dir-relative key loader rejects absolute paths, so cheap-routing checks
+/// them directly to decide route availability.
+fn absolute_env_file_has_key(env_key: Option<&str>, env_file: Option<&str>) -> bool {
+    let (Some(env_key), Some(env_file)) = (env_key, env_file) else {
+        return false;
+    };
+    let path = std::path::Path::new(env_file);
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let prefix = format!("{env_key}=");
+    content
+        .lines()
+        .any(|line| line.strip_prefix(&prefix).is_some_and(|v| !v.trim().is_empty()))
+}
+
 fn configured_named_provider_routes() -> Vec<ModelRoute> {
     let cfg = crate::config::config();
     let mut routes = Vec::new();
@@ -297,12 +323,22 @@ fn configured_named_provider_routes() -> Vec<ModelRoute> {
         // env-file lookup finds one. We pass empty-string defaults for None
         // optional fields; load_api_key_from_env_or_config returns None for
         // invalid (empty) names, which is safe.
-        let key_present = provider_cfg.api_key.is_some()
+        // A discovered disk catalog (cached_ids) means a real /v1/models fetch
+        // succeeded for this provider, which only happens with a working key — so
+        // treat that as conclusive availability. Otherwise fall back to the env
+        // lookups (incl. absolute env_file paths, which the config-dir-relative
+        // helper rejects).
+        let key_present = !cached_ids.is_empty()
+            || provider_cfg.api_key.is_some()
             || crate::provider_catalog::load_api_key_from_env_or_config(
                 provider_cfg.api_key_env.as_deref().unwrap_or(""),
                 provider_cfg.env_file.as_deref().unwrap_or(""),
             )
-            .is_some();
+            .is_some()
+            || absolute_env_file_has_key(
+                provider_cfg.api_key_env.as_deref(),
+                provider_cfg.env_file.as_deref(),
+            );
         routes.extend(build_named_provider_routes(
             name,
             &provider_cfg.base_url,
@@ -651,6 +687,25 @@ mod tests {
         );
         assert_eq!(routes.len(), 1);
         assert!(!routes[0].available);
+    }
+
+    #[test]
+    fn absolute_env_file_has_key_reads_absolute_path() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("jcode_cheap_route_absenv_test.env");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "DEEPSEEK_API_KEY=sk-abc123").unwrap();
+        drop(file);
+        let abs = path.to_str().unwrap();
+
+        assert!(absolute_env_file_has_key(Some("DEEPSEEK_API_KEY"), Some(abs)));
+        assert!(!absolute_env_file_has_key(Some("MISSING_KEY"), Some(abs)));
+        // relative path is not handled here (config-dir helper covers those)
+        assert!(!absolute_env_file_has_key(Some("DEEPSEEK_API_KEY"), Some("rel.env")));
+        // missing args
+        assert!(!absolute_env_file_has_key(None, Some(abs)));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
