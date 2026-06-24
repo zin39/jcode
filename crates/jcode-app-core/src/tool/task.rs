@@ -151,6 +151,17 @@ impl Tool for SubagentTool {
             session.working_dir = Some(working_dir.display().to_string());
         }
 
+        // Propagate budget root: all subagents in a session tree share the root's
+        // budget. Load the parent session to discover its effective root, then
+        // store it on this new child session so all descendants accumulate spend
+        // under a single ledger key regardless of nesting depth.
+        if session.budget_root_id.is_none() {
+            if let Ok(parent_session) = Session::load(&ctx.session_id) {
+                let root_id = parent_session.effective_budget_root().to_owned();
+                session.budget_root_id = Some(root_id);
+            }
+        }
+
         session.save()?;
 
         let mut allowed: HashSet<String> = self.registry.tool_names().await.into_iter().collect();
