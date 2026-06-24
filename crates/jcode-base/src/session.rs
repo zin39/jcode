@@ -91,6 +91,11 @@ fn is_visible_conversation_message(message: &StoredMessage) -> bool {
 pub struct Session {
     pub id: String,
     pub parent_id: Option<String>,
+    /// Budget root for spend tracking. `None` means this session IS the root;
+    /// subagents set this to the ancestor's root id so all spend accumulates
+    /// under a single ledger key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_root_id: Option<String>,
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_title: Option<String>,
@@ -701,6 +706,7 @@ impl Session {
         let mut session = Self {
             id: session_id,
             parent_id,
+            budget_root_id: None,
             title,
             custom_title: None,
             created_at: now,
@@ -748,6 +754,7 @@ impl Session {
         let mut session = Self {
             id,
             parent_id,
+            budget_root_id: None,
             title,
             custom_title: None,
             created_at: now,
@@ -1149,6 +1156,15 @@ request in this new forked session, using the inherited conversation only as con
                 .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
         }
         totals
+    }
+
+    /// The effective budget root id for spend tracking.
+    ///
+    /// If this session has a `budget_root_id`, use that (it was set by the
+    /// subagent spawner to point at the tree root). Otherwise this session IS
+    /// the root, so return its own `id`.
+    pub fn effective_budget_root(&self) -> &str {
+        self.budget_root_id.as_deref().unwrap_or(&self.id)
     }
 
     pub fn add_message(&mut self, role: Role, content: Vec<ContentBlock>) -> String {

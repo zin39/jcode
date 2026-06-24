@@ -1957,3 +1957,25 @@ fn streaming_guard_creates_visible_macos_sleep_assertion() {
         "streaming assertion should be released after guard drop; output was:\n{stdout}"
     );
 }
+
+#[test]
+fn test_effective_budget_root_own_id_when_no_root_set() {
+    let session = Session::create_with_id(
+        "sess-abc-root".to_string(),
+        None,
+        None,
+    );
+    // No budget_root_id set → returns own id
+    assert_eq!(session.effective_budget_root(), "sess-abc-root");
+}
+
+#[test]
+fn test_effective_budget_root_uses_budget_root_id_when_set() {
+    let mut session = Session::create_with_id(
+        "sess-child-xyz".to_string(),
+        Some("parent-session-id".to_string()),
+        None,
+    );
+    session.budget_root_id = Some("sess-root-ancestor".to_owned());
+    assert_eq!(session.effective_budget_root(), "sess-root-ancestor");
+}
