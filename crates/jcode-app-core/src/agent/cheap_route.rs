@@ -445,11 +445,15 @@ pub async fn run_cheap_route(
         .find(|c| c.route.model == strong_model)
         .map(|c| c.route.api_method.clone());
 
-    // Guaranteed last resort: the parent's own current model, which is known to
-    // work (it just answered the decompose/recommend calls). No pinned route — it
-    // resolves via the parent's active provider. This rescues runs where every
-    // ranked cheap route is dead-quota.
-    if !current_model.is_empty() && !candidates.iter().any(|(m, _)| m == &current_model) {
+    // Last resort: the parent's own current model. EXCEPT when it is banned via
+    // cheap_route_ban (e.g. the user banned Claude): never silently burn an
+    // expensive banned coordinator just because every cheap route is dead — the
+    // subtask should fail loudly instead. The cheap candidates above are already
+    // a cooled-but-cheap fallback, so this only drops the truly-expensive escape.
+    if !current_model.is_empty()
+        && !model_is_cheap_route_banned(&current_model)
+        && !candidates.iter().any(|(m, _)| m == &current_model)
+    {
         candidates.push((current_model, None));
     }
 
@@ -823,14 +827,36 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
     let routes = drop_banned_routes(routes, &agents.cheap_route_ban);
     let ranked = rank_routes_by_cost(routes);
     let ranked = prioritize_preferred(ranked, &agents.cheap_route_prefer);
-    // Skip routes cooled down by a recent quota/rate failure so spawns pick the
-    // next-cheapest *healthy* route. When every cheap route is unhealthy this
-    // returns empty on purpose: callers then escalate to the coordinator model
-    // as the genuine last resort, rather than looping on a dead route.
-    ranked
-        .into_iter()
+    // Prefer routes NOT cooled down by a recent quota/rate failure. But if EVERY
+    // cheap route is cooled, return them anyway (cheapest-first) instead of an
+    // empty list. An empty list makes callers escalate to the coordinator model
+    // — which can be expensive AND ban-exempt (the last-resort path bypasses
+    // cheap_route_ban), so all-cheap-dead used to silently burn an expensive
+    // coordinator (e.g. Claude). Retrying a cooled CHEAP route is always safer.
+    // `ranked` already had banned routes dropped, so nothing returned here is a
+    // banned model.
+    let healthy: Vec<CheapRouteCandidate> = ranked
+        .iter()
         .filter(|c| route_is_healthy(&c.route.model))
-        .collect()
+        .cloned()
+        .collect();
+    if healthy.is_empty() { ranked } else { healthy }
+}
+
+/// Whether a model id is excluded by `agents.cheap_route_ban`. Used to keep the
+/// last-resort coordinator fallback from EVER using a banned model (e.g. Claude)
+/// when every cheap route is dead.
+fn model_is_cheap_route_banned(model: &str) -> bool {
+    let agents = &crate::config::config().agents;
+    let probe = ModelRoute {
+        model: model.to_string(),
+        provider: String::new(),
+        api_method: String::new(),
+        available: true,
+        detail: String::new(),
+        cheapness: None,
+    };
+    drop_banned_routes(vec![probe], &agents.cheap_route_ban).is_empty()
 }
 
 /// The sentinel value users put in `agents.swarm_model` (or pass as a subagent
@@ -1458,10 +1484,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cheap_route_falls_back_to_current_model_when_all_routes_cooled() {
-        // Regression: a quota blip recorded in the health map can cool EVERY
-        // cheap route, making `ranked_with_preferences` return empty. The run
-        // must still escalate to the parent's current model, not hard-error.
+    async fn uses_cooled_cheap_route_not_parent_when_all_cooled() {
+        // SAFETY (Claude-burn fix): when EVERY cheap route is cooled, run on the
+        // cheapest cooled CHEAP route — do NOT escalate to the parent/coordinator
+        // model, which can be expensive and ban-exempt. Retrying a cooled cheap
+        // route is always safer than burning an expensive coordinator.
         // Unique route names so the process-global health map stays isolated.
         mark_route_unhealthy("cooled-route-x");
         mark_route_unhealthy("cooled-route-y");
@@ -1481,10 +1508,14 @@ mod tests {
 
         let outcome = run_cheap_route(&backend, "task").await.unwrap();
 
-        assert_eq!(outcome.recommended_model, "parent-live");
-        assert_eq!(outcome.results[0].model_used, "parent-live");
+        // Ran on the cheapest cooled CHEAP route, NOT the parent model.
+        assert_eq!(outcome.results[0].model_used, "cooled-route-x");
         let attempts = backend.attempts.lock().unwrap();
-        assert_eq!(*attempts, vec!["parent-live".to_string()]);
+        assert_eq!(attempts[0], "cooled-route-x");
+        assert!(
+            !attempts.contains(&"parent-live".to_string()),
+            "must never escalate to the parent/coordinator when cheap routes exist"
+        );
     }
 
     #[tokio::test]
