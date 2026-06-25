@@ -793,8 +793,18 @@ fn route_is_healthy(model: &str) -> bool {
 /// drained), which previously made every cheap spawn fall back to the expensive
 /// coordinator model instead of the next-cheapest cheap route.
 pub fn note_provider_error(model: &str, error: &str) {
+    if is_rate_or_quota_error(error) {
+        mark_route_unhealthy(model);
+    }
+}
+
+/// Whether a provider error looks like a route is out of quota, rate-limited, or
+/// transiently unavailable (402/429/403/5xx, "insufficient balance", "rate
+/// limit", "quota"). Used both to cool a route down and to decide whether a
+/// cheap worker should auto-reroute to another model.
+pub fn is_rate_or_quota_error(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
-    let unhealthy = e.contains("status: 402")
+    e.contains("status: 402")
         || e.contains("status: 429")
         || e.contains("status: 403")
         || e.contains("status: 500")
@@ -805,10 +815,7 @@ pub fn note_provider_error(model: &str, error: &str) {
         || e.contains("payment required")
         || e.contains("rate limit")
         || e.contains("rate-limit")
-        || e.contains("quota");
-    if unhealthy {
-        mark_route_unhealthy(model);
-    }
+        || e.contains("quota")
 }
 
 fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> {
@@ -963,6 +970,9 @@ impl CheapRouteBackend for ProviderCheapBackend {
             session,
             Some(allowed),
         );
+        // Cheap workers may auto-switch to the next-cheapest healthy model if
+        // their pinned model rate-limits/quota-fails mid-run, instead of failing.
+        agent.set_allow_auto_reroute(true);
         agent.run_once_capture(&subtask.prompt).await
     }
 

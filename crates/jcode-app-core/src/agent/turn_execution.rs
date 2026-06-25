@@ -30,7 +30,19 @@ impl Agent {
         if trace_enabled() {
             eprintln!("[trace] session_id {}", self.session.id);
         }
-        self.run_turn(false).await
+        let mut result = self.run_turn(false).await;
+        let mut reroutes = 0u32;
+        while self.allow_auto_reroute
+            && reroutes < Self::MAX_AUTO_REROUTES
+            && matches!(&result, Err(e) if crate::agent::cheap_route::is_rate_or_quota_error(&e.to_string()))
+        {
+            if self.reroute_to_next_cheap_model().is_none() {
+                break;
+            }
+            reroutes += 1;
+            result = self.run_turn(false).await;
+        }
+        result
     }
 
     /// Run one conversation turn with streaming events via mpsc channel (per-client)
@@ -82,7 +94,23 @@ impl Agent {
         self.session.save()?;
         let turn_started_at = Instant::now();
         let start_message_index = self.message_count();
-        let result = self.run_turn_streaming_mpsc(event_tx).await;
+        let mut result = self.run_turn_streaming_mpsc(event_tx.clone()).await;
+        // Cheap workers (swarm members) auto-switch to the next-cheapest healthy
+        // model if their pinned model rate-limited/quota-failed, instead of the
+        // member failing. The failed model was cooled by note_provider_error, so
+        // the reroute picks a different route. Only fires for the first-call
+        // failure case (no partial assistant output to duplicate).
+        let mut reroutes = 0u32;
+        while self.allow_auto_reroute
+            && reroutes < Self::MAX_AUTO_REROUTES
+            && matches!(&result, Err(e) if crate::agent::cheap_route::is_rate_or_quota_error(&e.to_string()))
+        {
+            if self.reroute_to_next_cheap_model().is_none() {
+                break;
+            }
+            reroutes += 1;
+            result = self.run_turn_streaming_mpsc(event_tx.clone()).await;
+        }
         self.current_turn_system_reminder = None;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
         result
@@ -271,6 +299,49 @@ impl Agent {
     /// coordinator can render a live inline gallery viewport for it.
     pub fn set_inline_output_tap(&mut self, enabled: bool) {
         self.inline_output_tap = enabled;
+    }
+
+    /// Allow this session's turn loop to auto-switch to the next-cheapest healthy
+    /// model on a rate/quota/transient failure. Only for spawned cheap workers
+    /// and swarm members — never the user's interactive session.
+    pub fn set_allow_auto_reroute(&mut self, enabled: bool) {
+        self.allow_auto_reroute = enabled;
+    }
+
+    /// Max number of times a cheap worker auto-switches models within one turn
+    /// before giving up.
+    const MAX_AUTO_REROUTES: u32 = 2;
+
+    /// Switch this session to the next-cheapest HEALTHY model after the current
+    /// one failed with a rate/quota error (the failed model was already cooled by
+    /// `note_provider_error`, so this returns a different route). Returns the new
+    /// model name, or None if there's no different healthy alternative.
+    pub(crate) fn reroute_to_next_cheap_model(&mut self) -> Option<String> {
+        let current = self.provider.model();
+        let (next_model, next_api) =
+            crate::agent::cheap_route::cheapest_available_model(self.provider.as_ref())?;
+        if next_model == current {
+            return None;
+        }
+        let request = crate::provider::MultiProvider::model_switch_request_for_session_route(
+            &next_model,
+            None,
+            Some(&next_api),
+        );
+        match self.set_model(&request) {
+            Ok(()) => {
+                crate::logging::info(&format!(
+                    "auto-reroute: '{current}' failed (rate/quota); switched to '{next_model}'"
+                ));
+                Some(next_model)
+            }
+            Err(e) => {
+                crate::logging::warn(&format!(
+                    "auto-reroute: failed to switch from '{current}' to '{next_model}': {e}"
+                ));
+                None
+            }
+        }
     }
 
     /// Whether this session streams an inline output tail to the bus.

@@ -240,6 +240,11 @@ pub struct Agent {
     /// output tail to the global bus so the coordinator's inline gallery can
     /// render a live viewport. Off for normal sessions to avoid bus traffic.
     inline_output_tap: bool,
+    /// When true (cheap workers / swarm members only), the turn loop may
+    /// auto-switch to the next-cheapest HEALTHY model on a rate/quota/transient
+    /// provider failure instead of failing the turn. NEVER set for the user's
+    /// own interactive session — we must not silently change the model they chose.
+    allow_auto_reroute: bool,
 }
 
 impl Agent {
@@ -292,6 +297,7 @@ impl Agent {
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
             inline_output_tap: false,
+            allow_auto_reroute: false,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,

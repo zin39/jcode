@@ -94,6 +94,10 @@ pub(super) async fn create_headless_session(
                 model, model_request, e
             ));
         }
+        // A spawned worker pinned to a specific model (swarm member / cheap
+        // subagent) may auto-switch to the next-cheapest healthy model if this
+        // one rate-limits/quota-fails mid-run, instead of failing the agent.
+        new_agent.set_allow_auto_reroute(true);
     }
 
     if let Some(ref dir) = working_dir
