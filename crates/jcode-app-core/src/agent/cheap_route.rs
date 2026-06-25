@@ -193,7 +193,19 @@ pub async fn run_cheap_route(
     let recommend = backend
         .ask_parent(&build_recommend_prompt(task, &subtasks, &menu_str))
         .await?;
-    let recommended_model = parse_recommended_model(&recommend, &menu)?;
+    let mut recommended_model = parse_recommended_model(&recommend, &menu)?;
+
+    // Honor an explicit preference as a HARD override: if the user pinned a
+    // preferred provider (agents.cheap_route_prefer), use its prefer-prioritized,
+    // cheapest route as the primary pick instead of the parent's free choice —
+    // which otherwise often picks its own (expensive) model over the cheap one
+    // the user wanted. `ranked` is already prefer-prioritized, so ranked[0] is
+    // the preferred route when a preference matched.
+    if !crate::config::config().agents.cheap_route_prefer.is_empty()
+        && let Some(top) = ranked.first()
+    {
+        recommended_model = top.route.model.clone();
+    }
 
     // 4. Candidate order: recommended first, then the cheapest model of EACH
     //    other provider. Quota/auth failures are per-key, so once one model of a
