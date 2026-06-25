@@ -3464,6 +3464,7 @@ dependencies = [
  "jcode-protocol",
  "jcode-provider-core",
  "jcode-provider-metadata",
+ "jcode-provider-openrouter",
  "jcode-selfdev-types",
  "jcode-session-types",
  "jcode-setup-hints",

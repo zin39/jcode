@@ -2029,17 +2029,25 @@ impl OpenRouterProvider {
         }
 
         let ranked = {
-            let mut endpoints = load_endpoints_disk_cache(model).or_else(|| {
+            let endpoints = load_endpoints_disk_cache(model).or_else(|| {
                 let cache = self.endpoints_cache.try_read().ok()?;
                 cache.get(model).map(|(_, eps)| eps.clone())
             });
 
-            // Fetch endpoints from API if no cache available
-            if endpoints.is_none()
-                && let Ok(fetched) = self.fetch_endpoints(model).await
-                && !fetched.is_empty()
-            {
-                endpoints = Some(fetched);
+            // Endpoint metadata must NEVER block the request path. A direct
+            // OpenAI-compatible profile whose upstream has no OpenRouter-style
+            // `/models/{id}/endpoints` route (e.g. api.deepseek.com,
+            // dashscope) responds 404 — but only after a full, sometimes very
+            // slow, TLS connect (observed up to 13s, occasionally >45s under
+            // connection-pool contention). Fetching inline here stalled the
+            // turn *before the stream even opened* and, because a 404 never
+            // populates the cache, it re-stalled on every request. Provider
+            // ranking is a best-effort KV-cache-warmth optimization, not a
+            // correctness requirement, so when we have no cached endpoints we
+            // warm them in the background (deduped + throttled) and fall
+            // through to default routing for this turn.
+            if endpoints.is_none() {
+                self.maybe_schedule_endpoint_refresh(model, None, "request_routing", false);
             }
 
             Self::rank_providers_from_endpoints(&endpoints.unwrap_or_default())

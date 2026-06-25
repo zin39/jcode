@@ -93,17 +93,34 @@ impl Agent {
             };
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
-            let mut stream = match self
-                .provider
-                .complete_split(
-                    send_messages,
-                    &tools,
-                    &split_prompt.static_part,
-                    &split_prompt.dynamic_part,
-                    self.provider_session_id.as_deref(),
-                )
-                .await
-            {
+            // Bound stream-open so a subagent can't hang indefinitely. Unlike the
+            // primary mpsc turn (which has its own deadline), this path is used by
+            // subagents/cheap_route workers; without a cap a slow or unreachable
+            // provider left the subagent "running" for minutes with no progress.
+            const SUBAGENT_STREAM_OPEN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(45);
+            let complete_split = self.provider.complete_split(
+                send_messages,
+                &tools,
+                &split_prompt.static_part,
+                &split_prompt.dynamic_part,
+                self.provider_session_id.as_deref(),
+            );
+            let open_result =
+                match tokio::time::timeout(SUBAGENT_STREAM_OPEN_TIMEOUT, complete_split).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        logging::warn(&format!(
+                            "Subagent API stream did not open within {}s (provider may be rate-limited or unreachable) - aborting turn",
+                            SUBAGENT_STREAM_OPEN_TIMEOUT.as_secs()
+                        ));
+                        return Err(anyhow::anyhow!(
+                            "Provider did not respond within {}s — it may be rate-limited or unreachable. Try again or switch models with /model.",
+                            SUBAGENT_STREAM_OPEN_TIMEOUT.as_secs()
+                        ));
+                    }
+                };
+            let mut stream = match open_result {
                 Ok(stream) => stream,
                 Err(e) => {
                     if self.try_auto_compact_after_context_limit(&e.to_string()) {
