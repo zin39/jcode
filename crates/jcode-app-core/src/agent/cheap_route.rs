@@ -444,12 +444,29 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
 /// `model`) to mean "pick the cheapest available model dynamically".
 pub const CHEAPEST_SENTINEL: &str = "cheapest";
 
-/// Core file/shell tools a cheap subagent is given. The full registry (~31
-/// tools) bloats the prompt and stalls cheap models, so cheap-route subtasks get
-/// only these essentials. Names are intersected with the live registry.
+/// Default tool set for a cheap subagent: core file/shell work plus web
+/// search/fetch (so research subtasks work), but not the full ~31-tool registry
+/// that bloats the prompt and stalls cheap models. Overridable via
+/// `agents.cheap_route_tools`. Names are intersected with the live registry.
 const CHEAP_SUBAGENT_TOOLS: &[&str] = &[
     "read", "write", "edit", "multiedit", "apply_patch", "bash", "grep", "glob", "ls",
+    "websearch", "webfetch",
 ];
+
+/// Resolve the cheap-subagent tool allowlist: the configured
+/// `agents.cheap_route_tools` if non-empty, else [`CHEAP_SUBAGENT_TOOLS`].
+fn cheap_subagent_tool_allowlist(registry_tools: &std::collections::HashSet<String>) -> std::collections::HashSet<String> {
+    let configured = &crate::config::config().agents.cheap_route_tools;
+    let wanted: Vec<String> = if configured.is_empty() {
+        CHEAP_SUBAGENT_TOOLS.iter().map(|t| t.to_string()).collect()
+    } else {
+        configured.clone()
+    };
+    wanted
+        .into_iter()
+        .filter(|t| registry_tools.contains(t))
+        .collect()
+}
 
 /// Hard cap on a single subtask's model call. A slow/hanging route (e.g.
 /// OpenRouter stalling) must not block the whole run — on timeout the candidate
@@ -531,11 +548,7 @@ impl CheapRouteBackend for ProviderCheapBackend {
         // cheap models — keep just the essentials so the single call is fast.
         let registry_tools: std::collections::HashSet<String> =
             self.registry.tool_names().await.into_iter().collect();
-        let allowed: std::collections::HashSet<String> = CHEAP_SUBAGENT_TOOLS
-            .iter()
-            .map(|t| t.to_string())
-            .filter(|t| registry_tools.contains(t))
-            .collect();
+        let allowed = cheap_subagent_tool_allowlist(&registry_tools);
 
         let mut agent = super::Agent::new_with_session(
             self.provider.fork(),

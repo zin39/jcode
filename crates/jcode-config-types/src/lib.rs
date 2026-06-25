@@ -469,6 +469,12 @@ pub struct AgentsConfig {
     /// `cheap_route_prefer`.
     #[serde(default)]
     pub cheap_route_ban: Vec<String>,
+    /// Tool names a cheap-routed subagent is allowed to use. Empty = a built-in
+    /// default (core file/shell tools + websearch/webfetch). Keeping this small
+    /// matters: sending the full ~31-tool registry bloats the prompt and stalls
+    /// cheap models. Add e.g. `"browser"` here if cheap subtasks need it.
+    #[serde(default)]
+    pub cheap_route_tools: Vec<String>,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -554,6 +560,7 @@ impl Default for AgentsConfig {
             swarm_model: None,
             cheap_route_prefer: Vec::new(),
             cheap_route_ban: Vec::new(),
+            cheap_route_tools: Vec::new(),
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             memory_model: None,
