@@ -1012,6 +1012,12 @@ pub enum WebSearchEngine {
     /// `JCODE_SEARXNG_URL` env var) to point at a SearXNG instance. Useful on
     /// hosts where DuckDuckGo/Bing block the request via TLS fingerprinting.
     Searxng,
+    /// Tavily AI search API. Agent-grade results with clean extracted content.
+    /// Reads one or more API keys from the `TAVILY_API_KEYS` env var (comma- or
+    /// whitespace-separated) and rotates across them, skipping keys that are
+    /// rate-limited or out of credits, so a single exhausted free-tier key does
+    /// not break search.
+    Tavily,
 }
 
 impl WebSearchEngine {
@@ -1020,6 +1026,7 @@ impl WebSearchEngine {
             Self::Duckduckgo => "duckduckgo",
             Self::Bing => "bing",
             Self::Searxng => "searxng",
+            Self::Tavily => "tavily",
         }
     }
 
@@ -1028,6 +1035,7 @@ impl WebSearchEngine {
             "duckduckgo" | "ddg" => Some(Self::Duckduckgo),
             "bing" => Some(Self::Bing),
             "searxng" | "searx" => Some(Self::Searxng),
+            "tavily" => Some(Self::Tavily),
             _ => None,
         }
     }
@@ -1053,6 +1061,18 @@ pub struct WebSearchConfig {
     pub searxng_url: Option<String>,
     /// Environment variable containing the SearXNG base URL.
     pub searxng_url_env: String,
+    /// Environment variable holding one or more Tavily API keys, comma- or
+    /// whitespace-separated. The `tavily` engine rotates across them and skips
+    /// keys that are rate-limited or out of credits.
+    pub tavily_api_keys_env: String,
+    /// Bare filename under the jcode config dir (e.g. `~/.jcode/tavily.env`)
+    /// read for `{tavily_api_keys_env}=...` when the env var is unset. Lets keys
+    /// live in a secret file like other provider credentials instead of the
+    /// server's process environment.
+    pub tavily_api_keys_file: String,
+    /// Tavily search depth: "basic" (1 credit, fast) or "advanced" (2 credits,
+    /// deeper extraction). Defaults to "advanced".
+    pub tavily_search_depth: String,
 }
 
 impl Default for WebSearchConfig {
@@ -1065,6 +1085,9 @@ impl Default for WebSearchConfig {
             bing_market: "en-US".to_string(),
             searxng_url: None,
             searxng_url_env: "JCODE_SEARXNG_URL".to_string(),
+            tavily_api_keys_env: "TAVILY_API_KEYS".to_string(),
+            tavily_api_keys_file: "tavily.env".to_string(),
+            tavily_search_depth: "advanced".to_string(),
         }
     }
 }

@@ -69,8 +69,8 @@ impl Tool for WebSearchTool {
                 },
                 "engine": {
                     "type": "string",
-                    "enum": ["duckduckgo", "bing", "searxng"],
-                    "description": "Search engine. Defaults to duckduckgo. Bing uses JCODE_BING_API_KEY when set, otherwise Bing HTML scraping. searxng queries a configured SearXNG instance (JCODE_SEARXNG_URL)."
+                    "enum": ["duckduckgo", "bing", "searxng", "tavily"],
+                    "description": "Search engine. Defaults to the configured engine. tavily is AI-grade search with clean extracted content (rotates across TAVILY_API_KEYS). searxng queries a configured SearXNG instance (JCODE_SEARXNG_URL). Bing uses JCODE_BING_API_KEY when set, otherwise HTML scraping."
                 },
                 "bing_market": {
                     "type": "string",
@@ -173,7 +173,116 @@ impl WebSearchTool {
                     .await
             }
             WebSearchEngine::Searxng => self.search_searxng(query, num_results).await,
+            WebSearchEngine::Tavily => self.search_tavily(query, num_results).await,
         }
+    }
+
+    /// Tavily AI search with multi-key rotation. Reads keys from the configured
+    /// env var (comma-/whitespace-separated), tries them round-robin starting
+    /// from a process-global cursor, and skips keys that are dead (bad key) or
+    /// temporarily blocked (rate-limited / out of credits). Only when every key
+    /// is unavailable does this return an error, at which point the caller's
+    /// `fallback_engines` (e.g. searxng) take over.
+    async fn search_tavily(&self, query: &str, num_results: usize) -> Result<Vec<SearchResult>> {
+        let config = crate::config::config();
+        let keys = load_tavily_keys(
+            &config.websearch.tavily_api_keys_env,
+            &config.websearch.tavily_api_keys_file,
+        );
+        if keys.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Tavily engine selected but no API keys found. Set {} (comma- or \
+                 whitespace-separated), or put `{}=key1,key2,...` in ~/.jcode/{}.",
+                config.websearch.tavily_api_keys_env,
+                config.websearch.tavily_api_keys_env,
+                config.websearch.tavily_api_keys_file
+            ));
+        }
+        let depth = match config.websearch.tavily_search_depth.trim().to_ascii_lowercase().as_str() {
+            "basic" => "basic",
+            _ => "advanced",
+        };
+
+        let order = tavily_try_order(&keys);
+        let total = order.len();
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut skipped_blocked = 0usize;
+
+        for key in order {
+            if tavily_key_blocked(&key) {
+                skipped_blocked += 1;
+                continue;
+            }
+            match self.tavily_request(&key, query, num_results, depth).await {
+                Ok(results) => {
+                    tavily_on_success(&key, &keys);
+                    return Ok(results);
+                }
+                Err(TavilyError::Dead(msg)) => {
+                    tavily_block_key(&key, u64::MAX);
+                    last_error = Some(anyhow::anyhow!("Tavily key rejected: {msg}"));
+                }
+                Err(TavilyError::Exhausted(msg)) => {
+                    tavily_block_key(&key, now_unix().saturating_add(TAVILY_COOLDOWN_SECS));
+                    last_error = Some(anyhow::anyhow!("Tavily key rate-limited/out of credits: {msg}"));
+                }
+                Err(TavilyError::Transient(msg)) => {
+                    last_error = Some(anyhow::anyhow!("Tavily request failed: {msg}"));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "All {total} Tavily key(s) are currently unavailable ({skipped_blocked} blocked); \
+                 falling back to another engine if configured."
+            )
+        }))
+    }
+
+    async fn tavily_request(
+        &self,
+        api_key: &str,
+        query: &str,
+        num_results: usize,
+        depth: &str,
+    ) -> std::result::Result<Vec<SearchResult>, TavilyError> {
+        let body = json!({
+            "query": query,
+            "search_depth": depth,
+            "max_results": num_results,
+            "include_answer": false,
+        });
+        let response = self
+            .client
+            .post("https://api.tavily.com/search")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| TavilyError::Transient(e.to_string()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let code = status.as_u16();
+            let detail = response.text().await.unwrap_or_default();
+            let detail = detail.chars().take(200).collect::<String>();
+            // 401/403: the key itself is invalid -> never retry it.
+            // 429 (rate limit) / 432 (plan/usage limit) / 433 / 402 (payment):
+            // the key is valid but out of budget for now -> cool down, rotate.
+            return Err(match code {
+                401 | 403 => TavilyError::Dead(format!("HTTP {code}: {detail}")),
+                402 | 429 | 432 | 433 => TavilyError::Exhausted(format!("HTTP {code}: {detail}")),
+                _ => TavilyError::Transient(format!("HTTP {code}: {detail}")),
+            });
+        }
+
+        let parsed: TavilyResponse = response
+            .json()
+            .await
+            .map_err(|e| TavilyError::Transient(format!("invalid JSON: {e}")))?;
+        Ok(parse_tavily_results(parsed, num_results))
     }
 
     async fn search_duckduckgo(
@@ -643,6 +752,162 @@ fn html_decode(s: &str) -> String {
         .to_string()
 }
 
+/// Outcome classification for a single Tavily key attempt, so the rotation
+/// loop can decide whether to retire the key, cool it down, or just try the
+/// next one.
+enum TavilyError {
+    /// Key is invalid (401/403) — never use it again this process.
+    Dead(String),
+    /// Key is valid but rate-limited / out of credits — cool down, rotate.
+    Exhausted(String),
+    /// Transient failure (network, 5xx, bad JSON) — try the next key.
+    Transient(String),
+}
+
+/// How long a rate-limited / credit-exhausted Tavily key is skipped before it
+/// is eligible again. Tavily free credits reset monthly; this cooldown just
+/// stops a depleted key from being retried on every search. 6 hours.
+const TAVILY_COOLDOWN_SECS: u64 = 6 * 60 * 60;
+
+#[derive(Default)]
+struct TavilyKeyState {
+    /// Round-robin cursor into the configured key list.
+    cursor: usize,
+    /// key -> unix-seconds-until-eligible. `u64::MAX` means permanently dead.
+    blocked: std::collections::HashMap<String, u64>,
+}
+
+fn tavily_state() -> &'static std::sync::Mutex<TavilyKeyState> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<TavilyKeyState>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(TavilyKeyState::default()))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse keys from a raw env value: split on commas and whitespace/newlines,
+/// trim, drop empties, dedupe while preserving order.
+fn parse_tavily_keys(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter(|s| seen.insert(s.to_string()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Load Tavily keys: prefer the process env var, otherwise read
+/// `{env_var}=...` from the bare `file_name` under the jcode config dir (e.g.
+/// `~/.jcode/tavily.env`), mirroring how provider credentials are stored.
+fn load_tavily_keys(env_var: &str, file_name: &str) -> Vec<String> {
+    if let Ok(raw) = std::env::var(env_var) {
+        let keys = parse_tavily_keys(&raw);
+        if !keys.is_empty() {
+            return keys;
+        }
+    }
+    let Ok(dir) = jcode_storage::app_config_dir() else {
+        return Vec::new();
+    };
+    // Bare filename only — never traverse outside the config dir.
+    if file_name.is_empty() || file_name.contains('/') || file_name.contains("..") {
+        return Vec::new();
+    }
+    let Ok(content) = std::fs::read_to_string(dir.join(file_name)) else {
+        return Vec::new();
+    };
+    let prefix = format!("{env_var}=");
+    for line in content.lines() {
+        if let Some(value) = line.trim().strip_prefix(&prefix) {
+            // Strip optional surrounding quotes, then split into keys.
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            let keys = parse_tavily_keys(value);
+            if !keys.is_empty() {
+                return keys;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Build the order in which keys are tried this call: start at the global
+/// cursor and wrap, so load spreads across keys round-robin.
+fn tavily_try_order(keys: &[String]) -> Vec<String> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let start = {
+        let state = tavily_state().lock().unwrap_or_else(|e| e.into_inner());
+        state.cursor % keys.len()
+    };
+    (0..keys.len())
+        .map(|i| keys[(start + i) % keys.len()].clone())
+        .collect()
+}
+
+fn tavily_key_blocked(key: &str) -> bool {
+    let state = tavily_state().lock().unwrap_or_else(|e| e.into_inner());
+    state
+        .blocked
+        .get(key)
+        .map(|&until| until > now_unix())
+        .unwrap_or(false)
+}
+
+fn tavily_block_key(key: &str, until_unix: u64) {
+    let mut state = tavily_state().lock().unwrap_or_else(|e| e.into_inner());
+    state.blocked.insert(key.to_string(), until_unix);
+}
+
+/// On a successful search, clear any cooldown on the winning key and advance
+/// the round-robin cursor to the key after it.
+fn tavily_on_success(key: &str, keys: &[String]) {
+    let mut state = tavily_state().lock().unwrap_or_else(|e| e.into_inner());
+    state.blocked.remove(key);
+    if let Some(pos) = keys.iter().position(|k| k == key) {
+        state.cursor = (pos + 1) % keys.len().max(1);
+    }
+}
+
+#[derive(Deserialize)]
+struct TavilyResponse {
+    #[serde(default)]
+    results: Vec<TavilyResult>,
+}
+
+#[derive(Deserialize)]
+struct TavilyResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+fn parse_tavily_results(response: TavilyResponse, num_results: usize) -> Vec<SearchResult> {
+    response
+        .results
+        .into_iter()
+        .filter(|r| !r.url.trim().is_empty())
+        .take(num_results)
+        .map(|r| SearchResult {
+            title: if r.title.trim().is_empty() {
+                r.url.clone()
+            } else {
+                r.title
+            },
+            url: r.url,
+            snippet: r.content.unwrap_or_default(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,5 +1098,69 @@ mod tests {
             Some(WebSearchEngine::Searxng)
         );
         assert_eq!(WebSearchEngine::Searxng.as_str(), "searxng");
+    }
+
+    #[test]
+    fn websearch_engine_parses_tavily() {
+        assert_eq!(WebSearchEngine::parse("tavily"), Some(WebSearchEngine::Tavily));
+        assert_eq!(WebSearchEngine::parse("TAVILY"), Some(WebSearchEngine::Tavily));
+        assert_eq!(WebSearchEngine::Tavily.as_str(), "tavily");
+    }
+
+    #[test]
+    fn tavily_keys_split_on_commas_and_whitespace_and_dedupe() {
+        let raw = "key-a, key-b\n key-c\tkey-a,,  key-b ";
+        assert_eq!(parse_tavily_keys(raw), vec!["key-a", "key-b", "key-c"]);
+        assert!(parse_tavily_keys("   ").is_empty());
+        assert!(parse_tavily_keys("").is_empty());
+    }
+
+    #[test]
+    fn tavily_results_map_and_respect_limit() {
+        let body = serde_json::json!({
+            "query": "rust",
+            "results": [
+                {"title": "Rust", "url": "https://rust-lang.org", "content": "A language."},
+                {"title": "", "url": "https://crates.io", "content": null},
+                {"title": "junk", "url": ""},
+                {"title": "Book", "url": "https://doc.rust-lang.org", "content": "Learn."}
+            ]
+        });
+        let parsed: TavilyResponse = serde_json::from_value(body).unwrap();
+        let results = parse_tavily_results(parsed, 10);
+        assert_eq!(results.len(), 3, "empty-url entry dropped");
+        assert_eq!(results[0].url, "https://rust-lang.org");
+        assert_eq!(results[0].snippet, "A language.");
+        // Missing title falls back to URL; missing content -> empty snippet.
+        assert_eq!(results[1].title, "https://crates.io");
+        assert_eq!(results[1].snippet, "");
+    }
+
+    #[test]
+    fn tavily_try_order_is_round_robin_from_cursor() {
+        // Reset shared state for a deterministic check (tests in one binary share
+        // the process-global cursor; set it explicitly).
+        {
+            let mut st = tavily_state().lock().unwrap();
+            st.cursor = 1;
+            st.blocked.clear();
+        }
+        let keys = vec!["k0".to_string(), "k1".to_string(), "k2".to_string()];
+        assert_eq!(tavily_try_order(&keys), vec!["k1", "k2", "k0"]);
+
+        // After a success on k1, cursor advances to k2.
+        tavily_on_success("k1", &keys);
+        assert_eq!(tavily_try_order(&keys), vec!["k2", "k0", "k1"]);
+    }
+
+    #[test]
+    fn tavily_block_and_cooldown() {
+        let key = "block-test-key";
+        tavily_block_key(key, u64::MAX);
+        assert!(tavily_key_blocked(key), "permanently dead key stays blocked");
+
+        // A cooldown in the past is no longer blocking.
+        tavily_block_key(key, 1);
+        assert!(!tavily_key_blocked(key), "expired cooldown is eligible again");
     }
 }
