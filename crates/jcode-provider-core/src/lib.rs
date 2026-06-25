@@ -464,6 +464,15 @@ pub fn shared_http_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .user_agent(JCODE_USER_AGENT)
                 .connect_timeout(Duration::from_secs(15))
+                // Bound the read phase: if a connection accepts the request but
+                // sends NO response bytes within this window, error out instead of
+                // hanging forever. This is the key guard for HTTP/1.1 providers
+                // (e.g. api.deepseek.com): the http2 keepalive below only detects
+                // dead HTTP/2 connections, so a stale pooled HTTP/1.1 connection
+                // would otherwise be reused and hang with no response. On this
+                // error reqwest/our retry layer opens a fresh connection, which
+                // works. Generous enough not to trip on a slow first token.
+                .read_timeout(Duration::from_secs(60))
                 .tcp_keepalive(Some(Duration::from_secs(30)))
                 // Proactively detect half-dead pooled HTTP/2 connections before we
                 // reuse them. Without keepalive pings, a stale multiplexed connection
@@ -473,7 +482,9 @@ pub fn shared_http_client() -> reqwest::Client {
                 .http2_keep_alive_interval(Some(Duration::from_secs(30)))
                 .http2_keep_alive_timeout(Duration::from_secs(15))
                 .http2_keep_alive_while_idle(true)
-                .pool_idle_timeout(Duration::from_secs(90))
+                // Drop idle pooled connections sooner so an HTTP/1.1 connection is
+                // less likely to be reused after the server has quietly closed it.
+                .pool_idle_timeout(Duration::from_secs(30))
                 .pool_max_idle_per_host(8)
                 .build()
                 .unwrap_or_else(|err| {
