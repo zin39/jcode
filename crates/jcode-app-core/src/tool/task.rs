@@ -156,9 +156,15 @@ impl Tool for SubagentTool {
         // model) to the dynamically-cheapest available route, so "spawn an agent"
         // routes cheap without the caller naming a model.
         if resolved_model.eq_ignore_ascii_case(crate::agent::cheap_route::CHEAPEST_SENTINEL) {
-            resolved_model =
-                crate::agent::cheap_route::cheapest_available_model(self.provider.as_ref())
-                    .unwrap_or_else(|| provider_model.clone());
+            match crate::agent::cheap_route::cheapest_available_model(self.provider.as_ref()) {
+                Some((model, route_api_method)) => {
+                    resolved_model = model;
+                    // Pin the chosen route so the bare model name is not
+                    // re-resolved to the wrong provider.
+                    session.route_api_method = Some(route_api_method);
+                }
+                None => resolved_model = provider_model.clone(),
+            }
         }
         session.model = Some(resolved_model.clone());
 

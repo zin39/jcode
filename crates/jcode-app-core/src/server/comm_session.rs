@@ -498,21 +498,29 @@ pub(super) async fn spawn_swarm_agent(
     let coordinator_is_canary = coordinator.is_canary;
     let agents_config = &crate::config::config().agents;
     let mut configured_swarm_model = agents_config.swarm_model.clone();
-    // Resolve the "cheapest" sentinel to the dynamically-cheapest available model
-    // so swarm spawns route cheap without naming a model. None => inherit
-    // coordinator (handled below) when no available route exists.
+    // Resolve the "cheapest" sentinel to the dynamically-cheapest available route
+    // so swarm spawns route cheap without naming a model. We keep the route's
+    // api_method to PIN the exact route (avoiding bare-name re-resolution to the
+    // wrong provider). None => inherit coordinator (handled below).
+    let mut pinned_route_api_method: Option<String> = None;
     if configured_swarm_model
         .as_deref()
         .is_some_and(|model| model.eq_ignore_ascii_case(crate::agent::cheap_route::CHEAPEST_SENTINEL))
     {
-        configured_swarm_model =
-            crate::agent::cheap_route::cheapest_available_model(provider_template.as_ref());
+        match crate::agent::cheap_route::cheapest_available_model(provider_template.as_ref()) {
+            Some((model, route_api_method)) => {
+                configured_swarm_model = Some(model);
+                pinned_route_api_method = Some(route_api_method);
+            }
+            None => configured_swarm_model = None,
+        }
     }
     let resolved_spawn_mode = spawn_mode.unwrap_or(agents_config.swarm_spawn_mode);
     let selection = resolve_swarm_spawn_selection(configured_swarm_model.clone(), &coordinator);
     let spawn_model = selection.model.clone();
     let spawn_provider_key = selection.provider_key.clone();
-    let spawn_route_api_method = selection.route_api_method.clone();
+    // Prefer the pinned route from the "cheapest" resolution over the re-derived one.
+    let spawn_route_api_method = pinned_route_api_method.or_else(|| selection.route_api_method.clone());
     crate::logging::info(&format!(
         "Swarm spawn model resolution: configured_swarm_model={:?} coordinator_model={:?} coordinator_provider_key={:?} coordinator_route={:?} -> spawn_model={:?} spawn_provider_key={:?} spawn_route={:?}",
         configured_swarm_model,

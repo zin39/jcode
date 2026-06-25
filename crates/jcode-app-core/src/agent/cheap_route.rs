@@ -53,8 +53,16 @@ pub struct CheapRouteOutcome {
 pub trait CheapRouteBackend: Send + Sync {
     /// Ask the expensive parent model a one-shot question, returning its text.
     async fn ask_parent(&self, prompt: &str) -> Result<String>;
-    /// Run one subtask on the chosen cheap model, returning the subagent output.
-    async fn run_subtask(&self, subtask: &Subtask, model: &str) -> Result<String>;
+    /// Run one subtask on the chosen cheap model. `route_api_method` (e.g.
+    /// `"openai-compatible:deepseek"`) pins the exact provider/route so the model
+    /// name is not re-resolved to the wrong provider; `None` lets it resolve via
+    /// the parent's active provider (used for the current-model last resort).
+    async fn run_subtask(
+        &self,
+        subtask: &Subtask,
+        model: &str,
+        route_api_method: Option<&str>,
+    ) -> Result<String>;
     /// Routes available for ranking into the cheapest-first menu.
     fn routes(&self) -> Vec<ModelRoute>;
     /// The parent's own current model — a known-working last-resort fallback
@@ -193,7 +201,15 @@ pub async fn run_cheap_route(
     //    provider avoids grinding through ~20 dead routes from a single exhausted
     //    key while still reaching every distinct provider (incl. cheap ones like
     //    deepseek sitting behind dead OpenAI catalog models).
-    let mut candidates: Vec<String> = vec![recommended_model.clone()];
+    // Each candidate carries (model, route_api_method) so the spawn pins the EXACT
+    // route ranking chose, instead of re-resolving the bare model name to the
+    // wrong provider.
+    let recommended_api = ranked
+        .iter()
+        .find(|c| c.route.model == recommended_model)
+        .map(|c| c.route.api_method.clone());
+    let mut candidates: Vec<(String, Option<String>)> =
+        vec![(recommended_model.clone(), recommended_api)];
     let mut seen_providers: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(rec) = ranked.iter().find(|c| c.route.model == recommended_model) {
         seen_providers.insert(rec.route.provider.clone());
@@ -202,16 +218,19 @@ pub async fn run_cheap_route(
         if seen_providers.insert(candidate.route.provider.clone())
             && candidate.route.model != recommended_model
         {
-            candidates.push(candidate.route.model.clone());
+            candidates.push((
+                candidate.route.model.clone(),
+                Some(candidate.route.api_method.clone()),
+            ));
         }
     }
     // Guaranteed last resort: the parent's own current model, which is known to
-    // work (it just answered the decompose/recommend calls). This rescues runs
-    // where every ranked cheap route is dead-quota — common when the cheapest
-    // priced routes all belong to one exhausted key.
+    // work (it just answered the decompose/recommend calls). No pinned route — it
+    // resolves via the parent's active provider. This rescues runs where every
+    // ranked cheap route is dead-quota.
     let current_model = backend.current_model();
-    if !current_model.is_empty() && !candidates.contains(&current_model) {
-        candidates.push(current_model);
+    if !current_model.is_empty() && !candidates.iter().any(|(m, _)| m == &current_model) {
+        candidates.push((current_model, None));
     }
 
     // 5. Run each subtask (with fallback) and have the parent review each result.
@@ -219,8 +238,8 @@ pub async fn run_cheap_route(
     for subtask in &subtasks {
         let mut chosen: Option<(String, String)> = None; // (model_used, output)
         let mut errors: Vec<String> = Vec::new();
-        for model in &candidates {
-            match backend.run_subtask(subtask, model).await {
+        for (model, api_method) in &candidates {
+            match backend.run_subtask(subtask, model, api_method.as_deref()).await {
                 Ok(output) => {
                     chosen = Some((model.clone(), output));
                     break;
@@ -416,18 +435,21 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
 /// `model`) to mean "pick the cheapest available model dynamically".
 pub const CHEAPEST_SENTINEL: &str = "cheapest";
 
-/// The cheapest currently-available model across the provider's own routes and
-/// all configured named providers (deduped, ranked cheapest-first). Resolves the
-/// [`CHEAPEST_SENTINEL`] used by agent/swarm spawns. Returns `None` when no
-/// priced/available route exists.
-pub fn cheapest_available_model(provider: &dyn crate::provider::Provider) -> Option<String> {
+/// The cheapest currently-available route across the provider's own routes and
+/// all configured named providers (deduped, ranked cheapest-first, prefer/ban
+/// applied). Returns `(model, route_api_method)` so the spawn can PIN the exact
+/// route instead of re-resolving the bare model name. `None` when no
+/// priced/available route exists. Resolves the [`CHEAPEST_SENTINEL`].
+pub fn cheapest_available_model(
+    provider: &dyn crate::provider::Provider,
+) -> Option<(String, String)> {
     let mut routes = provider.model_routes();
     routes.extend(configured_named_provider_routes());
     let routes = jcode_provider_core::selection::dedupe_model_routes(routes);
     ranked_with_preferences(routes)
         .into_iter()
         .next()
-        .map(|candidate| candidate.route.model)
+        .map(|candidate| (candidate.route.model, candidate.route.api_method))
 }
 
 use std::sync::Arc;
@@ -464,11 +486,23 @@ impl CheapRouteBackend for ProviderCheapBackend {
         self.provider.complete_simple(prompt, &self.parent_system).await
     }
 
-    async fn run_subtask(&self, subtask: &Subtask, model: &str) -> Result<String> {
+    async fn run_subtask(
+        &self,
+        subtask: &Subtask,
+        model: &str,
+        route_api_method: Option<&str>,
+    ) -> Result<String> {
         // Mirror SubagentTool::execute: new session pinned to `model`, blocked
         // recursive tools removed, run on an isolated provider fork.
         let mut session = crate::session::Session::create(None, Some(subtask.description.clone()));
         session.model = Some(model.to_string());
+        // Pin the EXACT route chosen by ranking. Without this, a bare model name
+        // (e.g. "deepseek-chat") is re-resolved to whatever provider is active —
+        // often the wrong one (OpenRouter) — instead of the route we selected.
+        // route_api_method takes priority in model_switch_request_for_session_route.
+        if let Some(api_method) = route_api_method.map(str::trim).filter(|m| !m.is_empty()) {
+            session.route_api_method = Some(api_method.to_string());
+        }
         session.save()?;
 
         let mut allowed: std::collections::HashSet<String> =
@@ -591,7 +625,12 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        async fn run_subtask(&self, subtask: &Subtask, model: &str) -> Result<String> {
+        async fn run_subtask(
+            &self,
+            subtask: &Subtask,
+            model: &str,
+            _route_api_method: Option<&str>,
+        ) -> Result<String> {
             self.subtask_calls
                 .lock()
                 .unwrap()
@@ -668,7 +707,12 @@ mod tests {
             Ok(self.parent_responses.lock().unwrap().pop_front().unwrap_or_default())
         }
 
-        async fn run_subtask(&self, _subtask: &Subtask, model: &str) -> Result<String> {
+        async fn run_subtask(
+            &self,
+            _subtask: &Subtask,
+            model: &str,
+            _route_api_method: Option<&str>,
+        ) -> Result<String> {
             self.attempts.lock().unwrap().push(model.to_string());
             if self.dead_models.contains(model) {
                 Err(anyhow!("insufficient_quota"))
@@ -943,7 +987,7 @@ mod tests {
         };
         assert_eq!(
             cheapest_available_model(&provider),
-            Some("cheapo".to_string())
+            Some(("cheapo".to_string(), "a".to_string())) // priced_route api_method = "a"
         );
     }
 
@@ -978,5 +1022,66 @@ mod tests {
         assert!(route_matches_preference(&route, "prov-deepseek-chat/deepseek-chat"));
         assert!(!route_matches_preference(&route, "gpt-5-nano"));
         assert!(!route_matches_preference(&route, ""));
+    }
+
+    #[tokio::test]
+    async fn run_cheap_route_pins_chosen_route_api_method() {
+        struct RouteRecordingBackend {
+            seen: Mutex<Vec<Option<String>>>,
+            routes: Vec<ModelRoute>,
+            responses: Mutex<VecDeque<String>>,
+        }
+        #[async_trait]
+        impl CheapRouteBackend for RouteRecordingBackend {
+            async fn ask_parent(&self, _p: &str) -> Result<String> {
+                Ok(self.responses.lock().unwrap().pop_front().unwrap_or_default())
+            }
+            async fn run_subtask(
+                &self,
+                _s: &Subtask,
+                _m: &str,
+                route_api_method: Option<&str>,
+            ) -> Result<String> {
+                self.seen.lock().unwrap().push(route_api_method.map(str::to_string));
+                Ok("done".to_string())
+            }
+            fn routes(&self) -> Vec<ModelRoute> {
+                self.routes.clone()
+            }
+            fn current_model(&self) -> String {
+                String::new()
+            }
+        }
+
+        let route = ModelRoute {
+            model: "deepseek-chat".to_string(),
+            provider: "deepseek".to_string(),
+            api_method: "openai-compatible:deepseek".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: Some(RouteCheapnessEstimate::metered(
+                RouteCostSource::PublicApiPricing,
+                RouteCostConfidence::Exact,
+                100,
+                100,
+                None,
+                None,
+            )),
+        };
+        let backend = RouteRecordingBackend {
+            seen: Mutex::new(Vec::new()),
+            routes: vec![route],
+            responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"x","prompt":"p","difficulty":1}]"#.to_string(),
+                "use deepseek-chat".to_string(),
+                "OK".to_string(),
+            ])),
+        };
+
+        run_cheap_route(&backend, "task").await.unwrap();
+
+        // The chosen route's api_method was pinned through to the spawn.
+        let seen = backend.seen.lock().unwrap();
+        assert_eq!(seen[0].as_deref(), Some("openai-compatible:deepseek"));
     }
 }
