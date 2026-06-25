@@ -129,11 +129,16 @@ async fn run_verify_command(command: &str) -> Result<(bool, String)> {
         combined.push_str(stderr.trim_end());
     }
     // Keep only the tail — build/test failures put the useful error at the end,
-    // and the repair prompt must stay small for a cheap model.
+    // and the repair prompt must stay small for a cheap model. Advance the cut
+    // point to the next char boundary so slicing never panics on a multibyte
+    // UTF-8 sequence (build logs contain non-ASCII).
     const MAX_VERIFY_OUTPUT: usize = 4000;
     if combined.len() > MAX_VERIFY_OUTPUT {
-        let tail = &combined[combined.len() - MAX_VERIFY_OUTPUT..];
-        combined = format!("…(truncated)…\n{tail}");
+        let mut start = combined.len() - MAX_VERIFY_OUTPUT;
+        while start < combined.len() && !combined.is_char_boundary(start) {
+            start += 1;
+        }
+        combined = format!("…(truncated)…\n{}", &combined[start..]);
     }
     Ok((status.success(), combined))
 }
@@ -146,7 +151,7 @@ pub fn strip_code_fence(text: &str) -> &str {
         return trimmed;
     };
     // Drop the optional language tag on the opening fence line.
-    let body = after_open.splitn(2, '\n').nth(1).unwrap_or("");
+    let body = after_open.split_once('\n').map(|x| x.1).unwrap_or("");
     match body.rfind("```") {
         Some(close) => body[..close].trim(),
         None => body.trim(),
@@ -264,6 +269,31 @@ VERIFY FAILURE OUTPUT:\n{}",
 /// fed back, then re-verify. Returns `(final_output, note)` where `note` is a
 /// short human-readable verdict prepended to the review. Best-effort: any
 /// verify-infrastructure error leaves the original output intact.
+/// Upper bound on a single verify command. A hanging test suite must not block
+/// the subtask loop forever; generous enough for a real build/test, bounded
+/// enough to fail fast on a deadlock.
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Outcome of one bounded verify run, normalizing timeout/spawn-error/exit into
+/// three cases the caller can match without nested `Result<Result<…>>`.
+enum VerifyOutcome {
+    Passed,
+    Failed(String),
+    Unavailable(String),
+}
+
+async fn run_bounded_verify(backend: &dyn CheapRouteBackend, cmd: &str) -> VerifyOutcome {
+    match tokio::time::timeout(VERIFY_TIMEOUT, backend.verify_edits(cmd)).await {
+        Ok(Ok((true, _))) => VerifyOutcome::Passed,
+        Ok(Ok((false, out))) => VerifyOutcome::Failed(out),
+        Ok(Err(e)) => VerifyOutcome::Unavailable(format!("could not run `{cmd}`: {e}")),
+        Err(_) => VerifyOutcome::Unavailable(format!(
+            "`{cmd}` timed out after {}s",
+            VERIFY_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 async fn verify_and_maybe_repair(
     backend: &dyn CheapRouteBackend,
     subtask: &Subtask,
@@ -272,47 +302,51 @@ async fn verify_and_maybe_repair(
     output: String,
     verify_cmd: &str,
 ) -> (String, String) {
-    match backend.verify_edits(verify_cmd).await {
-        Ok((true, _)) => (output, format!("[verify: `{verify_cmd}` passed] ")),
-        Ok((false, fail_out)) => {
-            let repair = Subtask {
-                description: subtask.description.clone(),
-                prompt: build_repair_prompt(subtask, &output, verify_cmd, &fail_out),
-                difficulty: subtask.difficulty,
-            };
-            let repaired = tokio::time::timeout(
-                SUBTASK_TIMEOUT,
-                backend.run_subtask(&repair, model, api_method),
-            )
-            .await;
-            match repaired {
-                Ok(Ok(new_output)) => match backend.verify_edits(verify_cmd).await {
-                    Ok((true, _)) => (
-                        new_output,
-                        format!("[verify: `{verify_cmd}` failed, repaired, now passes] "),
-                    ),
-                    Ok((false, _)) => (
-                        new_output,
-                        format!("[verify: `{verify_cmd}` still failing after one repair attempt] "),
-                    ),
-                    Err(e) => (new_output, format!("[verify re-check error: {e}] ")),
-                },
-                Ok(Err(e)) => (
-                    output,
-                    format!("[verify: `{verify_cmd}` failed; repair attempt errored: {e}] "),
-                ),
-                Err(_) => (
-                    output,
-                    format!(
-                        "[verify: `{verify_cmd}` failed; repair timed out after {}s] ",
-                        SUBTASK_TIMEOUT.as_secs()
-                    ),
-                ),
-            }
+    let fail_out = match run_bounded_verify(backend, verify_cmd).await {
+        VerifyOutcome::Passed => {
+            return (output, format!("[verify: `{verify_cmd}` passed] "));
         }
-        Err(e) => (
+        VerifyOutcome::Unavailable(msg) => {
+            return (output, format!("[verify: {msg}] "));
+        }
+        VerifyOutcome::Failed(out) => out,
+    };
+
+    // One repair attempt on the same pinned route, failure fed back.
+    let repair = Subtask {
+        description: subtask.description.clone(),
+        prompt: build_repair_prompt(subtask, &output, verify_cmd, &fail_out),
+        difficulty: subtask.difficulty,
+    };
+    let repaired = tokio::time::timeout(
+        SUBTASK_TIMEOUT,
+        backend.run_subtask(&repair, model, api_method),
+    )
+    .await;
+    match repaired {
+        Ok(Ok(new_output)) => match run_bounded_verify(backend, verify_cmd).await {
+            VerifyOutcome::Passed => (
+                new_output,
+                format!("[verify: `{verify_cmd}` failed, repaired, now passes] "),
+            ),
+            VerifyOutcome::Failed(_) => (
+                new_output,
+                format!("[verify: `{verify_cmd}` still failing after one repair attempt] "),
+            ),
+            VerifyOutcome::Unavailable(msg) => {
+                (new_output, format!("[verify re-check: {msg}] "))
+            }
+        },
+        Ok(Err(e)) => (
             output,
-            format!("[verify: could not run `{verify_cmd}`: {e}] "),
+            format!("[verify: `{verify_cmd}` failed; repair attempt errored: {e}] "),
+        ),
+        Err(_) => (
+            output,
+            format!(
+                "[verify: `{verify_cmd}` failed; repair timed out after {}s] ",
+                SUBTASK_TIMEOUT.as_secs()
+            ),
         ),
     }
 }
@@ -331,7 +365,12 @@ pub async fn run_cheap_route(
     //    route that isn't in the cheapest 6 (e.g. deepseek sitting behind dead
     //    OpenAI nano/mini) still gets reached instead of being skipped.
     let ranked = ranked_with_preferences(backend.routes());
-    if ranked.is_empty() {
+    let current_model = backend.current_model();
+    // A genuine absence of routes is fatal. But when routes EXIST and are merely
+    // all cooled down by health tracking (e.g. a transient quota blip across
+    // every cheap provider), don't fail the run — fall through to the parent's
+    // current model as the last resort (the candidate list below appends it).
+    if ranked.is_empty() && current_model.trim().is_empty() {
         return Err(anyhow!("no available model routes to route work to"));
     }
     let menu: Vec<CheapRouteCandidate> = ranked.iter().take(MAX_MENU).cloned().collect();
@@ -342,7 +381,11 @@ pub async fn run_cheap_route(
     //    round-trip entirely (faster + deterministic, and it stops the parent
     //    from picking its own expensive model over the cheap one the user wanted).
     //    Otherwise, ask the parent to recommend from the cheapest-first menu.
-    let recommended_model = if !crate::config::config().agents.cheap_route_prefer.is_empty() {
+    let recommended_model = if ranked.is_empty() {
+        // Every cheap route is cooled down: route directly to the parent's
+        // known-working current model instead of erroring.
+        current_model.clone()
+    } else if !crate::config::config().agents.cheap_route_prefer.is_empty() {
         ranked
             .first()
             .map(|c| c.route.model.clone())
@@ -388,7 +431,6 @@ pub async fn run_cheap_route(
     // work (it just answered the decompose/recommend calls). No pinned route — it
     // resolves via the parent's active provider. This rescues runs where every
     // ranked cheap route is dead-quota.
-    let current_model = backend.current_model();
     if !current_model.is_empty() && !candidates.iter().any(|(m, _)| m == &current_model) {
         candidates.push((current_model, None));
     }
@@ -646,21 +688,29 @@ pub fn mark_route_unhealthy(model: &str) {
     if model.is_empty() {
         return;
     }
-    let until = cheap_route_now_unix().saturating_add(CHEAP_ROUTE_COOLDOWN_SECS);
-    if let Ok(mut health) = cheap_route_health().lock() {
-        health.insert(model.to_string(), until);
-        crate::logging::info(&format!(
-            "Cheap route '{model}' marked unhealthy for {CHEAP_ROUTE_COOLDOWN_SECS}s \
-             (quota/rate/availability failure); cheap spawns will skip it and use the next-cheapest route"
-        ));
-    }
+    let now = cheap_route_now_unix();
+    let until = now.saturating_add(CHEAP_ROUTE_COOLDOWN_SECS);
+    // Recover from a poisoned lock rather than silently dropping the update —
+    // the body is a trivial map mutation, so the data is still consistent.
+    let mut health = cheap_route_health()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Prune expired entries so the map can't grow unbounded over a long session.
+    health.retain(|_, &mut until| until > now);
+    health.insert(model.to_string(), until);
+    crate::logging::info(&format!(
+        "Cheap route '{model}' marked unhealthy for {CHEAP_ROUTE_COOLDOWN_SECS}s \
+         (quota/rate/availability failure); cheap spawns will skip it and use the next-cheapest route"
+    ));
 }
 
 fn route_is_healthy(model: &str) -> bool {
-    cheap_route_health()
+    let health = cheap_route_health()
         .lock()
-        .ok()
-        .and_then(|h| h.get(model).copied())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    health
+        .get(model)
+        .copied()
         .map(|until| until <= cheap_route_now_unix())
         .unwrap_or(true)
 }
@@ -1323,6 +1373,36 @@ mod tests {
             *attempts,
             vec!["cheapo".to_string(), "pricey".to_string(), "qwen-live".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn run_cheap_route_falls_back_to_current_model_when_all_routes_cooled() {
+        // Regression: a quota blip recorded in the health map can cool EVERY
+        // cheap route, making `ranked_with_preferences` return empty. The run
+        // must still escalate to the parent's current model, not hard-error.
+        // Unique route names so the process-global health map stays isolated.
+        mark_route_unhealthy("cooled-route-x");
+        mark_route_unhealthy("cooled-route-y");
+        let backend = FallbackBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"do x","prompt":"p","difficulty":1}]"#.to_string(),
+                "OK".to_string(), // review
+            ])),
+            routes: vec![
+                priced_route("cooled-route-x", 100),
+                priced_route("cooled-route-y", 200),
+            ],
+            dead_models: std::collections::HashSet::new(),
+            attempts: Mutex::new(Vec::new()),
+            current: "parent-live".to_string(),
+        };
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.recommended_model, "parent-live");
+        assert_eq!(outcome.results[0].model_used, "parent-live");
+        let attempts = backend.attempts.lock().unwrap();
+        assert_eq!(*attempts, vec!["parent-live".to_string()]);
     }
 
     #[tokio::test]

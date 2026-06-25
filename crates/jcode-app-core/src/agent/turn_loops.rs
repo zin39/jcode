@@ -123,13 +123,6 @@ impl Agent {
             let mut stream = match open_result {
                 Ok(stream) => stream,
                 Err(e) => {
-                    // Cool this route down if it failed for quota/rate/availability
-                    // reasons (e.g. DeepSeek 402) so other cheap spawns route
-                    // around it instead of falling back to the expensive parent.
-                    crate::agent::cheap_route::note_provider_error(
-                        &self.provider.model(),
-                        &e.to_string(),
-                    );
                     if self.try_auto_compact_after_context_limit(&e.to_string()) {
                         context_limit_retries += 1;
                         if context_limit_retries > Self::MAX_CONTEXT_LIMIT_RETRIES {
@@ -143,6 +136,15 @@ impl Agent {
                         }
                         continue;
                     }
+                    // Not a context-limit error: if it was quota/rate/availability
+                    // (e.g. DeepSeek 402), cool this route down so other cheap
+                    // spawns route around it instead of the expensive parent.
+                    // Done AFTER the context-limit check so a context-limit error
+                    // that merely mentions "quota" doesn't wrongly cool the route.
+                    crate::agent::cheap_route::note_provider_error(
+                        &self.provider.model(),
+                        &e.to_string(),
+                    );
                     return Err(e);
                 }
             };
