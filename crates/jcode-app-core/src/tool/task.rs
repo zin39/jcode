@@ -152,53 +152,20 @@ impl Tool for SubagentTool {
             parent_subagent_model.as_deref(),
             &provider_model,
         );
-        // Resolve the "cheapest" sentinel (from agents.swarm_model or an explicit
-        // model) to the dynamically-cheapest available route, so "spawn an agent"
-        // routes cheap without the caller naming a model.
-        if resolved_model.eq_ignore_ascii_case(crate::agent::cheap_route::CHEAPEST_SENTINEL) {
-            match crate::agent::cheap_route::cheapest_available_model(self.provider.as_ref()) {
-                Some((model, route_api_method)) => {
-                    resolved_model = model;
-                    // Pin the chosen route so the bare model name is not
-                    // re-resolved to the wrong provider.
-                    session.route_api_method = Some(route_api_method);
-                }
-                None => resolved_model = provider_model.clone(),
-            }
-        } else if session.route_api_method.is_none()
-            && !resolved_model.eq_ignore_ascii_case(&provider_model)
-        {
-            // An EXPLICIT model that isn't the coordinator's own (e.g.
-            // "deepseek/deepseek-chat"): resolve and PIN its route. Without this,
-            // the forked coordinator provider can't switch to it and the subagent
-            // silently runs on the coordinator's (possibly expensive) model — the
-            // Claude-burn bug. If it has no resolvable route, refuse rather than
-            // fall back to the coordinator.
-            match crate::agent::cheap_route::resolve_model_route(
-                self.provider.as_ref(),
-                &resolved_model,
-            ) {
-                Some((model, route_api_method)) => {
-                    resolved_model = model;
-                    session.route_api_method = Some(route_api_method);
-                }
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "subagent model '{}' has no resolvable provider route; refusing to fall back to the coordinator's model",
-                        resolved_model
-                    ));
-                }
-            }
-        }
-        // SAFETY: never run a spawned subagent on a model excluded by
-        // cheap_route_ban (e.g. Claude). This catches a subagent that would
-        // otherwise inherit a banned coordinator model — fail loudly instead of
-        // silently burning it.
-        if crate::agent::cheap_route::model_is_cheap_route_banned(&resolved_model) {
-            return Err(anyhow::anyhow!(
-                "subagent model '{}' is excluded by cheap_route_ban; refusing to run on a banned (expensive) model",
-                resolved_model
-            ));
+        // Single chokepoint: resolve the worker's (model, route) and gate it
+        // against cheap_route_ban in ONE place. A spawned worker forks the
+        // coordinator's provider, whose default backend is the coordinator's own
+        // (expensive) model; this is the only function that decides what backend
+        // the fork actually uses, and it refuses rather than fall through to a
+        // banned model. See cheap_route::resolve_worker_route.
+        let (model, route_api) = crate::agent::cheap_route::resolve_worker_route(
+            self.provider.as_ref(),
+            &resolved_model,
+            session.route_api_method.is_some(),
+        )?;
+        resolved_model = model;
+        if let Some(api) = route_api {
+            session.route_api_method = Some(api);
         }
         session.model = Some(resolved_model.clone());
 

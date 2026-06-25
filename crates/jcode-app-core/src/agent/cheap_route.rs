@@ -887,6 +887,70 @@ pub fn model_is_cheap_route_banned(model: &str) -> bool {
     drop_banned_routes(vec![probe], &agents.cheap_route_ban).is_empty()
 }
 
+/// THE single decision point for a spawned worker's `(model, route_api_method)`.
+///
+/// Root-cause fix for the Claude-burn class of bugs: a spawned worker is a fork of
+/// the coordinator's provider, whose DEFAULT backend is the coordinator's own
+/// (often expensive) model. Every past leak was a separate code path that left the
+/// route unresolved, so the fork silently defaulted to that backend. Instead of
+/// guarding each path, ALL worker-route decisions funnel through here, and the
+/// final resolved model is gated against `cheap_route_ban` exactly once. The
+/// invariant: this returns a non-banned route, or it returns `Err` — it can NEVER
+/// return a route that bills the coordinator's banned model.
+///
+/// `requested_model` is the already-resolved model string (may be the `cheapest`
+/// sentinel). `route_already_pinned` is `session.route_api_method.is_some()`.
+/// Returns `(model, Some(api_method))` when a route should be pinned, or
+/// `(model, None)` to inherit the already-pinned/coordinator route.
+pub fn resolve_worker_route(
+    provider: &dyn crate::provider::Provider,
+    requested_model: &str,
+    route_already_pinned: bool,
+) -> anyhow::Result<(String, Option<String>)> {
+    let provider_model = provider.model();
+    let (model, route_api): (String, Option<String>) =
+        if requested_model.eq_ignore_ascii_case(CHEAPEST_SENTINEL) {
+            // "cheapest": pick the dynamically-cheapest available route.
+            match cheapest_available_model(provider) {
+                Some((m, api)) => (m, Some(api)),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "no cheap route available for a 'cheapest' worker; refusing to fall back to the coordinator's model"
+                    ));
+                }
+            }
+        } else if !route_already_pinned
+            && !requested_model.eq_ignore_ascii_case(&provider_model)
+        {
+            // An EXPLICIT model that isn't the coordinator's own (e.g.
+            // "deepseek/deepseek-chat"): resolve and PIN its route so the forked
+            // coordinator provider actually switches backend.
+            match resolve_model_route(provider, requested_model) {
+                Some((m, api)) => (m, Some(api)),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "subagent model '{}' has no resolvable provider route; refusing to fall back to the coordinator's model",
+                        requested_model
+                    ));
+                }
+            }
+        } else {
+            // Inherit: model is the coordinator's own and/or a route is already
+            // pinned. Keep the existing route; the ban gate below still applies.
+            (requested_model.to_string(), None)
+        };
+
+    // THE single backend gate. Whatever path resolved the model, it must not be
+    // excluded by cheap_route_ban (e.g. Claude). Fail loudly instead of billing.
+    if model_is_cheap_route_banned(&model) {
+        return Err(anyhow::anyhow!(
+            "worker model '{}' is excluded by cheap_route_ban; refusing to run on a banned (expensive) model",
+            model
+        ));
+    }
+    Ok((model, route_api))
+}
+
 /// The sentinel value users put in `agents.swarm_model` (or pass as a subagent
 /// `model`) to mean "pick the cheapest available model dynamically".
 pub const CHEAPEST_SENTINEL: &str = "cheapest";
