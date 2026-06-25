@@ -234,12 +234,27 @@ impl Agent {
             let model_at_request_start = provider.model().to_string();
             let resume_session_id = self.provider_session_id.clone();
             self.last_status_detail = None;
-            let _ = event_tx.send(kv_cache_request_event(
-                &cache_signature_messages,
-                &tools,
-                &split_prompt.static_part,
-                &ephemeral_signature_messages,
-            ));
+            // The KV-cache telemetry event serializes the full message history
+            // (up to ~9 MB) three times. Doing that inline on the async worker
+            // thread, right before opening the API stream, starves the runtime
+            // under concurrency — the provider's response sits unread and the turn
+            // appears to "hang" (stream did not open). It's pure observability, so
+            // compute it on the blocking pool and let the request proceed.
+            {
+                let kv_messages = cache_signature_messages.clone();
+                let kv_tools = tools.clone();
+                let kv_static = split_prompt.static_part.clone();
+                let kv_ephemeral = ephemeral_signature_messages.clone();
+                let kv_tx = event_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = kv_tx.send(kv_cache_request_event(
+                        &kv_messages,
+                        &kv_tools,
+                        &kv_static,
+                        &kv_ephemeral,
+                    ));
+                });
+            }
             let mut keepalive = stream_keepalive_ticker();
             let mut stream = {
                 let mut complete_future = std::pin::pin!(provider.complete_split(
