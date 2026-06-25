@@ -2567,12 +2567,15 @@ impl OpenRouterProvider {
             }
         }
 
-        if let Ok(models) = self.fetch_models().await
-            && let Some(model) = models.iter().find(|m| m.id == model_id)
-        {
-            return Some(model.pricing.clone());
-        }
-
+        // Never fetch the model catalog over the network on the request path.
+        // A cold or slow `/models` fetch here stalls the turn before the API
+        // stream even opens — the same failure mode as the request-path
+        // endpoint fetch in effective_routing (a hung first message that a
+        // retry then serves in milliseconds once the cache is warm). Pricing
+        // only drives the best-effort cache-breakpoint optimization, so warm
+        // the catalog in the background (deduped + throttled) and treat the
+        // model as unknown for this turn.
+        self.maybe_schedule_model_catalog_refresh(u64::MAX, "request_pricing");
         None
     }
 
