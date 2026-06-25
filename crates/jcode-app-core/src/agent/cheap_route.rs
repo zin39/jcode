@@ -445,11 +445,93 @@ fn prioritize_preferred(
 
 /// Rank routes cheapest-first after applying the configured cheap-route `ban`
 /// (drop) and `prefer` (move-to-front) lists from `agents` config.
+/// Process-global cheap-route health: model id -> unix-seconds-until-eligible.
+/// When a cheap session's API call fails with a quota / rate / availability
+/// error (402/429/403/5xx, "insufficient balance"), the route is cooled down so
+/// subsequent cheap spawns skip it and pick the next-cheapest *healthy* route
+/// instead of falling through to the expensive coordinator model. Recovers
+/// automatically once the cooldown expires (e.g. after the user tops up balance
+/// or a rate window resets).
+fn cheap_route_health() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static HEALTH: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    HEALTH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How long a route is skipped after a quota/rate failure. Long enough to route
+/// around a drained balance or outage, short enough to recover on its own.
+const CHEAP_ROUTE_COOLDOWN_SECS: u64 = 300;
+
+fn cheap_route_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Cool a cheap route down after a quota/rate/availability failure so future
+/// cheap spawns route around it. Called from the agent turn loop.
+pub fn mark_route_unhealthy(model: &str) {
+    let model = model.trim();
+    if model.is_empty() {
+        return;
+    }
+    let until = cheap_route_now_unix().saturating_add(CHEAP_ROUTE_COOLDOWN_SECS);
+    if let Ok(mut health) = cheap_route_health().lock() {
+        health.insert(model.to_string(), until);
+        crate::logging::info(&format!(
+            "Cheap route '{model}' marked unhealthy for {CHEAP_ROUTE_COOLDOWN_SECS}s \
+             (quota/rate/availability failure); cheap spawns will skip it and use the next-cheapest route"
+        ));
+    }
+}
+
+fn route_is_healthy(model: &str) -> bool {
+    cheap_route_health()
+        .lock()
+        .ok()
+        .and_then(|h| h.get(model).copied())
+        .map(|until| until <= cheap_route_now_unix())
+        .unwrap_or(true)
+}
+
+/// Inspect a provider error string; if it indicates the route is out of quota,
+/// rate-limited, or unavailable, cool the route down. Quota/payment errors are
+/// the common case (e.g. DeepSeek `402 Payment Required` when the balance is
+/// drained), which previously made every cheap spawn fall back to the expensive
+/// coordinator model instead of the next-cheapest cheap route.
+pub fn note_provider_error(model: &str, error: &str) {
+    let e = error.to_ascii_lowercase();
+    let unhealthy = e.contains("status: 402")
+        || e.contains("status: 429")
+        || e.contains("status: 403")
+        || e.contains("status: 500")
+        || e.contains("status: 502")
+        || e.contains("status: 503")
+        || e.contains("status: 529")
+        || e.contains("insufficient balance")
+        || e.contains("payment required")
+        || e.contains("rate limit")
+        || e.contains("rate-limit")
+        || e.contains("quota");
+    if unhealthy {
+        mark_route_unhealthy(model);
+    }
+}
+
 fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> {
     let agents = &crate::config::config().agents;
     let routes = drop_banned_routes(routes, &agents.cheap_route_ban);
     let ranked = rank_routes_by_cost(routes);
-    prioritize_preferred(ranked, &agents.cheap_route_prefer)
+    let ranked = prioritize_preferred(ranked, &agents.cheap_route_prefer);
+    // Skip routes cooled down by a recent quota/rate failure so spawns pick the
+    // next-cheapest *healthy* route. When every cheap route is unhealthy this
+    // returns empty on purpose: callers then escalate to the coordinator model
+    // as the genuine last resort, rather than looping on a dead route.
+    ranked
+        .into_iter()
+        .filter(|c| route_is_healthy(&c.route.model))
+        .collect()
 }
 
 /// The sentinel value users put in `agents.swarm_model` (or pass as a subagent
@@ -1060,6 +1142,52 @@ mod tests {
         assert_eq!(
             cheapest_available_model(&provider),
             Some(("cheapo".to_string(), "a".to_string())) // priced_route api_method = "a"
+        );
+    }
+
+    #[test]
+    fn unhealthy_route_is_skipped_then_recovers() {
+        let model = "zzz-health-test-model";
+        assert!(route_is_healthy(model), "unknown route is healthy by default");
+        mark_route_unhealthy(model);
+        assert!(!route_is_healthy(model), "cooled-down route is unhealthy");
+        // Simulate an expired cooldown (until in the past) -> healthy again.
+        if let Ok(mut h) = cheap_route_health().lock() {
+            h.insert(model.to_string(), 1);
+        }
+        assert!(route_is_healthy(model), "expired cooldown recovers");
+    }
+
+    #[test]
+    fn note_provider_error_cools_only_quota_rate_errors() {
+        let model = "zzz-quota-test-model";
+        // Clear any prior state for determinism.
+        if let Ok(mut h) = cheap_route_health().lock() {
+            h.remove(model);
+        }
+        note_provider_error(model, "some transient network blip");
+        assert!(route_is_healthy(model), "non-quota errors must not cool a route");
+        note_provider_error(
+            model,
+            "OpenAI-compatible chat request failed status: 402 Payment Required",
+        );
+        assert!(!route_is_healthy(model), "402 Payment Required must cool the route");
+    }
+
+    #[test]
+    fn ranked_with_preferences_filters_unhealthy() {
+        let model = "zzz-ranked-health-model";
+        if let Ok(mut h) = cheap_route_health().lock() {
+            h.remove(model);
+        }
+        let routes = vec![priced_route(model, 100), priced_route("other-cheap", 200)];
+        let before = ranked_with_preferences(routes.clone());
+        assert!(before.iter().any(|c| c.route.model == model), "healthy route present");
+        mark_route_unhealthy(model);
+        let after = ranked_with_preferences(routes);
+        assert!(
+            !after.iter().any(|c| c.route.model == model),
+            "unhealthy route filtered out of ranked candidates"
         );
     }
 
