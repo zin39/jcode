@@ -179,6 +179,7 @@ pub(crate) fn configure_provider_profile(
             id: model.clone(),
             context_window: options.context_window,
             input: Vec::new(),
+            ..Default::default()
         }],
         extra_body: None,
         supports_reasoning_effort: None,
