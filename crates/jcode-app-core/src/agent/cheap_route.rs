@@ -427,6 +427,24 @@ pub async fn run_cheap_route(
             ));
         }
     }
+    // Difficulty-tiered routing: hard subtasks (difficulty ABOVE the threshold)
+    // try a stronger model FIRST — the configured cheap_route_strong_model, or
+    // the parent's own (main) model — so the expensive model only spends on
+    // complex work. Trivial subtasks stay on the cheapest-first list. Captured
+    // before current_model is moved into the candidate list below.
+    let difficulty_threshold = crate::config::config().agents.cheap_route_difficulty_threshold;
+    let strong_model = crate::config::config()
+        .agents
+        .cheap_route_strong_model
+        .clone()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| current_model.clone());
+    let strong_api = ranked
+        .iter()
+        .find(|c| c.route.model == strong_model)
+        .map(|c| c.route.api_method.clone());
+
     // Guaranteed last resort: the parent's own current model, which is known to
     // work (it just answered the decompose/recommend calls). No pinned route — it
     // resolves via the parent's active provider. This rescues runs where every
@@ -438,9 +456,25 @@ pub async fn run_cheap_route(
     // 5. Run each subtask (with fallback) and have the parent review each result.
     let mut results = Vec::with_capacity(subtasks.len());
     for subtask in &subtasks {
+        // Hard subtasks try the strong model first (then cheap routes as
+        // fallback, so a dead strong model still completes). Trivial subtasks
+        // use the cheapest-first list directly.
+        let task_candidates: Vec<(String, Option<String>)> =
+            if subtask.difficulty > difficulty_threshold && !strong_model.is_empty() {
+                // Strong model FIRST, then the cheap routes as fallback (skipping
+                // a duplicate of the strong model, which is otherwise present as
+                // the last-resort entry).
+                let mut tiered = Vec::with_capacity(candidates.len() + 1);
+                tiered.push((strong_model.clone(), strong_api.clone()));
+                tiered.extend(candidates.iter().filter(|(m, _)| m != &strong_model).cloned());
+                tiered
+            } else {
+                candidates.clone()
+            };
+
         let mut chosen: Option<(String, Option<String>, String)> = None; // (model, api_method, output)
         let mut errors: Vec<String> = Vec::new();
-        for (model, api_method) in &candidates {
+        for (model, api_method) in &task_candidates {
             let attempt = tokio::time::timeout(
                 SUBTASK_TIMEOUT,
                 backend.run_subtask(subtask, model, api_method.as_deref()),
@@ -461,7 +495,7 @@ pub async fn run_cheap_route(
         let (model_used, api_method_used, mut output) = chosen.ok_or_else(|| {
             anyhow!(
                 "all {} candidate model(s) failed for subtask '{}': {}",
-                candidates.len(),
+                task_candidates.len(),
                 subtask.description,
                 errors.join("; ")
             )
@@ -1441,6 +1475,36 @@ mod tests {
         assert_eq!(outcome.results[0].model_used, "parent-live");
         let attempts = backend.attempts.lock().unwrap();
         assert_eq!(*attempts, vec!["parent-live".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn difficulty_routes_hard_subtask_to_strong_model() {
+        // Default threshold is 3: difficulty<=3 -> cheapest, >3 -> strong model
+        // (here the parent's current model, since cheap_route_strong_model unset).
+        let backend = FallbackBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"easy","prompt":"p","difficulty":2},{"description":"hard","prompt":"p","difficulty":5}]"#.to_string(),
+                "cheapo".to_string(), // recommend (cheapest)
+                "OK".to_string(),     // review easy
+                "OK".to_string(),     // review hard
+            ])),
+            routes: vec![priced_route("cheapo", 100), priced_route("pricey", 9_000_000)],
+            dead_models: std::collections::HashSet::new(),
+            attempts: Mutex::new(Vec::new()),
+            current: "strong-main".to_string(),
+        };
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.results.len(), 2);
+        let attempts = backend.attempts.lock().unwrap();
+        // Easy (diff 2) ran on the cheapest model; hard (diff 5) ran on the
+        // strong/current model first — the expensive model only touched the hard
+        // subtask.
+        assert_eq!(
+            *attempts,
+            vec!["cheapo".to_string(), "strong-main".to_string()]
+        );
     }
 
     #[tokio::test]

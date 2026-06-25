@@ -494,6 +494,21 @@ pub struct AgentsConfig {
     /// cheap output is accepted as-is, preserving prior behavior).
     #[serde(default)]
     pub cheap_route_verify_cmd: Option<String>,
+    /// Difficulty-tiered routing: cheap-route subtasks at or below this
+    /// difficulty (1-5) go to the cheapest model; subtasks ABOVE it go to the
+    /// stronger model (`cheap_route_strong_model`, or the parent's own model),
+    /// so the expensive model only spends on complex subtasks. Default 3
+    /// (1-3 cheap, 4-5 strong). Set to 5 to keep nearly everything on cheap
+    /// models, or 0 to route every subtask to the strong model.
+    #[serde(default = "default_cheap_route_difficulty_threshold")]
+    pub cheap_route_difficulty_threshold: u8,
+    /// Model used for hard subtasks (difficulty above
+    /// `cheap_route_difficulty_threshold`). Unset = the parent's own current
+    /// (main) model, so complex work runs on the strong model you're chatting
+    /// with. Set to a strong-but-cheaper model (e.g. "glm-5.1", "qwen3-max") to
+    /// keep even hard subtasks off the most expensive model.
+    #[serde(default)]
+    pub cheap_route_strong_model: Option<String>,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -561,6 +576,10 @@ fn default_memory_sidecar_enabled() -> bool {
     true
 }
 
+fn default_cheap_route_difficulty_threshold() -> u8 {
+    3
+}
+
 fn default_memory_rerank_cadence() -> usize {
     3
 }
@@ -581,6 +600,8 @@ impl Default for AgentsConfig {
             cheap_route_ban: Vec::new(),
             cheap_route_tools: Vec::new(),
             cheap_route_verify_cmd: None,
+            cheap_route_difficulty_threshold: default_cheap_route_difficulty_threshold(),
+            cheap_route_strong_model: None,
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             memory_model: None,
