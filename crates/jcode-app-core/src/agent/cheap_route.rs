@@ -188,24 +188,24 @@ pub async fn run_cheap_route(
     }
     let menu: Vec<CheapRouteCandidate> = ranked.iter().take(MAX_MENU).cloned().collect();
 
-    // 3. Parent recommends one model from the menu.
-    let menu_str = format_menu_for_prompt(&menu);
-    let recommend = backend
-        .ask_parent(&build_recommend_prompt(task, &subtasks, &menu_str))
-        .await?;
-    let mut recommended_model = parse_recommended_model(&recommend, &menu)?;
-
-    // Honor an explicit preference as a HARD override: if the user pinned a
-    // preferred provider (agents.cheap_route_prefer), use its prefer-prioritized,
-    // cheapest route as the primary pick instead of the parent's free choice —
-    // which otherwise often picks its own (expensive) model over the cheap one
-    // the user wanted. `ranked` is already prefer-prioritized, so ranked[0] is
-    // the preferred route when a preference matched.
-    if !crate::config::config().agents.cheap_route_prefer.is_empty()
-        && let Some(top) = ranked.first()
-    {
-        recommended_model = top.route.model.clone();
-    }
+    // 3. Pick the primary model. When the user pinned a preference
+    //    (agents.cheap_route_prefer), it is a HARD override: use the
+    //    prefer-prioritized cheapest route directly and SKIP the parent recommend
+    //    round-trip entirely (faster + deterministic, and it stops the parent
+    //    from picking its own expensive model over the cheap one the user wanted).
+    //    Otherwise, ask the parent to recommend from the cheapest-first menu.
+    let recommended_model = if !crate::config::config().agents.cheap_route_prefer.is_empty() {
+        ranked
+            .first()
+            .map(|c| c.route.model.clone())
+            .ok_or_else(|| anyhow!("no candidate models to route to"))?
+    } else {
+        let menu_str = format_menu_for_prompt(&menu);
+        let recommend = backend
+            .ask_parent(&build_recommend_prompt(task, &subtasks, &menu_str))
+            .await?;
+        parse_recommended_model(&recommend, &menu)?
+    };
 
     // 4. Candidate order: recommended first, then the cheapest model of EACH
     //    other provider. Quota/auth failures are per-key, so once one model of a
@@ -480,10 +480,12 @@ fn cheap_subagent_tool_allowlist(registry_tools: &std::collections::HashSet<Stri
         .collect()
 }
 
-/// Hard cap on a single subtask's model call. A slow/hanging route (e.g.
-/// OpenRouter stalling) must not block the whole run — on timeout the candidate
-/// is treated as failed and the next route is tried.
-const SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Hard cap on a single subtask's model call. A slow/hanging route (e.g. a
+/// stalled provider) must not block the whole run — on timeout the candidate is
+/// treated as failed and the next route is tried. Kept tight so a dead route is
+/// abandoned quickly: a healthy cheap model opens + answers a small subtask in a
+/// few seconds, so 30s is generous for "working" yet fast to fail on a hang.
+const SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The cheapest currently-available route across the provider's own routes and
 /// all configured named providers (deduped, ranked cheapest-first, prefer/ban

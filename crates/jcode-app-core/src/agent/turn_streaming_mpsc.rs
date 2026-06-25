@@ -21,9 +21,10 @@ const WRAP_TOOL_MARKERS: [&str; 2] = ["to=functions.", "+#+#"];
 /// Maximum time to wait for the provider to OPEN the response stream (including
 /// the provider's own internal retries) before aborting the turn. Without this,
 /// a stalled provider (rate-limited / unreachable / hung) keeps the turn
-/// "sending…" forever until the user manually interrupts. Generous so legitimate
-/// slow opens and retry sequences are not cut off; it only fires on a true hang.
-const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// "sending…" forever until the user manually interrupts. Opening a stream is a
+/// sub-second operation on a healthy provider, so 45s is generous for retries
+/// yet fails fast on a true hang instead of making the user wait two minutes.
+const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Find the first wrapped-tool-call marker in `accumulated`, scanning only the
 /// newly appended `delta` plus a short overlap from the previous tail (so a
