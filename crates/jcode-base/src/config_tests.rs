@@ -838,6 +838,7 @@ fn populate_context_limits_from_config_ref_seeds_global_cache() {
                 id: model_id.to_string(),
                 context_window: Some(1_000_000),
                 input: Vec::new(),
+                ..Default::default()
             }],
             ..Default::default()
         },

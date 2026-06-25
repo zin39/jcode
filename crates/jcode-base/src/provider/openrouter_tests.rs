@@ -1798,6 +1798,7 @@ fn named_openai_compatible_model_context_window_overrides_default() {
             id: "custom-long-context".to_string(),
             context_window: Some(512_000),
             input: Vec::new(),
+            ..Default::default()
         }],
         ..Default::default()
     };

@@ -353,7 +353,10 @@ pub enum NamedProviderAuth {
     None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// Not `Eq`: the optional `f64` price hints below are only `PartialEq`. The
+// parent `NamedProviderConfig` is `PartialEq`-only too, and nothing keys on this
+// struct, so dropping `Eq` is safe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct NamedProviderModelConfig {
     pub id: String,
@@ -368,6 +371,15 @@ pub struct NamedProviderModelConfig {
     pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    /// Price hint: USD per million INPUT tokens. Lets a provider whose pricing
+    /// isn't in the models.dev catalog (e.g. modelscope, dashscope) be
+    /// cost-ranked by cheap-routing. Both input and output must be set to take
+    /// effect; unset = the model stays unpriced (ranked last).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_input_per_mtok: Option<f64>,
+    /// Price hint: USD per million OUTPUT tokens. See `price_input_per_mtok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_output_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

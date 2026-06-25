@@ -565,6 +565,25 @@ fn absolute_env_file_has_key(env_key: Option<&str>, env_file: Option<&str>) -> b
         .any(|line| line.strip_prefix(&prefix).is_some_and(|v| !v.trim().is_empty()))
 }
 
+/// Build a metered cheapness estimate from a user-configured per-million-token
+/// price hint (USD). Lets providers absent from the models.dev catalog
+/// (modelscope, dashscope, …) participate in cost ranking. Negative inputs are
+/// clamped to 0.
+fn cheapness_from_price_hint(
+    input_usd_per_mtok: f64,
+    output_usd_per_mtok: f64,
+) -> jcode_provider_core::RouteCheapnessEstimate {
+    let to_micros = |usd: f64| (usd.max(0.0) * 1_000_000.0).round() as u64;
+    jcode_provider_core::RouteCheapnessEstimate::metered(
+        jcode_provider_core::RouteCostSource::PublicApiPricing,
+        jcode_provider_core::RouteCostConfidence::High,
+        to_micros(input_usd_per_mtok),
+        to_micros(output_usd_per_mtok),
+        None,
+        Some("config price hint".to_string()),
+    )
+}
+
 fn configured_named_provider_routes() -> Vec<ModelRoute> {
     let cfg = crate::config::config();
     let mut routes = Vec::new();
@@ -598,6 +617,20 @@ fn configured_named_provider_routes() -> Vec<ModelRoute> {
                 provider_cfg.api_key_env.as_deref(),
                 provider_cfg.env_file.as_deref(),
             );
+        // Per-model price hints from config let a provider whose pricing is NOT
+        // in the models.dev catalog (e.g. modelscope, dashscope) still be
+        // cost-ranked instead of sorting last as "price unknown". Both input and
+        // output must be set and non-negative.
+        let price_hints: std::collections::HashMap<String, (f64, f64)> = provider_cfg
+            .models
+            .iter()
+            .filter_map(|m| match (m.price_input_per_mtok, m.price_output_per_mtok) {
+                (Some(input), Some(output)) if input >= 0.0 && output >= 0.0 => {
+                    Some((m.id.clone(), (input, output)))
+                }
+                _ => None,
+            })
+            .collect();
         routes.extend(build_named_provider_routes(
             name,
             &provider_cfg.base_url,
@@ -605,6 +638,11 @@ fn configured_named_provider_routes() -> Vec<ModelRoute> {
             &cached_ids,
             key_present,
             |source, model| {
+                // Config price hint wins over the catalog: the user is declaring
+                // the price for a key the catalog doesn't cover.
+                if let Some(&(input, output)) = price_hints.get(model) {
+                    return Some(cheapness_from_price_hint(input, output));
+                }
                 crate::provider::pricing::metered_pricing_for_source_with_tier(source, model, None)
             },
         ));
@@ -1592,6 +1630,48 @@ mod tests {
         let kept = drop_banned_routes(routes, &["deepseek-v4-flash".to_string()]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].model, "deepseek-chat");
+    }
+
+    #[test]
+    fn price_hint_converts_usd_per_mtok_to_micros() {
+        let est = cheapness_from_price_hint(0.14, 0.28);
+        assert_eq!(est.input_price_per_mtok_micros, Some(140_000));
+        assert_eq!(est.output_price_per_mtok_micros, Some(280_000));
+        assert_eq!(est.source, RouteCostSource::PublicApiPricing);
+        assert!(
+            est.estimated_reference_cost_micros.is_some(),
+            "must have a reference cost so it sorts"
+        );
+        // Negative is clamped to 0 (a free/garbage value can't underflow).
+        assert_eq!(
+            cheapness_from_price_hint(-5.0, 0.0).input_price_per_mtok_micros,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn price_hinted_route_ranks_before_unpriced() {
+        let hinted = ModelRoute {
+            model: "modelscope-cheap".to_string(),
+            provider: "modelscope".to_string(),
+            api_method: "openai-compatible:modelscope".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: Some(cheapness_from_price_hint(0.1, 0.2)),
+        };
+        let unpriced = ModelRoute {
+            model: "mystery-model".to_string(),
+            provider: "other".to_string(),
+            api_method: "a".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        };
+        let ranked = rank_routes_by_cost(vec![unpriced, hinted]);
+        assert_eq!(
+            ranked[0].route.model, "modelscope-cheap",
+            "a config-priced route must rank ahead of an unpriced one"
+        );
     }
 
     #[test]
