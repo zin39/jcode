@@ -174,7 +174,7 @@ pub async fn run_cheap_route(
     //    menu; the FULL ranked list is the fallback candidate order, so a working
     //    route that isn't in the cheapest 6 (e.g. deepseek sitting behind dead
     //    OpenAI nano/mini) still gets reached instead of being skipped.
-    let ranked = rank_routes_by_cost(backend.routes());
+    let ranked = ranked_with_preferences(backend.routes());
     if ranked.is_empty() {
         return Err(anyhow!("no available model routes to route work to"));
     }
@@ -360,6 +360,58 @@ fn configured_named_provider_routes() -> Vec<ModelRoute> {
     routes
 }
 
+/// Whether `entry` (case-insensitive substring) matches this route by model id,
+/// provider, api_method, or `"provider/model"` composite. Used by the
+/// `agents.cheap_route_prefer` / `cheap_route_ban` lists.
+fn route_matches_preference(route: &ModelRoute, entry: &str) -> bool {
+    let entry = entry.trim().to_lowercase();
+    if entry.is_empty() {
+        return false;
+    }
+    let composite = format!("{}/{}", route.provider, route.model).to_lowercase();
+    route.model.to_lowercase().contains(&entry)
+        || route.provider.to_lowercase().contains(&entry)
+        || route.api_method.to_lowercase().contains(&entry)
+        || composite.contains(&entry)
+}
+
+/// Drop routes matching any `ban` entry.
+fn drop_banned_routes(routes: Vec<ModelRoute>, ban: &[String]) -> Vec<ModelRoute> {
+    if ban.is_empty() {
+        return routes;
+    }
+    routes
+        .into_iter()
+        .filter(|route| !ban.iter().any(|b| route_matches_preference(route, b)))
+        .collect()
+}
+
+/// Stable-partition ranked candidates so any matching a `prefer` entry come
+/// first (each group stays cheapest-first), so a preferred model is chosen even
+/// when something else is marginally cheaper.
+fn prioritize_preferred(
+    ranked: Vec<CheapRouteCandidate>,
+    prefer: &[String],
+) -> Vec<CheapRouteCandidate> {
+    if prefer.is_empty() {
+        return ranked;
+    }
+    let (mut preferred, mut rest): (Vec<_>, Vec<_>) = ranked
+        .into_iter()
+        .partition(|c| prefer.iter().any(|p| route_matches_preference(&c.route, p)));
+    preferred.append(&mut rest);
+    preferred
+}
+
+/// Rank routes cheapest-first after applying the configured cheap-route `ban`
+/// (drop) and `prefer` (move-to-front) lists from `agents` config.
+fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> {
+    let agents = &crate::config::config().agents;
+    let routes = drop_banned_routes(routes, &agents.cheap_route_ban);
+    let ranked = rank_routes_by_cost(routes);
+    prioritize_preferred(ranked, &agents.cheap_route_prefer)
+}
+
 /// The sentinel value users put in `agents.swarm_model` (or pass as a subagent
 /// `model`) to mean "pick the cheapest available model dynamically".
 pub const CHEAPEST_SENTINEL: &str = "cheapest";
@@ -372,7 +424,7 @@ pub fn cheapest_available_model(provider: &dyn crate::provider::Provider) -> Opt
     let mut routes = provider.model_routes();
     routes.extend(configured_named_provider_routes());
     let routes = jcode_provider_core::selection::dedupe_model_routes(routes);
-    rank_routes_by_cost(routes)
+    ranked_with_preferences(routes)
         .into_iter()
         .next()
         .map(|candidate| candidate.route.model)
@@ -893,5 +945,38 @@ mod tests {
             cheapest_available_model(&provider),
             Some("cheapo".to_string())
         );
+    }
+
+    #[test]
+    fn drop_banned_routes_removes_matching_models() {
+        let routes = vec![
+            priced_route("deepseek-chat", 100),
+            priced_route("deepseek-v4-flash", 50),
+        ];
+        let kept = drop_banned_routes(routes, &["deepseek-v4-flash".to_string()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].model, "deepseek-chat");
+    }
+
+    #[test]
+    fn prioritize_preferred_moves_matches_to_front() {
+        let ranked = rank_routes_by_cost(vec![
+            priced_route("cheapo", 100),
+            priced_route("pricey", 9_000_000),
+        ]);
+        assert_eq!(ranked[0].route.model, "cheapo");
+        // Preferring "pricey" moves it ahead of the cheaper "cheapo".
+        let reordered = prioritize_preferred(ranked, &["pricey".to_string()]);
+        assert_eq!(reordered[0].route.model, "pricey");
+        assert_eq!(reordered[1].route.model, "cheapo");
+    }
+
+    #[test]
+    fn route_matches_preference_handles_model_and_composite() {
+        let route = priced_route("deepseek-chat", 100); // provider "prov-deepseek-chat"
+        assert!(route_matches_preference(&route, "deepseek-chat"));
+        assert!(route_matches_preference(&route, "prov-deepseek-chat/deepseek-chat"));
+        assert!(!route_matches_preference(&route, "gpt-5-nano"));
+        assert!(!route_matches_preference(&route, ""));
     }
 }

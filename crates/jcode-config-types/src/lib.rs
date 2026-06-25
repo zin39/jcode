@@ -458,6 +458,17 @@ pub struct AgentsConfig {
     /// string only when you deliberately want every swarm worker pinned to a
     /// specific model regardless of which model spawned them.
     pub swarm_model: Option<String>,
+    /// Models/providers to PREFER for cheap-routing and `"cheapest"` spawns —
+    /// tried before others even when marginally pricier. Each entry is matched
+    /// case-insensitively as a substring against a route's model id, provider,
+    /// api_method, or `"provider/model"` (e.g. `"deepseek/deepseek-chat"`).
+    #[serde(default)]
+    pub cheap_route_prefer: Vec<String>,
+    /// Models/providers to NEVER use for cheap-routing and `"cheapest"` spawns
+    /// (e.g. `"deepseek-v4-flash"` or `"openrouter"`). Same matching as
+    /// `cheap_route_prefer`.
+    #[serde(default)]
+    pub cheap_route_ban: Vec<String>,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -541,6 +552,8 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             swarm_model: None,
+            cheap_route_prefer: Vec::new(),
+            cheap_route_ban: Vec::new(),
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             memory_model: None,
