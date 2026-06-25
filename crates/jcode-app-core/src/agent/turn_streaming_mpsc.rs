@@ -18,6 +18,13 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 /// The wrapped-tool-call markers emitted by some models inside plain text.
 const WRAP_TOOL_MARKERS: [&str; 2] = ["to=functions.", "+#+#"];
 
+/// Maximum time to wait for the provider to OPEN the response stream (including
+/// the provider's own internal retries) before aborting the turn. Without this,
+/// a stalled provider (rate-limited / unreachable / hung) keeps the turn
+/// "sending…" forever until the user manually interrupts. Generous so legitimate
+/// slow opens and retry sequences are not cut off; it only fires on a true hang.
+const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Find the first wrapped-tool-call marker in `accumulated`, scanning only the
 /// newly appended `delta` plus a short overlap from the previous tail (so a
 /// marker straddling the append boundary is still found).
@@ -241,10 +248,22 @@ impl Agent {
                     &split_prompt.dynamic_part,
                     resume_session_id.as_deref(),
                 ));
+                let stream_open_deadline = tokio::time::sleep(STREAM_OPEN_TIMEOUT);
+                tokio::pin!(stream_open_deadline);
                 loop {
                     tokio::select! {
                         _ = keepalive.tick() => {
                             send_stream_keepalive_mpsc(&event_tx);
+                        }
+                        _ = &mut stream_open_deadline => {
+                            logging::warn(&format!(
+                                "API stream did not open within {}s (provider may be rate-limited or unreachable) - aborting turn",
+                                STREAM_OPEN_TIMEOUT.as_secs()
+                            ));
+                            return Err(anyhow::anyhow!(
+                                "Provider did not respond within {}s — it may be rate-limited or unreachable. Try again or switch models with /model.",
+                                STREAM_OPEN_TIMEOUT.as_secs()
+                            ));
                         }
                         _ = self.graceful_shutdown.notified() => {
                             logging::info(
