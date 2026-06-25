@@ -843,10 +843,38 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
     if healthy.is_empty() { ranked } else { healthy }
 }
 
+/// Resolve an explicit (non-"cheapest") model spec to a concrete
+/// `(model, api_method)` route from the available routes, so a provider-qualified
+/// cheap model (e.g. `"deepseek/deepseek-chat"`) gets its route PINNED instead of
+/// silently running on the coordinator's own provider. Matches on the bare model
+/// id after any `"provider/"` prefix. Returns None if no available route matches.
+pub fn resolve_model_route(
+    provider: &dyn crate::provider::Provider,
+    model_spec: &str,
+) -> Option<(String, String)> {
+    let bare = model_spec
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_spec)
+        .trim()
+        .to_ascii_lowercase();
+    if bare.is_empty() {
+        return None;
+    }
+    let mut routes = provider.model_routes();
+    routes.extend(configured_named_provider_routes());
+    let routes = jcode_provider_core::selection::dedupe_model_routes(routes);
+    routes
+        .into_iter()
+        .find(|r| r.available && r.model.to_ascii_lowercase() == bare)
+        .map(|r| (r.model, r.api_method))
+}
+
 /// Whether a model id is excluded by `agents.cheap_route_ban`. Used to keep the
 /// last-resort coordinator fallback from EVER using a banned model (e.g. Claude)
-/// when every cheap route is dead.
-fn model_is_cheap_route_banned(model: &str) -> bool {
+/// when every cheap route is dead, and to refuse running a spawned subagent on a
+/// banned model.
+pub fn model_is_cheap_route_banned(model: &str) -> bool {
     let agents = &crate::config::config().agents;
     let probe = ModelRoute {
         model: model.to_string(),
