@@ -482,10 +482,18 @@ pub fn shared_http_client() -> reqwest::Client {
                 .http2_keep_alive_interval(Some(Duration::from_secs(30)))
                 .http2_keep_alive_timeout(Duration::from_secs(15))
                 .http2_keep_alive_while_idle(true)
-                // Drop idle pooled connections sooner so an HTTP/1.1 connection is
-                // less likely to be reused after the server has quietly closed it.
+                // Do NOT keep idle connections in the pool. Reusing a pooled
+                // HTTP/1.1 connection that the server has quietly half-closed
+                // (common for api.deepseek.com and other openai-compatible
+                // endpoints) makes the next request hang waiting for response
+                // headers that never arrive — read_timeout does not cover that
+                // pre-header phase, and http2 keepalive only helps HTTP/2. With no
+                // idle reuse, every request opens a fresh connection so
+                // connect_timeout(15s) guards it. The cost is one TLS handshake per
+                // request (~tens of ms), negligible next to model latency. This
+                // mirrors the Gemini provider, which uses the same setting.
                 .pool_idle_timeout(Duration::from_secs(30))
-                .pool_max_idle_per_host(8)
+                .pool_max_idle_per_host(0)
                 .build()
                 .unwrap_or_else(|err| {
                     eprintln!("jcode: failed to build shared provider HTTP client: {err}");
