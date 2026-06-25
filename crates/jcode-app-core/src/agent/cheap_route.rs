@@ -512,6 +512,10 @@ use std::sync::Arc;
 /// provider fork, mirroring `SubagentTool::execute`.
 pub struct ProviderCheapBackend {
     provider: Arc<dyn crate::provider::Provider>,
+    /// Provider used for coordination calls (decompose/review). It is a fork of
+    /// `provider` switched to the cheapest available model, so coordination is
+    /// fast and cheap regardless of how slow the session/chat model is.
+    coordinator: Arc<dyn crate::provider::Provider>,
     registry: crate::tool::Registry,
     parent_system: String,
 }
@@ -521,8 +525,23 @@ impl ProviderCheapBackend {
         provider: Arc<dyn crate::provider::Provider>,
         registry: crate::tool::Registry,
     ) -> Self {
+        // Coordination (decompose/review) must not run on a slow session model
+        // (e.g. qwen3.7-max, ~10-20s/call). Fork the provider and switch it to the
+        // cheapest available route; complete_simple sends no tools so even a
+        // slow-with-tools model opens fast for these small text calls.
+        let coordinator = provider.fork();
+        if let Some((model, route_api_method)) = cheapest_available_model(provider.as_ref()) {
+            let request =
+                crate::provider::MultiProvider::model_switch_request_for_session_route(
+                    &model,
+                    None,
+                    Some(&route_api_method),
+                );
+            let _ = crate::provider::set_model_with_auth_refresh(coordinator.as_ref(), &request);
+        }
         Self {
             provider,
+            coordinator,
             registry,
             parent_system:
                 "You are a cost-routing coordinator. Decompose, recommend a model, and review \
@@ -535,7 +554,7 @@ impl ProviderCheapBackend {
 #[async_trait]
 impl CheapRouteBackend for ProviderCheapBackend {
     async fn ask_parent(&self, prompt: &str) -> Result<String> {
-        self.provider.complete_simple(prompt, &self.parent_system).await
+        self.coordinator.complete_simple(prompt, &self.parent_system).await
     }
 
     async fn run_subtask(
