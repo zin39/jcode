@@ -68,6 +68,74 @@ pub trait CheapRouteBackend: Send + Sync {
     /// The parent's own current model — a known-working last-resort fallback
     /// when every ranked cheap route errors (e.g. all dead-quota).
     fn current_model(&self) -> String;
+    /// Run the configured verification command (e.g. `cargo check`) after a
+    /// subtask's edits, returning `(passed, combined_output)`. The default impl
+    /// shells out in the working directory; test backends override it to script
+    /// outcomes without spawning a process.
+    async fn verify_edits(&self, command: &str) -> Result<(bool, String)> {
+        run_verify_command(command).await
+    }
+}
+
+/// Run a verification shell command in the current working directory, capturing
+/// stdout+stderr and the exit status. Returns `(passed, combined_output)` where
+/// `passed` is true only on a zero exit code. Mirrors the spawn/capture pattern
+/// used by the bash tool (kill-on-drop, piped stdout/stderr read concurrently).
+/// Output is truncated so a noisy build log can't blow up the repair prompt.
+async fn run_verify_command(command: &str) -> Result<(bool, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    cmd.kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn verify command '{command}': {e}"))?;
+    let mut stdout_handle = child.stdout.take();
+    let mut stderr_handle = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(mut out) = stdout_handle.take() {
+            let _ = out.read_to_string(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(mut err) = stderr_handle.take() {
+            let _ = err.read_to_string(&mut buf).await;
+        }
+        buf
+    });
+    let status = child.wait().await?;
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    let mut combined = String::new();
+    if !stdout.trim().is_empty() {
+        combined.push_str(stdout.trim_end());
+    }
+    if !stderr.trim().is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(stderr.trim_end());
+    }
+    // Keep only the tail — build/test failures put the useful error at the end,
+    // and the repair prompt must stay small for a cheap model.
+    const MAX_VERIFY_OUTPUT: usize = 4000;
+    if combined.len() > MAX_VERIFY_OUTPUT {
+        let tail = &combined[combined.len() - MAX_VERIFY_OUTPUT..];
+        combined = format!("…(truncated)…\n{tail}");
+    }
+    Ok((status.success(), combined))
 }
 
 /// Strip a single surrounding markdown code fence (```json ... ```), returning
@@ -169,6 +237,86 @@ If correct reply 'OK'. If not, reply 'FIX:' then what is wrong.\n\nSUBTASK: {}\n
     )
 }
 
+/// Prompt for the single repair attempt after a verification command failed.
+/// Gives the model the original subtask, what it produced, the exact command
+/// that failed, and the failure output, and asks it to fix the actual cause so
+/// the command passes — not to paper over the symptom.
+pub fn build_repair_prompt(
+    subtask: &Subtask,
+    previous_output: &str,
+    verify_cmd: &str,
+    failure_output: &str,
+) -> String {
+    format!(
+        "Your previous attempt at this subtask did not pass verification. \
+Fix the underlying cause so `{verify_cmd}` succeeds. Re-read and edit the \
+relevant files; do not just describe the fix.\n\n\
+SUBTASK: {}\n\n\
+YOUR PREVIOUS RESULT:\n{}\n\n\
+VERIFY COMMAND: {verify_cmd}\n\
+VERIFY FAILURE OUTPUT:\n{}",
+        subtask.description, previous_output, failure_output
+    )
+}
+
+/// Verify a completed subtask's edits with `verify_cmd`; on failure, retry the
+/// subtask ONCE on the same route (`model`/`api_method`) with the failure output
+/// fed back, then re-verify. Returns `(final_output, note)` where `note` is a
+/// short human-readable verdict prepended to the review. Best-effort: any
+/// verify-infrastructure error leaves the original output intact.
+async fn verify_and_maybe_repair(
+    backend: &dyn CheapRouteBackend,
+    subtask: &Subtask,
+    model: &str,
+    api_method: Option<&str>,
+    output: String,
+    verify_cmd: &str,
+) -> (String, String) {
+    match backend.verify_edits(verify_cmd).await {
+        Ok((true, _)) => (output, format!("[verify: `{verify_cmd}` passed] ")),
+        Ok((false, fail_out)) => {
+            let repair = Subtask {
+                description: subtask.description.clone(),
+                prompt: build_repair_prompt(subtask, &output, verify_cmd, &fail_out),
+                difficulty: subtask.difficulty,
+            };
+            let repaired = tokio::time::timeout(
+                SUBTASK_TIMEOUT,
+                backend.run_subtask(&repair, model, api_method),
+            )
+            .await;
+            match repaired {
+                Ok(Ok(new_output)) => match backend.verify_edits(verify_cmd).await {
+                    Ok((true, _)) => (
+                        new_output,
+                        format!("[verify: `{verify_cmd}` failed, repaired, now passes] "),
+                    ),
+                    Ok((false, _)) => (
+                        new_output,
+                        format!("[verify: `{verify_cmd}` still failing after one repair attempt] "),
+                    ),
+                    Err(e) => (new_output, format!("[verify re-check error: {e}] ")),
+                },
+                Ok(Err(e)) => (
+                    output,
+                    format!("[verify: `{verify_cmd}` failed; repair attempt errored: {e}] "),
+                ),
+                Err(_) => (
+                    output,
+                    format!(
+                        "[verify: `{verify_cmd}` failed; repair timed out after {}s] ",
+                        SUBTASK_TIMEOUT.as_secs()
+                    ),
+                ),
+            }
+        }
+        Err(e) => (
+            output,
+            format!("[verify: could not run `{verify_cmd}`: {e}] "),
+        ),
+    }
+}
+
 /// Auto-mode cheap routing: decompose -> rank -> recommend -> spawn -> review.
 pub async fn run_cheap_route(
     backend: &dyn CheapRouteBackend,
@@ -248,7 +396,7 @@ pub async fn run_cheap_route(
     // 5. Run each subtask (with fallback) and have the parent review each result.
     let mut results = Vec::with_capacity(subtasks.len());
     for subtask in &subtasks {
-        let mut chosen: Option<(String, String)> = None; // (model_used, output)
+        let mut chosen: Option<(String, Option<String>, String)> = None; // (model, api_method, output)
         let mut errors: Vec<String> = Vec::new();
         for (model, api_method) in &candidates {
             let attempt = tokio::time::timeout(
@@ -258,7 +406,7 @@ pub async fn run_cheap_route(
             .await;
             match attempt {
                 Ok(Ok(output)) => {
-                    chosen = Some((model.clone(), output));
+                    chosen = Some((model.clone(), api_method.clone(), output));
                     break;
                 }
                 Ok(Err(err)) => errors.push(format!("{model}: {err}")),
@@ -268,7 +416,7 @@ pub async fn run_cheap_route(
                 )),
             }
         }
-        let (model_used, output) = chosen.ok_or_else(|| {
+        let (model_used, api_method_used, mut output) = chosen.ok_or_else(|| {
             anyhow!(
                 "all {} candidate model(s) failed for subtask '{}': {}",
                 candidates.len(),
@@ -276,11 +424,33 @@ pub async fn run_cheap_route(
                 errors.join("; ")
             )
         })?;
+
+        // Execution-grounded verification: if a verify command is configured,
+        // run it after the subtask's edits, retrying the subtask once on failure
+        // with the failure fed back (see `verify_and_maybe_repair`). No command
+        // configured => no-op, preserving prior behavior.
+        let mut verify_note = String::new();
+        if let Some(cmd) = crate::config::config().agents.cheap_route_verify_cmd.clone()
+            && !cmd.trim().is_empty()
+        {
+            let (new_output, note) = verify_and_maybe_repair(
+                backend,
+                subtask,
+                &model_used,
+                api_method_used.as_deref(),
+                output,
+                &cmd,
+            )
+            .await;
+            output = new_output;
+            verify_note = note;
+        }
+
         // Review is best-effort: a parent-review error must not discard a
         // subtask that already completed successfully.
         let review = match backend.ask_parent(&build_review_prompt(subtask, &output)).await {
-            Ok(review) => review,
-            Err(err) => format!("(review unavailable: {err})"),
+            Ok(review) => format!("{verify_note}{review}"),
+            Err(err) => format!("{verify_note}(review unavailable: {err})"),
         };
         results.push(SubtaskResult {
             description: subtask.description.clone(),
@@ -843,6 +1013,148 @@ mod tests {
         };
         let err = run_cheap_route(&backend, "task").await.unwrap_err();
         assert!(err.to_string().contains("no available model routes"));
+    }
+
+    /// Backend for testing execution-grounded verify+repair: scripted
+    /// `verify_edits` outcomes and a `run_subtask` call counter.
+    struct VerifyBackend {
+        verify_results: Mutex<VecDeque<(bool, String)>>,
+        subtask_outputs: Mutex<VecDeque<String>>,
+        subtask_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CheapRouteBackend for VerifyBackend {
+        async fn ask_parent(&self, _prompt: &str) -> Result<String> {
+            Ok("OK".to_string())
+        }
+        async fn run_subtask(
+            &self,
+            _subtask: &Subtask,
+            _model: &str,
+            _route_api_method: Option<&str>,
+        ) -> Result<String> {
+            self.subtask_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .subtask_outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "repaired".to_string()))
+        }
+        fn routes(&self) -> Vec<ModelRoute> {
+            vec![]
+        }
+        fn current_model(&self) -> String {
+            "parent".to_string()
+        }
+        async fn verify_edits(&self, _command: &str) -> Result<(bool, String)> {
+            Ok(self
+                .verify_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((true, String::new())))
+        }
+    }
+
+    fn verify_subtask() -> Subtask {
+        Subtask {
+            description: "t".to_string(),
+            prompt: "do it".to_string(),
+            difficulty: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_passes_means_no_repair() {
+        let backend = VerifyBackend {
+            verify_results: Mutex::new(VecDeque::from(vec![(true, String::new())])),
+            subtask_outputs: Mutex::new(VecDeque::new()),
+            subtask_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (out, note) = verify_and_maybe_repair(
+            &backend,
+            &verify_subtask(),
+            "m",
+            None,
+            "orig".to_string(),
+            "cargo check",
+        )
+        .await;
+        assert_eq!(out, "orig");
+        assert!(note.contains("passed"), "note was: {note}");
+        assert_eq!(
+            backend.subtask_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no repair attempt when verify passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_fails_then_repair_passes() {
+        let backend = VerifyBackend {
+            verify_results: Mutex::new(VecDeque::from(vec![
+                (false, "error[E0308] mismatched types".to_string()),
+                (true, String::new()),
+            ])),
+            subtask_outputs: Mutex::new(VecDeque::from(vec!["repaired-output".to_string()])),
+            subtask_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (out, note) = verify_and_maybe_repair(
+            &backend,
+            &verify_subtask(),
+            "m",
+            None,
+            "orig".to_string(),
+            "cargo check",
+        )
+        .await;
+        assert_eq!(out, "repaired-output", "output replaced by repaired result");
+        assert!(note.contains("repaired, now passes"), "note was: {note}");
+        assert_eq!(
+            backend.subtask_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one repair attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_fails_and_repair_still_fails() {
+        let backend = VerifyBackend {
+            verify_results: Mutex::new(VecDeque::from(vec![
+                (false, "err".to_string()),
+                (false, "still err".to_string()),
+            ])),
+            subtask_outputs: Mutex::new(VecDeque::from(vec!["repaired".to_string()])),
+            subtask_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (out, note) = verify_and_maybe_repair(
+            &backend,
+            &verify_subtask(),
+            "m",
+            None,
+            "orig".to_string(),
+            "cargo check",
+        )
+        .await;
+        assert_eq!(out, "repaired");
+        assert!(note.contains("still failing"), "note was: {note}");
+        assert_eq!(
+            backend.subtask_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn run_verify_command_captures_exit_and_output() {
+        let (passed, out) = run_verify_command("echo hello && exit 0").await.unwrap();
+        assert!(passed);
+        assert!(out.contains("hello"));
+        let (failed, _) = run_verify_command("echo boom 1>&2; exit 7").await.unwrap();
+        assert!(!failed, "non-zero exit must report not-passed");
     }
 
     /// Backend where `run_subtask` errors for any model in `dead_models`,

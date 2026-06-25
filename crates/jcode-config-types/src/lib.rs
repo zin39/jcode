@@ -475,6 +475,13 @@ pub struct AgentsConfig {
     /// cheap models. Add e.g. `"browser"` here if cheap subtasks need it.
     #[serde(default)]
     pub cheap_route_tools: Vec<String>,
+    /// Optional shell command run after each cheap subtask to verify its edits
+    /// (e.g. `"cargo check -q"`, `"npm test -s"`). Runs in the working
+    /// directory. If it exits non-zero, the subtask is retried once with the
+    /// failure output fed back, then re-verified. Unset = no verification (the
+    /// cheap output is accepted as-is, preserving prior behavior).
+    #[serde(default)]
+    pub cheap_route_verify_cmd: Option<String>,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -561,6 +568,7 @@ impl Default for AgentsConfig {
             cheap_route_prefer: Vec::new(),
             cheap_route_ban: Vec::new(),
             cheap_route_tools: Vec::new(),
+            cheap_route_verify_cmd: None,
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             memory_model: None,
