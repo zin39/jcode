@@ -235,6 +235,10 @@ impl Tool for SubagentTool {
             session,
             Some(allowed),
         );
+        // A spawned subagent may auto-switch to the next-cheapest healthy model if
+        // its model rate-limits/quota-fails (e.g. GLM 429 under concurrent load),
+        // instead of the subagent failing outright.
+        agent.set_allow_auto_reroute(true);
 
         let start = std::time::Instant::now();
         let final_text = agent.run_once_capture(&params.prompt).await.map_err(|err| {
