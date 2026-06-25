@@ -239,12 +239,21 @@ pub async fn run_cheap_route(
         let mut chosen: Option<(String, String)> = None; // (model_used, output)
         let mut errors: Vec<String> = Vec::new();
         for (model, api_method) in &candidates {
-            match backend.run_subtask(subtask, model, api_method.as_deref()).await {
-                Ok(output) => {
+            let attempt = tokio::time::timeout(
+                SUBTASK_TIMEOUT,
+                backend.run_subtask(subtask, model, api_method.as_deref()),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(output)) => {
                     chosen = Some((model.clone(), output));
                     break;
                 }
-                Err(err) => errors.push(format!("{model}: {err}")),
+                Ok(Err(err)) => errors.push(format!("{model}: {err}")),
+                Err(_) => errors.push(format!(
+                    "{model}: timed out after {}s",
+                    SUBTASK_TIMEOUT.as_secs()
+                )),
             }
         }
         let (model_used, output) = chosen.ok_or_else(|| {
@@ -435,6 +444,18 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
 /// `model`) to mean "pick the cheapest available model dynamically".
 pub const CHEAPEST_SENTINEL: &str = "cheapest";
 
+/// Core file/shell tools a cheap subagent is given. The full registry (~31
+/// tools) bloats the prompt and stalls cheap models, so cheap-route subtasks get
+/// only these essentials. Names are intersected with the live registry.
+const CHEAP_SUBAGENT_TOOLS: &[&str] = &[
+    "read", "write", "edit", "multiedit", "apply_patch", "bash", "grep", "glob", "ls",
+];
+
+/// Hard cap on a single subtask's model call. A slow/hanging route (e.g.
+/// OpenRouter stalling) must not block the whole run — on timeout the candidate
+/// is treated as failed and the next route is tried.
+const SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The cheapest currently-available route across the provider's own routes and
 /// all configured named providers (deduped, ranked cheapest-first, prefer/ban
 /// applied). Returns `(model, route_api_method)` so the spawn can PIN the exact
@@ -505,11 +526,16 @@ impl CheapRouteBackend for ProviderCheapBackend {
         }
         session.save()?;
 
-        let mut allowed: std::collections::HashSet<String> =
+        // Cheap subagents only need core file/shell tools. Sending the full
+        // registry (~31 tool schemas, ~9k tokens) bloats the prompt and stalls
+        // cheap models — keep just the essentials so the single call is fast.
+        let registry_tools: std::collections::HashSet<String> =
             self.registry.tool_names().await.into_iter().collect();
-        for blocked in ["subagent", "task", "todo", "todowrite", "todoread", "cheap_route"] {
-            allowed.remove(blocked);
-        }
+        let allowed: std::collections::HashSet<String> = CHEAP_SUBAGENT_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .filter(|t| registry_tools.contains(t))
+            .collect();
 
         let mut agent = super::Agent::new_with_session(
             self.provider.fork(),
@@ -1022,6 +1048,60 @@ mod tests {
         assert!(route_matches_preference(&route, "prov-deepseek-chat/deepseek-chat"));
         assert!(!route_matches_preference(&route, "gpt-5-nano"));
         assert!(!route_matches_preference(&route, ""));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_cheap_route_times_out_hanging_route_and_falls_back() {
+        struct HangBackend {
+            responses: Mutex<VecDeque<String>>,
+            routes: Vec<ModelRoute>,
+            attempts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl CheapRouteBackend for HangBackend {
+            async fn ask_parent(&self, _p: &str) -> Result<String> {
+                Ok(self.responses.lock().unwrap().pop_front().unwrap_or_default())
+            }
+            async fn run_subtask(
+                &self,
+                _s: &Subtask,
+                model: &str,
+                _r: Option<&str>,
+            ) -> Result<String> {
+                self.attempts.lock().unwrap().push(model.to_string());
+                if model == "hang" {
+                    // Never returns within the timeout (paused clock auto-advances).
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    Ok("late".to_string())
+                } else {
+                    Ok(format!("done via {model}"))
+                }
+            }
+            fn routes(&self) -> Vec<ModelRoute> {
+                self.routes.clone()
+            }
+            fn current_model(&self) -> String {
+                String::new()
+            }
+        }
+
+        // "hang" is cheapest (recommended) but stalls; "good" is the next route.
+        let backend = HangBackend {
+            responses: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"x","prompt":"p","difficulty":1}]"#.to_string(),
+                "use hang".to_string(),
+                "OK".to_string(),
+            ])),
+            routes: vec![priced_route("hang", 100), priced_route("good", 9_000_000)],
+            attempts: Mutex::new(Vec::new()),
+        };
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        // Timed out on the hanging route, fell back to the working one.
+        assert_eq!(outcome.results[0].model_used, "good");
+        let attempts = backend.attempts.lock().unwrap();
+        assert_eq!(*attempts, vec!["hang".to_string(), "good".to_string()]);
     }
 
     #[tokio::test]
