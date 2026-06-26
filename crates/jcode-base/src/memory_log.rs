@@ -277,7 +277,7 @@ pub fn log_pending_prepared(session_id: &str, prompt: &str, count: usize, memory
             "target_session": session_id,
             "count": count,
             "prompt_chars": prompt.chars().count(),
-            "prompt_preview": &prompt[..prompt.len().min(500)],
+            "prompt_preview": jcode_core::util::truncate_str(prompt, 500),
             "memory_ids": memory_ids,
         })),
     );
@@ -357,7 +357,7 @@ pub fn log_candidate_filter(
             "target_session": session_id,
             "total_candidates": total_candidates,
             "after_dedup": after_dedup,
-            "context_preview": &context_preview[..context_preview.len().min(200)],
+            "context_preview": jcode_core::util::truncate_str(context_preview, 200),
         })),
     );
 }
