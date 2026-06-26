@@ -2,6 +2,27 @@ use super::Agent;
 use crate::logging;
 use crate::message::{Message, ToolDefinition};
 
+/// Injected into a coordinator's system prompt when `agents.auto_delegate` is on.
+/// Pushes execution onto cheap subagents so the expensive coordinator model is
+/// spent on planning + review rather than grunt work.
+const AUTO_DELEGATION_DIRECTIVE: &str = "\
+# Delegation policy (cost control)
+
+You have cheap subagents available via the `subagent` tool. DELEGATE all hands-on \
+execution to them and reserve yourself for planning and review:
+
+- Spawn a subagent for every unit of real work — running shell commands, \
+  editing/writing files, searching and reading code, investigating behavior, \
+  reproducing bugs, and any repetitive or bulk task.
+- Do NOT run bash, file edits, grep/search, or file reads yourself when a \
+  subagent can do it. Each time you do cheap work directly you waste the \
+  expensive model.
+- For independent subtasks, spawn multiple subagents in the SAME turn — they run \
+  concurrently, which is faster.
+- Keep yourself for: understanding the request, decomposing it into delegable \
+  subtasks, choosing what to delegate, and reviewing/integrating subagent \
+  results before the next step.";
+
 impl Agent {
     pub(super) fn log_prompt_prefix_accounting(
         &self,
@@ -108,8 +129,27 @@ impl Agent {
         );
 
         self.append_current_turn_system_reminder(&mut split);
+        self.append_auto_delegation_directive(&mut split);
 
         split
+    }
+
+    /// When `agents.auto_delegate` is on and this agent can spawn subagents (i.e.
+    /// it is a coordinator, not a spawned subagent), instruct it to offload all
+    /// hands-on execution to cheap subagents and keep itself for planning/review.
+    fn append_auto_delegation_directive(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        if !crate::config::config().agents.auto_delegate {
+            return;
+        }
+        // Only coordinators get this. A spawned subagent has the `subagent` tool
+        // removed, so it must not be told to delegate work it cannot delegate.
+        if self.validate_tool_allowed("subagent").is_err() {
+            return;
+        }
+        if !split.dynamic_part.is_empty() {
+            split.dynamic_part.push_str("\n\n");
+        }
+        split.dynamic_part.push_str(AUTO_DELEGATION_DIRECTIVE);
     }
 
     /// Non-blocking memory prompt - takes pending result and spawns check for next turn

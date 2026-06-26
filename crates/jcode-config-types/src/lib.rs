@@ -509,6 +509,13 @@ pub struct AgentsConfig {
     /// keep even hard subtasks off the most expensive model.
     #[serde(default)]
     pub cheap_route_strong_model: Option<String>,
+    /// When true, a coordinator (an agent that can spawn subagents) is instructed
+    /// to delegate ALL hands-on execution (bash, edits, search, investigation) to
+    /// cheap subagents and reserve itself for planning + review — so the expensive
+    /// model stops doing cheap grunt work. Off by default. Spawned subagents (which
+    /// cannot delegate further) never get this directive.
+    #[serde(default)]
+    pub auto_delegate: bool,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -602,6 +609,7 @@ impl Default for AgentsConfig {
             cheap_route_verify_cmd: None,
             cheap_route_difficulty_threshold: default_cheap_route_difficulty_threshold(),
             cheap_route_strong_model: None,
+            auto_delegate: false,
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             memory_model: None,
