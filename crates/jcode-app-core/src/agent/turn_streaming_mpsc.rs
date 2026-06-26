@@ -1182,6 +1182,16 @@ impl Agent {
 
             // Execute tools and add results
             let tool_count = tool_calls.len();
+            // Pre-execute parallel-safe tool calls (e.g. multiple subagent spawns)
+            // concurrently; the loop below consumes these instead of running them
+            // serially, leaving its interrupt/shutdown/event handling unchanged.
+            let mut precomputed_results = self
+                .precompute_parallel_safe_tools(
+                    &tool_calls,
+                    assistant_message_id.as_deref(),
+                    &sdk_tool_results,
+                )
+                .await;
             let mut tool_results_dirty = false;
             for tool_index in 0..tool_count {
                 // === INJECTION POINT C (before): Check for urgent abort before each tool (except first) ===
@@ -1289,15 +1299,23 @@ impl Agent {
                 logging::info(&format!("Tool starting: {}", tc.name));
                 let tool_start = Instant::now();
 
-                // Spawn tool in its own task so we can detach it to background on Alt+B
-                let registry_clone = self.registry.clone();
-                let tool_name_for_spawn = tc.name.clone();
-                let tool_input_for_spawn = tc.input.clone();
-                let tool_handle = tokio::spawn(async move {
-                    registry_clone
-                        .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
-                        .await
-                });
+                // Spawn tool in its own task so we can detach it to background on
+                // Alt+B. A parallel-safe tool may have been pre-executed
+                // concurrently above; if so, resolve immediately with its result
+                // instead of running it again.
+                let tool_handle = match precomputed_results.remove(&tc.id) {
+                    Some(precomputed) => tokio::spawn(async move { precomputed }),
+                    None => {
+                        let registry_clone = self.registry.clone();
+                        let tool_name_for_spawn = tc.name.clone();
+                        let tool_input_for_spawn = tc.input.clone();
+                        tokio::spawn(async move {
+                            registry_clone
+                                .execute(&tool_name_for_spawn, tool_input_for_spawn, ctx)
+                                .await
+                        })
+                    }
+                };
 
                 // Reset background signal before waiting
                 self.background_tool_signal.reset();

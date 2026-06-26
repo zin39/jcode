@@ -6,6 +6,7 @@ mod cost_guard;
 mod environment;
 mod interrupts;
 mod messages;
+mod parallel_tools;
 mod prompting;
 mod provider;
 mod response_recovery;

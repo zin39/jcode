@@ -855,6 +855,17 @@ impl Agent {
                 logging::info("Provider handles tools internally - executing native tools locally");
             }
 
+            // Pre-execute parallel-safe tool calls (e.g. multiple subagent spawns)
+            // concurrently; the loop below consumes these like SDK-precomputed
+            // results, so its ordering/append semantics are unchanged.
+            let mut precomputed_results = self
+                .precompute_parallel_safe_tools(
+                    &tool_calls,
+                    assistant_message_id.as_deref(),
+                    &sdk_tool_results,
+                )
+                .await;
+
             // Execute tools and add results
             let mut tool_results_dirty = false;
             for tc in tool_calls {
@@ -983,7 +994,10 @@ impl Agent {
                     model: Some(self.provider.model()),
                 }));
 
-                let result = self.registry.execute(&tc.name, tc.input.clone(), ctx).await;
+                let result = match precomputed_results.remove(&tc.id) {
+                    Some(precomputed) => precomputed,
+                    None => self.registry.execute(&tc.name, tc.input.clone(), ctx).await,
+                };
                 crate::telemetry::record_tool_call();
                 self.unlock_tools_if_needed(&tc.name);
                 let tool_elapsed = tool_start.elapsed();
