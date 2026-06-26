@@ -43,7 +43,19 @@ pub(super) fn build_grep_args(params: &AgentGrepInput, ctx: &ToolContext) -> Res
     let query = params
         .query
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("agentgrep grep requires 'query'"))?;
+        .filter(|q| !q.trim().is_empty())
+        .or_else(|| {
+            // Tolerate models (esp. small/cheap ones) that put the search pattern
+            // in `terms` instead of `query` — a common mistake that otherwise
+            // wastes a whole turn on a "requires 'query'" error.
+            params.terms.as_ref().and_then(|t| {
+                let joined = t.join(" ");
+                (!joined.trim().is_empty()).then_some(joined)
+            })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("agentgrep grep requires 'query' (the search pattern text)")
+        })?;
     let scope = resolved_search_scope(ctx, params.path.as_deref(), params.glob.as_deref());
     Ok(GrepArgs {
         query,

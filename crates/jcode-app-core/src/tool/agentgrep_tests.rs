@@ -158,6 +158,57 @@ fn build_grep_args_includes_scope_flags() {
 }
 
 #[test]
+fn build_grep_args_falls_back_to_terms_when_query_missing() {
+    // Cheap models often put the search pattern in `terms` instead of `query`;
+    // grep must tolerate that instead of wasting a turn on a required-arg error.
+    let ctx = test_ctx(Path::new("/tmp/root"));
+    let params = AgentGrepInput {
+        mode: "grep".to_string(),
+        query: None,
+        terms: Some(vec!["foo".to_string(), "bar".to_string()]),
+        file: None,
+        regex: None,
+        path: None,
+        glob: None,
+        file_type: None,
+        hidden: None,
+        no_ignore: None,
+        max_files: None,
+        max_regions: None,
+        full_region: None,
+        debug_plan: None,
+        debug_score: None,
+        paths_only: None,
+    };
+    let args = build_grep_args(&params, &ctx).unwrap();
+    assert_eq!(args.query, "foo bar");
+}
+
+#[test]
+fn build_grep_args_still_errors_when_neither_query_nor_terms() {
+    let ctx = test_ctx(Path::new("/tmp/root"));
+    let params = AgentGrepInput {
+        mode: "grep".to_string(),
+        query: None,
+        terms: None,
+        file: None,
+        regex: None,
+        path: None,
+        glob: None,
+        file_type: None,
+        hidden: None,
+        no_ignore: None,
+        max_files: None,
+        max_regions: None,
+        full_region: None,
+        debug_plan: None,
+        debug_score: None,
+        paths_only: None,
+    };
+    assert!(build_grep_args(&params, &ctx).is_err());
+}
+
+#[test]
 fn build_grep_args_drops_match_all_glob() {
     let ctx = test_ctx(Path::new("/tmp/root"));
     let params = AgentGrepInput {
