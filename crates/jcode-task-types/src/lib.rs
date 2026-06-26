@@ -165,12 +165,31 @@ impl Goal {
     }
 }
 
+/// Max length of a goal id. The id becomes a filename, so an unbounded slug from
+/// a long title overflows the filesystem name limit ("File name too long",
+/// os error 36 / ENAMETOOLONG). 64 chars stays well under the 255-byte limit while
+/// leaving room for the scope prefix and a uniquifying suffix.
+const MAX_GOAL_ID_LEN: usize = 64;
+
 pub fn sanitize_goal_id(id: &str) -> String {
     let slug = slugify(id);
-    if slug.is_empty() {
+    let slug = if slug.is_empty() {
         "goal".to_string()
     } else {
         slug
+    };
+    if slug.len() <= MAX_GOAL_ID_LEN {
+        return slug;
+    }
+    // slugify produces ASCII (a-z0-9-), so truncating by chars is byte-safe.
+    let mut truncated: String = slug.chars().take(MAX_GOAL_ID_LEN).collect();
+    while truncated.ends_with('-') {
+        truncated.pop();
+    }
+    if truncated.is_empty() {
+        "goal".to_string()
+    } else {
+        truncated
     }
 }
 
@@ -237,4 +256,29 @@ pub struct CatchupBrief {
     pub latest_agent_response: Option<String>,
     pub needs_from_user: String,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod sanitize_goal_id_tests {
+    use super::{MAX_GOAL_ID_LEN, sanitize_goal_id};
+
+    #[test]
+    fn bounds_long_titles_to_a_valid_filename() {
+        // A paragraph-length /goal must not produce a too-long filename.
+        let long = "keep doing search online and keep building it properly to make it more cheap and efficient and fast and robust so we do not face production issues";
+        let id = sanitize_goal_id(long);
+        assert!(id.len() <= MAX_GOAL_ID_LEN, "len {} > {}", id.len(), MAX_GOAL_ID_LEN);
+        assert!(!id.ends_with('-'));
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn keeps_short_ids_unchanged() {
+        assert_eq!(sanitize_goal_id("Ship the watchdog"), "ship-the-watchdog");
+    }
+
+    #[test]
+    fn empty_slug_falls_back_to_goal() {
+        assert_eq!(sanitize_goal_id("!!! ???"), "goal");
+    }
 }
