@@ -57,6 +57,13 @@ struct SubagentInput {
     output_mode: SubagentOutputMode,
     #[serde(default)]
     allowed_tools: Option<Vec<String>>,
+    /// Per-task inactivity (stall) budget in seconds, decided by the orchestrator
+    /// based on how long this task may legitimately run silently. The subagent is
+    /// aborted only if it makes NO progress (no API call, stream, or tool event)
+    /// for this long — NOT a total-runtime cap, so genuinely long work keeps
+    /// running. Omit to use `JCODE_SUBAGENT_STALL_SECS` (default 300s). 0 disables.
+    #[serde(default)]
+    stall_timeout_secs: Option<u64>,
     #[serde(rename = "command", default)]
     _command: Option<String>,
 }
@@ -121,6 +128,11 @@ impl Tool for SubagentTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional subset of tool names this subagent may use. When set, the subagent's tools are intersected with this list (can only remove tools, never grant new ones)."
+                },
+                "stall_timeout_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Inactivity budget in seconds for this subagent: abort it only if it makes NO progress (no API call, stream, or tool event) for this long. This is a STALL guard, not a total-runtime cap — long-running work that keeps progressing is never killed. Set higher for tasks with long silent steps (e.g. multi-minute scans/builds), lower for quick tasks. Omit for the default (300s); 0 disables the guard."
                 },
                 "command": {
                     "type": "string",
@@ -189,14 +201,27 @@ impl Tool for SubagentTool {
         let summary_map_handle = summary_map.clone();
         let session_id = session.id.clone();
 
+        // Heartbeat for the stall watchdog: bumped whenever the child publishes ANY
+        // progress event for its session (a tool start/finish OR an API/stream
+        // status). The watchdog reads this to tell "genuinely working but slow"
+        // apart from "hung". Shared with the run loop below.
+        let last_activity: Arc<Mutex<tokio::time::Instant>> =
+            Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let listener_last_activity = last_activity.clone();
+        let listener_session_id = session_id.clone();
+
         let mut receiver = Bus::global().subscribe();
         let listener = tokio::spawn(async move {
+            let bump = |la: &Arc<Mutex<tokio::time::Instant>>| {
+                *la.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
+            };
             loop {
                 match receiver.recv().await {
                     Ok(BusEvent::ToolUpdated(event)) => {
-                        if event.session_id != session_id {
+                        if event.session_id != listener_session_id {
                             continue;
                         }
+                        bump(&listener_last_activity);
                         let mut summary = summary_map_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -215,6 +240,11 @@ impl Tool for SubagentTool {
                                 },
                             },
                         );
+                    }
+                    Ok(BusEvent::SubagentStatus(status)) => {
+                        if status.session_id == listener_session_id {
+                            bump(&listener_last_activity);
+                        }
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -242,7 +272,44 @@ impl Tool for SubagentTool {
         agent.set_allow_auto_reroute(true);
 
         let start = std::time::Instant::now();
-        let final_text = agent.run_once_capture(&params.prompt).await.map_err(|err| {
+        // Inactivity watchdog: drive the subagent to completion, but if it makes no
+        // progress (no heartbeat) for the resolved stall budget, abort so the
+        // coordinator's tool call returns an error instead of blocking forever (the
+        // hung-subagent freeze). Dropping the run future cancels the in-flight work;
+        // we also fire graceful_shutdown for any cooperative cleanup.
+        let run_outcome = match resolve_subagent_stall_timeout(params.stall_timeout_secs) {
+            Some(stall) => {
+                let poll = std::time::Duration::from_secs(5).min(stall);
+                match run_until_complete_or_stalled(
+                    agent.run_once_capture(&params.prompt),
+                    last_activity.clone(),
+                    stall,
+                    poll,
+                )
+                .await
+                {
+                    StallResult::Completed(res) => res,
+                    StallResult::Stalled { idle } => {
+                        agent.request_graceful_shutdown();
+                        logging::warn(&format!(
+                            "[tool:subagent] stall watchdog fired: no progress for {}s (limit {}s) session_id={} description={}",
+                            idle.as_secs(),
+                            stall.as_secs(),
+                            agent.session_id(),
+                            params.description,
+                        ));
+                        Err(anyhow::anyhow!(
+                            "subagent '{}' stalled: no progress for {}s (inactivity limit {}s); aborted so the coordinator is not blocked. Retry, raise stall_timeout_secs, or split the task.",
+                            params.description,
+                            idle.as_secs(),
+                            stall.as_secs(),
+                        ))
+                    }
+                }
+            }
+            None => agent.run_once_capture(&params.prompt).await,
+        };
+        let final_text = run_outcome.map_err(|err| {
             logging::warn(&format!(
                 "[tool:subagent] subagent failed description={} type={} session_id={} model={} error={}",
                 params.description,
@@ -408,13 +475,80 @@ fn format_compact_subagent_history(messages: &[HistoryMessage]) -> String {
     output
 }
 
+/// Default inactivity budget for a spawned subagent when neither the orchestrator
+/// nor `JCODE_SUBAGENT_STALL_SECS` specify one.
+const DEFAULT_SUBAGENT_STALL_SECS: u64 = 300;
+
+/// Resolve the inactivity (stall) budget for a spawned subagent.
+///
+/// Precedence: explicit per-task `stall_timeout_secs` (set by the orchestrator) →
+/// env `JCODE_SUBAGENT_STALL_SECS` → [`DEFAULT_SUBAGENT_STALL_SECS`]. A value of 0
+/// (from either source) disables the watchdog entirely (unbounded — the old
+/// behavior), returning `None`.
+fn resolve_subagent_stall_timeout(override_secs: Option<u64>) -> Option<std::time::Duration> {
+    let secs = override_secs.unwrap_or_else(|| {
+        std::env::var("JCODE_SUBAGENT_STALL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SUBAGENT_STALL_SECS)
+    });
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Outcome of [`run_until_complete_or_stalled`].
+enum StallResult<T> {
+    /// The future finished on its own; carries its output.
+    Completed(T),
+    /// No heartbeat for `>= stall`; the future was dropped (cancelled).
+    Stalled { idle: std::time::Duration },
+}
+
+/// Drive `fut` to completion, but give up (return [`StallResult::Stalled`]) if
+/// `last_activity` is not bumped for `stall`. `poll` is how often the watchdog
+/// wakes to check. Returning `Stalled` drops `fut`, cancelling its in-flight
+/// `.await` chain. Generic over the future so it is unit-testable without a real
+/// `Agent`.
+async fn run_until_complete_or_stalled<F, T>(
+    fut: F,
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
+    stall: std::time::Duration,
+    poll: std::time::Duration,
+) -> StallResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return StallResult::Completed(out),
+            _ = tokio::time::sleep(poll) => {
+                let idle = last_activity
+                    .lock()
+                    .map(|t| t.elapsed())
+                    .unwrap_or(std::time::Duration::ZERO);
+                if idle >= stall {
+                    return StallResult::Stalled { idle };
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SubagentInput, SubagentOutputMode, format_compact_subagent_history, format_subagent_output,
-        subagent_display_title, prune_allowed_tools,
+        StallResult, SubagentInput, SubagentOutputMode, format_compact_subagent_history,
+        format_subagent_output, prune_allowed_tools, resolve_subagent_stall_timeout,
+        run_until_complete_or_stalled, subagent_display_title,
     };
     use crate::protocol::HistoryMessage;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn subagent_display_title_includes_type_and_model() {
@@ -426,6 +560,7 @@ mod tests {
             session_id: None,
             output_mode: SubagentOutputMode::Answer,
             allowed_tools: None,
+            stall_timeout_secs: None,
             _command: None,
         };
 
@@ -562,5 +697,85 @@ mod tests {
 
         let got: Vec<String> = pruned.into_iter().collect();
         assert_eq!(got, vec!["read".to_string()]);
+    }
+
+    // --- stall watchdog ---
+
+    #[test]
+    fn stall_timeout_orchestrator_override_wins() {
+        // The per-task value the orchestrator passes takes precedence (and ignores
+        // any env). This is the "orchestrator decides per task" contract.
+        assert_eq!(
+            resolve_subagent_stall_timeout(Some(90)),
+            Some(Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn stall_timeout_zero_disables_watchdog() {
+        // 0 means "no stall guard" — unbounded, like the pre-watchdog behavior.
+        assert_eq!(resolve_subagent_stall_timeout(Some(0)), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_returns_completion_for_a_fast_task() {
+        let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let fut = async {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            7_i32
+        };
+        let res = run_until_complete_or_stalled(
+            fut,
+            last_activity,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(res, StallResult::Completed(7)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_aborts_a_stalled_task() {
+        let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        // A future that never makes progress and never completes.
+        let fut = std::future::pending::<i32>();
+        let res = run_until_complete_or_stalled(
+            fut,
+            last_activity,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .await;
+        match res {
+            StallResult::Stalled { idle } => assert!(idle >= Duration::from_secs(30)),
+            StallResult::Completed(_) => panic!("expected the watchdog to abort a stalled task"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_keeps_a_heartbeating_long_task_alive() {
+        // The key guarantee: a task that runs WAY past the stall budget but keeps
+        // emitting heartbeats is NOT killed — only true inactivity aborts.
+        let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let beat = last_activity.clone();
+        let fut = async move {
+            // 30s of work (>> 12s stall budget), heartbeating every 5s.
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                *beat.lock().unwrap() = tokio::time::Instant::now();
+            }
+            99_i32
+        };
+        let res = run_until_complete_or_stalled(
+            fut,
+            last_activity,
+            Duration::from_secs(12),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            matches!(res, StallResult::Completed(99)),
+            "a continuously-heartbeating task must run to completion despite exceeding the stall budget"
+        );
     }
 }
