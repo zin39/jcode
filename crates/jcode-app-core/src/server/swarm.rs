@@ -84,6 +84,11 @@ const DEFAULT_SWARM_STATUS_DEBOUNCE_MS: u64 = 75;
 const DEFAULT_SWARM_TASK_HEARTBEAT_SECS: u64 = 10;
 const DEFAULT_SWARM_TASK_STALE_AFTER_SECS: u64 = 45;
 const DEFAULT_SWARM_TASK_SWEEP_INTERVAL_SECS: u64 = 5;
+/// How long a swarm member's assigned task may go with NO heartbeat before the
+/// member watchdog declares it dead and fails it (waking the awaiting
+/// coordinator). Deliberately far longer than the task *stale* window (45s, which
+/// only flips a status flag) — this is the point at which we give up and reclaim.
+const DEFAULT_SWARM_MEMBER_DEAD_AFTER_SECS: u64 = 300;
 #[derive(Default, Clone, Copy)]
 struct PendingSwarmStatusBroadcast {
     scheduled: bool,
@@ -169,6 +174,19 @@ pub(super) fn swarm_task_sweep_interval() -> Duration {
         "JCODE_SWARM_TASK_SWEEP_INTERVAL_SECS",
         DEFAULT_SWARM_TASK_SWEEP_INTERVAL_SECS,
     ))
+}
+
+/// Inactivity budget after which the member watchdog fails a stuck swarm member.
+/// `Some(d)` = enabled; `None` (env explicitly `0`) = disabled, no auto-fail.
+/// Reads `JCODE_SWARM_MEMBER_DEAD_AFTER_SECS` (default
+/// [`DEFAULT_SWARM_MEMBER_DEAD_AFTER_SECS`]). Unlike [`configured_positive_u64`],
+/// an explicit `0` is honored as "disabled" rather than falling back to default.
+pub(super) fn swarm_member_dead_after() -> Option<Duration> {
+    let secs = std::env::var("JCODE_SWARM_MEMBER_DEAD_AFTER_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SWARM_MEMBER_DEAD_AFTER_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 #[expect(
@@ -287,6 +305,186 @@ pub(super) async fn refresh_swarm_task_staleness(
         broadcast_swarm_plan(
             &swarm_id,
             Some("task_staleness_changed".to_string()),
+            swarm_plans,
+            swarm_members,
+            swarms_by_id,
+        )
+        .await;
+    }
+}
+
+/// A swarm member whose assigned task the watchdog has judged dead.
+struct DeadMember {
+    swarm_id: String,
+    task_id: String,
+    session_id: String,
+    idle_secs: u64,
+}
+
+/// Member-level watchdog: fail swarm members whose assigned task made no progress
+/// (no heartbeat) for `swarm_member_dead_after`, then wake the awaiting
+/// coordinator. This escalates beyond the task-staleness sweep (which only flips
+/// `running_stale`). It reuses [`update_member_status`] so the proven SwarmEvent
+/// broadcast + completion-notification path runs — that is what unblocks a
+/// coordinator `await`-ing members. No-op when disabled or nothing is stuck.
+pub(super) async fn refresh_swarm_member_staleness(
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    event_history: Option<&Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>>,
+    event_counter: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    swarm_event_tx: Option<&broadcast::Sender<SwarmEvent>>,
+) {
+    refresh_swarm_member_staleness_with(
+        swarm_member_dead_after(),
+        swarm_members,
+        swarms_by_id,
+        swarm_plans,
+        swarm_coordinators,
+        event_history,
+        event_counter,
+        swarm_event_tx,
+    )
+    .await;
+}
+
+/// Core of [`refresh_swarm_member_staleness`] with the dead-after budget injected
+/// so it is deterministically unit-testable without env vars.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "member watchdog needs swarm state, plan state, and the broadcast/notification sinks to wake the coordinator"
+)]
+async fn refresh_swarm_member_staleness_with(
+    dead_after: Option<Duration>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    event_history: Option<&Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>>,
+    event_counter: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    swarm_event_tx: Option<&broadcast::Sender<SwarmEvent>>,
+) {
+    let Some(dead_after) = dead_after else {
+        return;
+    };
+    let dead_after_ms = dead_after.as_millis() as u64;
+    let now_ms = now_unix_ms();
+
+    // Phase 1 (plans READ): find candidate dead tasks WITHOUT mutating, so we never
+    // fail a task whose member actually just finished. A task with no timestamps at
+    // all is skipped — we can't prove it is dead.
+    let candidates: Vec<DeadMember> = {
+        let plans = swarm_plans.read().await;
+        let mut out = Vec::new();
+        for (swarm_id, plan) in plans.iter() {
+            for item in &plan.items {
+                if !matches!(item.status.as_str(), "running" | "running_stale") {
+                    continue;
+                }
+                let Some(progress) = plan.task_progress.get(&item.id) else {
+                    continue;
+                };
+                let Some(session_id) = progress.assigned_session_id.clone() else {
+                    continue;
+                };
+                let Some(last) = progress
+                    .last_heartbeat_unix_ms
+                    .or(progress.started_at_unix_ms)
+                    .or(progress.assigned_at_unix_ms)
+                else {
+                    continue;
+                };
+                let idle_ms = now_ms.saturating_sub(last);
+                if idle_ms >= dead_after_ms {
+                    out.push(DeadMember {
+                        swarm_id: swarm_id.clone(),
+                        task_id: item.id.clone(),
+                        session_id,
+                        idle_secs: idle_ms / 1000,
+                    });
+                }
+            }
+        }
+        out
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Phase 2 (members): only fail members that are STILL active — never override a
+    // member that already reached a terminal/idle state (it may have just finished
+    // and stopped heartbeating). Failing routes through update_member_status, which
+    // emits the SwarmEvent + notification that wakes the coordinator's await.
+    let mut confirmed: Vec<DeadMember> = Vec::new();
+    for dead in candidates {
+        let still_active = {
+            let members = swarm_members.read().await;
+            members
+                .get(&dead.session_id)
+                .map(|m| matches!(m.status.as_str(), "running" | "running_stale"))
+                .unwrap_or(false)
+        };
+        if !still_active {
+            continue;
+        }
+        log_swarm_lifecycle(
+            "member_watchdog_failed",
+            vec![
+                ("session_id", dead.session_id.clone()),
+                ("swarm_id", dead.swarm_id.clone()),
+                ("task_id", dead.task_id.clone()),
+                ("idle_secs", dead.idle_secs.to_string()),
+                ("dead_after_secs", dead_after.as_secs().to_string()),
+            ],
+        );
+        update_member_status(
+            &dead.session_id,
+            "failed",
+            Some(format!(
+                "watchdog: no progress for {}s (task {}); reclaimed so the coordinator is not blocked",
+                dead.idle_secs, dead.task_id
+            )),
+            swarm_members,
+            swarms_by_id,
+            event_history,
+            event_counter,
+            swarm_event_tx,
+        )
+        .await;
+        confirmed.push(dead);
+    }
+    if confirmed.is_empty() {
+        return;
+    }
+
+    // Phase 3 (plans WRITE): mark the confirmed-dead tasks failed (re-checking the
+    // status under the lock), then persist + broadcast so coordinators see it.
+    let mut affected_swarms: HashSet<String> = HashSet::new();
+    {
+        let mut plans = swarm_plans.write().await;
+        for dead in &confirmed {
+            if let Some(plan) = plans.get_mut(&dead.swarm_id)
+                && let Some(item) = plan.items.iter_mut().find(|i| i.id == dead.task_id)
+                && matches!(item.status.as_str(), "running" | "running_stale")
+            {
+                item.status = "failed".to_string();
+                plan.version += 1;
+                affected_swarms.insert(dead.swarm_id.clone());
+            }
+        }
+    }
+    for swarm_id in affected_swarms {
+        let swarm_state = SwarmState {
+            members: Arc::clone(swarm_members),
+            swarms_by_id: Arc::clone(swarms_by_id),
+            plans: Arc::clone(swarm_plans),
+            coordinators: Arc::clone(swarm_coordinators),
+        };
+        persist_swarm_state_for(&swarm_id, &swarm_state).await;
+        broadcast_swarm_plan(
+            &swarm_id,
+            Some("member_watchdog_failed".to_string()),
             swarm_plans,
             swarm_members,
             swarms_by_id,
@@ -1764,5 +1962,183 @@ mod tests {
             Some("checkpoint saved")
         );
         assert!(progress.stale_since_unix_ms.is_none());
+    }
+
+    // --- member watchdog ---
+
+    type MemberWatchdogArcs = (
+        Arc<RwLock<HashMap<String, SwarmMember>>>,
+        Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        Arc<RwLock<HashMap<String, VersionedPlan>>>,
+        Arc<RwLock<HashMap<String, String>>>,
+        mpsc::UnboundedReceiver<ServerEvent>,
+    );
+
+    /// Build a one-member swarm with a single `running` task whose progress is
+    /// `progress`, and the member at `member_status`.
+    fn swarm_with_running_task(
+        member_status: &str,
+        progress: crate::server::SwarmTaskProgress,
+    ) -> MemberWatchdogArcs {
+        let (mut worker, rx) = swarm_member("worker", "agent", true);
+        worker.status = member_status.to_string();
+        let swarm_members =
+            Arc::new(RwLock::new(HashMap::from([("worker".to_string(), worker)])));
+        let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
+            "swarm-1".to_string(),
+            HashSet::from(["worker".to_string()]),
+        )])));
+        let swarm_coordinators = Arc::new(RwLock::new(HashMap::new()));
+        let swarm_plans = Arc::new(RwLock::new(HashMap::from([(
+            "swarm-1".to_string(),
+            VersionedPlan {
+                items: vec![PlanItem {
+                    content: "scan".to_string(),
+                    status: "running".to_string(),
+                    priority: "medium".to_string(),
+                    id: "task-1".to_string(),
+                    subsystem: None,
+                    file_scope: Vec::new(),
+                    blocked_by: Vec::new(),
+                    assigned_to: Some("worker".to_string()),
+                }],
+                version: 1,
+                participants: HashSet::from(["worker".to_string()]),
+                task_progress: HashMap::from([("task-1".to_string(), progress)]),
+            },
+        )])));
+        (swarm_members, swarms_by_id, swarm_plans, swarm_coordinators, rx)
+    }
+
+    fn dead_progress() -> crate::server::SwarmTaskProgress {
+        crate::server::SwarmTaskProgress {
+            assigned_session_id: Some("worker".to_string()),
+            last_heartbeat_unix_ms: Some(now_unix_ms().saturating_sub(400_000)),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn member_watchdog_fails_a_dead_member_and_its_task() {
+        let (members, by_id, plans, coords, _rx) =
+            swarm_with_running_task("running", dead_progress());
+        super::refresh_swarm_member_staleness_with(
+            Some(std::time::Duration::from_secs(300)),
+            &members,
+            &by_id,
+            &plans,
+            &coords,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(members.read().await.get("worker").unwrap().status, "failed");
+        assert_eq!(
+            plans.read().await.get("swarm-1").unwrap().items[0].status,
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_watchdog_spares_a_heartbeating_member() {
+        // Fresh heartbeat => not a candidate => left alone (the long-running but
+        // progressing case must never be killed).
+        let progress = crate::server::SwarmTaskProgress {
+            assigned_session_id: Some("worker".to_string()),
+            last_heartbeat_unix_ms: Some(now_unix_ms()),
+            ..Default::default()
+        };
+        let (members, by_id, plans, coords, _rx) =
+            swarm_with_running_task("running", progress);
+        super::refresh_swarm_member_staleness_with(
+            Some(std::time::Duration::from_secs(300)),
+            &members,
+            &by_id,
+            &plans,
+            &coords,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(members.read().await.get("worker").unwrap().status, "running");
+        assert_eq!(
+            plans.read().await.get("swarm-1").unwrap().items[0].status,
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_watchdog_skips_task_without_timestamps() {
+        // No heartbeat/started/assigned timestamps => we can't prove it's dead =>
+        // never kill it.
+        let progress = crate::server::SwarmTaskProgress {
+            assigned_session_id: Some("worker".to_string()),
+            ..Default::default()
+        };
+        let (members, by_id, plans, coords, _rx) =
+            swarm_with_running_task("running", progress);
+        super::refresh_swarm_member_staleness_with(
+            Some(std::time::Duration::from_secs(300)),
+            &members,
+            &by_id,
+            &plans,
+            &coords,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(members.read().await.get("worker").unwrap().status, "running");
+    }
+
+    #[tokio::test]
+    async fn member_watchdog_does_not_refail_a_finished_member() {
+        // Member already finished (status terminal) but its task heartbeat is old
+        // because it stopped beating when done. We must NOT clobber the member and
+        // must NOT fail its task.
+        let (members, by_id, plans, coords, _rx) =
+            swarm_with_running_task("completed", dead_progress());
+        super::refresh_swarm_member_staleness_with(
+            Some(std::time::Duration::from_secs(300)),
+            &members,
+            &by_id,
+            &plans,
+            &coords,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            members.read().await.get("worker").unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            plans.read().await.get("swarm-1").unwrap().items[0].status,
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_watchdog_disabled_is_a_noop() {
+        let (members, by_id, plans, coords, _rx) =
+            swarm_with_running_task("running", dead_progress());
+        super::refresh_swarm_member_staleness_with(
+            None, &members, &by_id, &plans, &coords, None, None, None,
+        )
+        .await;
+        assert_eq!(members.read().await.get("worker").unwrap().status, "running");
+    }
+
+    #[test]
+    fn swarm_member_dead_after_defaults_to_300s() {
+        // No test sets JCODE_SWARM_MEMBER_DEAD_AFTER_SECS, so the documented
+        // default applies and the watchdog is enabled.
+        assert_eq!(
+            super::swarm_member_dead_after(),
+            Some(std::time::Duration::from_secs(300))
+        );
     }
 }

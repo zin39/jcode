@@ -1051,6 +1051,9 @@ impl Server {
         let stale_swarms_by_id = Arc::clone(&self.swarm_state.swarms_by_id);
         let stale_swarm_plans = Arc::clone(&self.swarm_state.plans);
         let stale_swarm_coordinators = Arc::clone(&self.swarm_state.coordinators);
+        let stale_event_history = Arc::clone(&self.event_history);
+        let stale_event_counter = Arc::clone(&self.event_counter);
+        let stale_swarm_event_tx = self.swarm_event_tx.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(crate::server::swarm::swarm_task_sweep_interval());
@@ -1062,6 +1065,20 @@ impl Server {
                     &stale_swarms_by_id,
                     &stale_swarm_plans,
                     &stale_swarm_coordinators,
+                )
+                .await;
+                // Member-level watchdog: escalate a member whose task has had no
+                // heartbeat for the dead-after budget to "failed", waking any
+                // coordinator blocked awaiting it (the headless-swarm analogue of
+                // the in-process subagent stall watchdog).
+                crate::server::swarm::refresh_swarm_member_staleness(
+                    &stale_swarm_members,
+                    &stale_swarms_by_id,
+                    &stale_swarm_plans,
+                    &stale_swarm_coordinators,
+                    Some(&stale_event_history),
+                    Some(&stale_event_counter),
+                    Some(&stale_swarm_event_tx),
                 )
                 .await;
             }
