@@ -19,6 +19,7 @@ impl Agent {
     }
 
     pub async fn run_once_capture(&mut self, user_message: &str) -> Result<String> {
+        self.enforce_cost_ceiling()?;
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
@@ -53,6 +54,7 @@ impl Agent {
         system_reminder: Option<String>,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Result<()> {
+        self.enforce_cost_ceiling()?;
         // Inject any pending notifications before the user message
         let alerts = self.take_alerts();
         if !alerts.is_empty() {

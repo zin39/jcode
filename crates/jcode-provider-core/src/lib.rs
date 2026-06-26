@@ -340,6 +340,15 @@ pub trait Provider: Send + Sync {
             .unwrap_or(DEFAULT_CONTEXT_LIMIT)
     }
 
+    /// The cross-provider activity-ledger source key for the CURRENTLY ACTIVE
+    /// credential, but ONLY when this provider is billed per token (an API key we
+    /// can price). Returns `None` for OAuth/subscription logins or providers we
+    /// cannot meter. The cost guard uses this to record real per-call spend and
+    /// enforce a daily ceiling; `None` opts a provider out of both.
+    fn billing_source_key(&self) -> Option<String> {
+        None
+    }
+
     /// Create a new provider instance with independent mutable state.
     fn fork(&self) -> Arc<dyn Provider>;
 

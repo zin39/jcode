@@ -2122,6 +2122,17 @@ impl Provider for MultiProvider {
         )
     }
 
+    fn billing_source_key(&self) -> Option<String> {
+        let key = self.activity_source_key(self.active_provider());
+        // OAuth / subscription logins (and flat-rate slots) are not billed per
+        // token, so they opt out of spend recording and the cost ceiling.
+        if key.contains(":oauth:") || key == "jcode" || key == "copilot" {
+            None
+        } else {
+            Some(key)
+        }
+    }
+
     fn context_window(&self) -> usize {
         match self.active_provider() {
             ActiveProvider::Claude => {

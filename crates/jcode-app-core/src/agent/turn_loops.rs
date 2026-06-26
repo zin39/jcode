@@ -714,6 +714,9 @@ impl Agent {
                 cache_read_input_tokens: usage_cache_read,
                 cache_creation_input_tokens: usage_cache_creation,
             };
+            // Record real per-call API-key spend into the cross-provider ledger
+            // (cost guard); no-op for unbilled credentials.
+            self.record_call_spend();
 
             self.recover_text_wrapped_tool_call(&mut text_content, &mut tool_calls);
 
