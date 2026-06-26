@@ -2326,16 +2326,73 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+// Note: name kept for its existing dispatch sites. `/mission` stays deprecated,
+// but `/goal` is now a live singular alias into the initiatives (goals) system:
+//   /goal              -> open the goals overview
+//   /goal resume       -> resume the current goal
+//   /goal show <id>    -> open a specific goal
+//   /goal <free text>  -> create a project-scoped initiative titled <free text>
 pub(super) fn handle_disabled_mission_command(app: &mut App, trimmed: &str) -> bool {
-    if slash_command_rest(trimmed, "/mission").is_none()
-        && slash_command_rest(trimmed, "/goal").is_none()
-    {
-        return false;
+    if slash_command_rest(trimmed, "/mission").is_some() {
+        app.push_display_message(DisplayMessage::system(
+            "/mission is deprecated — use /goals (initiatives).".to_string(),
+        ));
+        return true;
     }
 
-    app.push_display_message(DisplayMessage::system(
-        "The /mission and /goal commands are disabled in this build.".to_string(),
-    ));
+    let Some(rest) = slash_command_rest(trimmed, "/goal") else {
+        return false;
+    };
+    let rest = rest.trim();
+
+    // Bare /goal and the resume/show subcommands reuse the goals handler.
+    if rest.is_empty() || rest == "resume" || rest.starts_with("show") {
+        let rewritten = if rest.is_empty() {
+            "/goals".to_string()
+        } else {
+            format!("/goals {rest}")
+        };
+        return handle_goals_command(app, &rewritten);
+    }
+
+    // /goal <free text>: create a project-scoped initiative titled <free text>.
+    let working_dir = active_working_dir(app);
+    let session_id = active_session_id(app);
+    match crate::goal::create_goal(
+        crate::goal::GoalCreateInput {
+            id: None,
+            title: rest.to_string(),
+            scope: crate::goal::GoalScope::Project,
+            description: None,
+            why: None,
+            success_criteria: Vec::new(),
+            milestones: Vec::new(),
+            next_steps: Vec::new(),
+            blockers: Vec::new(),
+            current_milestone_id: None,
+            progress_percent: None,
+        },
+        working_dir.as_deref(),
+    ) {
+        Ok(goal) => {
+            if let Ok(snapshot) = crate::goal::open_goals_overview_for_session(
+                session_id.as_str(),
+                working_dir.as_deref(),
+                true,
+            ) {
+                app.set_side_panel_snapshot(snapshot);
+            }
+            app.push_display_message(DisplayMessage::system(format!(
+                "Created initiative \"{}\". Opened in the side panel.",
+                goal.title
+            )));
+            app.set_status_notice("Initiative created");
+        }
+        Err(e) => app.push_display_message(DisplayMessage::error(format!(
+            "Failed to create initiative: {}",
+            e
+        ))),
+    }
     true
 }
 

@@ -409,6 +409,39 @@ impl Agent {
         agent
     }
 
+    /// Re-sync the compaction budget to the CURRENT model's context window.
+    ///
+    /// The budget is seeded once at session start (`seed_compaction_from_session`)
+    /// from whatever model is active then — for a daemon whose `default_model` is a
+    /// small-window cheap model, that is e.g. 64k. When the session later switches
+    /// to a large-window model (e.g. Opus, 1M), nothing updated the budget, so the
+    /// session kept compacting at the old tiny limit — triggering emergency
+    /// hard-compaction every few turns, dropping context and churning the prompt
+    /// cache (real token cost). Call this on every model switch so the budget
+    /// always tracks the live model. Does NOT reset messages/summary — only the
+    /// budget.
+    pub(crate) fn resync_compaction_budget_to_model(&self) {
+        let budget = self.provider.context_window();
+        let compaction = self.registry.compaction();
+        match compaction.try_write() {
+            Ok(mut manager) => {
+                let current = manager.token_budget();
+                if current != budget {
+                    logging::info(&format!(
+                        "resync compaction budget: {} -> {} after model switch",
+                        current, budget
+                    ));
+                    manager.set_budget(budget);
+                }
+            }
+            Err(_) => {
+                logging::warn(
+                    "resync_compaction_budget_to_model: compaction lock unavailable, keeping old budget",
+                );
+            }
+        }
+    }
+
     fn seed_compaction_from_session(&mut self) {
         logging::info(&format!(
             "seed_compaction_from_session: session has {} messages",

@@ -82,6 +82,7 @@ impl Agent {
             resolved_model,
         );
         self.provider_runtime_state.apply(event);
+        self.resync_compaction_budget_to_model();
         self.persist_session_best_effort("route selection");
         self.log_env_snapshot("set_route_selection");
         Ok(())
@@ -110,6 +111,11 @@ impl Agent {
         self.session.model = Some(resolved_model.clone());
         let event = crate::provider::ProviderStateEvent::selected_model(source, resolved_model);
         self.provider_runtime_state.apply(event);
+        // The new model may have a different context window than the one the
+        // compaction budget was seeded with; keep the budget in sync so we don't
+        // compact at a stale (often far too small) limit. See
+        // Agent::resync_compaction_budget_to_model.
+        self.resync_compaction_budget_to_model();
         self.persist_session_best_effort("model selection");
         self.log_env_snapshot("set_model");
         Ok(())
