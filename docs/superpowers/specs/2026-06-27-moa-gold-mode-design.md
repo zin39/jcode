@@ -1,7 +1,42 @@
 # Gold Mode — Multi-Model Debate ("Mixture-of-Agents") — Design
 
-**Status:** Approved design (UX + architecture verified against the codebase), pending implementation plan.
+**Status:** Approved design, revised after deep verification (2 blockers fixed, 7 ambiguities resolved). Pending implementation plan.
 **Date:** 2026-06-27
+
+## Post-verification revisions (read first)
+
+Deep verification by cheap subagents found two real blockers + several gaps the
+first draft missed; all are now folded into the design below:
+
+1. **Concurrency (compile blocker):** `run_subtask` is `#[async_trait]`, so its
+   future borrows `&self`/`&subtask`/`&model` — the naive
+   `run_in_parallel_ordered(|_,(m,a)| backend.run_subtask(...))` will NOT compile.
+   **Resolution:** `run_debate` takes `Arc<dyn CheapRouteBackend + Send + Sync>`;
+   each proposer closure `clone`s the Arc and `move`s OWNED `(model, api, subtask
+   clone)` into an `async move`. `run_cheap_route` wraps its `&dyn` backend in an
+   `Arc` only on the debate path.
+2. **Status tiles (access blocker):** `update_member_status` /
+   `broadcast_swarm_status` are `pub(super)` (server-only) and
+   `ProviderCheapBackend` holds NO swarm-state Arcs — so the gallery bridge as
+   first written is impossible. **Resolution:** add an optional
+   `DebateStatusReporter` (trait object) to `ProviderCheapBackend`, constructed by
+   `CheapRouteTool::execute` (which can receive the swarm-state Arcs at tool
+   registration), plus a `pub(crate)` `report_member_status(...)` wrapper in the
+   server module. If the reporter is `None` (e.g. non-server contexts), the
+   debate still runs with no tiles.
+3. **Critique ran on the cheap model:** `ask_parent` calls the coordinator, which
+   `ProviderCheapBackend::new` switches to the CHEAPEST model — so an LLM critique
+   would be weak. **Resolution:** add `ask_strong(prompt) -> String` to the
+   backend (runs the strong model) and use it for the critique step.
+4. **Timeout:** cheap models on hard subtasks need more than the 30s
+   `SUBTASK_TIMEOUT`. **Resolution:** new `DEBATE_PROPOSER_TIMEOUT = 60s` for the
+   proposer + aggregate calls on the debate path.
+5. **gold_mode plumbing:** `run_cheap_route` has no `gold_mode` today.
+   **Resolution:** `ProviderCheapBackend` gains `gold_mode: bool` + a
+   `CheapRouteBackend::gold_mode(&self) -> bool` accessor read at `:467`.
+6. **Session orphans:** K proposer sessions are `Session::create`d + saved per
+   debate. **Resolution:** delete/close proposer sessions after the debate
+   resolves (success or abort).
 
 ## Goal
 
@@ -61,17 +96,27 @@ swarm gallery, side panel, watchdogs, cost-guard), not a parallel system.
 
 ### Debate orchestration (the genuinely new logic)
 
-New `run_debate(backend, subtask, proposer_models, strong_model, k)`:
+New `run_debate(backend: Arc<dyn CheapRouteBackend + Send + Sync>, subtask, proposer_models, k)`:
 
 ```
-candidates = run_in_parallel_ordered(proposer_models[..k], |_, (model, api)|
-                 backend.run_subtask(subtask, model, api))   // Vec<String>
-candidates = candidates with failed ones dropped            // see error handling
-if candidates.len() < 2 { fall back to single-model strong result }  // not enough to debate
-critique = backend.ask_parent(critique_prompt(subtask, candidates))
-gold     = backend.run_subtask_on(strong_model, aggregate_prompt(subtask, candidates, critique))
+// proposers — own everything moved into each async (async_trait lifetime fix):
+candidates = run_in_parallel_ordered(proposer_models[..k], |_, (model, api)| {
+    let backend = backend.clone();          // Arc clone
+    let subtask = subtask.clone();          // owned
+    async move { backend.run_subtask(&subtask, &model, api.as_deref()).await }
+})  // Vec<Result<String>>
+candidates = surviving Ok(..) only                      // drop failed (decision #1/#7)
+if candidates.len() < 2 { return backend.ask_strong(single_prompt(subtask)) }  // decision #2
+critique = backend.ask_strong(critique_prompt(subtask, candidates))   // STRONG model, not cheap
+gold     = backend.ask_strong(aggregate_prompt(subtask, candidates, critique))
+// decision #5: if aggregate errors, return candidates[0]
 return gold
 ```
+
+`ask_strong(prompt) -> Result<String>` is a NEW backend method that runs the
+strong model (`cheap_route_strong_model`, else the coordinator's own model) — used
+for critique + aggregate so they are NOT on the cheapest model. Proposer + strong
+calls use `DEBATE_PROPOSER_TIMEOUT` (60s).
 
 `critique_prompt` asks the parent to point out errors/gaps across the candidates.
 `aggregate_prompt` asks the strong model to synthesize the single best answer
@@ -106,12 +151,15 @@ map; a member is shown when it has an entry + `SwarmStatus` is broadcast
 stream `output_tail` (only the streaming path does), so we use **status tiles**
 rather than token streaming:
 
-- Around each proposer `run_subtask`, `run_debate` registers a lightweight
-  `swarm_members` entry for the proposer session and broadcasts `SwarmStatus`
-  transitions: `running` (with detail = `proposer: <model>`), then `done`/`failed`.
-  Uses the existing `update_member_status` / `broadcast_swarm_status` path
-  (`server/swarm.rs`); de-registers (or marks `done`) on completion. ~30 lines of
-  glue; **no change to the agent execution path**.
+- **Reporter plumbing (the real cost — `update_member_status` is `pub(super)`):**
+  add an optional `DebateStatusReporter` trait object to `ProviderCheapBackend`.
+  `CheapRouteTool::execute` constructs it with the server's swarm-state Arcs +
+  calls a new `pub(crate)` `server::report_member_status(...)` wrapper. Around
+  each proposer, `run_debate` calls `reporter.proposer(model, Running|Done|Failed)`
+  which registers/updates a lightweight `swarm_members` entry + broadcasts
+  `SwarmStatus`. If the reporter is `None` (non-server context, or not injected),
+  the debate runs with no tiles (test F5). This is NOT a change to the agent
+  execution path, but it IS new plumbing across the tool/server boundary.
 - **Phase header:** a one-line `propose → critique → merge` indicator, via the
   existing gallery header (`info_widget_swarm_gallery.rs` `gallery_header`) or a
   thin 1-line widget above the gallery band (`ui.rs` ~`:2507`). ~50 lines max.
@@ -144,6 +192,38 @@ rather than token streaming:
   `gold_mode_enabled` unset → behavior is exactly today's (single-model). Purely
   additive, default-off.
 
+### Resolved design decisions (the 7 ambiguities)
+
+1. **All proposers fail (0 survivors):** fall back to a single strong-model
+   result for the subtask. Never error the whole task on debate failure.
+2. **< 2 surviving / K < 2 / 0-1 models / K=0 config:** no debate (you can't
+   debate one answer) → single strong-model result. Debate requires ≥ 2 distinct
+   models.
+3. **"Distinct" key = `(provider, model)`** (what `dedupe_model_routes` uses).
+   `api_method` variants of the same model collapse to one proposer.
+4. **Mid-debate toggle:** the gold flag is sampled ONCE at the start of each
+   subtask. Flipping `/gold` mid-subtask does not interrupt an in-flight debate;
+   it affects the next subtask. Predictable, no torn state.
+5. **Aggregate (strong model) errors:** recoverable — return the first surviving
+   candidate as the result rather than failing the subtask. Log a warning.
+6. **No strong model AND no parent:** the aggregator falls back to the
+   coordinator's own model (`ask_strong` defaults to it); if even that is
+   unavailable, return the first candidate. Never panic.
+7. **Critique empty/errors:** advisory only — aggregate proceeds with an empty
+   critique. The gold result is still produced.
+
+## Value & scope (honest)
+
+Verification's honest take: the debate adds the most value on **reasoning/design-
+heavy** subtasks where K diverse models explore different approaches and the
+critique catches consistent errors (~10-25% quality lift, ~+40% cost vs the
+strong model alone). It adds **little** on **code-writing** subtasks, where
+jcode's existing execution-grounded `verify+repair` loop (`cheap_route_verify_cmd`)
+is already a stronger correctness signal than an LLM critique. Implication:
+default to debate on hard *reasoning* subtasks; rely on verify+repair for code.
+This is a deliberate scoping note, not a blocker — the difficulty gate already
+limits when debate runs, and it is default-off.
+
 ## Components & boundaries
 
 | Unit | File | Responsibility |
@@ -158,23 +238,75 @@ rather than token streaming:
 | config | `jcode-config-types/src/lib.rs` | `cheap_route_gold_mode`, `cheap_route_gold_k`. |
 | tool wiring | `tool/cheap_route_tool.rs` | Read session flag → pass gold into the backend. |
 
-## Testing
+## Testing — full matrix (54 cases; [U]=unit, [I]=integration)
 
-- **`run_debate` (unit, pure-ish via a fake `CheapRouteBackend`):** K candidates
-  → aggregate called with all K + critique; order preserved; **< 2 surviving
-  candidates falls back to single-model**; a failing proposer is dropped not
-  fatal; **recursion guard** (proposer backend has gold off).
-- **K-distinct selection (unit):** top-K from a ranked list are distinct models;
-  `K = min(gold_k, available)`.
-- **Config/session flag (unit):** `gold_mode_enabled` round-trips; gold runs only
-  when both global config and session flag are on.
-- **`/gold` command (unit):** `on`/`off`/status set + persist the session flag
-  (mirror existing command tests).
-- **Concurrency (unit, paused time):** proposers run concurrently (wall-clock ≈
-  max, not sum) — reuse the `run_in_parallel_ordered` test pattern.
-- Gallery/side-panel are status-broadcast reuse (covered by existing swarm/side
-  -panel paths); a thin integration check that a debate broadcasts K member
-  statuses.
+All `run_debate` tests use a **fake `CheapRouteBackend`** (records calls, scripts
+proposer outputs/errors/delays) so the orchestration is unit-testable without
+real models. Concurrency tests use `tokio::time` paused.
+
+**A. `run_debate` orchestration**
+- A1 [U] K candidates collected; aggregate gets all K + critique; order preserved.
+- A2 [U] <2 survivors → single strong-model fallback; no critique call.
+- A3 [U] exactly 2 candidates → full debate runs (not a fallback).
+- A4 [U] a proposer Err/timeout → dropped; others still aggregate.
+- A5 [U] ALL proposers fail → single strong-model fallback (decision #1).
+- A6 [U] recursion guard: proposer + aggregator sub-runs have `gold_mode=false`.
+- A7 [U] empty/whitespace candidate text passed through, no panic.
+- A8 [U] candidate order preserved end-to-end.
+
+**B. K-distinct model selection**
+- B1 [U] top-K distinct by `(provider,model)`; dups collapsed.
+- B2 [U] fewer than K available → `K = available`.
+- B3 [U] 0 or 1 models → no debate (fallback).
+- B4 [U] banned/unhealthy models excluded from proposers.
+- B5 [U] `cheap_route_gold_k`=1 → no debate (decision #2).
+
+**C. Gold gate**
+- C1 [U] difficulty>threshold + gold on → debate.
+- C2 [U] difficulty≤threshold → single model even with gold on.
+- C3 [U] gold off (session unset OR global false) → never debates.
+- C4 [I] `auto_delegate`+gold both on → no nested debate (recursion guard).
+- C5 [U] difficulty == threshold (boundary) → no debate.
+
+**D. Config + session flag + `/gold`**
+- D1 [U] defaults: `cheap_route_gold_mode=false`, `cheap_route_gold_k=3`.
+- D2 [U] `gold_mode_enabled` round-trips save/load.
+- D3 [U] `/gold on` sets+persists. D4 [U] `/gold off` sets+persists.
+- D5 [U] `/gold status`/`/gold` shows state. D6 [U] `/gold <junk>` → usage error, no change.
+- D7 [U] global vs session: debate only when BOTH on.
+- D8 [U] session `None` + global true → debate (`unwrap_or(false) && global`).
+
+**E. Concurrency / timeout / cost**
+- E1 [U] K proposers concurrent: wall-clock ≈ max not sum (paused time).
+- E2 [U] per-proposer `DEBATE_PROPOSER_TIMEOUT` fires independently.
+- E3 [I] cost-guard records all K + critique + aggregate calls.
+- E4 [U] one slow proposer doesn't stall the others past its own timeout.
+- E5 [I] critique call cost recorded.
+
+**F. UI status tiles + side panel**
+- F1 [I] K member-status broadcasts (running→done/failed) on a debate.
+- F2 [I] phase header transitions propose→critique→merge.
+- F3 [I] gold result written to side panel (with candidate list).
+- F4 [I] tiles de-register / marked done after the debate (no stale "running").
+- F5 [U] reporter `None` → debate still runs, no broadcasts, no panic.
+
+**G. Edge cases**
+- G1 [U] unicode candidate text preserved. G2 [U] very large (100KB) candidate handled.
+- G3 [U] same model, two api_methods → one proposer (decision #3).
+- G4 [U] only model == strong model, K=3 → no debate (need ≥2 distinct).
+- G5 [U] `gold_k`=0 → no debate, no panic. G6 [U] `gold_k`≫available → `K=available`.
+- G7 [I] `/gold off` mid-debate → in-flight debate completes (flag sampled at start, decision #4).
+- G8 [U] critique empty/Err → aggregate still proceeds (decision #7).
+- G9 [U] aggregate Err → return first surviving candidate (decision #5).
+- G10 [U] difficulty unset/0 → single model, no crash.
+- G11 [U] `cheap_route_strong_model`=None → aggregator uses coordinator model.
+- G12 [U] no strong + no parent → first candidate returned, no panic (decision #6).
+- G13 [U] asymmetric candidate sizes (1 word vs paragraph) → all aggregated.
+- G14 [U] all candidates identical → debate still runs, no dedup.
+- G15 [U] proposer session cleanup: K sessions deleted/closed after the debate.
+
+**Totals:** ~45 unit + ~9 integration. The fake-backend harness covers A/B/C/E/G;
+the server-plumbed reporter + side panel are the integration set (F, C4, E3/E5, G7).
 
 ## Out of scope (YAGNI)
 
