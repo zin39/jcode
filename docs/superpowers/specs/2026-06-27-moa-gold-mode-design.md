@@ -50,13 +50,25 @@ swarm gallery, side panel, watchdogs, cost-guard), not a parallel system.
 ## User-facing behavior (the decided UX)
 
 - **Toggle:** `/gold on` / `/gold off` (per-session, live, no reload). `/gold`
-  shows status.
+  shows status. `/gold k=N` overrides the proposer count for the session (mirrors
+  the `/model` override pattern).
 - **Model choice:** automatic — the K (default 3) **cheapest distinct** capable
   models from the user's keys are the proposers; the aggregator is the strong
   model (`cheap_route_strong_model`, else the parent/coordinator's own model).
 - **Scope:** the coordinator auto-decides — a delegated subtask runs the debate
-  only when its `difficulty > cheap_route_difficulty_threshold`; trivial subtasks
-  stay single cheap model. "Gold where it matters."
+  only when its `difficulty > cheap_route_difficulty_threshold` **and it is not a
+  code subtask with a verify oracle**. Hard *code* subtasks (decomposer-labeled
+  `kind=code`, or that edit files, when `cheap_route_verify_cmd` is set) use the
+  strong model + the existing verify+repair loop instead — execution-grounded
+  beats LLM critique for code. Trivial subtasks stay single cheap model. "Gold
+  where it matters."
+- **Run summary + cost:** after a debate, a one-line summary —
+  `gold from 3 models in 42s · $0.02` (time + per-run cost from the cost-guard
+  spend records) — and the gold result carries its cost. When a debate is skipped
+  (e.g. <2 models, or code+verify), a clear note says why.
+- **Attribution + rationale:** the side-panel candidate list labels each
+  candidate with its model; the gold result ends with a 1-line "why this won"
+  rationale from the aggregator.
 - **Loop shape:** debate — `propose (K, parallel) → critique (each reviews the
   others) → aggregate (strong model merges answers + critiques) → gold`.
 - **Live view:** the K proposers appear as **status tiles** in the existing
@@ -107,16 +119,45 @@ candidates = run_in_parallel_ordered(proposer_models[..k], |_, (model, api)| {
 })  // Vec<Result<String>>
 candidates = surviving Ok(..) only                      // drop failed (decision #1/#7)
 if candidates.len() < 2 { return backend.ask_strong(single_prompt(subtask)) }  // decision #2
-critique = backend.ask_strong(critique_prompt(subtask, candidates))   // STRONG model, not cheap
-gold     = backend.ask_strong(aggregate_prompt(subtask, candidates, critique))
-// decision #5: if aggregate errors, return candidates[0]
+// COST OPT 2 — early exit: if >=2 candidates agree (strip_code_fence + casefold +
+// whitespace-normalize, exact match), the consensus IS the answer; skip BOTH
+// strong calls. ~90% of a debate's cost saved when it fires.
+if let Some(agreed) = consensus(&candidates) { return Ok(agreed) }
+// COST OPT 4 — bound aggregate input tokens (mirrors MAX_VERIFY_OUTPUT):
+let trimmed = candidates.map(|c| truncate_tail(strip_code_fence(c), MAX_DEBATE_CANDIDATE_CHARS))
+// COST OPT 1 — ONE strong call: critique folded into aggregate. The prompt asks
+// the strong model to (a) note errors/gaps across candidates, (b) synthesize the
+// best answer, (c) end with a 1-line "why this won" rationale. (No separate
+// critique call — the two-call split was operational, not a quality requirement.)
+gold = backend.ask_strong(aggregate_prompt(subtask, trimmed))   // strong model
+// decision #5: if this errors, return candidates[0]
 return gold
 ```
 
-`ask_strong(prompt) -> Result<String>` is a NEW backend method that runs the
-strong model (`cheap_route_strong_model`, else the coordinator's own model) — used
-for critique + aggregate so they are NOT on the cheapest model. Proposer + strong
-calls use `DEBATE_PROPOSER_TIMEOUT` (60s).
+`ask_strong(prompt) -> Result<String>` is a NEW backend method running the strong
+model (`cheap_route_strong_model`, else the coordinator's own model) — so the
+aggregate is NOT on the cheapest model. Proposer + strong calls use
+`DEBATE_PROPOSER_TIMEOUT` (60s). `consensus(..)` and `truncate_tail(..)` reuse the
+existing `strip_code_fence` (`:148`) + `MAX_VERIFY_OUTPUT` tail-truncation pattern
+(`:135`). `MAX_DEBATE_CANDIDATE_CHARS = 3000`.
+
+### Cost efficiency (verified, ~60-80% reduction vs naive debate)
+
+The two strong-model calls dominate debate cost (~90%). Optimizations, all v1:
+1. **Fold critique into the single aggregate call** (above) — ~45% off every debate.
+2. **Early-exit on proposer consensus** (above) — ~90% off when it fires (~20-35%
+   of debates).
+3. **Code subtasks skip the debate entirely** — see the gold gate below. For a
+   hard subtask the decomposer labels `kind=code` (or that edits files) AND
+   `cheap_route_verify_cmd` is configured, route to strong model + the existing
+   execution-grounded verify+repair loop instead of an LLM debate (which the spec
+   already notes is weaker for code). Biggest practical win for code-heavy work;
+   debate is reserved for hard *reasoning/design* subtasks.
+4. **Candidate truncation** (above) — bounds the aggregate input on verbose
+   proposers.
+*Follow-up (not v1):* confidence-gated cascade (run one cheap model, escalate only
+on low confidence / verify failure) — large but uncertain savings, needs
+calibration data first.
 
 `critique_prompt` asks the parent to point out errors/gaps across the candidates.
 `aggregate_prompt` asks the strong model to synthesize the single best answer
@@ -305,12 +346,40 @@ real models. Concurrency tests use `tokio::time` paused.
 - G14 [U] all candidates identical → debate still runs, no dedup.
 - G15 [U] proposer session cleanup: K sessions deleted/closed after the debate.
 
-**Totals:** ~45 unit + ~9 integration. The fake-backend harness covers A/B/C/E/G;
-the server-plumbed reporter + side panel are the integration set (F, C4, E3/E5, G7).
+**H. Cost + UX optimizations**
+- H1 [U] consensus early-exit: ≥2 candidates agree (after `strip_code_fence`+
+  casefold+normalize) → returns the agreed answer, **zero `ask_strong` calls**.
+- H2 [U] no consensus → exactly **one** `ask_strong` (folded critique+aggregate),
+  never two.
+- H3 [U] near-but-not-equal candidates (whitespace/fence only) still count as
+  consensus; genuinely different candidates do not.
+- H4 [U] code subtask + `cheap_route_verify_cmd` set → debate skipped, strong+
+  verify+repair path used (no proposers spawned).
+- H5 [U] reasoning subtask (no verify oracle) → debate runs.
+- H6 [U] candidate truncation: a >`MAX_DEBATE_CANDIDATE_CHARS` candidate is
+  tail-truncated before the aggregate prompt; short ones untouched.
+- H7 [U] `/gold k=5` sets the session proposer count; `/gold k=0`/junk → rejected.
+- H8 [U] aggregate prompt asks for + the result includes a 1-line rationale.
+- H9 [I] run summary emitted (model count + elapsed + `$` from cost-guard).
+- H10 [I] skip note emitted when debate skipped (<2 models OR code+verify).
 
-## Out of scope (YAGNI)
+**Totals:** ~55 unit + ~11 integration (~66 cases). The fake-backend harness
+covers A/B/C/E/G/H1-H8; the server-plumbed reporter + side panel + summary are the
+integration set (F, C4, E3/E5, G7, H9/H10).
+
+## Out of scope (YAGNI) — v1
 
 - Full per-proposer token streaming in the gallery (status tiles only for now).
 - Iterative multi-layer MoA (N rounds) — single debate round only.
 - Manual model picker (auto-pick K cheapest distinct only).
 - Per-message opt-in / every-turn modes (coordinator auto-decides only).
+
+## Tracked follow-ups (post-v1)
+
+- Confidence-gated cascade (run one cheap model, escalate only on low confidence /
+  verify failure) — the biggest remaining cost lever, needs calibration data.
+- Accept/Retry on the side-panel gold result; let the user pick a specific
+  candidate over the aggregator's gold.
+- Agreement/confidence badge ("2 of 3 agreed"); candidate diff/comparison view.
+- Per-session model win-tracking ("model A won 65% of debates") for ops insight.
+- Full per-proposer token streaming (upgrade from status tiles).
