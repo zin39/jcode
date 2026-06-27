@@ -516,6 +516,13 @@ pub struct AgentsConfig {
     /// cannot delegate further) never get this directive.
     #[serde(default)]
     pub auto_delegate: bool,
+    /// Master enable for gold mode (multi-model debate on hard subtasks). The
+    /// per-session `/gold` flag only takes effect when this is also true. Off by default.
+    #[serde(default)]
+    pub cheap_route_gold_mode: bool,
+    /// Number of distinct cheap-model proposers in a debate. Default 3.
+    #[serde(default = "default_cheap_route_gold_k")]
+    pub cheap_route_gold_k: usize,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -587,6 +594,10 @@ fn default_cheap_route_difficulty_threshold() -> u8 {
     3
 }
 
+fn default_cheap_route_gold_k() -> usize {
+    3
+}
+
 fn default_memory_rerank_cadence() -> usize {
     3
 }
@@ -610,6 +621,8 @@ impl Default for AgentsConfig {
             cheap_route_difficulty_threshold: default_cheap_route_difficulty_threshold(),
             cheap_route_strong_model: None,
             auto_delegate: false,
+            cheap_route_gold_mode: false,
+            cheap_route_gold_k: default_cheap_route_gold_k(),
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             memory_model: None,
@@ -1404,6 +1417,18 @@ impl Default for GatewayConfig {
             port: 7643,
             bind_addr: "0.0.0.0".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agents_config_gold_defaults() {
+        let c = AgentsConfig::default();
+        assert!(!c.cheap_route_gold_mode);
+        assert_eq!(c.cheap_route_gold_k, 3);
     }
 }
 
