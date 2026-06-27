@@ -80,6 +80,8 @@ pub trait CheapRouteBackend: Send + Sync {
     async fn ask_strong(&self, prompt: &str) -> Result<String> { self.ask_parent(prompt).await }
     /// Whether this backend runs gold-mode debates. Default false. Production impl reads session+config.
     fn gold_mode(&self) -> bool { false }
+    /// Number of distinct proposers for a gold debate. Default 3. Prod impl reads config.
+    fn gold_k(&self) -> usize { 3 }
 }
 
 /// Run a verification shell command in the current working directory, capturing
@@ -465,6 +467,32 @@ pub async fn run_cheap_route(
     // 5. Run each subtask (with fallback) and have the parent review each result.
     let mut results = Vec::with_capacity(subtasks.len());
     for subtask in &subtasks {
+        // Gold mode: run a multi-model debate on a HARD REASONING subtask
+        // (code subtasks use strong + verify+repair instead — execution-grounded).
+        if backend.gold_mode()
+            && subtask.difficulty > difficulty_threshold
+            && !is_code_subtask(subtask)
+        {
+            let proposers: Vec<(String, Option<String>)> = ranked
+                .iter()
+                .map(|c| (c.route.model.clone(), Some(c.route.api_method.clone())))
+                .take(backend.gold_k().max(2))
+                .collect();
+            if proposers.len() >= 2 {
+                if let Ok(output) = run_debate(backend, subtask, &proposers, backend.gold_k()).await
+                {
+                    results.push(SubtaskResult {
+                        description: subtask.description.clone(),
+                        output,
+                        review: String::new(),
+                        model_used: format!("debate({})", proposers.len()),
+                    });
+                    continue;
+                }
+                // on debate Err: fall through to the normal single-model path below
+            }
+        }
+
         // Hard subtasks try the strong model first (then cheap routes as
         // fallback, so a dead strong model still completes). Trivial subtasks
         // use the cheapest-first list directly.
@@ -1184,7 +1212,6 @@ fn truncate_tail(s: &str, max: usize) -> String {
 
 /// Heuristic: a subtask is "code" if it edits/creates files or names code paths.
 /// Debate is skipped for code (verify+repair is the stronger signal).
-#[allow(dead_code)]
 fn is_code_subtask(s: &Subtask) -> bool {
     let t = format!("{} {}", s.description, s.prompt).to_ascii_lowercase();
     const CODE_HINTS: &[&str] = &["edit","write","modify","implement","refactor","fix the","function","```",".rs",".ts",".py",".go",".js","src/","compile","cargo"];
@@ -1194,7 +1221,6 @@ fn is_code_subtask(s: &Subtask) -> bool {
 /// Run K proposer models concurrently (each under `DEBATE_PROPOSER_TIMEOUT`),
 /// drop failures/timeouts, early-exit if 2+ agree (consensus), else make ONE
 /// strong aggregate call. The strong model sees all candidates in input order.
-#[allow(dead_code)]
 async fn run_debate(
     backend: &dyn CheapRouteBackend,
     subtask: &Subtask,
@@ -2555,5 +2581,100 @@ mod tests {
         let result = run_debate(&b, &debate_st(), &models, 5).await.unwrap();
         assert_eq!(result, "GOLD");
         assert_eq!(b.strong_prompts().len(), 1, "2 distinct candidates → one strong call");
+    }
+
+    // --- GoldFakeBackend: fake CheapRouteBackend with gold_mode=true for gate tests ---
+
+    struct GoldFakeBackend {
+        parent_responses: Mutex<VecDeque<String>>,
+        routes: Vec<ModelRoute>,
+        strong_reply: String,
+        strong_prompts_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GoldFakeBackend {
+        fn strong_prompts(&self) -> Vec<String> {
+            self.strong_prompts_log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CheapRouteBackend for GoldFakeBackend {
+        async fn ask_parent(&self, _prompt: &str) -> Result<String> {
+            Ok(self.parent_responses.lock().unwrap().pop_front().unwrap_or_default())
+        }
+
+        async fn run_subtask(
+            &self,
+            _subtask: &Subtask,
+            model: &str,
+            _route_api_method: Option<&str>,
+        ) -> Result<String> {
+            // Return a distinct answer per model so proposers disagree and the
+            // aggregate ask_strong path (which contains "candidate 1") is exercised.
+            Ok(format!("cheap answer from {model}"))
+        }
+
+        fn routes(&self) -> Vec<ModelRoute> {
+            self.routes.clone()
+        }
+
+        fn current_model(&self) -> String {
+            "current".to_string()
+        }
+
+        async fn ask_strong(&self, prompt: &str) -> Result<String> {
+            self.strong_prompts_log.lock().unwrap().push(prompt.to_string());
+            Ok(self.strong_reply.clone())
+        }
+
+        fn gold_mode(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_debates_hard_reasoning_only() {
+        // 3 subtasks: hard reasoning (diff 5, non-code), hard code (diff 5, has .rs/src/),
+        // trivial (diff 1). Gold mode is ON. Expected: exactly ONE debate (reasoning only).
+        let decompose = r#"[
+            {"description":"design the core algorithm","prompt":"what is the best approach for X","difficulty":5},
+            {"description":"edit src/x.rs","prompt":"modify the file","difficulty":5},
+            {"description":"rename a var","prompt":"trivial","difficulty":1}
+        ]"#;
+        let b = GoldFakeBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec![
+                decompose.to_string(),
+                "use model-a".to_string(), // recommend
+                "OK".to_string(),          // review code subtask
+                "OK".to_string(),          // review trivial subtask
+            ])),
+            // Two distinct routes so proposers.len() >= 2 and debate can run.
+            routes: vec![priced_route("model-a", 100), priced_route("model-b", 200)],
+            strong_reply: "GOLD".to_string(),
+            strong_prompts_log: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let out = run_cheap_route(&b, "task").await.unwrap();
+
+        assert_eq!(out.results.len(), 3, "all 3 subtasks produced results");
+        // The reasoning subtask was debated → model_used is "debate(2)".
+        assert_eq!(out.results[0].model_used, "debate(2)", "reasoning subtask debated");
+        // Code subtask and trivial subtask were NOT debated.
+        assert!(
+            !out.results[1].model_used.starts_with("debate"),
+            "code subtask must NOT be debated"
+        );
+        assert!(
+            !out.results[2].model_used.starts_with("debate"),
+            "trivial subtask must NOT be debated"
+        );
+        // Exactly ONE aggregate ask_strong call (for the reasoning debate).
+        let strong = b.strong_prompts();
+        assert_eq!(
+            strong.iter().filter(|p| p.contains("candidate 1")).count(),
+            1,
+            "exactly one aggregate debate (hard reasoning subtask only)"
+        );
     }
 }
