@@ -1299,6 +1299,60 @@ fn is_code_subtask(s: &Subtask) -> bool {
     CODE_HINTS.iter().any(|h| t.contains(h))
 }
 
+/// Deterministic gold entry point for `/gold <task>`: run a multi-model debate
+/// DIRECTLY on `task` — no decomposition, no difficulty/code gate. Picks the K
+/// cheapest DISTINCT proposer models, runs the debate (proposers → consensus or
+/// one strong aggregate), and returns the synthesized answer.
+///
+/// Edge cases:
+/// - fewer than 2 distinct proposers available → fall back to a single strong
+///   answer (`ask_strong`) so the user still gets a result;
+/// - the debate itself erroring → same single-strong fallback;
+/// - both unavailable → propagate the error.
+pub async fn run_gold_debate(backend: &dyn CheapRouteBackend, task: &str) -> Result<String> {
+    let task = task.trim();
+    if task.is_empty() {
+        return Err(anyhow!("gold: task is empty"));
+    }
+
+    // Cheapest-first, DISTINCT models (debate value comes from diversity, so
+    // never seed two proposers with the same model).
+    let ranked = ranked_with_preferences(backend.routes());
+    let mut seen = std::collections::HashSet::new();
+    let proposers: Vec<(String, Option<String>)> = ranked
+        .iter()
+        .filter(|c| seen.insert(c.route.model.clone()))
+        .map(|c| (c.route.model.clone(), Some(c.route.api_method.clone())))
+        .take(backend.gold_k().max(2))
+        .collect();
+
+    let subtask = Subtask {
+        description: task.to_string(),
+        prompt: task.to_string(),
+        difficulty: 5,
+    };
+
+    if proposers.len() >= 2 {
+        match run_debate(backend, &subtask, &proposers, backend.gold_k(), backend.reporter()).await
+        {
+            Ok(output) => return Ok(output),
+            Err(e) => {
+                crate::logging::warn(&format!(
+                    "run_gold_debate: debate failed ({}); falling back to single strong answer",
+                    e
+                ));
+            }
+        }
+    } else {
+        crate::logging::warn(&format!(
+            "run_gold_debate: only {} distinct proposer(s) available; using single strong answer",
+            proposers.len()
+        ));
+    }
+
+    backend.ask_strong(task).await
+}
+
 /// Run K proposer models concurrently (each under `DEBATE_PROPOSER_TIMEOUT`),
 /// drop failures/timeouts, early-exit if 2+ agree (consensus), else make ONE
 /// strong aggregate call. The strong model sees all candidates in input order.
@@ -2428,6 +2482,34 @@ mod tests {
             }
             Ok(self.strong_reply.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn run_gold_debate_falls_back_to_strong_when_no_proposers() {
+        // DebateBackend::routes() is empty → 0 distinct proposers (< 2) → the
+        // deterministic gold path must still return a single strong answer.
+        let b = DebateBackend::new().strong("the gold answer");
+        let out = run_gold_debate(&b, "which approach is best?").await.unwrap();
+        assert_eq!(out, "the gold answer");
+        let prompts = b.strong_prompts();
+        assert_eq!(prompts.len(), 1, "exactly one strong call");
+        assert!(
+            prompts[0].contains("which approach is best?"),
+            "strong call gets the raw task"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gold_debate_empty_task_errors() {
+        let b = DebateBackend::new().strong("x");
+        assert!(run_gold_debate(&b, "   ").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_gold_debate_strong_fallback_propagates_error() {
+        // No proposers AND the strong model errors → propagate (no silent empty).
+        let b = DebateBackend::new().strong_err();
+        assert!(run_gold_debate(&b, "x?").await.is_err());
     }
 
     #[tokio::test]

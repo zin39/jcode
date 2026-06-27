@@ -1,8 +1,8 @@
 use super::client_actions::{
     AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
-    handle_notify_session, handle_rename_session, handle_run_gold, handle_run_subagent,
-    handle_set_feature, handle_set_subagent_model, handle_split, handle_stdin_response,
-    handle_transfer, handle_trigger_memory_extraction,
+    handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
+    handle_set_subagent_model, handle_split, handle_stdin_response, handle_transfer,
+    handle_trigger_memory_extraction,
 };
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
@@ -1749,24 +1749,28 @@ pub(super) async fn handle_client(
             }
 
             Request::RunGold { id, task } => {
-                if reject_if_agent_busy_for_request(
-                    id,
-                    "run_gold",
-                    &client_session_id,
-                    client_is_processing,
-                    &agent,
-                    &client_event_tx,
-                ) {
-                    continue;
+                if !client_is_processing {
+                    let mut connections = client_connections.write().await;
+                    if let Some(info) = connections.get_mut(&client_connection_id) {
+                        info.is_processing = true;
+                        info.current_tool_name = None;
+                    }
                 }
-                handle_run_gold(
+                start_processing_gold(
                     id,
                     task,
+                    &client_session_id,
+                    &mut ProcessingState {
+                        client_is_processing: &mut client_is_processing,
+                        message_id: &mut processing_message_id,
+                        session_id: &mut processing_session_id,
+                        task: &mut processing_task,
+                    },
                     &provider,
                     &registry,
                     &agent,
-                    &client_session_id,
                     &client_event_tx,
+                    &processing_done_tx,
                 )
                 .await;
             }
@@ -2642,6 +2646,95 @@ async fn start_processing_message(
             None
         };
         let _ = done_tx.send((id, result, completion_report));
+    }));
+}
+
+/// Deterministic `/gold <task>`: run the gold debate as a SPAWNED, cancellable
+/// turn (not inline), so the dispatch/select loop stays free to (a) forward live
+/// `SidePanelState` updates from the debate reporter to the client and (b) keep
+/// the client's stall guard fed. Completion flows through `processing_done_tx`
+/// exactly like a normal message turn, so `Done` + state cleanup are shared.
+#[allow(clippy::too_many_arguments)]
+async fn start_processing_gold(
+    id: u64,
+    task: String,
+    client_session_id: &str,
+    state: &mut ProcessingState<'_>,
+    provider: &Arc<dyn Provider>,
+    registry: &Registry,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    processing_done_tx: &mpsc::UnboundedSender<(u64, Result<()>, Option<String>)>,
+) {
+    let task = task.trim().to_string();
+    if task.is_empty() {
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: "gold: task is empty".to_string(),
+            retry_after_secs: None,
+        });
+        let _ = client_event_tx.send(ServerEvent::Done { id });
+        return;
+    }
+    if *state.client_is_processing {
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: "Already processing a message".to_string(),
+            retry_after_secs: None,
+        });
+        return;
+    }
+
+    *state.client_is_processing = true;
+    *state.message_id = Some(id);
+    *state.session_id = Some(client_session_id.to_string());
+
+    let _ = client_event_tx.send(ServerEvent::Ack { id });
+    // Immediate keepalive so the client shows activity before the first proposer
+    // streams (decompose-free, but model ranking + first round still take a few s).
+    let _ = client_event_tx.send(ServerEvent::StatusDetail {
+        detail: "gold: starting multi-model debate…".to_string(),
+    });
+
+    let provider = provider.clone();
+    let registry = registry.clone();
+    let agent = Arc::clone(agent);
+    let session_id = client_session_id.to_string();
+    let tx = client_event_tx.clone();
+    let done_tx = processing_done_tx.clone();
+    let gold_k = crate::config::config().agents.cheap_route_gold_k;
+
+    crate::logging::info(&format!("Gold debate id={} spawning task", id));
+    *state.task = Some(tokio::spawn(async move {
+        let reporter = Arc::new(crate::agent::debate_status::SidePanelDebateReporter::new(
+            session_id.clone(),
+        ));
+        let backend = crate::agent::cheap_route::ProviderCheapBackend::new(provider, registry)
+            .with_gold(true, gold_k)
+            .with_reporter(reporter);
+
+        let result = std::panic::AssertUnwindSafe(crate::agent::cheap_route::run_gold_debate(
+            &backend, &task,
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("gold debate panicked")));
+
+        let text = match &result {
+            Ok(t) if !t.trim().is_empty() => t.clone(),
+            Ok(_) => "Gold debate produced no output.".to_string(),
+            Err(e) => format!("Gold debate failed: {}", crate::util::format_error_chain(e)),
+        };
+
+        let _ = tx.send(ServerEvent::TextDelta { text: text.clone() });
+        let _ = tx.send(ServerEvent::MessageEnd);
+        {
+            let mut agent_guard = agent.lock().await;
+            agent_guard.append_assistant_text_and_save(text);
+        }
+        // Report success regardless of debate outcome — we always delivered a
+        // message (result or error text) and want the turn to close cleanly.
+        let _ = done_tx.send((id, Ok(()), None));
     }));
 }
 

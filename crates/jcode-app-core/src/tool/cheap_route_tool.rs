@@ -91,7 +91,7 @@ impl Tool for CheapRouteTool {
 }
 
 /// Render a cheap-routing outcome as human-readable text for the tool result.
-pub(crate) fn format_cheap_outcome(outcome: &CheapRouteOutcome) -> String {
+fn format_cheap_outcome(outcome: &CheapRouteOutcome) -> String {
     // Report the models that ACTUALLY ran (may differ from the recommendation
     // when cheaper routes errored and we fell back), not just the recommendation.
     let mut models_used: Vec<&str> =
