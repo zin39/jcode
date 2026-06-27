@@ -2199,7 +2199,10 @@ mod tests {
 
     struct DebateBackend {
         subtask_replies: std::collections::HashMap<String, String>,
+        subtask_errors: std::collections::HashMap<String, String>,
+        subtask_delays: std::collections::HashMap<String, u64>,
         strong_reply: String,
+        strong_error: bool,
         strong_prompts_log: Arc<Mutex<Vec<String>>>,
     }
 
@@ -2207,7 +2210,10 @@ mod tests {
         fn new() -> Self {
             Self {
                 subtask_replies: std::collections::HashMap::new(),
+                subtask_errors: std::collections::HashMap::new(),
+                subtask_delays: std::collections::HashMap::new(),
                 strong_reply: String::new(),
+                strong_error: false,
                 strong_prompts_log: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -2216,9 +2222,24 @@ mod tests {
             self.subtask_replies.insert(model.to_string(), reply.to_string());
             self
         }
+        /// Script a per-model run_subtask error (builder).
+        fn subtask_error(mut self, model: &str, msg: &str) -> Self {
+            self.subtask_errors.insert(model.to_string(), msg.to_string());
+            self
+        }
+        /// Script a per-model run_subtask sleep delay in seconds (builder).
+        fn subtask_delay(mut self, model: &str, secs: u64) -> Self {
+            self.subtask_delays.insert(model.to_string(), secs);
+            self
+        }
         /// Script the ask_strong reply (builder).
         fn strong(mut self, reply: &str) -> Self {
             self.strong_reply = reply.to_string();
+            self
+        }
+        /// Make ask_strong return an error (builder).
+        fn strong_err(mut self) -> Self {
+            self.strong_error = true;
             self
         }
         /// Return all prompts recorded by ask_strong calls so far.
@@ -2238,6 +2259,14 @@ mod tests {
             model: &str,
             _route_api_method: Option<&str>,
         ) -> Result<String> {
+            // Apply delay first (simulates a slow model).
+            if let Some(&secs) = self.subtask_delays.get(model) {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
+            // Then return a scripted error if one was registered.
+            if let Some(msg) = self.subtask_errors.get(model) {
+                return Err(anyhow!("{msg}"));
+            }
             match self.subtask_replies.get(model) {
                 Some(reply) => Ok(reply.clone()),
                 None => Err(anyhow!("no scripted reply for model '{model}'")),
@@ -2251,6 +2280,9 @@ mod tests {
         }
         async fn ask_strong(&self, prompt: &str) -> Result<String> {
             self.strong_prompts_log.lock().unwrap().push(prompt.to_string());
+            if self.strong_error {
+                return Err(anyhow!("scripted strong error"));
+            }
             Ok(self.strong_reply.clone())
         }
     }
@@ -2282,5 +2314,246 @@ mod tests {
             strong[0].find("gamma").unwrap(),
         );
         assert!(ia < ib && ib < ig); // candidates in order
+    }
+
+    // --- helpers shared by run_debate exhaustive tests ---
+
+    fn debate_st() -> Subtask {
+        Subtask { description: "d".into(), prompt: "p".into(), difficulty: 5 }
+    }
+
+    fn models3() -> Vec<(String, Option<String>)> {
+        vec![("m1".into(), None), ("m2".into(), None), ("m3".into(), None)]
+    }
+
+    // === Fallback / survivor ===
+
+    #[tokio::test]
+    async fn debate_one_survivor_falls_back_to_strong() {
+        // m2 + m3 error → only m1 survives → len < 2 → ask_strong with single_prompt.
+        let b = DebateBackend::new()
+            .subtask("m1", "only")
+            .subtask_error("m2", "boom")
+            .subtask_error("m3", "boom")
+            .strong("S");
+        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        assert_eq!(result, "S");
+        let prompts = b.strong_prompts();
+        assert!(!prompts.is_empty(), "ask_strong must be called for single survivor");
+        assert!(
+            !prompts[0].contains("--- candidate"),
+            "single-survivor path uses single_prompt (no candidate blocks); prompt was:\n{}",
+            &prompts[0][..prompts[0].len().min(300)]
+        );
+    }
+
+    #[tokio::test]
+    async fn debate_exactly_two_runs_full() {
+        // Exactly 2 distinct candidates → no consensus → exactly 1 strong call.
+        let b = DebateBackend::new()
+            .subtask("m1", "x")
+            .subtask("m2", "y")
+            .strong("GOLD");
+        let models = vec![("m1".into(), None), ("m2".into(), None)];
+        let result = run_debate(&b, &debate_st(), &models, 2).await.unwrap();
+        assert_eq!(result, "GOLD");
+        assert_eq!(b.strong_prompts().len(), 1, "exactly one strong call for two distinct candidates");
+    }
+
+    #[tokio::test]
+    async fn debate_proposer_error_dropped_others_aggregate() {
+        // m1 errors; m2 + m3 survive → aggregate prompt must contain m2 and m3 replies.
+        let b = DebateBackend::new()
+            .subtask_error("m1", "fail")
+            .subtask("m2", "y")
+            .subtask("m3", "z")
+            .strong("GOLD");
+        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        assert_eq!(result, "GOLD");
+        assert_eq!(b.strong_prompts().len(), 1);
+        let prompt = &b.strong_prompts()[0];
+        assert!(prompt.contains("y"), "m2 reply must appear in aggregate prompt");
+        assert!(prompt.contains("z"), "m3 reply must appear in aggregate prompt");
+    }
+
+    #[tokio::test]
+    async fn debate_all_fail_falls_back_to_strong() {
+        // Zero survivors → ask_strong with single_prompt (no candidate blocks).
+        let b = DebateBackend::new()
+            .subtask_error("m1", "boom")
+            .subtask_error("m2", "boom")
+            .subtask_error("m3", "boom")
+            .strong("FALLBACK");
+        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        assert_eq!(result, "FALLBACK");
+        let prompts = b.strong_prompts();
+        assert!(!prompts.is_empty(), "ask_strong must be called with zero survivors");
+        assert!(
+            !prompts[0].contains("--- candidate"),
+            "zero-survivor path uses single_prompt, not aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn debate_aggregate_error_returns_first_candidate() {
+        // Distinct candidates but ask_strong errors → fallback to candidates[0].
+        let b = DebateBackend::new()
+            .subtask("m1", "x")
+            .subtask("m2", "y")
+            .subtask("m3", "z")
+            .strong_err();
+        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        assert_eq!(result, "x", "aggregate error must return candidates[0] ('x')");
+    }
+
+    // === Consensus / truncation / single-call ===
+
+    #[tokio::test]
+    async fn debate_consensus_skips_strong() {
+        // m1 "Same" and m2 "same" agree after normalization → consensus → no strong call.
+        let b = DebateBackend::new()
+            .subtask("m1", "Same")
+            .subtask("m2", "same")
+            .subtask("m3", "Other")
+            .strong("SHOULD_NOT_BE_CALLED");
+        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        assert_eq!(
+            result.to_ascii_lowercase(),
+            "same",
+            "must return one of the agreeing originals; got: {result}"
+        );
+        assert!(b.strong_prompts().is_empty(), "consensus path must not call ask_strong");
+    }
+
+    #[tokio::test]
+    async fn debate_no_consensus_one_strong() {
+        // 3 distinct candidates → exactly 1 aggregate strong call.
+        let b = DebateBackend::new()
+            .subtask("m1", "alpha")
+            .subtask("m2", "beta")
+            .subtask("m3", "gamma")
+            .strong("GOLD");
+        run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        assert_eq!(b.strong_prompts().len(), 1, "exactly one strong call for 3 distinct candidates");
+    }
+
+    #[tokio::test]
+    async fn debate_truncates_long_candidate() {
+        // A 5000-char candidate exceeds MAX_DEBATE_CANDIDATE_CHARS (3000).
+        // The aggregate prompt must show the trimmed marker, not the full string.
+        let long = "A".repeat(5000);
+        let b = DebateBackend::new()
+            .subtask("m1", &long)
+            .subtask("m2", "b")
+            .subtask("m3", "c")
+            .strong("GOLD");
+        run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let prompts = b.strong_prompts();
+        assert!(!prompts.is_empty());
+        assert!(
+            prompts[0].contains("\u{2026}(trimmed)"),
+            "truncated marker '\u{2026}(trimmed)' must appear in aggregate prompt"
+        );
+        assert!(
+            !prompts[0].contains(&long),
+            "full 5000-char string must not appear verbatim in the aggregate prompt"
+        );
+    }
+
+    // === Concurrency / timeout ===
+
+    #[tokio::test(start_paused = true)]
+    async fn debate_runs_proposers_concurrently() {
+        // Proposers have delays of 30s, 5s, 3s. Concurrent (join_all) completes in
+        // max(30,5,3)=30s; sequential would take 38s. Assert < 40s to verify no
+        // hang while documenting the concurrent-execution contract.
+        let b = DebateBackend::new()
+            .subtask("m1", "alpha").subtask_delay("m1", 30)
+            .subtask("m2", "beta").subtask_delay("m2", 5)
+            .subtask("m3", "gamma").subtask_delay("m3", 3)
+            .strong("GOLD");
+        let t0 = tokio::time::Instant::now();
+        run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(40),
+            "proposers must run concurrently (max≈30s, sequential would be 38s); elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debate_drops_timed_out_proposer() {
+        // m1 sleeps 90s — beyond DEBATE_PROPOSER_TIMEOUT (60s) — so it is dropped.
+        // m2 and m3 complete instantly; the aggregate path is taken over y and z.
+        // Total virtual time ≈ 60s (the timeout), not 90s.
+        let b = DebateBackend::new()
+            .subtask("m1", "x").subtask_delay("m1", 90)
+            .subtask("m2", "y")
+            .subtask("m3", "z")
+            .strong("GOLD");
+        let t0 = tokio::time::Instant::now();
+        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(result, "GOLD");
+        assert_eq!(b.strong_prompts().len(), 1, "surviving m2+m3 → one aggregate strong call");
+        let prompt = &b.strong_prompts()[0];
+        assert!(prompt.contains("y"), "m2 reply must appear in aggregate");
+        assert!(prompt.contains("z"), "m3 reply must appear in aggregate");
+        assert!(
+            elapsed >= std::time::Duration::from_secs(60),
+            "must wait for DEBATE_PROPOSER_TIMEOUT (60s); elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(85),
+            "must not wait for full 90s m1 delay; elapsed={elapsed:?}"
+        );
+    }
+
+    // === Edge cases ===
+
+    #[tokio::test]
+    async fn debate_unicode_candidate_preserved() {
+        // A candidate with non-ASCII content must survive truncation and appear
+        // intact in the aggregate prompt.
+        let unicode = "caf\u{e9} \u{1f680} \u{65e5}\u{672c}"; // "café 🚀 日本"
+        let b = DebateBackend::new()
+            .subtask("m1", unicode)
+            .subtask("m2", "other")
+            .strong("GOLD");
+        let models = vec![("m1".into(), None), ("m2".into(), None)];
+        run_debate(&b, &debate_st(), &models, 2).await.unwrap();
+        let prompts = b.strong_prompts();
+        assert!(!prompts.is_empty());
+        assert!(
+            prompts[0].contains(unicode),
+            "unicode content must be preserved intact in the aggregate prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn debate_identical_candidates_take_consensus() {
+        // All three give the exact same answer → consensus → no strong call.
+        let b = DebateBackend::new()
+            .subtask("m1", "Same")
+            .subtask("m2", "Same")
+            .subtask("m3", "Same")
+            .strong("SHOULD_NOT_BE_CALLED");
+        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        assert_eq!(result, "Same");
+        assert!(b.strong_prompts().is_empty(), "no strong call when all candidates are identical");
+    }
+
+    #[tokio::test]
+    async fn debate_k_caps_to_available() {
+        // gold_k=5 with only 2 models → k=min(5,2)=2; must not panic.
+        // Two distinct candidates → 1 strong call.
+        let b = DebateBackend::new()
+            .subtask("m1", "x")
+            .subtask("m2", "y")
+            .strong("GOLD");
+        let models = vec![("m1".into(), None), ("m2".into(), None)];
+        let result = run_debate(&b, &debate_st(), &models, 5).await.unwrap();
+        assert_eq!(result, "GOLD");
+        assert_eq!(b.strong_prompts().len(), 1, "2 distinct candidates → one strong call");
     }
 }
