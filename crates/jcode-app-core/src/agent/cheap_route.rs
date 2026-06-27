@@ -75,6 +75,10 @@ pub trait CheapRouteBackend: Send + Sync {
     async fn verify_edits(&self, command: &str) -> Result<(bool, String)> {
         run_verify_command(command).await
     }
+    /// Run the STRONG model for one-shot text (used for debate aggregate). Default delegates to ask_parent.
+    async fn ask_strong(&self, prompt: &str) -> Result<String> { self.ask_parent(prompt).await }
+    /// Whether this backend runs gold-mode debates. Default false. Production impl reads session+config.
+    fn gold_mode(&self) -> bool { false }
 }
 
 /// Run a verification shell command in the current working directory, capturing
@@ -714,6 +718,41 @@ fn drop_banned_routes(routes: Vec<ModelRoute>, ban: &[String]) -> Vec<ModelRoute
         .collect()
 }
 
+/// Model-name fragments for legacy COMPLETION / base models and non-chat
+/// endpoints (embeddings, audio, image, moderation) that are cheap by price but
+/// unusable for agentic chat — e.g. OpenAI `babbage-002` / `davinci-002`, which a
+/// pure cost ranker would pick as "cheapest" and then strand a worker on a
+/// `model_not_found` (the cause of a real Claude-session worker dying after a
+/// 120s stall). Matched as substrings, case-insensitive, and dropped
+/// UNCONDITIONALLY (independent of config `ban`) so no user has to enumerate junk
+/// models by hand. Deliberately does NOT include "instruct": many legitimate chat
+/// models (qwen/llama `*-instruct`) carry that suffix; only the specific OpenAI
+/// completion model `gpt-3.5-turbo-instruct` is listed.
+const NON_CHAT_MODEL_FRAGMENTS: &[&str] = &[
+    "babbage",
+    "davinci",
+    "curie",
+    "gpt-3.5-turbo-instruct",
+    "text-embedding",
+    "whisper",
+    "dall-e",
+    "tts-",
+    "moderation",
+];
+
+/// Drop models that are not usable for agentic chat (see
+/// [`NON_CHAT_MODEL_FRAGMENTS`]). Applied to every cheap-route ranking so a junk
+/// completion/base model can never be selected as the "cheapest" worker.
+fn drop_non_chat_models(routes: Vec<ModelRoute>) -> Vec<ModelRoute> {
+    routes
+        .into_iter()
+        .filter(|route| {
+            let m = route.model.to_ascii_lowercase();
+            !NON_CHAT_MODEL_FRAGMENTS.iter().any(|frag| m.contains(frag))
+        })
+        .collect()
+}
+
 /// Stable-partition ranked candidates so any matching a `prefer` entry come
 /// first (each group stays cheapest-first), so a preferred model is chosen even
 /// when something else is marginally cheaper.
@@ -820,11 +859,18 @@ pub fn is_rate_or_quota_error(error: &str) -> bool {
         || e.contains("rate limit")
         || e.contains("rate-limit")
         || e.contains("quota")
+        // A model that doesn't exist / was deprovisioned (e.g. a junk completion
+        // model that slipped through) must fail over to the next cheap route, not
+        // strand the worker on a dead model after a stream stall.
+        || e.contains("model_not_found")
+        || e.contains("model not found")
+        || e.contains("does not exist")
 }
 
 fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> {
     let agents = &crate::config::config().agents;
     let routes = drop_banned_routes(routes, &agents.cheap_route_ban);
+    let routes = drop_non_chat_models(routes);
     let ranked = rank_routes_by_cost(routes);
     let ranked = prioritize_preferred(ranked, &agents.cheap_route_prefer);
     // Prefer routes NOT cooled down by a recent quota/rate failure. But if EVERY
@@ -985,6 +1031,10 @@ fn cheap_subagent_tool_allowlist(registry_tools: &std::collections::HashSet<Stri
 /// abandoned quickly: a healthy cheap model opens + answers a small subtask in a
 /// few seconds, so 30s is generous for "working" yet fast to fail on a hang.
 const SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[allow(dead_code)]
+const DEBATE_PROPOSER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+#[allow(dead_code)]
+const MAX_DEBATE_CANDIDATE_CHARS: usize = 3000;
 
 /// The cheapest currently-available route across the provider's own routes and
 /// all configured named providers (deduped, ranked cheapest-first, prefer/ban
@@ -2006,5 +2056,16 @@ mod tests {
         // The chosen route's api_method was pinned through to the spawn.
         let seen = backend.seen.lock().unwrap();
         assert_eq!(seen[0].as_deref(), Some("openai-compatible:deepseek"));
+    }
+
+    #[tokio::test]
+    async fn ask_strong_defaults_to_ask_parent_and_gold_off() {
+        let b = FakeBackend {
+            parent_responses: Mutex::new(VecDeque::from(vec!["PARENT".to_string()])),
+            routes: vec![],
+            subtask_calls: Mutex::new(Vec::new()),
+        };
+        assert_eq!(b.ask_strong("q").await.unwrap(), "PARENT");
+        assert!(!b.gold_mode());
     }
 }
