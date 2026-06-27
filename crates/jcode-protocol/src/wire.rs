@@ -250,6 +250,11 @@ pub enum Request {
         enabled: bool,
     },
 
+    /// Run a gold-mode multi-model debate on `task` directly (bypassing the
+    /// coordinator's tool choice) and stream the synthesized result back.
+    #[serde(rename = "run_gold")]
+    RunGold { id: u64, task: String },
+
     /// Set the compaction mode for this session
     #[serde(rename = "set_compaction_mode")]
     SetCompactionMode {

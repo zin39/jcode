@@ -743,6 +743,17 @@ impl RemoteConnection {
         self.send_request(request).await
     }
 
+    /// Run a gold-mode debate on `task` directly on the server (deterministic,
+    /// bypasses the coordinator's tool choice).
+    pub async fn run_gold(&mut self, task: String) -> Result<()> {
+        let request = Request::RunGold {
+            id: self.next_request_id,
+            task,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await
+    }
+
     /// Set compaction mode on the server for this session.
     pub async fn set_compaction_mode(&mut self, mode: crate::config::CompactionMode) -> Result<()> {
         let request = Request::SetCompactionMode {

@@ -1504,6 +1504,32 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if let Some(rest) = trimmed.strip_prefix("/gold ") {
+                    let task = rest.trim();
+                    let is_subcommand = task.is_empty()
+                        || task == "on"
+                        || task == "off"
+                        || task == "status"
+                        || task.starts_with("k=");
+                    if !is_subcommand {
+                        // Deterministic gold: run the debate server-side directly,
+                        // bypassing the coordinator's tool choice. Result streams
+                        // back via TextDelta; live progress shows in the side panel.
+                        app.push_display_message(DisplayMessage::system(format!(
+                            "🥇 Gold debate: {}",
+                            task
+                        )));
+                        app.is_processing = true;
+                        app.status = ProcessingStatus::Sending;
+                        app.clear_streaming_render_state();
+                        app.stream_buffer.clear();
+                        app.processing_started = Some(std::time::Instant::now());
+                        app.set_status_notice("Running gold debate...");
+                        remote.run_gold(task.to_string()).await?;
+                        return Ok(());
+                    }
+                }
+
                 if trimmed == "/memory" {
                     let new_state = !app.memory_enabled;
                     remote

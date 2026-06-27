@@ -311,6 +311,25 @@ impl Agent {
         }
     }
 
+    /// Append a standalone assistant text message to this session and persist
+    /// it. Used by the deterministic `/gold <task>` path, which produces a
+    /// synthesized answer outside the normal streaming turn loop.
+    pub fn append_assistant_text_and_save(&mut self, text: String) {
+        self.add_message(
+            crate::message::Role::Assistant,
+            vec![crate::message::ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+        );
+        if let Err(e) = self.session.save() {
+            crate::logging::warn(&format!(
+                "append_assistant_text_and_save: persist failed for {}: {}",
+                self.session.id, e
+            ));
+        }
+    }
+
     /// Mark this session as an inline swarm worker. When enabled, the streaming
     /// loop publishes a throttled output tail to the global bus so a
     /// coordinator can render a live inline gallery viewport for it.

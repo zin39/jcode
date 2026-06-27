@@ -31,6 +31,7 @@ mod session_search;
 mod side_panel;
 mod skill;
 mod cheap_route_tool;
+pub(crate) use cheap_route_tool::format_cheap_outcome;
 mod task;
 mod todo;
 mod webfetch;
