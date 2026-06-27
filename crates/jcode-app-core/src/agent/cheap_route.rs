@@ -1155,6 +1155,32 @@ impl CheapRouteBackend for ProviderCheapBackend {
     }
 }
 
+/// If >=2 candidates agree after normalize (strip_code_fence + casefold + whitespace-collapse),
+/// return one ORIGINAL agreeing candidate; else None.
+#[allow(dead_code)]
+fn consensus(candidates: &[String]) -> Option<String> {
+    fn norm(s: &str) -> String {
+        strip_code_fence(s).split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+    }
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let ni = norm(&candidates[i]);
+            if !ni.is_empty() && ni == norm(&candidates[j]) {
+                return Some(candidates[i].clone());
+            }
+        }
+    }
+    None
+}
+
+/// Keep the last `max` chars (tail holds the conclusion), with a marker when truncated.
+#[allow(dead_code)]
+fn truncate_tail(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { return s.to_string(); }
+    let tail: String = { let v: Vec<char> = s.chars().collect(); v[v.len()-max..].iter().collect() };
+    format!("…(trimmed)\n{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2056,6 +2082,26 @@ mod tests {
         // The chosen route's api_method was pinned through to the spawn.
         let seen = backend.seen.lock().unwrap();
         assert_eq!(seen[0].as_deref(), Some("openai-compatible:deepseek"));
+    }
+
+    #[test]
+    fn consensus_matches_on_fence_and_case() {
+        let c = vec!["```\nFoo Bar\n```".to_string(), "foo bar".to_string(), "other".to_string()];
+        assert_eq!(consensus(&c).as_deref(), Some("```\nFoo Bar\n```"));
+    }
+
+    #[test]
+    fn consensus_none_when_all_differ() {
+        let c = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(consensus(&c).is_none());
+    }
+
+    #[test]
+    fn truncate_tail_keeps_tail() {
+        let s = "x".repeat(5000);
+        let t = truncate_tail(&s, 3000);
+        assert!(t.chars().count() <= 3000 + 16);
+        assert!(t.ends_with("xxxxxxxxxx"));
     }
 
     #[tokio::test]
