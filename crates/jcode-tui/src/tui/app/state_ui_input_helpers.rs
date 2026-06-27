@@ -96,6 +96,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "Open initiatives overview / resume tracked initiatives",
     ),
     RegisteredCommand::public("/goals", "Legacy alias for /initiatives"),
+    RegisteredCommand::public("/gold", "Toggle gold mode or set k value (on|off|status|k=N)"),
     RegisteredCommand::public("/swarm", "Toggle swarm feature"),
     RegisteredCommand::public("/overnight", "Run a supervised overnight coordinator"),
     RegisteredCommand::public("/context", "Show the full session context snapshot"),
@@ -1396,6 +1397,7 @@ impl App {
                 | "/initiatives show"
                 | "/goals"
                 | "/goals show"
+                | "/gold"
                 | "/swarm"
                 | "/plan"
                 | "/improve"

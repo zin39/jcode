@@ -1,3 +1,4 @@
+use super::handle_gold_command;
 use super::parse_diff_mode_name;
 use super::parse_manual_subagent_spec;
 
@@ -74,4 +75,61 @@ fn transient_server_error_remains_retryable_for_auto_poke() {
     use super::is_non_retryable_auto_poke_error;
     let err = "OpenAI-compatible chat request failed\n  status: 503 Service Unavailable";
     assert!(!is_non_retryable_auto_poke_error(err));
+}
+
+// ---------------------------------------------------------------------------
+// Gold command tests
+// ---------------------------------------------------------------------------
+
+struct MockProvider;
+
+#[async_trait::async_trait]
+impl crate::provider::Provider for MockProvider {
+    async fn complete(
+        &self,
+        _messages: &[crate::message::Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> anyhow::Result<crate::provider::EventStream> {
+        Err(anyhow::anyhow!("mock provider"))
+    }
+
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn fork(&self) -> std::sync::Arc<dyn crate::provider::Provider> {
+        std::sync::Arc::new(MockProvider)
+    }
+}
+
+fn create_test_app() -> crate::tui::app::App {
+    let provider: std::sync::Arc<dyn crate::provider::Provider> =
+        std::sync::Arc::new(MockProvider);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
+    let mut app = crate::tui::app::App::new_for_test_harness(provider, registry);
+    app.queue_mode = false;
+    app.diff_mode = crate::config::DiffDisplayMode::Inline;
+    app
+}
+
+#[test]
+fn gold_command_on_off_sets_session_flag() {
+    let mut app = create_test_app();
+    assert!(handle_gold_command(&mut app, "/gold on"));
+    assert_eq!(app.session.gold_mode_enabled, Some(true));
+    assert!(handle_gold_command(&mut app, "/gold off"));
+    assert_eq!(app.session.gold_mode_enabled, Some(false));
+    assert!(!handle_gold_command(&mut app, "/notgold"));
+}
+
+#[test]
+fn gold_command_k_override() {
+    let mut app = create_test_app();
+    assert!(handle_gold_command(&mut app, "/gold k=5"));
+    assert_eq!(app.gold_k_override, Some(5));
+    assert!(handle_gold_command(&mut app, "/gold k=0")); // rejected
+    assert_eq!(app.gold_k_override, Some(5));
 }

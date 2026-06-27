@@ -1866,6 +1866,10 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if handle_gold_command(app, trimmed) {
+        return true;
+    }
+
     if trimmed == "/swarm" || trimmed == "/swarm status" {
         let default_enabled = crate::config::config().features.swarm;
         app.push_display_message(DisplayMessage::system(format!(
@@ -2393,6 +2397,84 @@ pub(super) fn handle_disabled_mission_command(app: &mut App, trimmed: &str) -> b
             e
         ))),
     }
+    true
+}
+
+pub(super) fn handle_gold_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/gold") else {
+        return false;
+    };
+    let arg = rest.trim();
+
+    if arg.is_empty() || arg == "status" {
+        let state = match app.session.gold_mode_enabled {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "default (off)",
+        };
+        let k_info = match app.gold_k_override {
+            Some(k) => format!(" (k={})", k),
+            None => String::new(),
+        };
+        app.push_display_message(DisplayMessage::system(format!(
+            "Gold mode: {}{} (use /gold on|off|k=N to configure)",
+            state, k_info
+        )));
+        return true;
+    }
+
+    if arg == "on" {
+        app.session.gold_mode_enabled = Some(true);
+        if let Err(e) = app.session.save() {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to save session: {}",
+                e
+            )));
+        }
+        app.push_display_message(DisplayMessage::system(
+            "Gold mode enabled for this session.".to_string(),
+        ));
+        app.set_status_notice("Gold: ON");
+        return true;
+    }
+
+    if arg == "off" {
+        app.session.gold_mode_enabled = Some(false);
+        if let Err(e) = app.session.save() {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to save session: {}",
+                e
+            )));
+        }
+        app.push_display_message(DisplayMessage::system(
+            "Gold mode disabled for this session.".to_string(),
+        ));
+        app.set_status_notice("Gold: OFF");
+        return true;
+    }
+
+    if let Some(n_str) = arg.strip_prefix("k=") {
+        match n_str.parse::<usize>() {
+            Ok(n) if n >= 2 => {
+                app.gold_k_override = Some(n);
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Gold mode k set to {}.",
+                    n
+                )));
+                app.set_status_notice(format!("Gold k={}", n));
+            }
+            _ => {
+                app.push_display_message(DisplayMessage::error(
+                    "Gold mode k must be >= 2 (e.g. /gold k=3).".to_string(),
+                ));
+            }
+        }
+        return true;
+    }
+
+    app.push_display_message(DisplayMessage::error(
+        "Usage: /gold [on|off|status|k=N]".to_string(),
+    ));
     true
 }
 

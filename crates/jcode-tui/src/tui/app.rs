@@ -1299,6 +1299,9 @@ pub struct App {
     /// Per-client Niri-style workspace navigation state. Previously a process
     /// global; now owned per App instance.
     workspace_client: super::workspace_client::WorkspaceClientState,
+    /// Session-local override for the gold-mode candidate count (k).
+    /// `None` means use the compiled-in default.
+    pub(crate) gold_k_override: Option<usize>,
 }
 
 /// Inert provider used by runtime modes whose output is supplied by another source.

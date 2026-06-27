@@ -599,6 +599,7 @@ impl App {
             productivity_refreshing: false,
             last_overnight_card_refresh: None,
             workspace_client: crate::tui::workspace_client::WorkspaceClientState::default(),
+            gold_k_override: None,
         };
 
         for notice in app.provider.drain_startup_notices() {
@@ -989,6 +990,7 @@ impl App {
             productivity_refreshing: false,
             last_overnight_card_refresh: None,
             workspace_client: crate::tui::workspace_client::WorkspaceClientState::default(),
+            gold_k_override: None,
         };
 
         for notice in app.provider.drain_startup_notices() {
