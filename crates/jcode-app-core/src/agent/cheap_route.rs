@@ -1181,6 +1181,15 @@ fn truncate_tail(s: &str, max: usize) -> String {
     format!("…(trimmed)\n{tail}")
 }
 
+/// Heuristic: a subtask is "code" if it edits/creates files or names code paths.
+/// Debate is skipped for code (verify+repair is the stronger signal).
+#[allow(dead_code)]
+fn is_code_subtask(s: &Subtask) -> bool {
+    let t = format!("{} {}", s.description, s.prompt).to_ascii_lowercase();
+    const CODE_HINTS: &[&str] = &["edit","write","modify","implement","refactor","fix the","function","```",".rs",".ts",".py",".go",".js","src/","compile","cargo"];
+    CODE_HINTS.iter().any(|h| t.contains(h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2082,6 +2091,14 @@ mod tests {
         // The chosen route's api_method was pinned through to the spawn.
         let seen = backend.seen.lock().unwrap();
         assert_eq!(seen[0].as_deref(), Some("openai-compatible:deepseek"));
+    }
+
+    #[test]
+    fn is_code_subtask_detects_code() {
+        let code = Subtask { description: "edit main.rs".into(), prompt: "modify src/main.rs".into(), difficulty: 4 };
+        let reason = Subtask { description: "design the api".into(), prompt: "what is the best architecture for X".into(), difficulty: 4 };
+        assert!(is_code_subtask(&code));
+        assert!(!is_code_subtask(&reason));
     }
 
     #[test]
