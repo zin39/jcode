@@ -26,6 +26,13 @@ struct CheapRouteInput {
     task: String,
 }
 
+/// Compute the effective gold-mode flag: both the per-session toggle AND the
+/// global config gate must be `true`. Extracted as a pure function so it can be
+/// unit-tested without a live provider or config singleton.
+pub(crate) fn resolve_gold(session_flag: Option<bool>, global: bool) -> bool {
+    session_flag.unwrap_or(false) && global
+}
+
 #[async_trait]
 impl Tool for CheapRouteTool {
     fn name(&self) -> &str {
@@ -52,14 +59,22 @@ impl Tool for CheapRouteTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params: CheapRouteInput = serde_json::from_value(input)?;
         let task = params.task.trim();
         if task.is_empty() {
             return Err(anyhow!("cheap_route requires a non-empty 'task'"));
         }
 
-        let backend = ProviderCheapBackend::new(self.provider.clone(), self.registry.clone());
+        let session = crate::session::Session::load(&ctx.session_id).ok();
+        let gold_mode = resolve_gold(
+            session.as_ref().and_then(|s| s.gold_mode_enabled),
+            crate::config::config().agents.cheap_route_gold_mode,
+        );
+        let gold_k = crate::config::config().agents.cheap_route_gold_k;
+
+        let backend = ProviderCheapBackend::new(self.provider.clone(), self.registry.clone())
+            .with_gold(gold_mode, gold_k);
         let outcome = run_cheap_route(&backend, task).await?;
         let output = format_cheap_outcome(&outcome);
 
@@ -108,6 +123,30 @@ fn format_cheap_outcome(outcome: &CheapRouteOutcome) -> String {
 mod tests {
     use super::*;
     use crate::agent::cheap_route::SubtaskResult;
+
+    // --- resolve_gold pure-logic tests (no live provider needed) ---
+
+    #[test]
+    fn resolve_gold_both_true_yields_true() {
+        assert!(resolve_gold(Some(true), true));
+    }
+
+    #[test]
+    fn resolve_gold_session_true_but_global_off_yields_false() {
+        assert!(!resolve_gold(Some(true), false));
+    }
+
+    #[test]
+    fn resolve_gold_session_none_global_true_yields_false() {
+        assert!(!resolve_gold(None, true));
+    }
+
+    #[test]
+    fn resolve_gold_session_false_global_true_yields_false() {
+        assert!(!resolve_gold(Some(false), true));
+    }
+
+    // --- format_cheap_outcome tests ---
 
     #[test]
     fn format_cheap_outcome_lists_subtasks_and_reviews() {

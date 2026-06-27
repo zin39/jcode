@@ -1096,6 +1096,11 @@ pub struct ProviderCheapBackend {
     coordinator: Arc<dyn crate::provider::Provider>,
     registry: crate::tool::Registry,
     parent_system: String,
+    /// Whether to run multi-model gold debates on hard reasoning subtasks.
+    /// Computed from the per-session `/gold` flag AND the global config gate.
+    gold_mode: bool,
+    /// Number of distinct proposer models for a gold debate.
+    gold_k: usize,
 }
 
 impl ProviderCheapBackend {
@@ -1125,7 +1130,17 @@ impl ProviderCheapBackend {
                 "You are a cost-routing coordinator. Decompose, recommend a model, and review \
                  subagent work. Be terse and precise; output exactly what is asked."
                     .to_string(),
+            gold_mode: false,
+            gold_k: 3,
         }
+    }
+
+    /// Set the gold-mode flags on this backend. Call after `new` to wire in the
+    /// per-session flag combined with the global config gate.
+    pub fn with_gold(mut self, gold_mode: bool, gold_k: usize) -> Self {
+        self.gold_mode = gold_mode;
+        self.gold_k = gold_k;
+        self
     }
 }
 
@@ -1181,6 +1196,47 @@ impl CheapRouteBackend for ProviderCheapBackend {
 
     fn current_model(&self) -> String {
         self.provider.model()
+    }
+
+    fn gold_mode(&self) -> bool {
+        self.gold_mode
+    }
+
+    fn gold_k(&self) -> usize {
+        self.gold_k
+    }
+
+    /// Run the strong model for one-shot text (used for debate aggregate).
+    /// Uses `cheap_route_strong_model` from config if set and non-empty, else
+    /// falls back to the parent's own current model.  Forks the provider to
+    /// avoid mutating the coordinator/session model in-place.
+    async fn ask_strong(&self, prompt: &str) -> Result<String> {
+        let strong_model = crate::config::config()
+            .agents
+            .cheap_route_strong_model
+            .clone()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.current_model());
+
+        // Pin the exact route for the strong model (avoids re-resolving the
+        // bare model name to the wrong provider).
+        let routes = self.routes();
+        let strong_api = routes
+            .iter()
+            .find(|r| r.model == strong_model)
+            .map(|r| r.api_method.clone());
+
+        let strong_provider = self.provider.fork();
+        let request =
+            crate::provider::MultiProvider::model_switch_request_for_session_route(
+                &strong_model,
+                None,
+                strong_api.as_deref(),
+            );
+        let _ =
+            crate::provider::set_model_with_auth_refresh(strong_provider.as_ref(), &request);
+        strong_provider.complete_simple(prompt, &self.parent_system).await
     }
 }
 
