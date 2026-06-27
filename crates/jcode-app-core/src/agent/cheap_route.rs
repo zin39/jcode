@@ -5,6 +5,7 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use futures::future::join_all;
 use jcode_provider_core::ModelRoute;
 use jcode_provider_core::selection::{CheapRouteCandidate, rank_routes_by_cost};
 use serde::Deserialize;
@@ -1190,6 +1191,68 @@ fn is_code_subtask(s: &Subtask) -> bool {
     CODE_HINTS.iter().any(|h| t.contains(h))
 }
 
+/// Run K proposer models concurrently (each under `DEBATE_PROPOSER_TIMEOUT`),
+/// drop failures/timeouts, early-exit if 2+ agree (consensus), else make ONE
+/// strong aggregate call. The strong model sees all candidates in input order.
+#[allow(dead_code)]
+async fn run_debate(
+    backend: &dyn CheapRouteBackend,
+    subtask: &Subtask,
+    proposer_models: &[(String, Option<String>)],
+    gold_k: usize,
+) -> Result<String> {
+    let k = gold_k.min(proposer_models.len());
+    let futs = proposer_models[..k].iter().map(|(model, api)| async move {
+        tokio::time::timeout(
+            DEBATE_PROPOSER_TIMEOUT,
+            backend.run_subtask(subtask, model, api.as_deref()),
+        )
+        .await
+    });
+    let raw = join_all(futs).await; // Vec<Result<Result<String>, Elapsed>>, in input order
+    let candidates: Vec<String> = raw
+        .into_iter()
+        .filter_map(|r| r.ok().and_then(|inner| inner.ok()))
+        .collect();
+    if candidates.len() < 2 {
+        return backend.ask_strong(&build_debate_single_prompt(subtask)).await;
+    }
+    if let Some(agreed) = consensus(&candidates) {
+        return Ok(agreed);
+    }
+    let trimmed: Vec<String> = candidates
+        .iter()
+        .map(|c| truncate_tail(strip_code_fence(c), MAX_DEBATE_CANDIDATE_CHARS))
+        .collect();
+    match backend
+        .ask_strong(&build_debate_aggregate_prompt(subtask, &trimmed))
+        .await
+    {
+        Ok(gold) => Ok(gold),
+        Err(_) => Ok(candidates[0].clone()),
+    }
+}
+
+#[allow(dead_code)]
+fn build_debate_single_prompt(s: &Subtask) -> String {
+    format!("Complete this task as best you can.\n\nTASK: {}\n", s.prompt)
+}
+
+#[allow(dead_code)]
+fn build_debate_aggregate_prompt(s: &Subtask, candidates: &[String]) -> String {
+    let mut p = format!(
+        "You are the aggregator in a multi-model debate. {n} models each answered the task below.\n\
+         First note errors/gaps across the candidates, then write the single BEST answer (do not mention the debate). \
+         End with one line: 'why: <=1 sentence on what made it best'.\n\nTASK: {task}\n\n",
+        n = candidates.len(),
+        task = s.prompt
+    );
+    for (i, c) in candidates.iter().enumerate() {
+        p.push_str(&format!("--- candidate {} ---\n{}\n\n", i + 1, c));
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2130,5 +2193,94 @@ mod tests {
         };
         assert_eq!(b.ask_strong("q").await.unwrap(), "PARENT");
         assert!(!b.gold_mode());
+    }
+
+    // --- DebateBackend: builder-style fake for run_debate tests ---
+
+    struct DebateBackend {
+        subtask_replies: std::collections::HashMap<String, String>,
+        strong_reply: String,
+        strong_prompts_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DebateBackend {
+        fn new() -> Self {
+            Self {
+                subtask_replies: std::collections::HashMap::new(),
+                strong_reply: String::new(),
+                strong_prompts_log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        /// Script a per-model run_subtask reply (builder).
+        fn subtask(mut self, model: &str, reply: &str) -> Self {
+            self.subtask_replies.insert(model.to_string(), reply.to_string());
+            self
+        }
+        /// Script the ask_strong reply (builder).
+        fn strong(mut self, reply: &str) -> Self {
+            self.strong_reply = reply.to_string();
+            self
+        }
+        /// Return all prompts recorded by ask_strong calls so far.
+        fn strong_prompts(&self) -> Vec<String> {
+            self.strong_prompts_log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CheapRouteBackend for DebateBackend {
+        async fn ask_parent(&self, _prompt: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn run_subtask(
+            &self,
+            _subtask: &Subtask,
+            model: &str,
+            _route_api_method: Option<&str>,
+        ) -> Result<String> {
+            match self.subtask_replies.get(model) {
+                Some(reply) => Ok(reply.clone()),
+                None => Err(anyhow!("no scripted reply for model '{model}'")),
+            }
+        }
+        fn routes(&self) -> Vec<ModelRoute> {
+            vec![]
+        }
+        fn current_model(&self) -> String {
+            String::new()
+        }
+        async fn ask_strong(&self, prompt: &str) -> Result<String> {
+            self.strong_prompts_log.lock().unwrap().push(prompt.to_string());
+            Ok(self.strong_reply.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_debate_aggregates_all_candidates_one_strong_call() {
+        let b = DebateBackend::new()
+            .subtask("m1", "alpha")
+            .subtask("m2", "beta")
+            .subtask("m3", "gamma")
+            .strong("GOLD");
+        let st = Subtask {
+            description: "d".into(),
+            prompt: "p".into(),
+            difficulty: 5,
+        };
+        let models = vec![
+            ("m1".to_string(), None),
+            ("m2".to_string(), None),
+            ("m3".to_string(), None),
+        ];
+        let gold = run_debate(&b, &st, &models, 3).await.unwrap();
+        assert_eq!(gold, "GOLD");
+        let strong = b.strong_prompts();
+        assert_eq!(strong.len(), 1); // ONE strong call
+        let (ia, ib, ig) = (
+            strong[0].find("alpha").unwrap(),
+            strong[0].find("beta").unwrap(),
+            strong[0].find("gamma").unwrap(),
+        );
+        assert!(ia < ib && ib < ig); // candidates in order
     }
 }
