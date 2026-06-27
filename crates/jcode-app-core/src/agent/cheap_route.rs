@@ -83,6 +83,13 @@ pub trait CheapRouteBackend: Send + Sync {
     fn gold_mode(&self) -> bool { false }
     /// Number of distinct proposers for a gold debate. Default 3. Prod impl reads config.
     fn gold_k(&self) -> usize { 3 }
+    /// Debate status reporter. Default returns a static no-op so test backends
+    /// need not implement this method.
+    fn reporter(&self) -> &dyn crate::agent::debate_status::DebateStatusReporter {
+        static NOOP: crate::agent::debate_status::NoopDebateReporter =
+            crate::agent::debate_status::NoopDebateReporter;
+        &NOOP
+    }
 }
 
 /// Run a verification shell command in the current working directory, capturing
@@ -480,7 +487,7 @@ pub async fn run_cheap_route(
                 .take(backend.gold_k().max(2))
                 .collect();
             if proposers.len() >= 2 {
-                if let Ok(output) = run_debate(backend, subtask, &proposers, backend.gold_k(), &crate::agent::debate_status::NoopDebateReporter).await
+                if let Ok(output) = run_debate(backend, subtask, &proposers, backend.gold_k(), backend.reporter()).await
                 {
                     results.push(SubtaskResult {
                         description: subtask.description.clone(),
@@ -1102,6 +1109,8 @@ pub struct ProviderCheapBackend {
     gold_mode: bool,
     /// Number of distinct proposer models for a gold debate.
     gold_k: usize,
+    /// Live reporter for debate progress (side panel + bus). Defaults to no-op.
+    reporter: Arc<dyn crate::agent::debate_status::DebateStatusReporter>,
 }
 
 impl ProviderCheapBackend {
@@ -1133,6 +1142,7 @@ impl ProviderCheapBackend {
                     .to_string(),
             gold_mode: false,
             gold_k: 3,
+            reporter: Arc::new(crate::agent::debate_status::NoopDebateReporter),
         }
     }
 
@@ -1141,6 +1151,16 @@ impl ProviderCheapBackend {
     pub fn with_gold(mut self, gold_mode: bool, gold_k: usize) -> Self {
         self.gold_mode = gold_mode;
         self.gold_k = gold_k;
+        self
+    }
+
+    /// Attach a debate status reporter. Used by the production tool to surface
+    /// live debate progress to the side panel.
+    pub fn with_reporter(
+        mut self,
+        r: Arc<dyn crate::agent::debate_status::DebateStatusReporter>,
+    ) -> Self {
+        self.reporter = r;
         self
     }
 }
@@ -1238,6 +1258,10 @@ impl CheapRouteBackend for ProviderCheapBackend {
         let _ =
             crate::provider::set_model_with_auth_refresh(strong_provider.as_ref(), &request);
         strong_provider.complete_simple(prompt, &self.parent_system).await
+    }
+
+    fn reporter(&self) -> &dyn crate::agent::debate_status::DebateStatusReporter {
+        self.reporter.as_ref()
     }
 }
 
@@ -1360,6 +1384,12 @@ fn build_debate_aggregate_prompt(s: &Subtask, candidates: &[String]) -> String {
     p
 }
 
+/// Format a one-line run summary for a completed gold debate.
+/// Example: `"gold from 3 models in 42s · $0.02"`
+pub fn debate_summary(models: usize, elapsed_secs: u64, usd: f64) -> String {
+    format!("gold from {} models in {}s · ${:.2}", models, elapsed_secs, usd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,6 +1397,11 @@ mod tests {
     use jcode_provider_core::{RouteCheapnessEstimate, RouteCostConfidence, RouteCostSource};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[test]
+    fn debate_summary_formats() {
+        assert_eq!(debate_summary(3, 42, 0.0234), "gold from 3 models in 42s · $0.02");
+    }
 
     fn priced_route(model: &str, input_micros: u64) -> ModelRoute {
         ModelRoute {

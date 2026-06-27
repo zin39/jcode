@@ -28,6 +28,115 @@ impl DebateStatusReporter for NoopDebateReporter {
     fn gold(&self, _markdown: &str) {}
 }
 
+// ---------------------------------------------------------------------------
+// SidePanelDebateReporter — live updates to the session side panel.
+// ---------------------------------------------------------------------------
+
+struct DebateState {
+    phase_label: String,
+    proposers: Vec<(String, DebatePhase)>,
+    gold: Option<String>,
+}
+
+impl DebateState {
+    fn render(&self) -> String {
+        let mut buf = String::from("# Gold Debate\n\n");
+        if !self.phase_label.is_empty() {
+            buf.push_str(&format!("**Phase:** {}\n\n", self.phase_label));
+        }
+        if !self.proposers.is_empty() {
+            buf.push_str("## Proposers\n\n");
+            for (model, phase) in &self.proposers {
+                let icon = match phase {
+                    DebatePhase::Running => "⏳",
+                    DebatePhase::Done => "✅",
+                    DebatePhase::Failed => "❌",
+                };
+                buf.push_str(&format!("- {} {}\n", icon, model));
+            }
+            buf.push('\n');
+        }
+        if let Some(gold) = &self.gold {
+            buf.push_str("## Gold Result\n\n");
+            buf.push_str(gold);
+            if !gold.ends_with('\n') {
+                buf.push('\n');
+            }
+        }
+        buf
+    }
+}
+
+/// Reporter that writes debate progress live to the session's side panel page
+/// `"debate"` and publishes a `BusEvent::SidePanelUpdated` so the client
+/// receives the update immediately (the same path used by `/goals`).
+pub struct SidePanelDebateReporter {
+    session_id: String,
+    state: std::sync::Mutex<DebateState>,
+}
+
+impl SidePanelDebateReporter {
+    pub fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            state: std::sync::Mutex::new(DebateState {
+                phase_label: String::new(),
+                proposers: Vec::new(),
+                gold: None,
+            }),
+        }
+    }
+
+    fn flush(&self, state: &DebateState) {
+        let content = state.render();
+        match crate::side_panel::write_markdown_page(
+            &self.session_id,
+            "debate",
+            Some("Gold Debate"),
+            &content,
+            true,
+        ) {
+            Ok(snapshot) => {
+                crate::bus::Bus::global().publish(crate::bus::BusEvent::SidePanelUpdated(
+                    crate::bus::SidePanelUpdated {
+                        session_id: self.session_id.clone(),
+                        snapshot,
+                    },
+                ));
+            }
+            Err(err) => {
+                crate::logging::warn(&format!(
+                    "[debate_reporter] failed to write side panel page: {err}"
+                ));
+            }
+        }
+    }
+}
+
+impl DebateStatusReporter for SidePanelDebateReporter {
+    fn proposer(&self, model: &str, phase: DebatePhase) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = state.proposers.iter_mut().find(|(m, _)| m == model) {
+            entry.1 = phase;
+        } else {
+            state.proposers.push((model.to_string(), phase));
+        }
+        self.flush(&state);
+    }
+
+    fn phase(&self, label: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.phase_label = label.to_string();
+        self.flush(&state);
+    }
+
+    fn gold(&self, markdown: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.gold = Some(markdown.to_string());
+        self.flush(&state);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

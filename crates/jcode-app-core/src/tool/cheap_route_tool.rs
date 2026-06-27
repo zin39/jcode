@@ -1,5 +1,6 @@
 use super::{Registry, Tool, ToolContext, ToolOutput};
 use crate::agent::cheap_route::{CheapRouteOutcome, ProviderCheapBackend, run_cheap_route};
+use crate::agent::debate_status::SidePanelDebateReporter;
 use crate::provider::Provider;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -73,8 +74,10 @@ impl Tool for CheapRouteTool {
         );
         let gold_k = crate::config::config().agents.cheap_route_gold_k;
 
+        let reporter = Arc::new(SidePanelDebateReporter::new(ctx.session_id.clone()));
         let backend = ProviderCheapBackend::new(self.provider.clone(), self.registry.clone())
-            .with_gold(gold_mode, gold_k);
+            .with_gold(gold_mode, gold_k)
+            .with_reporter(reporter);
         let outcome = run_cheap_route(&backend, task).await?;
         let output = format_cheap_outcome(&outcome);
 
