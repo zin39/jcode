@@ -130,6 +130,9 @@ pub struct Session {
     /// Whether automatic end-of-turn judging is enabled for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autojudge_enabled: Option<bool>,
+    /// Whether gold mode (debate on hard subtasks) is on for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gold_mode_enabled: Option<bool>,
     /// Whether this session is a canary session (testing new builds)
     #[serde(default)]
     pub is_canary: bool,
@@ -216,6 +219,8 @@ struct SessionStartupStub {
     autoreview_enabled: Option<bool>,
     #[serde(default)]
     autojudge_enabled: Option<bool>,
+    #[serde(default)]
+    gold_mode_enabled: Option<bool>,
     #[serde(default)]
     is_canary: bool,
     #[serde(default)]
@@ -320,6 +325,7 @@ impl Session {
         session.improve_mode = stub.improve_mode;
         session.autoreview_enabled = stub.autoreview_enabled;
         session.autojudge_enabled = stub.autojudge_enabled;
+        session.gold_mode_enabled = stub.gold_mode_enabled;
         session.is_canary = stub.is_canary;
         session.testing_build = stub.testing_build;
         session.working_dir = stub.working_dir;
@@ -355,6 +361,7 @@ impl Session {
         session.improve_mode = snapshot.improve_mode;
         session.autoreview_enabled = snapshot.autoreview_enabled;
         session.autojudge_enabled = snapshot.autojudge_enabled;
+        session.gold_mode_enabled = snapshot.gold_mode_enabled;
         session.is_canary = snapshot.is_canary;
         session.testing_build = snapshot.testing_build;
         session.working_dir = snapshot.working_dir;
@@ -492,6 +499,7 @@ impl Session {
             improve_mode: self.improve_mode,
             autoreview_enabled: self.autoreview_enabled,
             autojudge_enabled: self.autojudge_enabled,
+            gold_mode_enabled: self.gold_mode_enabled,
             is_canary: self.is_canary,
             testing_build: self.testing_build.clone(),
             working_dir: self.working_dir.clone(),
@@ -676,6 +684,7 @@ impl Session {
         self.improve_mode = meta.improve_mode;
         self.autoreview_enabled = meta.autoreview_enabled;
         self.autojudge_enabled = meta.autojudge_enabled;
+        self.gold_mode_enabled = meta.gold_mode_enabled;
         self.is_canary = meta.is_canary;
         self.testing_build = meta.testing_build;
         self.working_dir = meta.working_dir;
@@ -716,6 +725,7 @@ impl Session {
             improve_mode: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
+            gold_mode_enabled: None,
             is_canary: false,
             testing_build: None,
             working_dir: current_working_dir_string(),
@@ -763,6 +773,7 @@ impl Session {
             improve_mode: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
+            gold_mode_enabled: None,
             is_canary: false,
             testing_build: None,
             working_dir: current_working_dir_string(),
@@ -1527,6 +1538,8 @@ struct RemoteStartupSessionSnapshot {
     autoreview_enabled: Option<bool>,
     #[serde(default)]
     autojudge_enabled: Option<bool>,
+    #[serde(default)]
+    gold_mode_enabled: Option<bool>,
     #[serde(default)]
     is_canary: bool,
     #[serde(default)]

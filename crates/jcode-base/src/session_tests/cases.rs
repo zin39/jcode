@@ -1957,3 +1957,20 @@ fn streaming_guard_creates_visible_macos_sleep_assertion() {
         "streaming assertion should be released after guard drop; output was:\n{stdout}"
     );
 }
+
+#[test]
+fn gold_mode_enabled_roundtrips() -> anyhow::Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-gold-mode-roundtrip-")
+        .tempdir()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let mut s = Session::create(None, Some("t".to_string()));
+    s.gold_mode_enabled = Some(true);
+    s.save().unwrap();
+    let loaded = Session::load(&s.id).unwrap();
+    assert_eq!(loaded.gold_mode_enabled, Some(true));
+    Ok(())
+}
