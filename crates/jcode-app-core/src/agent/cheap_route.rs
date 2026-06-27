@@ -5,6 +5,7 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use crate::agent::debate_status::{DebatePhase, DebateStatusReporter};
 use futures::future::join_all;
 use jcode_provider_core::ModelRoute;
 use jcode_provider_core::selection::{CheapRouteCandidate, rank_routes_by_cost};
@@ -479,7 +480,7 @@ pub async fn run_cheap_route(
                 .take(backend.gold_k().max(2))
                 .collect();
             if proposers.len() >= 2 {
-                if let Ok(output) = run_debate(backend, subtask, &proposers, backend.gold_k()).await
+                if let Ok(output) = run_debate(backend, subtask, &proposers, backend.gold_k(), &crate::agent::debate_status::NoopDebateReporter).await
                 {
                     results.push(SubtaskResult {
                         description: subtask.description.clone(),
@@ -1282,8 +1283,15 @@ async fn run_debate(
     subtask: &Subtask,
     proposer_models: &[(String, Option<String>)],
     gold_k: usize,
+    reporter: &dyn DebateStatusReporter,
 ) -> Result<String> {
     let k = gold_k.min(proposer_models.len());
+
+    reporter.phase("propose");
+    for (model, _) in &proposer_models[..k] {
+        reporter.proposer(model, DebatePhase::Running);
+    }
+
     let futs = proposer_models[..k].iter().map(|(model, api)| async move {
         tokio::time::timeout(
             DEBATE_PROPOSER_TIMEOUT,
@@ -1292,16 +1300,27 @@ async fn run_debate(
         .await
     });
     let raw = join_all(futs).await; // Vec<Result<Result<String>, Elapsed>>, in input order
+
+    // Emit Done/Failed per proposer, aligned by index.
+    for ((model, _), result) in proposer_models[..k].iter().zip(raw.iter()) {
+        let phase = if matches!(result, Ok(Ok(_))) { DebatePhase::Done } else { DebatePhase::Failed };
+        reporter.proposer(model, phase);
+    }
+
     let candidates: Vec<String> = raw
         .into_iter()
         .filter_map(|r| r.ok().and_then(|inner| inner.ok()))
         .collect();
     if candidates.len() < 2 {
-        return backend.ask_strong(&build_debate_single_prompt(subtask)).await;
+        let result = backend.ask_strong(&build_debate_single_prompt(subtask)).await?;
+        reporter.gold(&result);
+        return Ok(result);
     }
     if let Some(agreed) = consensus(&candidates) {
+        reporter.gold(&agreed);
         return Ok(agreed);
     }
+    reporter.phase("merge");
     let trimmed: Vec<String> = candidates
         .iter()
         .map(|c| truncate_tail(strip_code_fence(c), MAX_DEBATE_CANDIDATE_CHARS))
@@ -1310,8 +1329,14 @@ async fn run_debate(
         .ask_strong(&build_debate_aggregate_prompt(subtask, &trimmed))
         .await
     {
-        Ok(gold) => Ok(gold),
-        Err(_) => Ok(candidates[0].clone()),
+        Ok(gold) => {
+            reporter.gold(&gold);
+            Ok(gold)
+        }
+        Err(_) => {
+            reporter.gold(&candidates[0]);
+            Ok(candidates[0].clone())
+        }
     }
 }
 
@@ -1338,6 +1363,7 @@ fn build_debate_aggregate_prompt(s: &Subtask, candidates: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::debate_status::NoopDebateReporter;
     use jcode_provider_core::{RouteCheapnessEstimate, RouteCostConfidence, RouteCostSource};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -2386,7 +2412,7 @@ mod tests {
             ("m2".to_string(), None),
             ("m3".to_string(), None),
         ];
-        let gold = run_debate(&b, &st, &models, 3).await.unwrap();
+        let gold = run_debate(&b, &st, &models, 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(gold, "GOLD");
         let strong = b.strong_prompts();
         assert_eq!(strong.len(), 1); // ONE strong call
@@ -2418,7 +2444,7 @@ mod tests {
             .subtask_error("m2", "boom")
             .subtask_error("m3", "boom")
             .strong("S");
-        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(result, "S");
         let prompts = b.strong_prompts();
         assert!(!prompts.is_empty(), "ask_strong must be called for single survivor");
@@ -2437,7 +2463,7 @@ mod tests {
             .subtask("m2", "y")
             .strong("GOLD");
         let models = vec![("m1".into(), None), ("m2".into(), None)];
-        let result = run_debate(&b, &debate_st(), &models, 2).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models, 2, &NoopDebateReporter).await.unwrap();
         assert_eq!(result, "GOLD");
         assert_eq!(b.strong_prompts().len(), 1, "exactly one strong call for two distinct candidates");
     }
@@ -2450,7 +2476,7 @@ mod tests {
             .subtask("m2", "y")
             .subtask("m3", "z")
             .strong("GOLD");
-        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(result, "GOLD");
         assert_eq!(b.strong_prompts().len(), 1);
         let prompt = &b.strong_prompts()[0];
@@ -2466,7 +2492,7 @@ mod tests {
             .subtask_error("m2", "boom")
             .subtask_error("m3", "boom")
             .strong("FALLBACK");
-        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(result, "FALLBACK");
         let prompts = b.strong_prompts();
         assert!(!prompts.is_empty(), "ask_strong must be called with zero survivors");
@@ -2484,7 +2510,7 @@ mod tests {
             .subtask("m2", "y")
             .subtask("m3", "z")
             .strong_err();
-        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(result, "x", "aggregate error must return candidates[0] ('x')");
     }
 
@@ -2498,7 +2524,7 @@ mod tests {
             .subtask("m2", "same")
             .subtask("m3", "Other")
             .strong("SHOULD_NOT_BE_CALLED");
-        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(
             result.to_ascii_lowercase(),
             "same",
@@ -2515,7 +2541,7 @@ mod tests {
             .subtask("m2", "beta")
             .subtask("m3", "gamma")
             .strong("GOLD");
-        run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(b.strong_prompts().len(), 1, "exactly one strong call for 3 distinct candidates");
     }
 
@@ -2529,7 +2555,7 @@ mod tests {
             .subtask("m2", "b")
             .subtask("m3", "c")
             .strong("GOLD");
-        run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         let prompts = b.strong_prompts();
         assert!(!prompts.is_empty());
         assert!(
@@ -2555,7 +2581,7 @@ mod tests {
             .subtask("m3", "gamma").subtask_delay("m3", 3)
             .strong("GOLD");
         let t0 = tokio::time::Instant::now();
-        run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         let elapsed = t0.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(40),
@@ -2574,7 +2600,7 @@ mod tests {
             .subtask("m3", "z")
             .strong("GOLD");
         let t0 = tokio::time::Instant::now();
-        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         let elapsed = t0.elapsed();
         assert_eq!(result, "GOLD");
         assert_eq!(b.strong_prompts().len(), 1, "surviving m2+m3 → one aggregate strong call");
@@ -2603,7 +2629,7 @@ mod tests {
             .subtask("m2", "other")
             .strong("GOLD");
         let models = vec![("m1".into(), None), ("m2".into(), None)];
-        run_debate(&b, &debate_st(), &models, 2).await.unwrap();
+        run_debate(&b, &debate_st(), &models, 2, &NoopDebateReporter).await.unwrap();
         let prompts = b.strong_prompts();
         assert!(!prompts.is_empty());
         assert!(
@@ -2620,7 +2646,7 @@ mod tests {
             .subtask("m2", "Same")
             .subtask("m3", "Same")
             .strong("SHOULD_NOT_BE_CALLED");
-        let result = run_debate(&b, &debate_st(), &models3(), 3).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
         assert_eq!(result, "Same");
         assert!(b.strong_prompts().is_empty(), "no strong call when all candidates are identical");
     }
@@ -2634,7 +2660,7 @@ mod tests {
             .subtask("m2", "y")
             .strong("GOLD");
         let models = vec![("m1".into(), None), ("m2".into(), None)];
-        let result = run_debate(&b, &debate_st(), &models, 5).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models, 5, &NoopDebateReporter).await.unwrap();
         assert_eq!(result, "GOLD");
         assert_eq!(b.strong_prompts().len(), 1, "2 distinct candidates → one strong call");
     }

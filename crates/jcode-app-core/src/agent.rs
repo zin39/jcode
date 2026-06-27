@@ -2,6 +2,7 @@
 
 mod compaction;
 pub mod cheap_route;
+pub mod debate_status;
 mod cost_guard;
 mod environment;
 mod interrupts;
