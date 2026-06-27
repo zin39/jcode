@@ -1486,6 +1486,24 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if trimmed == "/gold on" || trimmed == "/gold off" {
+                    let new_state = trimmed == "/gold on";
+                    // Propagate to the SERVER session so the cheap_route tool
+                    // (reads gold via Session::load on the daemon) sees it. A
+                    // local session.save() alone never reaches the daemon.
+                    remote
+                        .set_feature(crate::protocol::FeatureToggle::GoldMode, new_state)
+                        .await?;
+                    app.session.gold_mode_enabled = Some(new_state);
+                    let label = if new_state { "ON" } else { "OFF" };
+                    app.set_status_notice(format!("Gold: {}", label));
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "Gold mode {} for this session.",
+                        if new_state { "enabled" } else { "disabled" }
+                    )));
+                    return Ok(());
+                }
+
                 if trimmed == "/memory" {
                     let new_state = !app.memory_enabled;
                     remote

@@ -296,6 +296,21 @@ impl Agent {
         }
     }
 
+    /// Toggle gold mode for this session and persist it to the server-side
+    /// session, so the `cheap_route` tool (which reads the flag via
+    /// `Session::load`) sees it. A remote `/gold on|off` reaches here through
+    /// `Request::SetFeature`; a plain client-side `session.save()` does not
+    /// touch the daemon's session, which is why the flag must be set here.
+    pub fn set_gold_mode_enabled(&mut self, enabled: bool) {
+        self.session.gold_mode_enabled = Some(enabled);
+        if let Err(e) = self.session.save() {
+            crate::logging::warn(&format!(
+                "set_gold_mode_enabled: failed to persist session {}: {}",
+                self.session.id, e
+            ));
+        }
+    }
+
     /// Mark this session as an inline swarm worker. When enabled, the streaming
     /// loop publishes a throttled output tail to the global bus so a
     /// coordinator can render a live inline gallery viewport for it.

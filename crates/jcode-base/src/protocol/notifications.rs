@@ -40,4 +40,5 @@ pub enum FeatureToggle {
     Swarm,
     Autoreview,
     Autojudge,
+    GoldMode,
 }

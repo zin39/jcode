@@ -457,6 +457,12 @@ pub(super) async fn handle_set_feature(
                 }
             }
         }
+        FeatureToggle::GoldMode => {
+            let mut agent_guard = agent.lock().await;
+            agent_guard.set_gold_mode_enabled(enabled);
+            drop(agent_guard);
+            let _ = client_event_tx.send(ServerEvent::Done { id });
+        }
         FeatureToggle::Swarm => {
             if *swarm_enabled == enabled {
                 let _ = client_event_tx.send(ServerEvent::Done { id });
