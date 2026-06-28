@@ -3,6 +3,7 @@
 mod compaction;
 mod environment;
 mod interrupts;
+mod loop_detect;
 mod messages;
 mod prompting;
 mod provider;

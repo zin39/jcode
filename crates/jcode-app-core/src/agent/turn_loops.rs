@@ -1038,6 +1038,15 @@ impl Agent {
                 self.session.save()?;
             }
 
+            // Observational loop-signal detection (E1). Does not interrupt the turn.
+            let signals = crate::agent::loop_detect::detect(self.session.provider_messages());
+            if signals.repeated_read {
+                crate::session_metrics::record_repeated_read(&self.session.id);
+            }
+            if crate::agent::loop_detect::is_stuck(&signals) {
+                crate::session_metrics::record_stuck_loop(&self.session.id);
+            }
+
             if !generated_image_contexts.is_empty() {
                 for blocks in generated_image_contexts.drain(..) {
                     self.add_message(Role::User, blocks);
