@@ -6,6 +6,7 @@ pub mod debate_status;
 mod cost_guard;
 mod environment;
 mod interrupts;
+mod loop_detect;
 mod messages;
 mod parallel_tools;
 mod prompting;
