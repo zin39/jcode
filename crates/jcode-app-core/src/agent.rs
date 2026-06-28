@@ -244,12 +244,15 @@ pub struct Agent {
 
 impl Agent {
     fn should_track_client_cache(&self) -> bool {
+        // Opt-out (C4): lightweight prefix-hash tracking is cheap and surfaces
+        // append-only violations in prod. Unset/empty => ON; only explicit
+        // 0/false disables.
         match std::env::var("JCODE_TRACK_CLIENT_CACHE") {
             Ok(value) => {
                 let value = value.trim();
-                !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+                value.is_empty() || (value != "0" && !value.eq_ignore_ascii_case("false"))
             }
-            Err(_) => false,
+            Err(_) => true,
         }
     }
 
@@ -719,6 +722,7 @@ impl Agent {
             };
 
         if let Some(violation) = violation {
+            crate::session_metrics::record_cache_violation(&self.session.id);
             logging::warn(&format!(
                 "CLIENT_CACHE_VIOLATION: {} | turn={} messages={}",
                 violation.reason, violation.turn, violation.message_count
