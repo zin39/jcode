@@ -177,13 +177,23 @@ pub fn build_compaction_conversation_text(
                 ContentBlock::ToolUse { name, input, .. } => {
                     conversation_text.push_str(&format!("[Tool: {} - {}]\n", name, input));
                 }
-                ContentBlock::ToolResult { content, .. } => {
-                    let truncated = if content.len() > 500 {
-                        format!("{}... (truncated)", truncate_str_boundary(content, 500))
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    if *is_error == Some(true) {
+                        // Self-conditioning (arXiv 2509.09677): a model's own error
+                        // payloads in context degrade later steps. Keep only the FACT of
+                        // failure — drop the payload entirely so the carried-forward
+                        // summary is not polluted by error noise.
+                        conversation_text.push_str("[tool failed]\n");
                     } else {
-                        content.clone()
-                    };
-                    conversation_text.push_str(&format!("[Result: {}]\n", truncated));
+                        let truncated = if content.len() > 500 {
+                            format!("{}... (truncated)", truncate_str_boundary(content, 500))
+                        } else {
+                            content.clone()
+                        };
+                        conversation_text.push_str(&format!("[Result: {}]\n", truncated));
+                    }
                 }
                 ContentBlock::Reasoning { .. }
                 | ContentBlock::ReasoningTrace { .. }
@@ -692,6 +702,31 @@ mod tests {
         assert!(prompt.contains("prior work"));
         assert!(prompt.contains("**User:**"));
         assert!(prompt.contains(SUMMARY_PROMPT));
+    }
+
+    #[test]
+    fn failed_tool_result_payload_excluded_from_summary() {
+        let messages = vec![Message::tool_result(
+            "t1",
+            "ERROR: secret-stacktrace-payload at line 42",
+            true,
+        )];
+        let text = build_compaction_conversation_text(&messages, None);
+        assert!(
+            !text.contains("secret-stacktrace-payload"),
+            "failed-result payload must not enter summary input"
+        );
+        assert!(
+            text.contains("[tool failed]"),
+            "a failure marker must remain so the summary knows an attempt happened"
+        );
+    }
+
+    #[test]
+    fn successful_tool_result_payload_kept() {
+        let messages = vec![Message::tool_result("t2", "build succeeded: ok-payload", false)];
+        let text = build_compaction_conversation_text(&messages, None);
+        assert!(text.contains("ok-payload"), "successful result must be kept");
     }
 
     #[test]
