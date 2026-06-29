@@ -129,6 +129,30 @@ fn test_anthropic_reasoning_effort_request_parts() {
 }
 
 #[test]
+fn test_anthropic_preserves_swarm_sentinels_for_cycling() {
+    // Regression: storing a swarm effort must preserve which swarm mode was
+    // chosen. Previously both `swarm` and `swarm-deep` collapsed to `swarm`,
+    // which capped Alt+Right effort cycling at swarm-light (it could never
+    // reach swarm-deep because the readback always reported `swarm`).
+    let provider = AnthropicProvider::new();
+    provider.set_model("claude-sonnet-4-6").unwrap();
+
+    provider.set_reasoning_effort("swarm").unwrap();
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("swarm"));
+
+    provider.set_reasoning_effort("swarm-deep").unwrap();
+    assert_eq!(
+        provider.reasoning_effort().as_deref(),
+        Some("swarm-deep"),
+        "swarm-deep must survive the round-trip so cycling can reach it"
+    );
+
+    // And cycling back down to swarm-light still works.
+    provider.set_reasoning_effort("swarm").unwrap();
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("swarm"));
+}
+
+#[test]
 fn test_anthropic_show_thinking_enables_adaptive_thinking_without_effort() {
     // With no explicit reasoning effort, an adaptive-thinking model should still
     // request summarized thinking when the user has opted into the display.
