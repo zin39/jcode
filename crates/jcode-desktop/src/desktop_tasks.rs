@@ -149,7 +149,9 @@ pub(crate) fn spawn_restore_crashed_sessions(event_loop_proxy: EventLoopProxy<De
     }
 }
 
-pub(crate) fn spawn_github_issue_sync(event_loop_proxy: EventLoopProxy<DesktopUserEvent>) -> Result<()> {
+pub(crate) fn spawn_github_issue_sync(
+    event_loop_proxy: EventLoopProxy<DesktopUserEvent>,
+) -> Result<()> {
     spawn_bounded_desktop_async_job("jcode-desktop-github-issues-sync", move || {
         let result = desktop_issue_cache::sync_current_repo_issue_cache()
             .map_err(|error| format!("{error:#}"));
@@ -244,7 +246,8 @@ pub(crate) fn start_pending_transcript_hydration(
     true
 }
 
-pub(crate) fn spawn_desktop_preferences_saver() -> Option<mpsc::Sender<workspace::DesktopPreferences>> {
+pub(crate) fn spawn_desktop_preferences_saver()
+-> Option<mpsc::Sender<workspace::DesktopPreferences>> {
     let (tx, rx) = mpsc::channel::<workspace::DesktopPreferences>();
     match std::thread::Builder::new()
         .name("jcode-desktop-preferences-saver".to_string())
@@ -311,4 +314,3 @@ pub(crate) fn save_desktop_preferences_off_ui_thread(
         error.as_deref(),
     );
 }
-

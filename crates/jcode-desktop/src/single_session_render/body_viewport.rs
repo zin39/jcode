@@ -364,6 +364,10 @@ pub(crate) fn inline_widget_target_top(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test-only geometry probe mirrors the render pipeline's parameters"
+)]
 pub(crate) fn inline_widget_body_and_card_vertical_geometry_for_test(
     size: PhysicalSize<u32>,
     kind: Option<InlineWidgetKind>,

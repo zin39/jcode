@@ -318,4 +318,3 @@ pub(crate) fn desktop_resume_session_id_from_args<'a>(
     }
     None
 }
-

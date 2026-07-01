@@ -51,11 +51,10 @@ mod desktop_jobs;
 pub(crate) use desktop_jobs::*;
 mod desktop_capture;
 pub(crate) use desktop_capture::*;
-mod streaming_text_style;
 mod desktop_tasks;
+mod streaming_text_style;
 pub(crate) use desktop_tasks::*;
 mod desktop_worker_process;
-pub(crate) use desktop_worker_process::*;
 use ab_glyph::{Font, FontArc, Glyph as AbGlyph, PxScale, ScaleFont, point};
 use animation::{
     APP_MODE_TRANSITION_DURATION, AnimatedRect, AnimatedViewport, ColorTransition, FocusPulse,
@@ -97,6 +96,7 @@ use desktop_session_events::{
     spawn_session_event_forwarder,
 };
 use desktop_worker_host::DesktopWorkerConnection;
+pub(crate) use desktop_worker_process::*;
 use glyphon::{
     Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Wrap,
@@ -1629,7 +1629,6 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-
 enum DesktopUserEvent {
     CanvasReady(Box<DesktopCanvasInitResult>),
     SessionEvents(DesktopSessionEventBatch),
@@ -1870,7 +1869,6 @@ fn initial_single_session_app(resume_session_id: Option<&str>) -> DesktopApp {
     }
     DesktopApp::SingleSession(app)
 }
-
 
 #[allow(clippy::large_enum_variant)]
 enum DesktopApp {
