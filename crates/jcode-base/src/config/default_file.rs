@@ -211,10 +211,18 @@ kv_cache_miss_notices = true
 update_channel = "stable"
 
 [websearch]
-# Preferred websearch engine: "duckduckgo", "bing", or "searxng".
-engine = "duckduckgo"
-# Keyless HTML engines to try if the preferred engine fails. Default falls back to Bing HTML.
-fallback_engines = ["bing"]
+# Preferred websearch engine: "hybrid" (default), "tavily", "last30days",
+# "duckduckgo", "bing", or "searxng".
+#
+# hybrid runs Tavily (fast, keyed) and the last30days skill (deep social:
+# Reddit/HN/GitHub/etc.) concurrently, cross-verifies their results (pages found
+# by both engines are marked "verified" and float to the top), and returns one
+# best-first ranking. If a leg has no key / is not installed it is skipped; if
+# both legs fail the fallback_engines below are used.
+engine = "hybrid"
+# Engines to try if the preferred engine fails. Default: Tavily, then keyless
+# DuckDuckGo/Bing HTML search.
+fallback_engines = ["tavily", "duckduckgo", "bing"]
 # Bring your own Bing Search API key for primary Bing searches. Prefer using an env var.
 # Fallback Bing searches intentionally use keyless HTML search.
 # bing_api_key_env = "JCODE_BING_API_KEY"
@@ -228,6 +236,23 @@ bing_market = "en-US"
 # this. Configure here or via the JCODE_SEARXNG_URL environment variable, then
 # set engine = "searxng" or add it to fallback_engines.
 # searxng_url = "https://searx.example.org"
+#
+# Tavily Search API (fast, keyed). Reads the key from tavily_api_key below, the
+# TAVILY_API_KEYS env var (comma-separated keys allowed), or ~/.jcode/tavily.env.
+# tavily_api_key = ""
+# tavily_api_key_env = "TAVILY_API_KEYS"
+# Tavily search depth: "basic" (fast, cheap) or "advanced" (deeper).
+tavily_search_depth = "basic"
+#
+# last30days deep engine. Shells out to the installed last30days skill under
+# ~/.jcode/skills/last30days/ (or ./.jcode/skills/last30days/). It is slow (tens
+# of seconds) so the hybrid engine bounds it with last30days_timeout_secs and
+# returns the fast (Tavily) results if it does not finish in time.
+last30days_enabled = true
+# last30days_script = ""  # explicit path to last30days.py (overrides skill lookup)
+last30days_timeout_secs = 75
+# Keyless/free last30days sources used for the deep leg.
+last30days_sources = "reddit,hackernews,github,grounding"
 
 [tools]
 # Controls which built-in tools are sent to the model.

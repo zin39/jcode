@@ -19,6 +19,10 @@ struct Args {
     /// Include network-backed tools (webfetch/websearch).
     #[arg(long)]
     include_network: bool,
+
+    /// Override the websearch query used by the network smoke test.
+    #[arg(long)]
+    query: Option<String>,
 }
 
 struct NoopProvider;
@@ -168,7 +172,7 @@ async fn main() -> Result<()> {
         cases.push(ToolCase {
             name: "websearch",
             label: "websearch rust async",
-            input: json!({"query": "rust async await"}),
+            input: json!({"query": args.query.clone().unwrap_or_else(|| "rust async await".to_string())}),
         });
     }
 

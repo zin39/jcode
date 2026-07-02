@@ -439,6 +439,42 @@ impl Config {
         {
             self.websearch.searxng_url = Some(v);
         }
+        if let Ok(v) = std::env::var("JCODE_TAVILY_API_KEY")
+            && !v.trim().is_empty()
+        {
+            self.websearch.tavily_api_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("JCODE_TAVILY_API_KEY_ENV")
+            && !v.trim().is_empty()
+        {
+            self.websearch.tavily_api_key_env = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_TAVILY_SEARCH_DEPTH")
+            && !v.trim().is_empty()
+        {
+            self.websearch.tavily_search_depth = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_ENABLED") {
+            self.websearch.last30days_enabled = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_SCRIPT")
+            && !v.trim().is_empty()
+        {
+            self.websearch.last30days_script = Some(v);
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_TIMEOUT_SECS")
+            && let Ok(parsed) = v.trim().parse::<u64>()
+        {
+            self.websearch.last30days_timeout_secs = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_SOURCES")
+            && !v.trim().is_empty()
+        {
+            self.websearch.last30days_sources = v;
+        }
 
         if let Ok(v) = std::env::var("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES") {
             let mut source_ids = Vec::new();

@@ -1138,6 +1138,18 @@ pub enum WebSearchEngine {
     /// `JCODE_SEARXNG_URL` env var) to point at a SearXNG instance. Useful on
     /// hosts where DuckDuckGo/Bing block the request via TLS fingerprinting.
     Searxng,
+    /// Tavily Search API (fast, keyed). Reads the API key from
+    /// `websearch.tavily_api_key`, the `TAVILY_API_KEYS` env var (comma-separated
+    /// keys allowed), or `~/.jcode/tavily.env`.
+    Tavily,
+    /// last30days skill (deep, engagement-scored social + web research). Shells
+    /// out to the installed `last30days.py` engine. Slow (tens of seconds) but
+    /// surfaces Reddit/HN/GitHub/etc. results ranked by real engagement.
+    Last30days,
+    /// Hybrid engine (default): fans out to Tavily and last30days concurrently,
+    /// cross-verifies their results (agreement between independent engines is a
+    /// strong quality signal), and returns a single merged, best-first ranking.
+    Hybrid,
 }
 
 impl WebSearchEngine {
@@ -1146,6 +1158,9 @@ impl WebSearchEngine {
             Self::Duckduckgo => "duckduckgo",
             Self::Bing => "bing",
             Self::Searxng => "searxng",
+            Self::Tavily => "tavily",
+            Self::Last30days => "last30days",
+            Self::Hybrid => "hybrid",
         }
     }
 
@@ -1154,6 +1169,9 @@ impl WebSearchEngine {
             "duckduckgo" | "ddg" => Some(Self::Duckduckgo),
             "bing" => Some(Self::Bing),
             "searxng" | "searx" => Some(Self::Searxng),
+            "tavily" => Some(Self::Tavily),
+            "last30days" | "l30d" | "last30" => Some(Self::Last30days),
+            "hybrid" | "verified" | "both" => Some(Self::Hybrid),
             _ => None,
         }
     }
@@ -1179,18 +1197,51 @@ pub struct WebSearchConfig {
     pub searxng_url: Option<String>,
     /// Environment variable containing the SearXNG base URL.
     pub searxng_url_env: String,
+    /// Optional Tavily Search API key (comma-separated keys allowed; the first
+    /// usable one is used). When empty, `tavily_api_key_env` and then
+    /// `~/.jcode/tavily.env` are consulted.
+    pub tavily_api_key: Option<String>,
+    /// Environment variable containing the Tavily API key(s).
+    pub tavily_api_key_env: String,
+    /// Tavily search depth: "basic" (fast, cheap) or "advanced" (deeper).
+    pub tavily_search_depth: String,
+    /// Whether the `last30days` and `hybrid` engines may shell out to the
+    /// installed last30days skill. Set false to disable the deep engine entirely.
+    pub last30days_enabled: bool,
+    /// Override path to the last30days engine script. When empty, jcode looks in
+    /// `~/.jcode/skills/last30days/scripts/last30days.py` then
+    /// `./.jcode/skills/last30days/scripts/last30days.py`.
+    pub last30days_script: Option<String>,
+    /// Max seconds the `hybrid`/`last30days` engines wait for the deep engine
+    /// before returning what the fast engine already found. Keeps searches
+    /// responsive since last30days can take tens of seconds.
+    pub last30days_timeout_secs: u64,
+    /// Comma-separated last30days source list for the deep leg (keeps it to the
+    /// keyless/free sources by default so no extra credentials are needed).
+    pub last30days_sources: String,
 }
 
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            engine: WebSearchEngine::Duckduckgo,
-            fallback_engines: vec![WebSearchEngine::Bing],
+            engine: WebSearchEngine::Hybrid,
+            fallback_engines: vec![
+                WebSearchEngine::Tavily,
+                WebSearchEngine::Duckduckgo,
+                WebSearchEngine::Bing,
+            ],
             bing_api_key: None,
             bing_api_key_env: "JCODE_BING_API_KEY".to_string(),
             bing_market: "en-US".to_string(),
             searxng_url: None,
             searxng_url_env: "JCODE_SEARXNG_URL".to_string(),
+            tavily_api_key: None,
+            tavily_api_key_env: "TAVILY_API_KEYS".to_string(),
+            tavily_search_depth: "basic".to_string(),
+            last30days_enabled: true,
+            last30days_script: None,
+            last30days_timeout_secs: 75,
+            last30days_sources: "reddit,hackernews,github,grounding".to_string(),
         }
     }
 }
