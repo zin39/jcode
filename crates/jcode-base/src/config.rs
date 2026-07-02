@@ -493,6 +493,9 @@ pub struct Config {
 
     /// Auto-judge configuration
     pub autojudge: AutoJudgeConfig,
+
+    /// Verification-before-done loop configuration
+    pub verify: VerifyConfig,
 }
 
 /// Agent Client Protocol adapter configuration.
@@ -531,6 +534,30 @@ pub struct ToolConfig {
     /// schemas load on demand via the load_tools meta-tool.
     #[serde(default)]
     pub deferred: bool,
+}
+
+/// Verification-before-done loop (spec: verify-loop-design).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VerifyConfig {
+    /// Enable verification loop on turns that edit files
+    pub enabled: bool,
+    /// Check commands to run (e.g. ["cargo check --quiet", "cargo fmt --check"])
+    pub commands: Vec<String>,
+    /// Max verify->fix attempts per turn before giving up
+    #[serde(default = "default_verify_max_attempts")]
+    pub max_attempts: u32,
+    /// Per-command timeout in seconds
+    #[serde(default = "default_verify_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_verify_max_attempts() -> u32 {
+    2
+}
+
+fn default_verify_timeout_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
