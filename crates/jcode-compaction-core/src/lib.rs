@@ -389,11 +389,10 @@ pub fn estimate_compaction_tokens_from_chars(total_chars: usize, token_budget: u
     // to be skipped entirely whenever `token_budget < DEFAULT_TOKEN_BUDGET / 2`
     // (100k), which silently gave small-context models (e.g. 32k/64k budgets)
     // an over-optimistic usage estimate and let them run past their real
-    // window before compaction kicked in. Clamp the overhead with
-    // `saturating_sub` so it never claims more than `token_budget` has to give,
-    // leaving at least `MIN_MESSAGE_TOKEN_FLOOR` of budget for message content
-    // even under pathologically tiny budgets.
-    let overhead = SYSTEM_OVERHEAD_TOKENS.min(token_budget.saturating_sub(MIN_MESSAGE_TOKEN_FLOOR));
+    // window before compaction kicked in. Overhead is capped at half the budget
+    // so estimate inflation alone cannot cross the critical threshold on
+    // small-context models, even under pathologically tiny budgets.
+    let overhead = SYSTEM_OVERHEAD_TOKENS.min(token_budget / 2);
     msg_tokens.saturating_add(overhead)
 }
 
@@ -896,12 +895,11 @@ mod tests {
             original_turn_count: 1,
         };
 
-        // Realistic small-context model budget (well above the overhead
-        // itself): full SYSTEM_OVERHEAD_TOKENS is accounted for, same as a
-        // large budget.
+        // Realistic small-context model budget: overhead capped at half the
+        // budget (16k), not the full SYSTEM_OVERHEAD_TOKENS constant (18k).
         assert_eq!(
             estimate_compaction_tokens(Some(&summary), 0, 32_000),
-            100 + SYSTEM_OVERHEAD_TOKENS
+            16100
         );
 
         // Pathologically tiny budget (smaller than the overhead constant
