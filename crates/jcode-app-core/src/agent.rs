@@ -843,7 +843,7 @@ impl Agent {
         {
             let (content, is_error) = match sdk_tool_results.remove(&tc.id) {
                 Some((sdk_content, sdk_is_error)) => (
-                    tools::cap_sdk_tool_content_for_history(&tc.name, sdk_content),
+                    tools::cap_sdk_tool_content_for_history(&tc.name, &self.session.id, &tc.id, sdk_content),
                     if sdk_is_error { Some(true) } else { None },
                 ),
                 None => (
