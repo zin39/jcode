@@ -585,3 +585,80 @@ async fn unknown_tool_error_lists_available_tools_and_suggestions() {
         "available list should include registered ambient tools: {msg}"
     );
 }
+
+#[test]
+fn test_expand_session_tools_roundtrip() {
+    let session_id = "test-expand-tools";
+    clear_session_tool_policy(session_id);
+
+    // Initially empty
+    let expanded = session_expanded_tools(session_id);
+    assert!(expanded.is_empty());
+
+    // Expand some tools
+    let tool_names = vec!["memory".to_string(), "websearch".to_string()];
+    expand_session_tools(session_id, &tool_names);
+
+    // Verify they're stored
+    let expanded = session_expanded_tools(session_id);
+    assert_eq!(expanded.len(), 2);
+    assert!(expanded.contains("memory"));
+    assert!(expanded.contains("websearch"));
+
+    // Expand more
+    expand_session_tools(session_id, &["gmail".to_string()]);
+    let expanded = session_expanded_tools(session_id);
+    assert_eq!(expanded.len(), 3);
+    assert!(expanded.contains("gmail"));
+
+    // Cleanup
+    clear_session_tool_policy(session_id);
+}
+
+#[tokio::test]
+async fn test_deferred_tool_index_excludes_core_tools() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+
+    let index = registry.deferred_tool_index().await;
+
+    // Check that all core tools are excluded
+    let indexed_names: std::collections::HashSet<_> =
+        index.iter().map(|(name, _)| name).cloned().collect();
+    for core_name in super::CORE_FULL_SCHEMA_TOOLS {
+        assert!(
+            !indexed_names.contains(&core_name.to_string()),
+            "core tool '{}' should not be in deferred index",
+            core_name
+        );
+    }
+
+    // Spot-check that non-core tools are present (e.g., memory, websearch)
+    assert!(
+        indexed_names.contains("memory"),
+        "memory should be in deferred index"
+    );
+    assert!(
+        indexed_names.contains("websearch"),
+        "websearch should be in deferred index"
+    );
+
+    // Check that descriptions are present and capped
+    for (_name, desc) in &index {
+        assert!(!desc.is_empty(), "description should not be empty");
+        assert!(
+            desc.len() <= 100,
+            "description should be capped at 100 chars, got: {}",
+            desc.len()
+        );
+    }
+
+    // Verify sorted by name
+    let names: Vec<_> = index.iter().map(|(n, _)| n).cloned().collect();
+    let mut sorted_names = names.clone();
+    sorted_names.sort();
+    assert_eq!(
+        names, sorted_names,
+        "deferred index should be sorted by name"
+    );
+}

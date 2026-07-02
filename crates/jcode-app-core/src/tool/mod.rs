@@ -17,6 +17,7 @@ mod gmail;
 mod goal;
 mod grep;
 mod invalid;
+mod load_tools;
 mod ls;
 mod lsp;
 pub mod mcp;
@@ -53,10 +54,19 @@ pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMod
 pub use jcode_tool_types::{ToolImage, ToolOutput};
 pub(crate) use session_search::spawn_recent_index_warmup;
 
+/// Tools that always ship full schemas even in deferred mode (spec:
+/// deferred-tool-schemas). load_tools must stay here or the model could
+/// never expand anything.
+pub const CORE_FULL_SCHEMA_TOOLS: &[&str] = &[
+    "bash", "read", "write", "edit", "multiedit", "ls", "glob", "grep",
+    "todo", "subagent", "load_tools",
+];
+
 #[derive(Clone, Debug, Default)]
 struct SessionToolPolicy {
     allowed_tools: Option<HashSet<String>>,
     disabled_tools: HashSet<String>,
+    expanded_tools: HashSet<String>,
 }
 
 static SESSION_TOOL_POLICIES: LazyLock<StdRwLock<HashMap<String, SessionToolPolicy>>> =
@@ -75,6 +85,7 @@ pub(crate) fn set_session_tool_policy(
         SessionToolPolicy {
             allowed_tools,
             disabled_tools,
+            expanded_tools: HashSet::new(),
         },
     );
 }
@@ -92,6 +103,29 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(session_id)
         .cloned()
+}
+
+/// Record deferred tools the session has explicitly loaded.
+pub fn expand_session_tools(session_id: &str, names: &[String]) {
+    let mut policies = SESSION_TOOL_POLICIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let policy = policies
+        .entry(session_id.to_string())
+        .or_insert_with(SessionToolPolicy::default);
+    for name in names {
+        policy.expanded_tools.insert(name.clone());
+    }
+}
+
+/// Return the set of deferred tools the session has explicitly loaded.
+pub fn session_expanded_tools(session_id: &str) -> HashSet<String> {
+    SESSION_TOOL_POLICIES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .map(|policy| policy.expanded_tools.clone())
+        .unwrap_or_default()
 }
 
 /// Registry of available tools (Arc-wrapped for sharing)
@@ -310,6 +344,11 @@ impl Registry {
             "conversation_search",
             conversation_search::ConversationSearchTool::new(compaction),
         );
+        Self::insert_tool(
+            &mut tools_map,
+            "load_tools",
+            load_tools::LoadToolsTool::new(registry.clone()),
+        );
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 
         let write_start = std::time::Instant::now();
@@ -357,6 +396,30 @@ impl Registry {
     pub async fn tool_names(&self) -> Vec<String> {
         let tools = self.tools.read().await;
         tools.keys().cloned().collect()
+    }
+
+    /// Return index of (name, first sentence of description) for all tools NOT
+    /// in CORE_FULL_SCHEMA_TOOLS, sorted by name. First sentence is extracted
+    /// by splitting on ". " and capped at 100 chars.
+    pub async fn deferred_tool_index(&self) -> Vec<(String, String)> {
+        let tools = self.tools.read().await;
+        let mut index: Vec<(String, String)> = tools
+            .iter()
+            .filter(|(name, _)| !CORE_FULL_SCHEMA_TOOLS.contains(&name.as_str()))
+            .map(|(name, tool)| {
+                let desc = tool.description();
+                let first_sentence = desc
+                    .split(". ")
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(100)
+                    .collect::<String>();
+                (name.clone(), first_sentence)
+            })
+            .collect();
+        index.sort_by(|a, b| a.0.cmp(&b.0));
+        index
     }
 
     /// Enable test mode for memory tools (isolated storage)

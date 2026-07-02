@@ -2,12 +2,22 @@ use anyhow::{Context, Result};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 use tract_hir::prelude::*;
 use tract_hir::infer::Factoid as _;
 
 pub const MODEL_NAME: &str = "all-MiniLM-L6-v2";
+
+/// Embedding model precision. fp32 is the long-standing default; fp16
+/// halves disk/download; int8 quarters it but depends on tract's
+/// quantized-op support — if load fails jcode falls back to fp32.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModelVariant {
+    Fp32,
+    Fp16,
+    Int8,
+}
 type RunnableEmbeddingModel =
     SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
@@ -84,10 +94,49 @@ where
 const EMBEDDING_DIM: usize = 384;
 const MAX_SEQ_LENGTH: usize = 256;
 
-const MODEL_URL: &str =
+const MODEL_URL_FP32: &str =
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx";
+const MODEL_URL_FP16: &str =
+    "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_fp16.onnx";
+const MODEL_URL_INT8: &str =
+    "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_int8.onnx";
 const TOKENIZER_URL: &str =
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
+
+fn parse_model_variant(value: Option<&str>) -> ModelVariant {
+    match value {
+        Some(v) => match v.to_lowercase().as_str() {
+            "fp16" => ModelVariant::Fp16,
+            "int8" => ModelVariant::Int8,
+            _ => ModelVariant::Fp32,
+        },
+        None => ModelVariant::Fp32,
+    }
+}
+
+fn model_variant() -> ModelVariant {
+    parse_model_variant(std::env::var("JCODE_EMBED_MODEL_VARIANT").ok().as_deref())
+}
+
+fn model_file_name(variant: ModelVariant) -> &'static str {
+    match variant {
+        ModelVariant::Fp32 => "model.onnx",
+        ModelVariant::Fp16 => "model_fp16.onnx",
+        ModelVariant::Int8 => "model_int8.onnx",
+    }
+}
+
+fn model_url(variant: ModelVariant) -> &'static str {
+    match variant {
+        ModelVariant::Fp32 => MODEL_URL_FP32,
+        ModelVariant::Fp16 => MODEL_URL_FP16,
+        ModelVariant::Int8 => MODEL_URL_INT8,
+    }
+}
+
+fn model_path(model_dir: &Path, variant: ModelVariant) -> PathBuf {
+    model_dir.join(model_file_name(variant))
+}
 
 pub type EmbeddingVec = Vec<f32>;
 
@@ -121,51 +170,85 @@ fn classify_input(name: &str) -> InputRole {
 
 impl Embedder {
     pub fn load_from_dir(model_dir: &Path) -> Result<Self> {
-        let model_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
+        let requested = model_variant();
 
-        if !model_path.exists() || !tokenizer_path.exists() {
-            download_model(model_dir)?;
-        }
+        // Try requested variant, then fallback to Fp32 if loading fails.
+        let variants_to_try = if requested == ModelVariant::Fp32 {
+            vec![ModelVariant::Fp32]
+        } else {
+            vec![requested, ModelVariant::Fp32]
+        };
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .or_else(|_| {
+                download_model(model_dir)?;
+                Tokenizer::from_file(&tokenizer_path)
+            })
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-        let raw = tract_onnx::onnx()
-            .model_for_path(&model_path)
-            .context("Failed to load ONNX model")?;
+        for variant in variants_to_try {
+            let model_path = model_path(model_dir, variant);
+            if !model_path.exists() {
+                download_model_variant(model_dir, variant)?;
+            }
 
-        // Determine each input's role (by name) and dtype (declared, else i64).
-        let input_outlets = raw
-            .input_outlets()
-            .context("Failed to read model input outlets")?
-            .to_vec();
-        let mut input_plan: Vec<(InputRole, DatumType)> = Vec::with_capacity(input_outlets.len());
-        for (ix, outlet) in input_outlets.iter().enumerate() {
-            let role = classify_input(&raw.node(outlet.node).name);
-            let dt = raw
-                .input_fact(ix)
-                .ok()
-                .and_then(|f| f.datum_type.concretize())
-                .unwrap_or(DatumType::I64);
-            input_plan.push((role, dt));
+            let load_result = tract_onnx::onnx()
+                .model_for_path(&model_path)
+                .and_then(|raw| {
+                    // Determine each input's role (by name) and dtype (declared, else i64).
+                    let input_outlets = raw
+                        .input_outlets()
+                        .context("Failed to read model input outlets")?
+                        .to_vec();
+                    let mut input_plan: Vec<(InputRole, DatumType)> =
+                        Vec::with_capacity(input_outlets.len());
+                    for (ix, outlet) in input_outlets.iter().enumerate() {
+                        let role = classify_input(&raw.node(outlet.node).name);
+                        let dt = raw
+                            .input_fact(ix)
+                            .ok()
+                            .and_then(|f| f.datum_type.concretize())
+                            .unwrap_or(DatumType::I64);
+                        input_plan.push((role, dt));
+                    }
+
+                    let mut model = raw;
+                    for (ix, (_, dt)) in input_plan.iter().enumerate() {
+                        model = model
+                            .with_input_fact(ix, InferenceFact::dt_shape(*dt, [1, MAX_SEQ_LENGTH]))?;
+                    }
+                    let model = model
+                        .into_optimized()
+                        .context("Failed to optimize model")?
+                        .into_runnable()
+                        .context("Failed to make model runnable")?;
+
+                    Ok((model, input_plan))
+                });
+
+            match load_result {
+                Ok((model, input_plan)) => {
+                    return Ok(Self {
+                        model,
+                        tokenizer,
+                        input_plan,
+                    });
+                }
+                Err(e) => {
+                    if variant != ModelVariant::Fp32 {
+                        eprintln!(
+                            "warning: {:?} embedding model failed to load; falling back to fp32: {}",
+                            variant, e
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
-        let mut model = raw;
-        for (ix, (_, dt)) in input_plan.iter().enumerate() {
-            model = model.with_input_fact(ix, InferenceFact::dt_shape(*dt, [1, MAX_SEQ_LENGTH]))?;
-        }
-        let model = model
-            .into_optimized()
-            .context("Failed to optimize model")?
-            .into_runnable()
-            .context("Failed to make model runnable")?;
-
-        Ok(Self {
-            model,
-            tokenizer,
-            input_plan,
-        })
+        anyhow::bail!("Failed to load embedding model with all variants")
     }
 
     pub fn embed(&self, text: &str) -> Result<EmbeddingVec> {
@@ -289,39 +372,72 @@ pub struct CrossEncoder {
 
 impl CrossEncoder {
     pub fn load_from_dir(model_dir: &Path) -> Result<Self> {
-        let model_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
+        let requested = model_variant();
+
+        // Try requested variant, then fallback to Fp32 if loading fails.
+        let variants_to_try = if requested == ModelVariant::Fp32 {
+            vec![ModelVariant::Fp32]
+        } else {
+            vec![requested, ModelVariant::Fp32]
+        };
+
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-        let raw = tract_onnx::onnx()
-            .model_for_path(&model_path)
-            .context("Failed to load cross-encoder ONNX model")?;
-        let input_outlets = raw.input_outlets().context("read input outlets")?.to_vec();
-        let mut input_plan: Vec<(InputRole, DatumType)> = Vec::with_capacity(input_outlets.len());
-        for (ix, outlet) in input_outlets.iter().enumerate() {
-            let role = classify_input(&raw.node(outlet.node).name);
-            let dt = raw
-                .input_fact(ix)
-                .ok()
-                .and_then(|f| f.datum_type.concretize())
-                .unwrap_or(DatumType::I64);
-            input_plan.push((role, dt));
+        for variant in variants_to_try {
+            let model_path = model_path(model_dir, variant);
+
+            let load_result = tract_onnx::onnx()
+                .model_for_path(&model_path)
+                .and_then(|raw| {
+                    let input_outlets = raw.input_outlets().context("read input outlets")?.to_vec();
+                    let mut input_plan: Vec<(InputRole, DatumType)> =
+                        Vec::with_capacity(input_outlets.len());
+                    for (ix, outlet) in input_outlets.iter().enumerate() {
+                        let role = classify_input(&raw.node(outlet.node).name);
+                        let dt = raw
+                            .input_fact(ix)
+                            .ok()
+                            .and_then(|f| f.datum_type.concretize())
+                            .unwrap_or(DatumType::I64);
+                        input_plan.push((role, dt));
+                    }
+                    let mut model = raw;
+                    for (ix, (_, dt)) in input_plan.iter().enumerate() {
+                        model = model
+                            .with_input_fact(ix, InferenceFact::dt_shape(*dt, [1, MAX_SEQ_LENGTH]))?;
+                    }
+                    let model = model
+                        .into_optimized()
+                        .context("optimize cross-encoder")?
+                        .into_runnable()
+                        .context("make cross-encoder runnable")?;
+                    Ok((model, input_plan))
+                });
+
+            match load_result {
+                Ok((model, input_plan)) => {
+                    return Ok(Self {
+                        model,
+                        tokenizer,
+                        input_plan,
+                    });
+                }
+                Err(e) => {
+                    if variant != ModelVariant::Fp32 {
+                        eprintln!(
+                            "warning: {:?} cross-encoder model failed to load; falling back to fp32: {}",
+                            variant, e
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
-        let mut model = raw;
-        for (ix, (_, dt)) in input_plan.iter().enumerate() {
-            model = model.with_input_fact(ix, InferenceFact::dt_shape(*dt, [1, MAX_SEQ_LENGTH]))?;
-        }
-        let model = model
-            .into_optimized()
-            .context("optimize cross-encoder")?
-            .into_runnable()
-            .context("make cross-encoder runnable")?;
-        Ok(Self {
-            model,
-            tokenizer,
-            input_plan,
-        })
+
+        anyhow::bail!("Failed to load cross-encoder model with all variants")
     }
 
     /// Relevance score for a (query, passage) pair. Higher = more relevant.
@@ -411,12 +527,14 @@ pub fn find_similar(
 }
 
 pub fn is_model_available(model_dir: &Path) -> bool {
-    model_dir.join("model.onnx").exists() && model_dir.join("tokenizer.json").exists()
+    let variant = model_variant();
+    model_path(model_dir, variant).exists() && model_dir.join("tokenizer.json").exists()
 }
 
 fn download_model(model_dir: &Path) -> Result<()> {
     let model_dir = model_dir.to_path_buf();
-    match std::thread::spawn(move || download_model_blocking(&model_dir)).join() {
+    let variant = model_variant();
+    match std::thread::spawn(move || download_model_blocking(&model_dir, variant)).join() {
         Ok(result) => result,
         Err(panic) => {
             let panic_msg = if let Some(msg) = panic.downcast_ref::<&str>() {
@@ -431,7 +549,24 @@ fn download_model(model_dir: &Path) -> Result<()> {
     }
 }
 
-fn download_model_blocking(model_dir: &Path) -> Result<()> {
+fn download_model_variant(model_dir: &Path, variant: ModelVariant) -> Result<()> {
+    let model_dir = model_dir.to_path_buf();
+    match std::thread::spawn(move || download_model_blocking(&model_dir, variant)).join() {
+        Ok(result) => result,
+        Err(panic) => {
+            let panic_msg = if let Some(msg) = panic.downcast_ref::<&str>() {
+                (*msg).to_string()
+            } else if let Some(msg) = panic.downcast_ref::<String>() {
+                msg.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            anyhow::bail!("Embedding model download thread panicked: {}", panic_msg);
+        }
+    }
+}
+
+fn download_model_blocking(model_dir: &Path, variant: ModelVariant) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("jcode-embedding/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))
@@ -439,9 +574,10 @@ fn download_model_blocking(model_dir: &Path) -> Result<()> {
 
     std::fs::create_dir_all(model_dir)?;
 
-    let model_path = model_dir.join("model.onnx");
+    let model_path = model_path(model_dir, variant);
     if !model_path.exists() {
-        let response = client.get(MODEL_URL).send()?;
+        let url = model_url(variant);
+        let response = client.get(url).send()?;
         if !response.status().is_success() {
             anyhow::bail!("Failed to download model: {}", response.status());
         }
@@ -555,7 +691,10 @@ mod tests {
     fn cross_encoder_scores_relevant_higher_if_present() {
         let dir = std::env::var_os("HOME")
             .map(|h| std::path::PathBuf::from(h).join("jcode-memory-bench/models/ce-minilm-l6"))
-            .filter(|d| d.join("model.onnx").exists() && d.join("tokenizer.json").exists());
+            .filter(|d| {
+                let variant = model_variant();
+                model_path(d, variant).exists() && d.join("tokenizer.json").exists()
+            });
         let Some(d) = dir else {
             eprintln!("skip: cross-encoder model not present locally");
             return;
@@ -568,6 +707,63 @@ mod tests {
         assert!(
             rel > unrel,
             "cross-encoder must score relevant ({rel:.3}) > irrelevant ({unrel:.3})"
+        );
+    }
+
+    #[test]
+    fn parse_model_variant_defaults_to_fp32() {
+        assert_eq!(parse_model_variant(None), ModelVariant::Fp32);
+        assert_eq!(parse_model_variant(Some("garbage")), ModelVariant::Fp32);
+        assert_eq!(parse_model_variant(Some("")), ModelVariant::Fp32);
+    }
+
+    #[test]
+    fn parse_model_variant_case_insensitive() {
+        assert_eq!(parse_model_variant(Some("INT8")), ModelVariant::Int8);
+        assert_eq!(parse_model_variant(Some("int8")), ModelVariant::Int8);
+        assert_eq!(parse_model_variant(Some("fp16")), ModelVariant::Fp16);
+        assert_eq!(parse_model_variant(Some("FP16")), ModelVariant::Fp16);
+        assert_eq!(parse_model_variant(Some("fp32")), ModelVariant::Fp32);
+        assert_eq!(parse_model_variant(Some("FP32")), ModelVariant::Fp32);
+    }
+
+    #[test]
+    fn model_file_name_matches_variant() {
+        assert_eq!(model_file_name(ModelVariant::Fp32), "model.onnx");
+        assert_eq!(model_file_name(ModelVariant::Fp16), "model_fp16.onnx");
+        assert_eq!(model_file_name(ModelVariant::Int8), "model_int8.onnx");
+    }
+
+    #[test]
+    fn model_url_matches_variant() {
+        assert_eq!(
+            model_url(ModelVariant::Fp32),
+            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+        );
+        assert_eq!(
+            model_url(ModelVariant::Fp16),
+            "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_fp16.onnx"
+        );
+        assert_eq!(
+            model_url(ModelVariant::Int8),
+            "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_int8.onnx"
+        );
+    }
+
+    #[test]
+    fn model_path_helper_builds_correct_path() {
+        let dir = std::path::Path::new("/tmp/models");
+        assert_eq!(
+            model_path(dir, ModelVariant::Fp32),
+            std::path::PathBuf::from("/tmp/models/model.onnx")
+        );
+        assert_eq!(
+            model_path(dir, ModelVariant::Fp16),
+            std::path::PathBuf::from("/tmp/models/model_fp16.onnx")
+        );
+        assert_eq!(
+            model_path(dir, ModelVariant::Int8),
+            std::path::PathBuf::from("/tmp/models/model_int8.onnx")
         );
     }
 }

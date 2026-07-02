@@ -230,6 +230,11 @@ pub struct Agent {
     /// MCP tools to wait for), this is set so the per-turn registry scan stops.
     /// Reset whenever the tool list is intentionally unlocked.
     mcp_late_register_resolved: bool,
+    /// Tracks the size of the session's expanded tool set to detect growth.
+    /// When deferred mode is on and expansion size grows, the locked_tools
+    /// snapshot is invalidated to include newly-expanded schemas (spec:
+    /// deferred-tool-schemas, invalidation via load_tools).
+    last_expanded_count: usize,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
     /// Whether memory features are enabled for this session
@@ -298,6 +303,7 @@ impl Agent {
             last_usage: TokenUsage::default(),
             locked_tools: None,
             mcp_late_register_resolved: false,
+            last_expanded_count: 0,
             system_prompt_override: None,
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,
@@ -576,6 +582,7 @@ impl Agent {
         self.last_usage = TokenUsage::default();
         self.locked_tools = None;
         self.mcp_late_register_resolved = false;
+        self.last_expanded_count = 0;
         self.rewind_undo_snapshot = None;
     }
 
@@ -886,7 +893,7 @@ impl Agent {
         {
             let (content, is_error) = match sdk_tool_results.remove(&tc.id) {
                 Some((sdk_content, sdk_is_error)) => (
-                    tools::cap_sdk_tool_content_for_history(&tc.name, sdk_content),
+                    tools::cap_sdk_tool_content_for_history(&tc.name, &self.session.id, &tc.id, sdk_content),
                     if sdk_is_error { Some(true) } else { None },
                 ),
                 None => (
