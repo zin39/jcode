@@ -55,6 +55,8 @@ struct SubagentInput {
     session_id: Option<String>,
     #[serde(default)]
     output_mode: SubagentOutputMode,
+    #[serde(default)]
+    output_schema: Option<Value>,
     #[serde(rename = "command", default)]
     _command: Option<String>,
 }
@@ -85,42 +87,7 @@ impl Tool for SubagentTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["description", "prompt", "subagent_type"],
-            "properties": {
-                "intent": super::intent_schema_property(),
-                "description": {
-                    "type": "string",
-                    "description": "Task description."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Task prompt."
-                },
-                "subagent_type": {
-                    "type": "string",
-                    "description": "Subagent type."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Model override."
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": "Existing session ID."
-                },
-                "output_mode": {
-                    "type": "string",
-                    "enum": ["answer", "compact", "full_transcript"],
-                    "description": "Return mode. 'answer' returns the final answer only, 'compact' adds a user-visible transcript, and 'full_transcript' adds raw persisted messages. Defaults to 'answer'."
-                },
-                "command": {
-                    "type": "string",
-                    "description": "Source command."
-                }
-            }
-        })
+        subagent_parameters_schema()
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
@@ -226,8 +193,18 @@ impl Tool for SubagentTool {
             Some(allowed),
         );
 
+        let augmented_prompt = if let Some(ref schema) = params.output_schema {
+            format!(
+                "{}\n\n## Output contract\nYour FINAL message must be exactly one JSON object (no prose, no code fences) conforming to this JSON Schema:\n{}",
+                params.prompt,
+                serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string())
+            )
+        } else {
+            params.prompt.clone()
+        };
+
         let start = std::time::Instant::now();
-        let final_text = agent.run_once_capture(&params.prompt).await.map_err(|err| {
+        let final_text = agent.run_once_capture(&augmented_prompt).await.map_err(|err| {
             logging::warn(&format!(
                 "[tool:subagent] subagent failed description={} type={} session_id={} model={} error={}",
                 params.description,
@@ -239,6 +216,19 @@ impl Tool for SubagentTool {
             err
         })?;
         let sub_session_id = agent.session_id().to_string();
+
+        let (processed_text, structured_success) = if let Some(_) = params.output_schema {
+            match enforce_structured_output(&final_text) {
+                Ok(canonical) => (canonical, true),
+                Err(err) => {
+                    let prefixed = format!("[structured output requested but the final message was not valid JSON: {}]\n\n{}", err, final_text);
+                    (prefixed, false)
+                }
+            }
+        } else {
+            (final_text, true)
+        };
+
         let history = if params.output_mode == SubagentOutputMode::Compact {
             Some(agent.get_history())
         } else {
@@ -268,22 +258,70 @@ impl Tool for SubagentTool {
         summary.sort_by(|a, b| a.id.cmp(&b.id));
 
         let output = format_subagent_output(
-            &final_text,
+            &processed_text,
             &sub_session_id,
             params.output_mode,
             history.as_deref(),
             full_transcript.as_deref(),
         );
 
+        let mut metadata = json!({
+            "summary": summary,
+            "sessionId": sub_session_id,
+            "model": resolved_model,
+            "outputMode": params.output_mode.as_str(),
+        });
+        if params.output_schema.is_some() {
+            metadata["structured"] = json!(structured_success);
+        }
+
         Ok(ToolOutput::new(output)
             .with_title(subagent_display_title(&params, &resolved_model))
-            .with_metadata(json!({
-                "summary": summary,
-                "sessionId": sub_session_id,
-                "model": resolved_model,
-                "outputMode": params.output_mode.as_str(),
-            })))
+            .with_metadata(metadata))
     }
+}
+
+fn subagent_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["description", "prompt", "subagent_type"],
+        "properties": {
+            "intent": super::intent_schema_property(),
+            "description": {
+                "type": "string",
+                "description": "Task description."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Task prompt."
+            },
+            "subagent_type": {
+                "type": "string",
+                "description": "Subagent type."
+            },
+            "model": {
+                "type": "string",
+                "description": "Model override."
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Existing session ID."
+            },
+            "output_mode": {
+                "type": "string",
+                "enum": ["answer", "compact", "full_transcript"],
+                "description": "Return mode. 'answer' returns the final answer only, 'compact' adds a user-visible transcript, and 'full_transcript' adds raw persisted messages. Defaults to 'answer'."
+            },
+            "output_schema": {
+                "type": "object",
+                "description": "Optional JSON Schema. When set, the subagent must answer with a single JSON object; the result is parse-checked (structural JSON check, not full schema validation) and returned as canonical JSON."
+            },
+            "command": {
+                "type": "string",
+                "description": "Source command."
+            }
+        }
+    })
 }
 
 fn subagent_title(params: &SubagentInput) -> String {
@@ -307,6 +345,31 @@ impl SubagentOutputMode {
             Self::Compact => "compact",
             Self::FullTranscript => "full_transcript",
         }
+    }
+}
+
+/// Best-effort structural check for schema-requested subagent output.
+/// Strips one ```/```json fence pair if present, then requires valid JSON.
+fn enforce_structured_output(final_text: &str) -> Result<String, String> {
+    let trimmed = final_text.trim();
+
+    // Strip markdown fence if present
+    let content = if trimmed.starts_with("```json") {
+        let after_fence = trimmed.strip_prefix("```json").unwrap_or("").trim_start();
+        after_fence.strip_suffix("```").unwrap_or(after_fence).trim()
+    } else if trimmed.starts_with("```") {
+        let after_fence = trimmed.strip_prefix("```").unwrap_or("").trim_start();
+        after_fence.strip_suffix("```").unwrap_or(after_fence).trim()
+    } else {
+        trimmed
+    };
+
+    match serde_json::from_str::<Value>(content) {
+        Ok(value) => {
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| format!("Failed to serialize parsed JSON: {}", e))
+        }
+        Err(e) => Err(format!("Invalid JSON: {}", e)),
     }
 }
 
@@ -443,6 +506,7 @@ mod tests {
             model: None,
             session_id: None,
             output_mode: SubagentOutputMode::Answer,
+            output_schema: None,
             _command: None,
         };
 
@@ -539,5 +603,57 @@ mod tests {
     #[test]
     fn compact_history_formats_empty_transcript() {
         assert_eq!(format_compact_subagent_history(&[]), "(empty transcript)\n");
+    }
+
+    #[test]
+    fn enforce_structured_output_accepts_valid_json() {
+        let input = r#"{"key": "value", "number": 42}"#;
+        let result = super::enforce_structured_output(input);
+        assert!(result.is_ok());
+        let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["key"], "value");
+        assert_eq!(parsed["number"], 42);
+    }
+
+    #[test]
+    fn enforce_structured_output_strips_json_fence() {
+        let input = r#"```json
+{"key": "value"}
+```"#;
+        let result = super::enforce_structured_output(input);
+        assert!(result.is_ok());
+        let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn enforce_structured_output_strips_code_fence() {
+        let input = r#"```
+{"key": "value"}
+```"#;
+        let result = super::enforce_structured_output(input);
+        assert!(result.is_ok());
+        let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn enforce_structured_output_rejects_invalid_json() {
+        let input = r#"this is not json"#;
+        let result = super::enforce_structured_output(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn parameters_schema_includes_output_schema_property() {
+        let schema = super::subagent_parameters_schema();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("output_schema"));
+        assert_eq!(props["output_schema"]["type"], "object");
+        assert!(props["output_schema"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("JSON Schema"));
     }
 }
