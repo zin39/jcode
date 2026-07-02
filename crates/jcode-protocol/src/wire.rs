@@ -729,6 +729,15 @@ pub enum ServerEvent {
     #[serde(rename = "status_detail")]
     StatusDetail { detail: String },
 
+    /// Live status of a child subagent (rebroadcast under the parent session)
+    /// so remote clients can show subagent activity in the status line.
+    #[serde(rename = "subagent_status")]
+    SubagentStatus {
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+
     /// Provider has finished the visible assistant message, but the turn may still be
     /// finalizing bookkeeping such as session IDs or completion trailers.
     #[serde(rename = "message_end")]

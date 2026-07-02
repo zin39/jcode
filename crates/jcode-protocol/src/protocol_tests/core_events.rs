@@ -245,6 +245,41 @@ fn test_status_detail_event_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn test_subagent_status_event_roundtrip() -> Result<()> {
+    let event = ServerEvent::SubagentStatus {
+        status: "running grep".to_string(),
+        model: Some("claude-opus".to_string()),
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"subagent_status\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::SubagentStatus { status, model } = decoded else {
+        return Err(anyhow!("wrong event type"));
+    };
+    assert_eq!(status, "running grep");
+    assert_eq!(model.as_deref(), Some("claude-opus"));
+    Ok(())
+}
+
+#[test]
+fn test_subagent_status_event_with_no_model_roundtrip() -> Result<()> {
+    let event = ServerEvent::SubagentStatus {
+        status: "calling API".to_string(),
+        model: None,
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"subagent_status\""));
+    assert!(!json.contains("\"model\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::SubagentStatus { status, model } = decoded else {
+        return Err(anyhow!("wrong event type"));
+    };
+    assert_eq!(status, "calling API");
+    assert!(model.is_none());
+    Ok(())
+}
+
+#[test]
 fn test_generated_image_event_roundtrip() -> Result<()> {
     let event = ServerEvent::GeneratedImage {
         id: "ig_123".to_string(),
