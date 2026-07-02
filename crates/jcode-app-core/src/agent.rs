@@ -15,6 +15,7 @@ mod turn_execution;
 mod turn_loops;
 mod turn_streaming_mpsc;
 mod utils;
+mod verify;
 
 use self::streaming::{send_stream_keepalive_mpsc, stream_keepalive_ticker};
 use self::tools::{
@@ -245,6 +246,10 @@ pub struct Agent {
     /// output tail to the global bus so the coordinator's inline gallery can
     /// render a live viewport. Off for normal sessions to avoid bus traffic.
     inline_output_tap: bool,
+    /// Files were modified by tools this turn (verify-loop spec).
+    turn_made_edits: bool,
+    /// Verification fix-cycles consumed this turn.
+    verify_attempts: u32,
 }
 
 impl Agent {
@@ -301,6 +306,8 @@ impl Agent {
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
             inline_output_tap: false,
+            turn_made_edits: false,
+            verify_attempts: 0,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
