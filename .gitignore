@@ -18,3 +18,7 @@ target-ttest*/
 /*.avif
 /*.mp4
 /*.png
+
+# local artifacts
+dist/
+.claude/worktrees/

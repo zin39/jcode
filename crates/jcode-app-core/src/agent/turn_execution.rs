@@ -315,32 +315,68 @@ impl Agent {
         // `mcp_late_register_resolved` flag makes this a one-shot check so we do
         // not rescan the registry on every subsequent turn.
         if let Some(ref locked) = self.locked_tools {
-            if self.mcp_late_register_resolved {
+            // In deferred mode, check if the expanded tool set has grown.
+            // If so, invalidate the snapshot so newly-expanded tools are included.
+            if crate::config::config().tools.deferred {
+                let current_expanded = crate::tool::session_expanded_tools(&self.session.id);
+                let current_count = current_expanded.len();
+                if current_count > self.last_expanded_count {
+                    logging::info(
+                        "Deferred tools expanded after snapshot lock — rebuilding to include \
+                         newly-expanded schemas. This is one intentional prompt-cache miss.",
+                    );
+                    self.last_expanded_count = current_count;
+                    self.locked_tools = None;
+                    self.cache_tracker.reset();
+                    // Drop through to rebuild below.
+                } else if self.mcp_late_register_resolved {
+                    return locked.clone();
+                } else if self.registry_has_new_mcp_tools(locked).await {
+                    logging::info(
+                        "MCP tools registered after first turn locked the tool snapshot — \
+                         rebuilding once to expose them. This is one intentional prompt-cache \
+                         miss; we accept it so the agent is reachable immediately at spawn \
+                         instead of blocking on MCP connection (#206).",
+                    );
+                    self.mcp_late_register_resolved = true;
+                    self.locked_tools = None;
+                    self.cache_tracker.reset();
+                } else {
+                    return locked.clone();
+                }
+            } else if self.mcp_late_register_resolved {
                 return locked.clone();
-            }
-            if self.registry_has_new_mcp_tools(locked).await {
+            } else if self.registry_has_new_mcp_tools(locked).await {
                 logging::info(
                     "MCP tools registered after first turn locked the tool snapshot — \
                      rebuilding once to expose them. This is one intentional prompt-cache \
                      miss; we accept it so the agent is reachable immediately at spawn \
                      instead of blocking on MCP connection (#206).",
                 );
-                // Latch the one-shot guard and drop the stale snapshot directly.
-                // We intentionally do NOT call `unlock_tools()` here, because that
-                // re-arms the guard (it is the explicit-reload path) and would let
-                // the recheck fire again on every later turn.
                 self.mcp_late_register_resolved = true;
                 self.locked_tools = None;
                 self.cache_tracker.reset();
             } else {
-                // No MCP tools have appeared. They may still be connecting, so
-                // leave the guard unset and re-check on the next turn. Once they
-                // appear (or never do, after the registry settles) we stop.
                 return locked.clone();
             }
         }
 
-        let tools = self.build_filtered_tool_definitions().await;
+        let mut tools = self.build_filtered_tool_definitions().await;
+
+        // Append deferred tool index to load_tools description when deferred mode is on.
+        if crate::config::config().tools.deferred {
+            if let Some(lt) = tools.iter_mut().find(|d| d.name == "load_tools") {
+                let index = self.registry.deferred_tool_index().await;
+                if !index.is_empty() {
+                    let mut desc = lt.description.clone();
+                    desc.push_str("\n\nDeferred tools available to load:\n");
+                    for (name, summary) in &index {
+                        desc.push_str(&format!("- {name} — {summary}\n"));
+                    }
+                    lt.description = desc;
+                }
+            }
+        }
 
         // Lock the tool list to prevent cache invalidation when more tools
         // arrive asynchronously mid-session.
@@ -349,6 +385,13 @@ impl Agent {
             tools.len()
         ));
         self.locked_tools = Some(tools.clone());
+
+        // Update expanded count when locking a fresh snapshot (deferred mode).
+        if crate::config::config().tools.deferred {
+            let current_expanded = crate::tool::session_expanded_tools(&self.session.id);
+            self.last_expanded_count = current_expanded.len();
+        }
+
         tools
     }
 
@@ -360,6 +403,14 @@ impl Agent {
             tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
         }
         Self::apply_selfdev_tool_surface(&mut tools, self.session.is_canary);
+
+        // Apply deferred tool filtering: when deferred mode is on, drop definitions
+        // not in CORE_FULL_SCHEMA_TOOLS ∪ expanded set.
+        if crate::config::config().tools.deferred {
+            let expanded = crate::tool::session_expanded_tools(&self.session.id);
+            Self::apply_deferred_filter(&mut tools, &expanded);
+        }
+
         tools
     }
 
@@ -378,6 +429,17 @@ impl Agent {
                 tool.input_schema = crate::tool::selfdev::SelfDevTool::schema_for(is_canary);
             }
         }
+    }
+
+    /// Apply deferred tool filtering: keep only tools in CORE_FULL_SCHEMA_TOOLS
+    /// or the session's expanded set.
+    fn apply_deferred_filter(
+        tools: &mut Vec<ToolDefinition>,
+        expanded: &std::collections::HashSet<String>,
+    ) {
+        tools.retain(|d| {
+            crate::tool::CORE_FULL_SCHEMA_TOOLS.contains(&d.name.as_str()) || expanded.contains(&d.name)
+        });
     }
 
     /// Returns true if the registry contains `mcp__*` tools (subject to the
@@ -855,5 +917,95 @@ impl Agent {
                 0
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_apply_deferred_filter_keeps_core_tools() {
+        let mut defs = vec![
+            ToolDefinition {
+                name: "bash".to_string(),
+                description: "Execute shell commands".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "memory".to_string(),
+                description: "Manage memory".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        let expanded = HashSet::new();
+
+        Agent::apply_deferred_filter(&mut defs, &expanded);
+
+        // bash and read are core, memory is not
+        assert_eq!(defs.len(), 2);
+        assert!(defs.iter().any(|d| d.name == "bash"));
+        assert!(defs.iter().any(|d| d.name == "read"));
+        assert!(!defs.iter().any(|d| d.name == "memory"));
+    }
+
+    #[test]
+    fn test_apply_deferred_filter_keeps_expanded_tools() {
+        let mut defs = vec![
+            ToolDefinition {
+                name: "bash".to_string(),
+                description: "Execute shell commands".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "memory".to_string(),
+                description: "Manage memory".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "websearch".to_string(),
+                description: "Search the web".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert("memory".to_string());
+
+        Agent::apply_deferred_filter(&mut defs, &expanded);
+
+        // bash (core), memory (expanded), websearch (neither)
+        assert_eq!(defs.len(), 2);
+        assert!(defs.iter().any(|d| d.name == "bash"));
+        assert!(defs.iter().any(|d| d.name == "memory"));
+        assert!(!defs.iter().any(|d| d.name == "websearch"));
+    }
+
+    #[test]
+    fn test_apply_deferred_filter_keeps_load_tools() {
+        let mut defs = vec![
+            ToolDefinition {
+                name: "load_tools".to_string(),
+                description: "Load deferred tools".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "memory".to_string(),
+                description: "Manage memory".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        let expanded = HashSet::new();
+
+        Agent::apply_deferred_filter(&mut defs, &expanded);
+
+        // load_tools is core, memory is not
+        assert_eq!(defs.len(), 1);
+        assert!(defs.iter().any(|d| d.name == "load_tools"));
     }
 }
