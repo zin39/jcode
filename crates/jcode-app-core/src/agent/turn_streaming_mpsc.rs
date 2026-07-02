@@ -1075,6 +1075,17 @@ impl Agent {
             // Injecting before tool_results would break the API requirement that
             // tool_use must be immediately followed by tool_result.
             if tool_calls.is_empty() {
+                // Graceful shutdown can fire while awaiting the next stream
+                // event (breaking the inner loop above without setting any
+                // local marker); honor it here the same way the TextDelta
+                // path does, otherwise handle_streaming_no_tool_calls may
+                // decide to continue the turn and the shutdown gets dropped.
+                if self.is_graceful_shutdown() {
+                    logging::info(
+                        "Graceful shutdown during streaming - stopping turn without further continuation",
+                    );
+                    break;
+                }
                 match self.handle_streaming_no_tool_calls(
                     stop_reason.as_deref(),
                     &mut incomplete_continuations,
@@ -1118,6 +1129,7 @@ impl Agent {
             ));
 
             if self.provider.handles_tools_internally() {
+                self.persist_provider_handled_tool_results(&tool_calls, &mut sdk_tool_results);
                 tool_calls.retain(|tc| JCODE_NATIVE_TOOLS.contains(&tc.name.as_str()));
                 if tool_calls.is_empty() {
                     // === INJECTION POINT D: After provider-handled tools, before next API call ===

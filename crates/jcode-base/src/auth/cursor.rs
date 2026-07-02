@@ -505,8 +505,15 @@ pub async fn refresh_resolved_tokens(
         .context("Cursor token was rejected and no refresh token is available")?;
     let mut refreshed = refresh_direct_access_token(client, refresh_token).await?;
     refreshed.source = tokens.source;
-    if tokens.source == "cursor_auth_file" {
-        let _ = save_auth_file_tokens(&refreshed);
+    if tokens.source == "cursor_auth_file"
+        && let Err(error) = save_auth_file_tokens(&refreshed)
+    {
+        // The refreshed token still works for this process; warn so the user
+        // knows the on-disk token is stale and the next start will refresh again.
+        crate::logging::warn(&format!(
+            "Cursor token refreshed but could not be persisted: {}",
+            error
+        ));
     }
     Ok(refreshed)
 }

@@ -286,13 +286,14 @@ pub fn active_backend() -> Box<dyn EmbeddingBackend> {
 /// `None` when remote embeddings are not selected/available.
 pub fn openai_backend_from_config() -> Option<OpenAiEmbeddingBackend> {
     let agents = &crate::config::config().agents;
-    if !agents.memory_embedding_backend.eq_ignore_ascii_case("openai") {
+    if !agents
+        .memory_embedding_backend
+        .eq_ignore_ascii_case("openai")
+    {
         return None;
     }
-    let api_key = crate::provider_catalog::load_api_key_from_env_or_config(
-        "OPENAI_API_KEY",
-        "openai.env",
-    )?;
+    let api_key =
+        crate::provider_catalog::load_api_key_from_env_or_config("OPENAI_API_KEY", "openai.env")?;
     let model = agents
         .memory_embedding_model
         .clone()

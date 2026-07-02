@@ -8,8 +8,8 @@ use super::{
     register_session_interrupt_queue, remove_background_tool_signal, remove_plan_participant,
     remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, rename_background_tool_signal, rename_plan_participant,
-    rename_session_interrupt_queue, swarm_id_for_dir, unregister_session_event_sender,
-    update_member_status,
+    rename_session_interrupt_queue, rename_stop_current_turn_signal, swarm_id_for_dir,
+    unregister_session_event_sender, update_member_status,
 };
 use crate::agent::Agent;
 use crate::message::ContentBlock;
@@ -120,6 +120,7 @@ async fn rename_shutdown_signal(
     }
     drop(signals);
     rename_background_tool_signal(old_session_id, new_session_id);
+    rename_stop_current_turn_signal(old_session_id, new_session_id);
 }
 
 #[allow(clippy::too_many_arguments)]

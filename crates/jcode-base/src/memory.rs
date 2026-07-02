@@ -702,11 +702,8 @@ impl MemoryManager {
             .filter_map(|&i| entries[i].embedding.as_deref())
             .collect();
         let dense_scores = crate::embedding::batch_cosine_similarity(query_embedding, &emb_refs);
-        let mut dense: Vec<(usize, f32)> = dense_eligible
-            .iter()
-            .copied()
-            .zip(dense_scores)
-            .collect();
+        let mut dense: Vec<(usize, f32)> =
+            dense_eligible.iter().copied().zip(dense_scores).collect();
         dense.sort_by(|a, b| b.1.total_cmp(&a.1));
         dense.truncate(pool);
 
@@ -1123,9 +1120,7 @@ impl MemoryManager {
         session_id: &str,
     ) -> Result<Vec<String>> {
         if !memory_llm_judge_available() {
-            crate::logging::info(
-                "Memory transcript extraction skipped: LLM judge unavailable",
-            );
+            crate::logging::info("Memory transcript extraction skipped: LLM judge unavailable");
             return Ok(Vec::new());
         }
 

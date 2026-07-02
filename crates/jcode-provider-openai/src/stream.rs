@@ -293,6 +293,7 @@ fn stream_tool_call_from_state(
 pub fn parse_openai_response_event(
     data: &str,
     saw_text_delta: &mut bool,
+    saw_reasoning_delta: &mut bool,
     streaming_tool_calls: &mut HashMap<String, StreamingToolCallState>,
     completed_tool_items: &mut HashSet<String>,
     pending: &mut VecDeque<StreamEvent>,
@@ -338,6 +339,7 @@ pub fn parse_openai_response_event(
         }
         "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
             if let Some(delta) = event.delta {
+                *saw_reasoning_delta = true;
                 return Some(StreamEvent::ThinkingDelta(delta));
             }
         }
@@ -423,7 +425,9 @@ pub fn parse_openai_response_event(
                     completed_tool_items.remove(&item_id);
                     return None;
                 }
-                if let Some(event) = handle_openai_output_item(item, saw_text_delta, pending) {
+                if let Some(event) =
+                    handle_openai_output_item(item, saw_text_delta, saw_reasoning_delta, pending)
+                {
                     return Some(event);
                 }
             }
@@ -514,6 +518,7 @@ fn extract_stop_reason_from_response(response: &Value) -> Option<String> {
 pub fn handle_openai_output_item(
     item: Value,
     saw_text_delta: &mut bool,
+    saw_reasoning_delta: &mut bool,
     pending: &mut VecDeque<StreamEvent>,
 ) -> Option<StreamEvent> {
     let item_type = item.get("type")?.as_str()?;
@@ -619,7 +624,7 @@ pub fn handle_openai_output_item(
                 });
             }
 
-            if !summary.is_empty() {
+            if !summary.is_empty() && !*saw_reasoning_delta {
                 pending.push_back(StreamEvent::ThinkingStart);
                 pending.push_back(StreamEvent::ThinkingDelta(summary.join("\n")));
                 pending.push_back(StreamEvent::ThinkingEnd);
@@ -683,27 +688,32 @@ fn handle_openai_image_generation_item(
         .unwrap_or_else(|_| std::env::temp_dir())
         .join(".jcode")
         .join("generated-images");
+
+    // Image generation is a rare, heavy event and the write is a local-disk
+    // write of already-decoded bytes (fast). Do it synchronously so the path is
+    // guaranteed to exist by the time the GeneratedImage event / markdown that
+    // references it is emitted — a background write would let a follow-up read
+    // race ahead of the file being on disk.
+    let filename = format!("{}-{}.{}", timestamp_ms, safe_id, extension);
+    let path = dir.clone().join(&filename);
+    let metadata_path = path.with_extension("json");
+
     if let Err(err) = std::fs::create_dir_all(&dir) {
         jcode_logging::warn(&format!(
             "Failed to create OpenAI generated image directory: {}",
             err
         ));
-        return Some(StreamEvent::TextDelta(format!(
-            "\n[Generated image received ({} bytes), but Jcode could not save it.]\n",
-            image_bytes.len()
-        )));
+        return Some(StreamEvent::TextDelta(
+            "\n[Generated image received, but Jcode could not save it to disk.]\n".to_string(),
+        ));
     }
-
-    let filename = format!("{}-{}.{}", timestamp_ms, safe_id, extension);
-    let path = dir.join(filename);
-    if let Err(err) = std::fs::write(&path, image_bytes) {
+    if let Err(err) = std::fs::write(&path, &image_bytes) {
         jcode_logging::warn(&format!("Failed to save OpenAI generated image: {}", err));
         return Some(StreamEvent::TextDelta(
-            "\n[Generated image received, but Jcode could not save it.]\n".to_string(),
+            "\n[Generated image received, but Jcode could not save it to disk.]\n".to_string(),
         ));
     }
 
-    let metadata_path = path.with_extension("json");
     let mut response_item = item.clone();
     if let Some(object) = response_item.as_object_mut() {
         object.remove("result");
@@ -712,6 +722,9 @@ fn handle_openai_image_generation_item(
         .get("revised_prompt")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+
+    let byte_count = image_bytes.len() as u64;
+
     let metadata = serde_json::json!({
         "schema_version": 1,
         "provider": "openai",
@@ -721,18 +734,27 @@ fn handle_openai_image_generation_item(
         "created_at_unix_ms": timestamp_ms,
         "image_path": path.display().to_string(),
         "output_format": output_format,
-        "byte_count": std::fs::metadata(&path).map(|m| m.len()).unwrap_or_default(),
-        "revised_prompt": revised_prompt,
+        "byte_count": byte_count,
+        "revised_prompt": revised_prompt.clone(),
         "response_item": response_item,
     });
-    let metadata_path_string = match serde_json::to_vec_pretty(&metadata).ok().and_then(|bytes| {
-        std::fs::write(&metadata_path, bytes)
-            .ok()
-            .map(|_| metadata_path.clone())
-    }) {
-        Some(path) => Some(path.display().to_string()),
-        None => {
-            jcode_logging::warn("Failed to save OpenAI generated image metadata");
+
+    let metadata_path_string = match serde_json::to_vec_pretty(&metadata) {
+        Ok(json_bytes) => match std::fs::write(&metadata_path, json_bytes) {
+            Ok(()) => Some(metadata_path.display().to_string()),
+            Err(err) => {
+                jcode_logging::warn(&format!(
+                    "Failed to save OpenAI generated image metadata: {}",
+                    err
+                ));
+                None
+            }
+        },
+        Err(err) => {
+            jcode_logging::warn(&format!(
+                "Failed to serialize OpenAI generated image metadata: {}",
+                err
+            ));
             None
         }
     };
@@ -761,8 +783,10 @@ fn handle_openai_image_generation_item(
 pub struct OpenAIResponsesStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     buffer: String,
+    decoder: jcode_core::util::Utf8StreamDecoder,
     pending: VecDeque<StreamEvent>,
     saw_text_delta: bool,
+    saw_reasoning_delta: bool,
     streaming_tool_calls: HashMap<String, StreamingToolCallState>,
     completed_tool_items: HashSet<String>,
 }
@@ -772,8 +796,10 @@ impl OpenAIResponsesStream {
         Self {
             inner: Box::pin(stream),
             buffer: String::new(),
+            decoder: jcode_core::util::Utf8StreamDecoder::default(),
             pending: VecDeque::new(),
             saw_text_delta: false,
+            saw_reasoning_delta: false,
             streaming_tool_calls: HashMap::new(),
             completed_tool_items: HashSet::new(),
         }
@@ -803,6 +829,7 @@ impl OpenAIResponsesStream {
             if let Some(event) = parse_openai_response_event(
                 &data,
                 &mut self.saw_text_delta,
+                &mut self.saw_reasoning_delta,
                 &mut self.streaming_tool_calls,
                 &mut self.completed_tool_items,
                 &mut self.pending,
@@ -851,9 +878,8 @@ impl Stream for OpenAIResponsesStream {
 
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        self.buffer.push_str(text);
-                    }
+                    let text = self.decoder.decode(&bytes);
+                    self.buffer.push_str(&text);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("Stream error: {}", e))));
@@ -883,6 +909,7 @@ mod tests {
     #[test]
     fn parse_openai_response_event_ignores_malformed_json_chunks() {
         let mut saw_text_delta = false;
+        let mut saw_reasoning_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -890,6 +917,7 @@ mod tests {
         let event = parse_openai_response_event(
             "{not-json}",
             &mut saw_text_delta,
+            &mut saw_reasoning_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,
@@ -909,6 +937,7 @@ mod tests {
         // `response.completed` frame containing the phrase must still produce a
         // MessageEnd, otherwise the stream "ends before the completion marker".
         let mut saw_text_delta = false;
+        let mut saw_reasoning_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -932,6 +961,7 @@ mod tests {
         let event = parse_openai_response_event(
             &payload,
             &mut saw_text_delta,
+            &mut saw_reasoning_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,
@@ -946,6 +976,7 @@ mod tests {
     #[test]
     fn function_call_arguments_with_fallback_phrase_still_emit_tool_call() {
         let mut saw_text_delta = false;
+        let mut saw_reasoning_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -962,6 +993,7 @@ mod tests {
         let event = parse_openai_response_event(
             &payload,
             &mut saw_text_delta,
+            &mut saw_reasoning_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,
@@ -976,6 +1008,7 @@ mod tests {
     #[test]
     fn plain_text_fallback_notice_is_still_dropped() {
         let mut saw_text_delta = false;
+        let mut saw_reasoning_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -983,11 +1016,155 @@ mod tests {
         let event = parse_openai_response_event(
             "falling back from websockets to https transport",
             &mut saw_text_delta,
+            &mut saw_reasoning_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,
         );
 
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_parse_openai_response_output_item_done_emits_reasoning_item() {
+        let mut saw_text_delta = false;
+        let mut saw_reasoning_delta = false;
+        let mut streaming_tool_calls = HashMap::new();
+        let mut completed_tool_items = HashSet::new();
+        let mut pending = VecDeque::new();
+
+        let reasoning_done = r#"{
+            "type":"response.output_item.done",
+            "item":{
+                "id":"rs_123",
+                "type":"reasoning",
+                "status":"completed",
+                "encrypted_content":"enc_reasoning",
+                "summary":[{"type":"summary_text","text":"Checked the constraints."}]
+            }
+        }"#;
+
+        let event = parse_openai_response_event(
+            reasoning_done,
+            &mut saw_text_delta,
+            &mut saw_reasoning_delta,
+            &mut streaming_tool_calls,
+            &mut completed_tool_items,
+            &mut pending,
+        )
+        .expect("expected reasoning event");
+
+        match event {
+            StreamEvent::OpenAIReasoning {
+                id,
+                summary,
+                encrypted_content,
+                status,
+            } => {
+                assert_eq!(id, "rs_123");
+                assert_eq!(summary, vec!["Checked the constraints.".to_string()]);
+                assert_eq!(encrypted_content.as_deref(), Some("enc_reasoning"));
+                assert_eq!(status.as_deref(), Some("completed"));
+            }
+            other => panic!("expected OpenAIReasoning, got {:?}", other),
+        }
+
+        // Without any prior reasoning deltas, the done event must still emit the
+        // full joined summary via ThinkingStart/ThinkingDelta/ThinkingEnd.
+        assert!(matches!(
+            pending.pop_front(),
+            Some(StreamEvent::ThinkingStart)
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(StreamEvent::ThinkingDelta(text)) if text == "Checked the constraints."
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(StreamEvent::ThinkingEnd)
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn reasoning_delta_then_output_item_done_does_not_duplicate_thinking_text() {
+        // Regression: response.reasoning.delta / response.reasoning_summary_text.delta
+        // events stream ThinkingDelta chunks incrementally. The later
+        // response.output_item.done event for the same "reasoning" item must not
+        // re-emit the full joined summary via ThinkingStart+ThinkingDelta(full)+ThinkingEnd
+        // (mirrors the saw_text_delta guard already present on the "message" branch).
+        let mut saw_text_delta = false;
+        let mut saw_reasoning_delta = false;
+        let mut streaming_tool_calls = HashMap::new();
+        let mut completed_tool_items = HashSet::new();
+        let mut pending = VecDeque::new();
+
+        let delta_payload = serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_123",
+            "delta": "Checked the constraints."
+        })
+        .to_string();
+
+        let delta_event = parse_openai_response_event(
+            &delta_payload,
+            &mut saw_text_delta,
+            &mut saw_reasoning_delta,
+            &mut streaming_tool_calls,
+            &mut completed_tool_items,
+            &mut pending,
+        );
+        assert!(matches!(
+            delta_event,
+            Some(StreamEvent::ThinkingDelta(text)) if text == "Checked the constraints."
+        ));
+        assert!(saw_reasoning_delta);
+
+        let reasoning_done = r#"{
+            "type":"response.output_item.done",
+            "item":{
+                "id":"rs_123",
+                "type":"reasoning",
+                "status":"completed",
+                "encrypted_content":"enc_reasoning",
+                "summary":[{"type":"summary_text","text":"Checked the constraints."}]
+            }
+        }"#;
+
+        let done_event = parse_openai_response_event(
+            reasoning_done,
+            &mut saw_text_delta,
+            &mut saw_reasoning_delta,
+            &mut streaming_tool_calls,
+            &mut completed_tool_items,
+            &mut pending,
+        );
+
+        // Non-duplicating bookkeeping side effect (OpenAIReasoning, carrying the
+        // encrypted_content) must still be preserved.
+        match done_event {
+            Some(StreamEvent::OpenAIReasoning {
+                id,
+                summary,
+                encrypted_content,
+                status,
+            }) => {
+                assert_eq!(id, "rs_123");
+                assert_eq!(summary, vec!["Checked the constraints.".to_string()]);
+                assert_eq!(encrypted_content.as_deref(), Some("enc_reasoning"));
+                assert_eq!(status.as_deref(), Some("completed"));
+            }
+            other => panic!(
+                "expected OpenAIReasoning bookkeeping event, got {:?}",
+                other
+            ),
+        }
+
+        // No duplicate Thinking* events should be queued behind it.
+        assert!(
+            pending.is_empty(),
+            "expected no duplicate Thinking events, pending={:?}",
+            pending
+        );
     }
 }

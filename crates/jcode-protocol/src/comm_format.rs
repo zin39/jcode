@@ -455,7 +455,12 @@ pub fn format_comm_context_history(target: &str, messages: &[HistoryMessage]) ->
         );
         for msg in messages {
             let truncated = if msg.content.len() > 500 {
-                format!("{}...", &msg.content[..500])
+                // Back off to a char boundary so multi-byte content can't panic the slice.
+                let mut end = 500;
+                while end > 0 && !msg.content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &msg.content[..end])
             } else {
                 msg.content.clone()
             };
@@ -573,5 +578,25 @@ pub fn format_comm_channels(channels: &[SwarmChannelInfo]) -> String {
             ));
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod comm_format_tests {
+    use super::*;
+
+    #[test]
+    fn history_truncation_survives_multibyte_content_at_boundary() {
+        // 500-byte boundary lands mid-emoji: must not panic.
+        let mut content = "a".repeat(498);
+        content.push_str("🎉🎉🎉🎉");
+        let messages = vec![crate::HistoryMessage {
+            role: "assistant".to_string(),
+            content,
+            tool_calls: None,
+            tool_data: None,
+        }];
+        let out = format_comm_context_history("agent-1", &messages);
+        assert!(out.contains("..."));
     }
 }

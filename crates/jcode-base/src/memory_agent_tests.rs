@@ -169,7 +169,9 @@ fn dynamic_gate_keeps_top1_even_when_isolated() {
 #[test]
 fn dynamic_gate_respects_max_k_on_flat_scores() {
     // All scores ~equal: gate would keep all, but max_k caps the count.
-    let cands: Vec<_> = (0..8).map(|i| (mem(&format!("m{i}")), 0.0160_f32)).collect();
+    let cands: Vec<_> = (0..8)
+        .map(|i| (mem(&format!("m{i}")), 0.0160_f32))
+        .collect();
     let out = dynamic_gate_select(cands, 5);
     assert_eq!(out.len(), 5, "capped at max_k even when no gap appears");
 }

@@ -808,6 +808,7 @@ impl Agent {
 
             // If provider handles tools internally (like Claude Code CLI), only run native tools locally
             if self.provider.handles_tools_internally() {
+                self.persist_provider_handled_tool_results(&tool_calls, &mut sdk_tool_results);
                 tool_calls.retain(|tc| JCODE_NATIVE_TOOLS.contains(&tc.name.as_str()));
                 if tool_calls.is_empty() {
                     if !generated_image_contexts.is_empty() {
@@ -1073,23 +1074,45 @@ impl Agent {
         Ok(final_text)
     }
 
+    /// True when the prompt ends immediately after a tool result, i.e. the
+    /// model is about to respond right after tool execution (optionally with
+    /// a single memory-injection message appended on top). Only the tail of
+    /// `messages` is examined - an older tool result buried earlier in the
+    /// history must NOT count, since the model has since produced other
+    /// output and is no longer "immediately after" tool results.
     fn messages_end_with_tool_result(messages: &[Message]) -> bool {
-        messages.iter().rev().any(|message| {
-            if !matches!(message.role, Role::User) {
-                return false;
-            }
-            if message
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-            {
-                return true;
-            }
-            message.content.iter().any(|block| match block {
-                ContentBlock::Text { text, .. } => text.trim().starts_with("<system-reminder>"),
-                _ => false,
-            })
-        })
+        fn has_tool_result(message: &Message) -> bool {
+            matches!(message.role, Role::User)
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        }
+        fn is_memory_reminder(message: &Message) -> bool {
+            matches!(message.role, Role::User)
+                && message.content.iter().any(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        text.trim().starts_with("<system-reminder>")
+                    }
+                    _ => false,
+                })
+        }
+
+        let mut iter = messages.iter().rev();
+        let Some(last) = iter.next() else {
+            return false;
+        };
+        if has_tool_result(last) {
+            return true;
+        }
+        // Allow a single memory-injection message appended after tool
+        // results (see run_turn: memory is pushed as the final message).
+        if is_memory_reminder(last)
+            && let Some(prev) = iter.next()
+        {
+            return has_tool_result(prev);
+        }
+        false
     }
 }
 

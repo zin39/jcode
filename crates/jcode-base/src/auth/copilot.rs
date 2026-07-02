@@ -765,7 +765,14 @@ pub fn save_github_token(token: &str, username: &str) -> Result<()> {
 
     let mut config: HashMap<String, HashMap<String, String>> =
         if let Ok(data) = std::fs::read_to_string(&hosts_path) {
-            serde_json::from_str(&data).unwrap_or_default()
+            serde_json::from_str(&data).unwrap_or_else(|error| {
+                crate::logging::warn(&format!(
+                    "Ignoring corrupt {} ({}); rewriting it with the new login entry",
+                    hosts_path.display(),
+                    error
+                ));
+                HashMap::new()
+            })
         } else {
             HashMap::new()
         };

@@ -297,6 +297,72 @@ async fn refresh_session_control_handle(
     )
 }
 
+/// Read the next complete newline-delimited request line from `reader`.
+///
+/// This is **cancellation safe** and is intended to be used directly as a
+/// branch in the client `tokio::select!` loop. `read_buffer` is owned by the
+/// caller and persists across calls, so every byte pulled from the socket is
+/// moved into it immediately; the only `.await` point is
+/// [`AsyncBufReadExt::fill_buf`], which tokio guarantees consumes nothing when
+/// its future is dropped.
+///
+/// A previous implementation used `BufReader::read_line` directly as a select!
+/// branch. tokio documents `read_line` as **not** cancellation safe: when a
+/// sibling branch (a processing-done, disconnect, bus, or debug event) won the
+/// race while a request line was mid-read, the `read_line` future was dropped
+/// and the bytes it had already pulled from the socket were lost. Because the
+/// shared `line` buffer was cleared at the top of every loop iteration, that
+/// partial line vanished and desynced the newline-framed request stream, so the
+/// next read began mid-line and `decode_request` failed (or blocked waiting for
+/// a newline that had already been consumed).
+///
+/// Returns `Ok(Some(line))` with a complete line including its trailing `\n`
+/// (matching `read_line`), `Ok(None)` on a clean peer close, or the underlying
+/// I/O error. Like `read_line`, a non-UTF-8 line surfaces as an
+/// [`std::io::ErrorKind::InvalidData`] error.
+async fn read_client_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    read_buffer: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    loop {
+        // Serve a complete line already buffered from a previous (possibly
+        // cancelled) read before touching the socket again.
+        if let Some(pos) = read_buffer.iter().position(|&b| b == b'\n') {
+            let bytes: Vec<u8> = read_buffer.drain(..=pos).collect();
+            return bytes_to_line(bytes).map(Some);
+        }
+
+        // No complete line yet: pull more bytes. `fill_buf` is cancellation
+        // safe, so if a select! peer wins the race here nothing is consumed or
+        // lost. Any bytes we do pull are moved into the caller-owned
+        // `read_buffer` before we `consume` them, so a later cancellation cannot
+        // lose them either.
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // EOF. Surface any trailing partial line (no terminating newline) as
+            // a final request, matching `read_line`; the next call returns
+            // `Ok(None)` for a clean disconnect.
+            if read_buffer.is_empty() {
+                return Ok(None);
+            }
+            let bytes = std::mem::take(read_buffer);
+            return bytes_to_line(bytes).map(Some);
+        }
+        let len = chunk.len();
+        read_buffer.extend_from_slice(chunk);
+        reader.consume(len);
+    }
+}
+
+/// Decode a raw request line as UTF-8, mirroring `BufReader::read_line`'s
+/// contract of failing with [`std::io::ErrorKind::InvalidData`] on invalid
+/// UTF-8 rather than silently lossy-decoding it.
+fn bytes_to_line(bytes: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "client lifecycle wiring spans sessions, swarm state, file state, channels, debug, and runtime coordination"
@@ -335,6 +401,12 @@ pub(super) async fn handle_client(
     let mut reader = BufReader::new(reader);
     let writer = Arc::new(Mutex::new(writer));
     let mut line = String::new();
+    // Bytes pulled from the client socket that have not yet been split into a
+    // complete newline-delimited request line. This buffer is persistent across
+    // loop iterations so a `read_client_line` future cancelled by a sibling
+    // `tokio::select!` branch never loses partially-read bytes (see
+    // `read_client_line` for the full rationale).
+    let mut read_buffer: Vec<u8> = Vec::new();
 
     let initial_request = loop {
         line.clear();
@@ -617,20 +689,22 @@ pub(super) async fn handle_client(
             biased;
             // Prioritize direct client I/O so subscribe/ping/message requests do not get
             // starved behind noisy background bus traffic.
-            n = reader.read_line(&mut line) => {
-                let n = match n {
-                    Ok(n) => n,
+            read = read_client_line(&mut reader, &mut read_buffer) => {
+                match read {
+                    Ok(Some(next_line)) => {
+                        line = next_line;
+                        let mut connections = client_connections.write().await;
+                        if let Some(info) = connections.get_mut(&client_connection_id) {
+                            info.last_seen = Instant::now();
+                        }
+                    }
+                    Ok(None) => {
+                        break; // Client disconnected
+                    }
                     Err(e) => {
                         crate::logging::error(&format!("Client read error: {}", e));
                         break;
                     }
-                };
-                if n == 0 {
-                    break; // Client disconnected
-                }
-                let mut connections = client_connections.write().await;
-                if let Some(info) = connections.get_mut(&client_connection_id) {
-                    info.last_seen = Instant::now();
                 }
             }
             done = processing_done_rx.recv() => {
@@ -1287,6 +1361,40 @@ pub(super) async fn handle_client(
                 if let Some(target_session_id) = target_session_id {
                     if crate::session::session_exists(&target_session_id) {
                         let pre_resume_session_id = client_session_id.clone();
+                        if target_session_id != pre_resume_session_id
+                            && (client_is_processing || processing_task.is_some())
+                        {
+                            // This connection is switching to a different live
+                            // session while still tracking an in-flight turn for
+                            // the OLD session. If we reassign `agent` below
+                            // without cancelling that stale task, its eventual
+                            // completion fires into `processing_done_rx` against
+                            // the new session's connection-local bookkeeping
+                            // (mismatched processing_message_id aside, the
+                            // client_is_processing/is_processing flags and any
+                            // in-progress tool-name metadata leak across the
+                            // switch), and the task keeps holding/using the old
+                            // agent after this connection has moved on. Cancel it
+                            // and reset the connection-local processing state
+                            // before rebinding `agent` to the new session.
+                            crate::logging::warn(&format!(
+                                "Subscribe resume switching connection {} from session {} to {} while a turn was in flight; cancelling stale processing task",
+                                client_connection_id, pre_resume_session_id, target_session_id
+                            ));
+                            if let Some(handle) = processing_task.take() {
+                                handle.abort();
+                            }
+                            processing_message_id = None;
+                            processing_session_id = None;
+                            client_is_processing = false;
+                            {
+                                let mut connections = client_connections.write().await;
+                                if let Some(info) = connections.get_mut(&client_connection_id) {
+                                    info.is_processing = false;
+                                    info.current_tool_name = None;
+                                }
+                            }
+                        }
                         agent = handle_resume_session(
                             id,
                             target_session_id.clone(),
