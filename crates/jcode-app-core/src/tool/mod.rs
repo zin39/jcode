@@ -33,6 +33,7 @@ mod side_panel;
 mod skill;
 mod task;
 mod todo;
+mod tournament;
 mod webfetch;
 mod websearch;
 mod write;
@@ -326,7 +327,12 @@ impl Registry {
         Self::insert_tool(
             &mut tools_map,
             "subagent",
-            task::SubagentTool::new(provider, registry.clone()),
+            task::SubagentTool::new(provider.clone(), registry.clone()),
+        );
+        Self::insert_tool(
+            &mut tools_map,
+            "tournament",
+            tournament::TournamentTool::new(provider.clone(), registry.clone()),
         );
         Self::insert_tool(
             &mut tools_map,
