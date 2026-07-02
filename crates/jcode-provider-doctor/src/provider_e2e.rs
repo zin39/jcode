@@ -18,10 +18,10 @@
 //! intentionally record the API-dependent checkpoints as skipped so nothing is
 //! over-credited in the ledger.
 
-use crate::auth::lifecycle::{
+use jcode_base::auth::lifecycle::{
     AuthActivationRequest, activate_auth_change, validate_catalog_invariants,
 };
-use crate::auth::live_provider_probes::{
+use crate::live_provider_probes::{
     fetch_live_openai_compatible_models, run_live_antigravity_native_reasoning_smoke,
     run_live_antigravity_native_smoke, run_live_antigravity_native_stream_smoke,
     run_live_antigravity_native_tool_smoke, run_live_claude_native_reasoning_smoke,
@@ -31,13 +31,13 @@ use crate::auth::live_provider_probes::{
     run_live_native_provider_tool_smoke, run_live_openai_compatible_smoke,
     run_live_openai_compatible_stream_smoke, run_live_openai_compatible_tool_smoke,
 };
-use crate::live_tests::{
+use jcode_base::live_tests::{
     self, LiveVerificationAuth, LiveVerificationEvent, LiveVerificationResult,
     LiveVerificationStage, LiveVerificationStageStatus, checkpoints,
 };
-use crate::protocol::{AuthChanged, CatalogNamespace, RuntimeProviderKey};
-use crate::provider::ModelRoute;
-use crate::provider_catalog::OpenAiCompatibleProfile;
+use jcode_base::protocol::{AuthChanged, CatalogNamespace, RuntimeProviderKey};
+use jcode_base::provider::ModelRoute;
+use jcode_base::provider_catalog::OpenAiCompatibleProfile;
 
 /// How much of the strict pipeline to exercise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,7 +292,7 @@ fn label_for(checkpoint: &str) -> &'static str {
 /// "missing a thought_signature ... position N" 400) or `skipped` (the model
 /// declined a second tool call). Surfacing it keeps the coverage observable in
 /// the doctor report instead of collapsing to a generic pass string.
-fn tool_stage_detail(stage: &crate::live_tests::LiveVerificationStage) -> String {
+fn tool_stage_detail(stage: &jcode_base::live_tests::LiveVerificationStage) -> String {
     let multi = match stage
         .evidence
         .get("multi_tool_replay")
@@ -328,7 +328,7 @@ fn tool_stage_detail(stage: &crate::live_tests::LiveVerificationStage) -> String
 /// `none` are legitimate because providers like Gemini-3 and OpenAI hide their
 /// reasoning. Surfacing the classification keeps the observation visible in the
 /// doctor report.
-fn reasoning_stage_detail(stage: &crate::live_tests::LiveVerificationStage) -> String {
+fn reasoning_stage_detail(stage: &jcode_base::live_tests::LiveVerificationStage) -> String {
     match stage
         .evidence
         .get("reasoning_capability")
@@ -400,7 +400,7 @@ pub async fn run_provider_e2e(
     requested_model: Option<&str>,
     tier: DoctorTier,
 ) -> anyhow::Result<DoctorReport> {
-    let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
+    let resolved = jcode_base::provider_catalog::resolve_openai_compatible_profile(profile);
     let provider_id = profile.id.to_string();
     let provider_label = profile.display_name.to_string();
     let mut checks: Vec<DoctorCheck> = Vec::new();
@@ -545,13 +545,12 @@ pub async fn run_provider_e2e(
 /// [`run_provider_e2e`]). Today this is the Claude OAuth/subscription provider,
 /// the Antigravity (Google OAuth Cloud Code) provider, and the generic
 /// native-runtime providers (OpenAI, Gemini, Cursor, Copilot, Bedrock).
-pub fn native_doctor_supports_provider(provider_id: &str) -> bool {
-    match crate::auth::lifecycle::normalized_auth_provider_id(Some(provider_id)) {
-        Some("claude") | Some("antigravity") => true,
-        Some(other) => NativeProviderKind::from_normalized(other).is_some(),
-        None => false,
-    }
-}
+///
+/// The predicate itself lives in `jcode_base::auth::doctor` so base-internal
+/// code (`live_tests` roster annotation) can call it without depending on this
+/// crate; `native_provider_roster_matches_base_predicate` below keeps it in
+/// sync with [`NativeProviderKind`].
+pub use jcode_base::auth::doctor::native_doctor_supports_provider;
 
 /// The wiring contract for the native Claude (OAuth/subscription) provider.
 ///
@@ -604,12 +603,12 @@ pub async fn run_claude_native_e2e(
     requested_model: Option<&str>,
     tier: DoctorTier,
 ) -> anyhow::Result<DoctorReport> {
-    use crate::provider::Provider;
-    use crate::provider::anthropic::AnthropicProvider;
+    use jcode_base::provider::Provider;
+    use jcode_base::provider::anthropic::AnthropicProvider;
 
     let normalized =
-        crate::auth::lifecycle::normalized_auth_provider_id(Some(provider_id)).unwrap_or("claude");
-    let provider_label = crate::auth::lifecycle::provider_display_label(Some(normalized))
+        jcode_base::auth::lifecycle::normalized_auth_provider_id(Some(provider_id)).unwrap_or("claude");
+    let provider_label = jcode_base::auth::lifecycle::provider_display_label(Some(normalized))
         .unwrap_or_else(|| "Anthropic/Claude".to_string());
     let provider_id = normalized.to_string();
     let mut checks: Vec<DoctorCheck> = Vec::new();
@@ -721,7 +720,7 @@ pub async fn run_claude_native_e2e(
                 // Endpoint worked but returned nothing usable; fall back to the
                 // known model ids so wiring checks can still run, and record the
                 // catalog endpoint as passed (it answered) but note the fallback.
-                let fallback = crate::provider::known_anthropic_model_ids();
+                let fallback = jcode_base::provider::known_anthropic_model_ids();
                 checks.push(DoctorCheck::passed(
                     checkpoints::MODEL_CATALOG_LIVE_ENDPOINT,
                     label_for(checkpoints::MODEL_CATALOG_LIVE_ENDPOINT),
@@ -755,7 +754,7 @@ pub async fn run_claude_native_e2e(
             label_for(checkpoints::MODEL_CATALOG_LIVE_ENDPOINT),
             "offline tier: using known Claude model ids (no network)".to_string(),
         ));
-        crate::provider::known_anthropic_model_ids()
+        jcode_base::provider::known_anthropic_model_ids()
     };
 
     // Pick the model under test. When the caller does not request a specific
@@ -1004,13 +1003,13 @@ pub async fn run_antigravity_native_e2e(
     requested_model: Option<&str>,
     tier: DoctorTier,
 ) -> anyhow::Result<DoctorReport> {
-    use crate::provider::Provider;
-    use crate::provider::antigravity::AntigravityProvider;
+    use jcode_base::provider::Provider;
+    use jcode_base::provider::antigravity::AntigravityProvider;
 
     // The antigravity login provider has a single fixed id; accept any alias the
     // caller passed (e.g. "antigravity") and normalize to the canonical id.
-    let _ = crate::auth::lifecycle::normalized_auth_provider_id(Some(provider_id));
-    let provider_label = crate::auth::lifecycle::provider_display_label(Some("antigravity"))
+    let _ = jcode_base::auth::lifecycle::normalized_auth_provider_id(Some(provider_id));
+    let provider_label = jcode_base::auth::lifecycle::provider_display_label(Some("antigravity"))
         .unwrap_or_else(|| "Antigravity".to_string());
     let provider_id = "antigravity".to_string();
     let mut checks: Vec<DoctorCheck> = Vec::new();
@@ -1432,13 +1431,13 @@ impl NativeProviderKind {
     /// Build the production runtime for this provider, pinned to no model yet.
     /// Returns an error only when the runtime cannot be constructed at all (e.g.
     /// Copilot with no credential file); model selection happens later.
-    fn build_runtime(self) -> anyhow::Result<std::sync::Arc<dyn crate::provider::Provider>> {
-        use crate::provider::Provider;
+    fn build_runtime(self) -> anyhow::Result<std::sync::Arc<dyn jcode_base::provider::Provider>> {
+        use jcode_base::provider::Provider;
         use anyhow::Context as _;
         let runtime: std::sync::Arc<dyn Provider> = match self {
             Self::OpenAi => {
-                let credentials = crate::auth::codex::load_credentials().unwrap_or_else(|_| {
-                    crate::auth::codex::CodexCredentials {
+                let credentials = jcode_base::auth::codex::load_credentials().unwrap_or_else(|_| {
+                    jcode_base::auth::codex::CodexCredentials {
                         access_token: String::new(),
                         refresh_token: String::new(),
                         id_token: None,
@@ -1446,10 +1445,10 @@ impl NativeProviderKind {
                         expires_at: None,
                     }
                 });
-                std::sync::Arc::new(crate::provider::openai::OpenAIProvider::new(credentials))
+                std::sync::Arc::new(jcode_base::provider::openai::OpenAIProvider::new(credentials))
             }
-            Self::Gemini => std::sync::Arc::new(crate::provider::gemini::GeminiProvider::new()),
-            Self::Cursor => std::sync::Arc::new(crate::provider::cursor::CursorCliProvider::new()),
+            Self::Gemini => std::sync::Arc::new(jcode_base::provider::gemini::GeminiProvider::new()),
+            Self::Cursor => std::sync::Arc::new(jcode_base::provider::cursor::CursorCliProvider::new()),
             Self::Copilot => {
                 // `new()` requires a loadable GitHub token; fall back to an empty
                 // token so the offline tier can still construct the runtime for
@@ -1461,29 +1460,29 @@ impl NativeProviderKind {
                 // `detect_tier_and_set_default` (run from `prefetch_models`). With
                 // the default grace window the doctor's immediate prefetch returns
                 // early without marking init done, so the live probes would hang.
-                crate::env::set_var("JCODE_COPILOT_PREFETCH_STARTUP_GRACE_MS", "0");
-                let runtime = match crate::provider::copilot::CopilotApiProvider::new() {
+                jcode_base::env::set_var("JCODE_COPILOT_PREFETCH_STARTUP_GRACE_MS", "0");
+                let runtime = match jcode_base::provider::copilot::CopilotApiProvider::new() {
                     Ok(runtime) => runtime,
                     Err(_) => {
-                        crate::provider::copilot::CopilotApiProvider::new_with_token(String::new())
+                        jcode_base::provider::copilot::CopilotApiProvider::new_with_token(String::new())
                     }
                 };
                 std::sync::Arc::new(runtime)
             }
-            Self::Bedrock => std::sync::Arc::new(crate::provider::bedrock::BedrockProvider::new()),
-            Self::Jcode => std::sync::Arc::new(crate::provider::jcode::JcodeProvider::new()),
+            Self::Bedrock => std::sync::Arc::new(jcode_base::provider::bedrock::BedrockProvider::new()),
+            Self::Jcode => std::sync::Arc::new(jcode_base::provider::jcode::JcodeProvider::new()),
             Self::Azure => {
                 // Azure OpenAI is the OpenRouter transport configured via Azure
                 // env; apply that env (endpoint/key/header wiring) before building
                 // so the runtime points at the user's Azure deployment.
-                crate::auth::azure::apply_runtime_env()
+                jcode_base::auth::azure::apply_runtime_env()
                     .context("apply Azure OpenAI runtime env")?;
-                let runtime = crate::provider::openrouter::OpenRouterProvider::new()
+                let runtime = jcode_base::provider::openrouter::OpenRouterProvider::new()
                     .context("construct Azure OpenAI (OpenRouter transport) runtime")?;
                 // Azure exposes a single user-configured deployment rather than a
                 // live catalog; pin the runtime to it so the catalog/picker
                 // checks have a model to assert.
-                if let Some(model) = crate::auth::azure::load_model() {
+                if let Some(model) = jcode_base::auth::azure::load_model() {
                     let _ = runtime.set_model(&model);
                 }
                 std::sync::Arc::new(runtime)
@@ -1499,7 +1498,7 @@ impl NativeProviderKind {
         use anyhow::Context as _;
         match self {
             Self::OpenAi => {
-                let credentials = crate::auth::codex::load_credentials()
+                let credentials = jcode_base::auth::codex::load_credentials()
                     .context("load OpenAI credentials (run `jcode login --provider openai`)")?;
                 if credentials.access_token.trim().is_empty() {
                     anyhow::bail!("resolved an empty OpenAI access token");
@@ -1507,7 +1506,7 @@ impl NativeProviderKind {
                 Ok("OpenAI credential resolved".to_string())
             }
             Self::Gemini => {
-                let tokens = crate::auth::gemini::load_or_refresh_tokens()
+                let tokens = jcode_base::auth::gemini::load_or_refresh_tokens()
                     .await
                     .context("load Gemini OAuth tokens")?;
                 if tokens.access_token.trim().is_empty() {
@@ -1516,7 +1515,7 @@ impl NativeProviderKind {
                 Ok("Gemini Code Assist OAuth credential resolved".to_string())
             }
             Self::Cursor => {
-                let key = crate::auth::cursor::load_api_key()
+                let key = jcode_base::auth::cursor::load_api_key()
                     .context("load Cursor credential (run `jcode login --provider cursor`)")?;
                 if key.trim().is_empty() {
                     anyhow::bail!("resolved an empty Cursor credential");
@@ -1524,7 +1523,7 @@ impl NativeProviderKind {
                 Ok("Cursor credential resolved".to_string())
             }
             Self::Copilot => {
-                let token = crate::auth::copilot::load_github_token()
+                let token = jcode_base::auth::copilot::load_github_token()
                     .context("load GitHub Copilot token (run `jcode login --provider copilot`)")?;
                 if token.trim().is_empty() {
                     anyhow::bail!("resolved an empty GitHub Copilot token");
@@ -1532,7 +1531,7 @@ impl NativeProviderKind {
                 Ok("GitHub Copilot token resolved".to_string())
             }
             Self::Bedrock => {
-                if !crate::provider::bedrock::BedrockProvider::has_credentials() {
+                if !jcode_base::provider::bedrock::BedrockProvider::has_credentials() {
                     anyhow::bail!(
                         "no AWS Bedrock credentials found (set AWS_BEARER_TOKEN_BEDROCK, AWS_PROFILE, \
                          or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY)"
@@ -1541,7 +1540,7 @@ impl NativeProviderKind {
                 Ok("AWS Bedrock credential resolved".to_string())
             }
             Self::Jcode => {
-                if !crate::subscription_catalog::has_credentials() {
+                if !jcode_base::subscription_catalog::has_credentials() {
                     anyhow::bail!(
                         "no Jcode subscription credential found (set JCODE_API_KEY or run \
                          `jcode login --provider jcode`)"
@@ -1550,7 +1549,7 @@ impl NativeProviderKind {
                 Ok("Jcode subscription credential resolved".to_string())
             }
             Self::Azure => {
-                if !crate::auth::azure::has_configuration() {
+                if !jcode_base::auth::azure::has_configuration() {
                     anyhow::bail!(
                         "Azure OpenAI is not fully configured (need AZURE_OPENAI_ENDPOINT plus an \
                          API key or Entra ID); run `jcode login --provider azure`"
@@ -1558,7 +1557,7 @@ impl NativeProviderKind {
                 }
                 Ok(format!(
                     "Azure OpenAI configured ({})",
-                    crate::auth::azure::method_detail()
+                    jcode_base::auth::azure::method_detail()
                 ))
             }
         }
@@ -1838,7 +1837,7 @@ pub async fn run_generic_native_e2e(
 /// Drive the three generic live native probes and fold their results into the
 /// six API-dependent checkpoints, mirroring [`run_native_claude_api_checks`].
 async fn run_generic_native_api_checks(
-    provider: &dyn crate::provider::Provider,
+    provider: &dyn jcode_base::provider::Provider,
     selected: &str,
     label: &str,
     checks: &mut Vec<DoctorCheck>,
@@ -1943,7 +1942,7 @@ struct WiringContract {
 }
 
 fn wiring_contract(profile: OpenAiCompatibleProfile) -> WiringContract {
-    match crate::auth::lifecycle::normalized_auth_provider_id(Some(profile.id)) {
+    match jcode_base::auth::lifecycle::normalized_auth_provider_id(Some(profile.id)) {
         Some("claude-api") => WiringContract {
             api_method: "claude-api".to_string(),
             route_provider: "Anthropic".to_string(),
@@ -2008,7 +2007,7 @@ fn run_wiring_checks_for_contract(
         .collect();
 
     let auth = AuthChanged {
-        provider: crate::protocol::AuthProviderId::new(auth_provider_id),
+        provider: jcode_base::protocol::AuthProviderId::new(auth_provider_id),
         credential_source: None,
         auth_method: None,
         expected_runtime: Some(RuntimeProviderKey::new(contract.expected_runtime)),
@@ -2516,6 +2515,36 @@ mod tests {
         assert!(!native_doctor_supports_provider(
             "definitely-not-a-provider"
         ));
+    }
+
+    /// `native_doctor_supports_provider` lives in `jcode_base::auth::doctor`
+    /// (so base's `live_tests` roster can call it) while the drivers live
+    /// here. Keep the base predicate in sync with the driver roster: every
+    /// generic `NativeProviderKind` id plus the bespoke claude/antigravity
+    /// drivers must be accepted, and nothing else native-flavored.
+    #[test]
+    fn native_provider_roster_matches_base_predicate() {
+        for kind in [
+            NativeProviderKind::OpenAi,
+            NativeProviderKind::Gemini,
+            NativeProviderKind::Cursor,
+            NativeProviderKind::Copilot,
+            NativeProviderKind::Bedrock,
+            NativeProviderKind::Jcode,
+            NativeProviderKind::Azure,
+        ] {
+            let id = kind.spec().provider_id;
+            assert!(
+                native_doctor_supports_provider(id),
+                "base predicate rejects generic native driver id {id:?}"
+            );
+        }
+        for id in ["claude", "antigravity"] {
+            assert!(
+                native_doctor_supports_provider(id),
+                "base predicate rejects bespoke native driver id {id:?}"
+            );
+        }
     }
 
     #[test]
