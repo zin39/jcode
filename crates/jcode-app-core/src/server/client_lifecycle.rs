@@ -853,6 +853,14 @@ pub(super) async fn handle_client(
                             let _ = client_event_tx.send(ServerEvent::BatchProgress { progress });
                         }
                     }
+                    Ok(BusEvent::SubagentStatus(status)) => {
+                        if status.session_id == client_session_id {
+                            let _ = client_event_tx.send(ServerEvent::SubagentStatus {
+                                status: status.status,
+                                model: status.model,
+                            });
+                        }
+                    }
                     Ok(BusEvent::SidePanelUpdated(update)) => {
                         if update.session_id == client_session_id {
                             let _ = client_event_tx.send(ServerEvent::SidePanelState {

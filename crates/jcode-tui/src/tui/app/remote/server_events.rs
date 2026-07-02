@@ -631,6 +631,14 @@ pub(in crate::tui::app) fn handle_server_event(
             app.status_detail = Some(detail);
             eager_stream_redraw
         }
+        ServerEvent::SubagentStatus { status, model } => {
+            let display = match model {
+                Some(model) => format!("{status} · {model}"),
+                None => status,
+            };
+            app.subagent_status = Some(display);
+            eager_stream_redraw
+        }
         ServerEvent::MessageEnd => {
             app.pause_streaming_tps(true);
             app.stream_message_ended = true;
@@ -702,6 +710,7 @@ pub(in crate::tui::app) fn handle_server_event(
             app.stream_buffer.clear();
             app.streaming_tool_calls.clear();
             app.batch_progress = None;
+            app.subagent_status = None;
             app.thought_line_inserted = false;
             app.thinking_prefix_emitted = false;
             app.thinking_buffer.clear();
@@ -797,6 +806,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.replay_elapsed_override = None;
                 app.remote_resume_activity = None;
                 app.batch_progress = None;
+                app.subagent_status = None;
                 app.streaming_tool_calls.clear();
                 app.current_message_id = None;
                 app.thought_line_inserted = false;
