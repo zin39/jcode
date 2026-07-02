@@ -329,6 +329,7 @@ objc2-app-kit = { version = "0.3", features = [
 [profile.release]
 opt-level = 1
 debug = 0
+strip = "symbols"
 codegen-units = 256
 incremental = true
 
