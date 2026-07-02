@@ -78,6 +78,68 @@ pub fn sse_data_line(line: &str) -> Option<&str> {
         .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
 }
 
+/// Incremental UTF-8 decoder for byte streams whose chunk boundaries are not
+/// guaranteed to align with character boundaries (HTTP/TLS framing splits
+/// multi-byte sequences arbitrarily). A partial sequence at the end of one
+/// chunk is carried over and completed by the next chunk instead of being
+/// dropped or lossy-decoded into replacement characters.
+#[derive(Default)]
+pub struct Utf8StreamDecoder {
+    carry: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    /// Decode `chunk` together with any bytes carried over from the previous
+    /// chunk. Genuinely invalid bytes become U+FFFD; an incomplete trailing
+    /// sequence is held back for the next call.
+    pub fn decode(&mut self, chunk: &[u8]) -> String {
+        let bytes = if self.carry.is_empty() {
+            chunk.to_vec()
+        } else {
+            let mut joined = std::mem::take(&mut self.carry);
+            joined.extend_from_slice(chunk);
+            joined
+        };
+        let mut out = String::with_capacity(bytes.len());
+        let mut rest: &[u8] = &bytes;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    break;
+                }
+                Err(err) => {
+                    let (valid, after) = rest.split_at(err.valid_up_to());
+                    if let Ok(valid) = std::str::from_utf8(valid) {
+                        out.push_str(valid);
+                    }
+                    match err.error_len() {
+                        Some(invalid_len) => {
+                            out.push('\u{FFFD}');
+                            rest = &after[invalid_len..];
+                        }
+                        None => {
+                            self.carry = after.to_vec();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Flush any carried partial sequence at end of stream (lossy, since it
+    /// can never be completed).
+    pub fn flush(&mut self) -> String {
+        if self.carry.is_empty() {
+            return String::new();
+        }
+        let carry = std::mem::take(&mut self.carry);
+        String::from_utf8_lossy(&carry).into_owned()
+    }
+}
+
 #[cfg(unix)]
 fn read_max_open_files_limits() -> Option<(String, String)> {
     let contents = std::fs::read_to_string("/proc/self/limits").ok()?;
@@ -232,5 +294,48 @@ mod tests {
             approx_tool_output_token_severity(12_000),
             ApproxTokenSeverity::Danger
         );
+    }
+
+    #[test]
+    fn utf8_decoder_reassembles_split_multibyte_char() {
+        let text = "héllo 🎉 wörld";
+        let bytes = text.as_bytes();
+        // Try every possible split point, including mid-character.
+        for split in 0..=bytes.len() {
+            let mut decoder = Utf8StreamDecoder::default();
+            let mut out = decoder.decode(&bytes[..split]);
+            out.push_str(&decoder.decode(&bytes[split..]));
+            out.push_str(&decoder.flush());
+            assert_eq!(out, text, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn utf8_decoder_replaces_genuinely_invalid_bytes() {
+        let mut decoder = Utf8StreamDecoder::default();
+        let out = decoder.decode(b"ok\xff\xfeok");
+        assert_eq!(out, "ok\u{FFFD}\u{FFFD}ok");
+        assert!(decoder.flush().is_empty());
+    }
+
+    #[test]
+    fn utf8_decoder_flushes_incomplete_tail_lossily() {
+        let mut decoder = Utf8StreamDecoder::default();
+        // First two bytes of a 4-byte emoji, never completed.
+        let out = decoder.decode(&[0xF0, 0x9F]);
+        assert!(out.is_empty());
+        assert_eq!(decoder.flush(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn utf8_decoder_handles_three_chunk_split() {
+        // 4-byte emoji split across three chunks.
+        let emoji = "🎉".as_bytes();
+        let mut decoder = Utf8StreamDecoder::default();
+        let mut out = String::new();
+        out.push_str(&decoder.decode(&emoji[..1]));
+        out.push_str(&decoder.decode(&emoji[1..3]));
+        out.push_str(&decoder.decode(&emoji[3..]));
+        assert_eq!(out, "🎉");
     }
 }

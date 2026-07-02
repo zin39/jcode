@@ -18,6 +18,7 @@ fn truncated_stream_payload_context(data: &str) -> String {
 pub struct OpenRouterStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     buffer: String,
+    decoder: jcode_core::util::Utf8StreamDecoder,
     pending: VecDeque<StreamEvent>,
     tool_call_accumulators: std::collections::BTreeMap<u64, ToolCallAccumulator>,
     /// Track if we've emitted the provider info (only emit once)
@@ -45,6 +46,7 @@ impl OpenRouterStream {
         Self {
             inner: Box::pin(stream),
             buffer: String::new(),
+            decoder: jcode_core::util::Utf8StreamDecoder::default(),
             pending: VecDeque::new(),
             tool_call_accumulators: std::collections::BTreeMap::new(),
             provider_emitted: false,
@@ -395,9 +397,8 @@ impl Stream for OpenRouterStream {
 
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        self.buffer.push_str(text);
-                    }
+                    let text = self.decoder.decode(&bytes);
+                    self.buffer.push_str(&text);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("Stream error: {}", e))));

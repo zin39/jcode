@@ -1,6 +1,6 @@
 use super::{Registry, Tool, ToolContext, ToolOutput};
 use crate::agent::Agent;
-use crate::bus::{Bus, BusEvent, ToolSummary, ToolSummaryState};
+use crate::bus::{Bus, BusEvent, SubagentStatus, ToolSummary, ToolSummaryState};
 use crate::logging;
 use crate::protocol::HistoryMessage;
 use crate::provider::Provider;
@@ -166,6 +166,9 @@ impl Tool for SubagentTool {
         let summary_map_handle = summary_map.clone();
         let session_id = session.id.clone();
 
+        let parent_session_id = ctx.session_id.clone();
+        let description = params.description.clone();
+
         let mut receiver = Bus::global().subscribe();
         let listener = tokio::spawn(async move {
             loop {
@@ -192,6 +195,15 @@ impl Tool for SubagentTool {
                                 },
                             },
                         );
+                    }
+                    Ok(BusEvent::SubagentStatus(status)) => {
+                        if status.session_id == session_id {
+                            Bus::global().publish(BusEvent::SubagentStatus(forward_subagent_status(
+                                &parent_session_id,
+                                &description,
+                                &status,
+                            )));
+                        }
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -365,6 +377,27 @@ fn format_compact_subagent_history(messages: &[HistoryMessage]) -> String {
     output
 }
 
+/// Rebroadcast a child subagent's status under the parent session so the
+/// parent TUI status line shows live subagent activity instead of a spinner.
+fn forward_subagent_status(
+    parent_session_id: &str,
+    description: &str,
+    status: &SubagentStatus,
+) -> SubagentStatus {
+    const LABEL_MAX_CHARS: usize = 40;
+    let trimmed = description.trim();
+    let label: String = if trimmed.chars().count() > LABEL_MAX_CHARS {
+        trimmed.chars().take(LABEL_MAX_CHARS - 1).chain(std::iter::once('…')).collect()
+    } else {
+        trimmed.to_string()
+    };
+    SubagentStatus {
+        session_id: parent_session_id.to_string(),
+        status: format!("{label}: {}", status.status),
+        model: status.model.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -372,6 +405,34 @@ mod tests {
         subagent_display_title,
     };
     use crate::protocol::HistoryMessage;
+
+    #[test]
+    fn forward_subagent_status_relabels_under_parent_session() {
+        let child = crate::bus::SubagentStatus {
+            session_id: "child".to_string(),
+            status: "running grep".to_string(),
+            model: Some("haiku".to_string()),
+        };
+        let forwarded = super::forward_subagent_status("parent", "Fix unwraps", &child);
+        assert_eq!(forwarded.session_id, "parent");
+        assert_eq!(forwarded.status, "Fix unwraps: running grep");
+        assert_eq!(forwarded.model.as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn forward_subagent_status_truncates_long_descriptions() {
+        let child = crate::bus::SubagentStatus {
+            session_id: "child".to_string(),
+            status: "streaming".to_string(),
+            model: None,
+        };
+        let desc = "x".repeat(60);
+        let forwarded = super::forward_subagent_status("parent", &desc, &child);
+        assert_eq!(forwarded.session_id, "parent");
+        assert!(forwarded.status.starts_with(&"x".repeat(39)));
+        assert!(forwarded.status.ends_with("…: streaming"));
+        assert!(forwarded.model.is_none());
+    }
 
     #[test]
     fn subagent_display_title_includes_type_and_model() {

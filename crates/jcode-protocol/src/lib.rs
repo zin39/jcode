@@ -518,9 +518,19 @@ fn default_model_direction() -> i8 {
 
 /// Encode an event as a newline-terminated JSON string
 pub fn encode_event(event: &ServerEvent) -> String {
-    let mut json = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
-    json.push('\n');
-    json
+    match serde_json::to_string(event) {
+        Ok(json) => {
+            let mut result = json;
+            result.push('\n');
+            result
+        }
+        Err(e) => {
+            eprintln!("Failed to serialize ServerEvent: {}", e);
+            let mut json = "{}".to_string();
+            json.push('\n');
+            json
+        }
+    }
 }
 
 /// Decode a request from a JSON string.

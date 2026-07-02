@@ -17,3 +17,6 @@ jcode-core = { path = "../jcode-core" }
 jcode-tui-style = { path = "../jcode-tui-style" }
 ratatui = "0.30"
 serde_json = "1"
+
+[lints]
+workspace = true

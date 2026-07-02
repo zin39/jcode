@@ -1797,6 +1797,7 @@ async fn stream_response(
 
     const SSE_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+    let mut utf8_decoder = jcode_core::util::Utf8StreamDecoder::default();
     loop {
         let chunk = match tokio::time::timeout(SSE_CHUNK_TIMEOUT, stream.next()).await {
             Ok(Some(chunk_result)) => chunk_result.context("Error reading stream chunk")?,
@@ -1806,7 +1807,7 @@ async fn stream_response(
                 anyhow::bail!("Stream read timeout: no data received for 180 seconds");
             }
         };
-        let chunk_str = String::from_utf8_lossy(&chunk);
+        let chunk_str = utf8_decoder.decode(&chunk);
         buffer.push_str(&chunk_str);
 
         // Process complete SSE events

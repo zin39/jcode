@@ -12,3 +12,6 @@ path = "src/lib.rs"
 [dependencies]
 base64 = "0.22"
 crossterm = "0.29"
+
+[lints]
+workspace = true

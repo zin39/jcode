@@ -9,7 +9,8 @@ use super::{
     create_headless_session, fanout_session_event, persist_swarm_state_for, record_swarm_event,
     record_swarm_event_for_session, remove_background_tool_signal,
     remove_session_channel_subscriptions, remove_session_from_swarm,
-    remove_session_interrupt_queue, truncate_detail, update_member_status,
+    remove_session_interrupt_queue, remove_stop_current_turn_signal,
+    stop_current_turn_signal_for_session, truncate_detail, update_member_status,
     update_member_status_with_report,
 };
 use crate::agent::Agent;
@@ -919,6 +920,21 @@ pub(super) async fn handle_comm_stop(
     let removed_live_agent = removed_agent.is_some();
     drop(sessions_guard);
     if let Some(agent_arc) = removed_agent {
+        // Cancel the target's in-flight turn (if any) using the same cooperative
+        // cancel path as user Esc / client disconnect (`SessionControlHandle::
+        // request_cancel` -> stop-current-turn signal). Without this the stopped
+        // agent keeps streaming its current turn in its own spawned task -
+        // burning provider tokens and mutating its session - after the coordinator
+        // removed it from the registry. The signal is looked up from the
+        // process-global registry so it can be fired lock-free, without waiting on
+        // the (busy) agent mutex that the in-flight turn is holding.
+        if let Some(stop_signal) = stop_current_turn_signal_for_session(&target_session) {
+            crate::logging::info(&format!(
+                "COMM_STOP_CANCEL_TURN target={target_session} requester={req_session_id}"
+            ));
+            stop_signal.fire();
+        }
+        remove_stop_current_turn_signal(&target_session);
         remove_session_interrupt_queue(soft_interrupt_queues, &target_session).await;
         remove_background_tool_signal(&target_session);
         if let Ok(agent) = agent_arc.try_lock() {

@@ -1,0 +1,45 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/)
+# Run locally with: cargo deny check
+# Complements the cargo-audit job in CI: adds license and source policy on top
+# of security advisories.
+
+[graph]
+all-features = true
+
+[advisories]
+# cargo-audit already gates advisories in CI; keep deny at warn so the two
+# tools don't double-fail a build on the same advisory.
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+# Permissive licenses commonly found in the Rust ecosystem. Extend as needed
+# when `cargo deny check licenses` reports a new (acceptable) license.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# A workspace this size will always have duplicate transitive versions;
+# surface them without failing the build.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"

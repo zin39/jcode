@@ -178,23 +178,43 @@ impl Agent {
             return;
         }
 
-        let before = tool_calls.len();
+        // Collect ids of the specific truncated (null-input) tool calls before
+        // dropping them, so we can strip only their orphaned ToolUse blocks
+        // from history - a mix of one valid + one truncated call must keep
+        // the valid call's block intact.
+        let discarded_ids: Vec<String> = tool_calls
+            .iter()
+            .filter(|tc| tc.input.is_null())
+            .map(|tc| tc.id.clone())
+            .collect();
+        if discarded_ids.is_empty() {
+            return;
+        }
         tool_calls.retain(|tc| !tc.input.is_null());
-        let discarded = before - tool_calls.len();
-        if discarded > 0 && tool_calls.is_empty() {
-            logging::warn(&format!(
-                "Discarded {} tool call(s) with null input (truncated by {}); requesting continuation",
-                discarded,
-                if stop_reason.is_empty() {
-                    "unknown"
-                } else {
-                    stop_reason
-                }
-            ));
-            if let Some(msg_id) = assistant_message_id {
-                self.session.remove_tool_use_blocks(msg_id);
-                self.persist_session_best_effort("truncated tool-call repair");
+        let discarded = discarded_ids.len();
+        logging::warn(&format!(
+            "Discarded {} tool call(s) with null input (truncated by {}); requesting continuation",
+            discarded,
+            if stop_reason.is_empty() {
+                "unknown"
+            } else {
+                stop_reason
             }
+        ));
+        if let Some(msg_id) = assistant_message_id {
+            // No per-id removal API is exposed on Session; rebuild the
+            // message vector locally and hand it back via replace_messages
+            // (which handles cache/dirty-state invalidation) instead of
+            // nuking every ToolUse block in the message.
+            let mut messages = std::mem::take(&mut self.session.messages);
+            if let Some(msg) = messages.iter_mut().find(|m| &m.id == msg_id) {
+                msg.content.retain(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => !discarded_ids.contains(id),
+                    _ => true,
+                });
+            }
+            self.session.replace_messages(messages);
+            self.persist_session_best_effort("truncated tool-call repair");
         }
     }
 }

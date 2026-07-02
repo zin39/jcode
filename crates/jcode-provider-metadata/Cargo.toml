@@ -9,3 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 url = "2"
+
+[lints]
+workspace = true

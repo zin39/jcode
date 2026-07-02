@@ -124,6 +124,8 @@ impl Agent {
         if !Self::is_context_limit_error(error) {
             return false;
         }
+        // Real token-context overflow signal (post other-recovery branches). E1.
+        crate::session_metrics::record_context_overflow(&self.session.id);
         if !self.provider.supports_compaction() {
             return false;
         }

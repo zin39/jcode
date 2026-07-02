@@ -233,6 +233,8 @@ pub fn load_tokens() -> Result<GeminiTokens> {
                         chrono::Utc::now().timestamp_millis() + (expires_in * 1000)
                     })
                 })
+                // No expiry info: treat as already expired so the first use
+                // refreshes immediately instead of trusting an unknown token age.
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() - 1);
             return Ok(GeminiTokens {
                 access_token,

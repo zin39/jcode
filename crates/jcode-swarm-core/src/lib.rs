@@ -339,6 +339,10 @@ fn completion_status_intro(name: &str, status: &str) -> String {
     match status {
         "ready" => format!("Agent {} finished their work and is ready for more.", name),
         "failed" => format!("Agent {} finished with status failed.", name),
+        "crashed" => format!(
+            "Agent {} crashed (disconnected while running) and did not finish their work.",
+            name
+        ),
         "stopped" => format!("Agent {} stopped.", name),
         _ => format!("Agent {} completed their work.", name),
     }
@@ -357,6 +361,9 @@ fn completion_followup(status: &str, has_report: bool) -> &'static str {
         }
         ("failed", false) => {
             "Use summary/read_context to inspect results, assign_task to retry with guidance, or stop to remove them."
+        }
+        ("crashed", _) => {
+            "Their work may be incomplete. Use summary/read_context to inspect what was done, then respawn or reassign the task."
         }
         ("stopped", _) => "Use summary/read_context to inspect results or stop to remove them.",
         (_, true) => {

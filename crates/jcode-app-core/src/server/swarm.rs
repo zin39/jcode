@@ -888,11 +888,20 @@ pub(super) async fn update_member_status_with_report(
 
         broadcast_swarm_status(id, swarm_members, swarms_by_id).await;
 
+        // Crashes and failures must always reach the coordinator, regardless of
+        // the previous status or whether report-back was configured — otherwise
+        // a member that dies (e.g. disconnect while running sets "crashed")
+        // vanishes silently and its work is lost without anyone being told.
+        let was_terminal = matches!(
+            old_status.as_str(),
+            "completed" | "done" | "failed" | "crashed" | "stopped"
+        );
         let should_notify_coordinator = status_changed
             && ((status == "completed")
+                || (matches!(status, "failed" | "crashed") && !was_terminal)
                 || (report_back_to_session_id.is_some()
                     && old_status == "running"
-                    && matches!(status, "ready" | "failed" | "stopped")));
+                    && matches!(status, "ready" | "stopped")));
         if should_notify_coordinator {
             let fallback_coordinator_id =
                 if report_back_to_session_id.as_deref() == Some(session_id) {

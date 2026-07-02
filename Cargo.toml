@@ -76,6 +76,18 @@ members = [
     "crates/jcode-render-core",
 ]
 
+# Workspace-wide lint policy. Member crates opt in via `[lints] workspace = true`.
+# Conservative on purpose: CI already runs `clippy -D warnings`, so only lints
+# with zero current violations are denied here to keep builds green. Broader
+# hygiene (unwrap/panic budgets) is ratcheted by scripts/check_*_budget.py.
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[lints]
+workspace = true
+
 [lib]
 name = "jcode"
 path = "src/lib.rs"

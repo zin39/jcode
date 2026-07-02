@@ -39,6 +39,10 @@ struct SessionMetrics {
     turns: u64,
     cumulative_total_tokens: u64,
     cumulative_output_tokens: u64,
+    context_overflow_count: u64,
+    repeated_read_count: u64,
+    stuck_loop_count: u64,
+    cache_violation_count: u64,
 }
 
 impl SessionMetrics {
@@ -95,6 +99,45 @@ pub fn record_turn(session_id: &str) {
     });
 }
 
+/// Shared mutation helper for monotonic failure-mode counters.
+fn bump(session_id: &str, f: impl FnOnce(&mut SessionMetrics)) {
+    if session_id.is_empty() {
+        return;
+    }
+    with_registry(|map| {
+        let entry = map.entry(session_id.to_string()).or_default();
+        f(entry);
+    });
+}
+
+/// Record a context-overflow event (context-limit error after a compaction attempt).
+pub fn record_context_overflow(session_id: &str) {
+    bump(session_id, |m| {
+        m.context_overflow_count = m.context_overflow_count.saturating_add(1)
+    });
+}
+
+/// Record a detected repeated-read / endless-file-read loop.
+pub fn record_repeated_read(session_id: &str) {
+    bump(session_id, |m| {
+        m.repeated_read_count = m.repeated_read_count.saturating_add(1)
+    });
+}
+
+/// Record a detected stuck-in-loop (tool-failure streak with no successes).
+pub fn record_stuck_loop(session_id: &str) {
+    bump(session_id, |m| {
+        m.stuck_loop_count = m.stuck_loop_count.saturating_add(1)
+    });
+}
+
+/// Record a client-side KV-cache append-only violation.
+pub fn record_cache_violation(session_id: &str) {
+    bump(session_id, |m| {
+        m.cache_violation_count = m.cache_violation_count.saturating_add(1)
+    });
+}
+
 /// Snapshot of a session's recent activity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionMetricsSnapshot {
@@ -108,6 +151,14 @@ pub struct SessionMetricsSnapshot {
     pub cumulative_output_tokens: u64,
     /// Number of turns recorded for the session.
     pub turns: u64,
+    /// Count of context-overflow events for the session lifetime.
+    pub context_overflow_count: u64,
+    /// Count of detected repeated-read loops.
+    pub repeated_read_count: u64,
+    /// Count of detected stuck-in-loop events.
+    pub stuck_loop_count: u64,
+    /// Count of client-cache append-only violations.
+    pub cache_violation_count: u64,
 }
 
 impl SessionMetricsSnapshot {
@@ -143,6 +194,10 @@ pub fn snapshot(session_id: &str, lookback: Duration) -> Option<SessionMetricsSn
             cumulative_total_tokens: entry.cumulative_total_tokens,
             cumulative_output_tokens: entry.cumulative_output_tokens,
             turns: entry.turns,
+            context_overflow_count: entry.context_overflow_count,
+            repeated_read_count: entry.repeated_read_count,
+            stuck_loop_count: entry.stuck_loop_count,
+            cache_violation_count: entry.cache_violation_count,
         })
     })
     .flatten()
@@ -193,6 +248,25 @@ mod tests {
         record_token_usage(sid, 0, 0);
         record_token_usage("", 100, 40);
         assert!(snapshot(sid, Duration::from_secs(10)).is_none());
+        forget(sid);
+    }
+
+    #[test]
+    fn counts_failure_modes() {
+        let sid = "session_metrics_test_failmodes";
+        forget(sid);
+        record_context_overflow(sid);
+        record_context_overflow(sid);
+        record_repeated_read(sid);
+        record_stuck_loop(sid);
+        record_cache_violation(sid);
+        record_cache_violation(sid);
+        record_cache_violation(sid);
+        let snap = snapshot(sid, Duration::from_secs(10)).expect("snapshot");
+        assert_eq!(snap.context_overflow_count, 2);
+        assert_eq!(snap.repeated_read_count, 1);
+        assert_eq!(snap.stuck_loop_count, 1);
+        assert_eq!(snap.cache_violation_count, 3);
         forget(sid);
     }
 

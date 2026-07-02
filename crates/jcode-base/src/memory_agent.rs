@@ -545,34 +545,33 @@ impl MemoryAgent {
         // local MiniLM by default, or the remote OpenAI backend when configured).
         let start = Instant::now();
         let context_for_embedding = context.clone();
-        let context_embedding =
-            match tokio::task::spawn_blocking(move || {
-                crate::embedding_backend::embed_query_active(&context_for_embedding)
-            })
-                .await
-            {
-                Ok(Ok((emb, _model))) => emb,
-                Ok(Err(e)) => {
-                    crate::logging::event_rate_limited(
-                        crate::logging::LogLevel::Info,
-                        "memory_agent_embedding_failed",
-                        std::time::Duration::from_secs(60),
-                        "MEMORY_EMBEDDING_FAILED",
-                        vec![
-                            ("session_id", session_id.to_string()),
-                            ("error", e.to_string()),
-                            ("fallback", "skip_memory_relevance".to_string()),
-                        ],
-                    );
-                    memory::set_state(MemoryState::Idle);
-                    return Ok(());
-                }
-                Err(e) => {
-                    crate::logging::info(&format!("Embedding task failed: {}", e));
-                    memory::set_state(MemoryState::Idle);
-                    return Ok(());
-                }
-            };
+        let context_embedding = match tokio::task::spawn_blocking(move || {
+            crate::embedding_backend::embed_query_active(&context_for_embedding)
+        })
+        .await
+        {
+            Ok(Ok((emb, _model))) => emb,
+            Ok(Err(e)) => {
+                crate::logging::event_rate_limited(
+                    crate::logging::LogLevel::Info,
+                    "memory_agent_embedding_failed",
+                    std::time::Duration::from_secs(60),
+                    "MEMORY_EMBEDDING_FAILED",
+                    vec![
+                        ("session_id", session_id.to_string()),
+                        ("error", e.to_string()),
+                        ("fallback", "skip_memory_relevance".to_string()),
+                    ],
+                );
+                memory::set_state(MemoryState::Idle);
+                return Ok(());
+            }
+            Err(e) => {
+                crate::logging::info(&format!("Embedding task failed: {}", e));
+                memory::set_state(MemoryState::Idle);
+                return Ok(());
+            }
+        };
 
         // Check for topic change (comparing against this session's last embedding)
         let mut topic_changed = false;
@@ -744,8 +743,7 @@ impl MemoryAgent {
                     // Real judge verdict: surface it and remember it as the new
                     // verified set for future cadence/failure carries.
                     let turn = self.session_state(session_id).turn_count;
-                    let result: Vec<_> =
-                        reranked.into_iter().take(MAX_MEMORIES_PER_TURN).collect();
+                    let result: Vec<_> = reranked.into_iter().take(MAX_MEMORIES_PER_TURN).collect();
                     {
                         let ss = self.session_state(session_id);
                         ss.last_rerank_turn = Some(turn);
