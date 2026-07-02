@@ -232,8 +232,12 @@ mod macos {
     }
 
     pub(super) fn run_status_item_app() {
-        let mtm = MainThreadMarker::new()
-            .expect("jcode menubar must run on the main thread (the process entry point)");
+        let Some(mtm) = MainThreadMarker::new() else {
+            crate::logging::error(
+                "menubar: must run on the main thread (the process entry point); not starting",
+            );
+            return;
+        };
 
         let app = NSApplication::sharedApplication(mtm);
         // Accessory: no Dock icon, no main menu, just a menu bar item.
