@@ -869,6 +869,46 @@ impl Agent {
         self.tool_output_scan_index = 0;
     }
 
+    /// When the provider executes non-native tools internally (Claude CLI),
+    /// persist their SDK-reported results before those tool calls are dropped
+    /// from local execution. Without this, the already-persisted ToolUse
+    /// blocks are orphaned and repair_missing_tool_outputs() fabricates
+    /// "tool output missing" failures for tools that actually succeeded.
+    pub(super) fn persist_provider_handled_tool_results(
+        &mut self,
+        tool_calls: &[ToolCall],
+        sdk_tool_results: &mut std::collections::HashMap<String, (String, bool)>,
+    ) {
+        let mut persisted = 0usize;
+        for tc in tool_calls
+            .iter()
+            .filter(|tc| !JCODE_NATIVE_TOOLS.contains(&tc.name.as_str()))
+        {
+            let (content, is_error) = match sdk_tool_results.remove(&tc.id) {
+                Some((sdk_content, sdk_is_error)) => (
+                    tools::cap_sdk_tool_content_for_history(&tc.name, sdk_content),
+                    if sdk_is_error { Some(true) } else { None },
+                ),
+                None => (
+                    "[Executed by provider; output not reported]".to_string(),
+                    None,
+                ),
+            };
+            self.add_message(
+                Role::User,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: tc.id.clone(),
+                    content,
+                    is_error,
+                }],
+            );
+            persisted += 1;
+        }
+        if persisted > 0 {
+            self.persist_session_best_effort("provider-handled tool results");
+        }
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session.id
     }

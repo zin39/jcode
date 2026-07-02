@@ -62,6 +62,14 @@ pub const IMAGE_TOKEN_COST: usize = 1_600;
 /// Estimated conservatively: ~8k tokens for system prompt + ~10k for 50+ tools.
 pub const SYSTEM_OVERHEAD_TOKENS: usize = 18_000;
 
+/// Minimum token headroom for message content that
+/// [`estimate_compaction_tokens_from_chars`] always leaves unclaimed by
+/// overhead, even when `token_budget` is smaller than `SYSTEM_OVERHEAD_TOKENS`
+/// itself. Keeps the overhead clamp well-defined for pathologically small
+/// budgets (e.g. in tests) instead of letting overhead alone consume the
+/// entire budget.
+const MIN_MESSAGE_TOKEN_FLOOR: usize = 500;
+
 /// Rolling window size for token history (proactive/semantic modes)
 pub const TOKEN_HISTORY_WINDOW: usize = 20;
 
@@ -140,14 +148,33 @@ pub fn build_compaction_prompt(
     existing_summary: Option<&Summary>,
     max_prompt_chars: usize,
 ) -> String {
-    let mut conversation_text = build_compaction_conversation_text(messages, existing_summary);
-    let overhead = SUMMARY_PROMPT.len() + 50;
-    if conversation_text.len() + overhead > max_prompt_chars && max_prompt_chars > overhead {
+    // Keep the previous-summary block and the NEWEST messages when the prompt
+    // must shrink: the oldest raw messages are the part already (partially)
+    // covered by the previous summary, while the newest ones exist nowhere
+    // else — dropping them would lose the freshest context permanently.
+    let summary_prefix = existing_summary
+        .map(|summary| {
+            format!(
+                "## Previous Summary\n\n{}\n\n## New Conversation\n\n",
+                summary.text
+            )
+        })
+        .unwrap_or_default();
+    let messages_text = build_compaction_conversation_text(messages, None);
+    let marker = "... [oldest messages truncated to fit context window]\n\n";
+    let overhead = SUMMARY_PROMPT.len() + summary_prefix.len() + marker.len() + 50;
+    let conversation_text = if messages_text.len() + overhead > max_prompt_chars
+        && max_prompt_chars > overhead
+    {
         let budget = max_prompt_chars - overhead;
-        conversation_text = truncate_str_boundary(&conversation_text, budget).to_string();
-        conversation_text
-            .push_str("\n\n... [earlier conversation truncated to fit context window]\n");
-    }
+        let mut start = messages_text.len() - budget;
+        while start < messages_text.len() && !messages_text.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("{}{}{}", summary_prefix, marker, &messages_text[start..])
+    } else {
+        format!("{}{}", summary_prefix, messages_text)
+    };
     format!("{}\n\n---\n\n{}", conversation_text, SUMMARY_PROMPT)
 }
 
@@ -357,15 +384,16 @@ pub fn estimate_compaction_tokens(
 
 pub fn estimate_compaction_tokens_from_chars(total_chars: usize, token_budget: usize) -> usize {
     let msg_tokens = total_chars / CHARS_PER_TOKEN;
-    // Add overhead for system prompt + tool definitions, which are not in the
-    // message list but do count toward the context limit. Scale the overhead to
-    // the budget so tests with tiny budgets aren't affected.
-    let overhead = if token_budget >= DEFAULT_TOKEN_BUDGET / 2 {
-        SYSTEM_OVERHEAD_TOKENS
-    } else {
-        0
-    };
-    msg_tokens + overhead
+    // Always account for system prompt + tool-definition overhead: it isn't in
+    // the message list but does count toward the real context limit. This used
+    // to be skipped entirely whenever `token_budget < DEFAULT_TOKEN_BUDGET / 2`
+    // (100k), which silently gave small-context models (e.g. 32k/64k budgets)
+    // an over-optimistic usage estimate and let them run past their real
+    // window before compaction kicked in. Overhead is capped at half the budget
+    // so estimate inflation alone cannot cross the critical threshold on
+    // small-context models, even under pathologically tiny budgets.
+    let overhead = SYSTEM_OVERHEAD_TOKENS.min(token_budget / 2);
+    msg_tokens.saturating_add(overhead)
 }
 
 pub fn semantic_goal_text(messages: &[Message]) -> String {
@@ -554,6 +582,21 @@ pub fn emergency_truncate_large_payloads(
                     };
                     truncated += 1;
                 }
+                ContentBlock::ToolUse { input, .. } => {
+                    // Oversized tool INPUTS (e.g. a Write call carrying a huge
+                    // file body) blow the budget just like oversized results.
+                    let serialized = input.to_string();
+                    if serialized.len() > max_tool_result_chars {
+                        let preview =
+                            truncate_str_boundary(&serialized, max_tool_result_chars.min(2000));
+                        *input = serde_json::json!({
+                            "_emergency_truncated": true,
+                            "original_chars": serialized.len(),
+                            "preview": preview,
+                        });
+                        truncated += 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -705,6 +748,49 @@ mod tests {
     }
 
     #[test]
+    fn emergency_truncation_shrinks_oversized_tool_use_input() {
+        let mut messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "write".to_string(),
+                input: serde_json::json!({"path": "a.txt", "content": "z".repeat(50_000)}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+        let truncated = emergency_truncate_large_payloads(&mut messages, 10_000, 10_000);
+        assert_eq!(truncated, 1);
+        let ContentBlock::ToolUse { input, .. } = &messages[0].content[0] else {
+            panic!("tool use block replaced unexpectedly");
+        };
+        assert!(input.to_string().len() < 15_000, "input actually shrank");
+        assert_eq!(input["_emergency_truncated"], true);
+    }
+
+    #[test]
+    fn oversized_compaction_prompt_keeps_newest_messages_and_summary() {
+        let summary = Summary {
+            text: "prior work".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 1,
+            original_turn_count: 1,
+        };
+        let messages = vec![
+            Message::user(&format!("OLDEST-MARKER {}", "x".repeat(4000))),
+            Message::user(&format!("{} NEWEST-MARKER", "y".repeat(4000))),
+        ];
+        let max = SUMMARY_PROMPT.len() + 3000;
+        let prompt = build_compaction_prompt(&messages, Some(&summary), max);
+        assert!(prompt.contains("## Previous Summary"), "summary block kept");
+        assert!(prompt.contains("prior work"), "summary text kept");
+        assert!(prompt.contains("NEWEST-MARKER"), "newest content kept");
+        assert!(!prompt.contains("OLDEST-MARKER"), "oldest content dropped");
+        assert!(prompt.contains("truncated to fit context window"));
+    }
+
+    #[test]
     fn failed_tool_result_payload_excluded_from_summary() {
         let messages = vec![Message::tool_result(
             "t1",
@@ -786,11 +872,50 @@ mod tests {
             original_turn_count: 1,
         };
 
-        assert_eq!(estimate_compaction_tokens(Some(&summary), 0, 1000), 100);
         assert_eq!(
             estimate_compaction_tokens(Some(&summary), 0, DEFAULT_TOKEN_BUDGET),
             100 + SYSTEM_OVERHEAD_TOKENS
         );
+    }
+
+    /// Regression: overhead used to be dropped entirely for any
+    /// `token_budget < DEFAULT_TOKEN_BUDGET / 2` (100k), so a small-context
+    /// model's usage estimate silently ignored the ~18k system-prompt/tool
+    /// overhead and could run past its real context window before compaction
+    /// triggered. Overhead must now always be accounted for realistic
+    /// small-context budgets (e.g. 32k/64k), and even a pathologically tiny
+    /// budget must still have *some* nonzero overhead applied rather than
+    /// none.
+    #[test]
+    fn small_budget_still_accounts_for_overhead() {
+        let summary = Summary {
+            text: "abcd".repeat(100),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 1,
+            original_turn_count: 1,
+        };
+
+        // Realistic small-context model budget: overhead capped at half the
+        // budget (16k), not the full SYSTEM_OVERHEAD_TOKENS constant (18k).
+        assert_eq!(
+            estimate_compaction_tokens(Some(&summary), 0, 32_000),
+            16100
+        );
+
+        // Pathologically tiny budget (smaller than the overhead constant
+        // itself, e.g. a test fixture): overhead is clamped, not dropped, and
+        // must still be nonzero.
+        let tokens = estimate_compaction_tokens(Some(&summary), 0, 1000);
+        assert!(
+            tokens > 100,
+            "overhead must be accounted for even under a tiny budget, got {tokens}"
+        );
+
+        // The clamp never underflows and always leaves at least
+        // MIN_MESSAGE_TOKEN_FLOOR of the budget available for message tokens,
+        // even for a budget smaller than SYSTEM_OVERHEAD_TOKENS.
+        assert_eq!(estimate_compaction_tokens_from_chars(0, 1000), 500);
+        assert_eq!(estimate_compaction_tokens_from_chars(0, 0), 0);
     }
 
     #[test]

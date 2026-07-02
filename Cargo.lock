@@ -35,19 +35,6 @@ dependencies = [
 
 [[package]]
 name = "agentgrep"
-version = "0.1.2"
-source = "git+https://github.com/1jehuang/agentgrep.git?tag=v0.1.2#63e420bb4e035490d28cbca3f58e26baf297048e"
-dependencies = [
- "clap",
- "globset",
- "ignore",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "agentgrep"
 version = "0.1.3"
 source = "git+https://github.com/1jehuang/agentgrep.git?tag=v0.1.3#1fc53630181548db7ad2c73ac8fb66969c04f854"
 dependencies = [
@@ -3289,7 +3276,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 name = "jcode"
 version = "0.31.2"
 dependencies = [
- "agentgrep 0.1.3",
+ "agentgrep",
  "anyhow",
  "arboard",
  "async-stream",
@@ -3422,7 +3409,7 @@ dependencies = [
 name = "jcode-app-core"
 version = "0.1.0"
 dependencies = [
- "agentgrep 0.1.3",
+ "agentgrep",
  "anyhow",
  "arboard",
  "async-stream",
@@ -3534,7 +3521,6 @@ dependencies = [
 name = "jcode-base"
 version = "0.1.0"
 dependencies = [
- "agentgrep 0.1.2",
  "anyhow",
  "async-trait",
  "base64 0.22.1",

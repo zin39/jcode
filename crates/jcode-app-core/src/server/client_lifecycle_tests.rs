@@ -795,3 +795,136 @@ async fn lightweight_comm_request_skips_full_session_initialization() {
 fn decode_request_or_event(line: &str) -> ServerEvent {
     serde_json::from_str(line.trim()).expect("decode server event")
 }
+
+/// Regression test for the client-loop protocol desync bug.
+///
+/// `read_client_line` runs as a branch in the client `tokio::select!`. If it
+/// were not cancellation safe, a large request line that is mid-read when a
+/// sibling branch (processing-done, disconnect, bus, or debug event) wins the
+/// race would lose the bytes already pulled from the socket and desync the
+/// newline-framed request stream. Here we cancel `read_client_line` repeatedly
+/// while a large line is still streaming in, then confirm the line arrives
+/// intact.
+#[tokio::test]
+async fn read_client_line_is_cancellation_safe_for_large_lines() {
+    let (client, server) = tokio::io::duplex(4096);
+    let mut reader = BufReader::new(server);
+    let mut read_buffer: Vec<u8> = Vec::new();
+
+    // A request line large enough to span many socket reads.
+    let payload = "x".repeat(1024 * 1024);
+    let line = format!("{payload}\n");
+
+    let writer_task = tokio::spawn(async move {
+        let mut client = client;
+        for chunk in line.as_bytes().chunks(4096) {
+            client.write_all(chunk).await.expect("chunk should write");
+            // Yield so the reader observes a partial line between writes.
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Repeatedly start and immediately cancel `read_client_line` (the select!
+    // peer "wins" via a zero-delay timeout) until the full line arrives. A
+    // cancellation-unsafe reader would lose buffered bytes and never reassemble.
+    let result = loop {
+        tokio::select! {
+            biased;
+            read = read_client_line(&mut reader, &mut read_buffer) => break read,
+            _ = tokio::time::sleep(std::time::Duration::from_micros(50)) => {
+                // Cancellation point: the in-flight future is dropped here.
+            }
+        }
+    };
+
+    writer_task.await.expect("writer task should finish");
+
+    let got = result
+        .expect("read should not error")
+        .expect("should get a complete line, not EOF");
+    assert_eq!(
+        got.len(),
+        payload.len() + 1,
+        "large line must survive repeated cancellations intact"
+    );
+    assert!(got.trim_end().bytes().all(|b| b == b'x'));
+}
+
+/// A single request line split across multiple socket writes must be
+/// reassembled into one line.
+#[tokio::test]
+async fn read_client_line_reassembles_line_split_across_reads() {
+    let (client, server) = tokio::io::duplex(64);
+    let mut reader = BufReader::new(server);
+    let mut read_buffer: Vec<u8> = Vec::new();
+
+    let writer_task = tokio::spawn(async move {
+        let mut client = client;
+        client.write_all(b"{\"hel").await.expect("first half");
+        tokio::task::yield_now().await;
+        client.write_all(b"lo\":1}\n").await.expect("second half");
+    });
+
+    let got = read_client_line(&mut reader, &mut read_buffer)
+        .await
+        .expect("read should not error")
+        .expect("should get a complete line");
+    writer_task.await.expect("writer task should finish");
+    assert_eq!(got, "{\"hello\":1}\n");
+}
+
+/// Two lines delivered back-to-back in one write must both be returned, the
+/// second served from the buffer without another socket read.
+#[tokio::test]
+async fn read_client_line_serves_multiple_buffered_lines() {
+    let (client, server) = tokio::io::duplex(64);
+    let mut reader = BufReader::new(server);
+    let mut read_buffer: Vec<u8> = Vec::new();
+
+    {
+        let mut client = client;
+        client.write_all(b"a\nb\n").await.expect("both lines write");
+        // Drop the writer so a trailing read would see EOF, proving the second
+        // line comes from the persistent buffer, not a fresh socket read.
+    }
+
+    let first = read_client_line(&mut reader, &mut read_buffer)
+        .await
+        .expect("read should not error")
+        .expect("first line");
+    assert_eq!(first, "a\n");
+    let second = read_client_line(&mut reader, &mut read_buffer)
+        .await
+        .expect("read should not error")
+        .expect("second line");
+    assert_eq!(second, "b\n");
+    // Buffer drained; next read hits EOF and reports a clean disconnect.
+    let eof = read_client_line(&mut reader, &mut read_buffer)
+        .await
+        .expect("read should not error");
+    assert!(eof.is_none(), "expected clean EOF after buffered lines");
+}
+
+/// A trailing partial line with no terminating newline is surfaced at EOF
+/// (matching `read_line`), then a clean disconnect follows.
+#[tokio::test]
+async fn read_client_line_surfaces_trailing_partial_at_eof() {
+    let (client, server) = tokio::io::duplex(64);
+    let mut reader = BufReader::new(server);
+    let mut read_buffer: Vec<u8> = Vec::new();
+
+    {
+        let mut client = client;
+        client.write_all(b"partial").await.expect("partial write");
+    }
+
+    let got = read_client_line(&mut reader, &mut read_buffer)
+        .await
+        .expect("read should not error")
+        .expect("trailing partial line at EOF");
+    assert_eq!(got, "partial");
+    let eof = read_client_line(&mut reader, &mut read_buffer)
+        .await
+        .expect("read should not error");
+    assert!(eof.is_none(), "expected clean EOF after trailing partial");
+}

@@ -652,6 +652,7 @@ impl CopilotApiProvider {
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut saw_any_data = false;
+        let mut utf8_decoder = jcode_core::util::Utf8StreamDecoder::default();
 
         loop {
             let chunk = match tokio::time::timeout(SSE_CHUNK_TIMEOUT, stream.next()).await {
@@ -674,7 +675,7 @@ impl CopilotApiProvider {
             };
             saw_any_data = true;
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.push_str(&utf8_decoder.decode(&chunk));
 
             // Process complete SSE lines
             while let Some(line_end) = buffer.find('\n') {

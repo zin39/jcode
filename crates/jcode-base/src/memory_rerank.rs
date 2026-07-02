@@ -370,7 +370,10 @@ pub async fn rerank_candidates_with_mode_attributed(
         };
     }
 
-    (compose_reranked(candidates, &order, mode), RerankOutcome::Judged)
+    (
+        compose_reranked(candidates, &order, mode),
+        RerankOutcome::Judged,
+    )
 }
 
 /// Pure composition step: given the candidates and the model's ranking
@@ -455,8 +458,14 @@ mod tests {
     }
 
     fn cands(ids: &[&str]) -> Vec<(MemoryEntry, f32)> {
-        ids.iter().rev().enumerate().map(|(i, id)| (mem(id), i as f32)).collect::<Vec<_>>()
-            .into_iter().rev().collect()
+        ids.iter()
+            .rev()
+            .enumerate()
+            .map(|(i, id)| (mem(id), i as f32))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     }
 
     #[test]
@@ -465,7 +474,11 @@ mod tests {
         let pool = cands(&["a", "b", "c", "d"]);
         let out = compose_reranked(pool, &[2, 0], RerankMode::Precision);
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, vec!["c", "a"], "precision returns ONLY model-kept, in model order");
+        assert_eq!(
+            ids,
+            vec!["c", "a"],
+            "precision returns ONLY model-kept, in model order"
+        );
     }
 
     #[test]
@@ -502,11 +515,7 @@ mod tests {
     #[test]
     fn tally_consensus_orders_by_votes_then_rank() {
         // 3 judges. c2 gets 3 votes, c0 gets 2, c1 gets 2 but ranked worse.
-        let ballots = vec![
-            Some(vec![2, 0, 1]),
-            Some(vec![2, 0]),
-            Some(vec![2, 1]),
-        ];
+        let ballots = vec![Some(vec![2, 0, 1]), Some(vec![2, 0]), Some(vec![2, 1])];
         // votes: c2=3, c0=2, c1=2. c0 ranked above c1 (best_rank 1 vs 1? c0 best
         // rank 1, c1 best rank 1 too) -> stable by index. Top should be c2.
         let kept = tally_consensus(&ballots, 3, 2);

@@ -16,3 +16,6 @@ serde = { version = "1", features = ["derive"] }
 unicode-width = "0.2"
 
 [dev-dependencies]
+
+[lints]
+workspace = true

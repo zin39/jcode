@@ -451,7 +451,15 @@ fn auth_doctor_provider_arg<'a>(
 fn resolve_resume_arg(args: &mut Args) -> Result<()> {
     if let Some(ref resume_id) = args.resume {
         if resume_id.is_empty() {
-            return tui_launch::list_sessions();
+            // Bare `--resume` with no id: hand off entirely to the interactive
+            // session picker (resume, spawn other terminals, or report "no
+            // session selected"). `list_sessions()` returning `Ok(())` does NOT
+            // mean there is nothing left to do here — it means the picker
+            // already fully handled the invocation. Exit immediately instead of
+            // falling through to normal startup, which would otherwise proceed
+            // with `args.resume == Some("")`, a bogus empty resume id.
+            tui_launch::list_sessions()?;
+            std::process::exit(0);
         }
 
         let resume_id = resume_id.clone();

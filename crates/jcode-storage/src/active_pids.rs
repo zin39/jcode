@@ -23,6 +23,9 @@ pub fn streaming_pids_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Record that `session_id` is owned by process `pid`.
+///
+/// Best-effort by design: this registry only feeds presence UI (menu bar
+/// counts), so write failures degrade the indicator rather than the session.
 pub fn register_active_pid(session_id: &str, pid: u32) {
     if let Some(dir) = active_pids_dir() {
         let _ = std::fs::create_dir_all(&dir);
@@ -80,10 +83,17 @@ impl Drop for StreamingGuard {
 pub fn find_active_session_id_by_pid(pid: u32) -> Option<String> {
     let dir = active_pids_dir()?;
     for entry in std::fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
+        // One unreadable or corrupt registry file must not hide the remaining
+        // valid sessions — skip it and keep scanning.
+        let Ok(entry) = entry else { continue };
         let session_id = entry.file_name().to_string_lossy().to_string();
-        let stored = std::fs::read_to_string(entry.path()).ok()?;
-        if stored.trim().parse::<u32>().ok()? == pid {
+        let Some(stored_pid) = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if stored_pid == pid {
             return Some(session_id);
         }
     }

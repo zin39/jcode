@@ -232,8 +232,12 @@ mod macos {
     }
 
     pub(super) fn run_status_item_app() {
-        let mtm = MainThreadMarker::new()
-            .expect("jcode menubar must run on the main thread (the process entry point)");
+        let Some(mtm) = MainThreadMarker::new() else {
+            crate::logging::error(
+                "menubar: must run on the main thread (the process entry point); not starting",
+            );
+            return;
+        };
 
         let app = NSApplication::sharedApplication(mtm);
         // Accessory: no Dock icon, no main menu, just a menu bar item.
@@ -252,16 +256,14 @@ mod macos {
         // in points from the right screen edge) before the item is realized
         // places it among the system icons; afterwards macOS keeps tracking
         // the user's chosen position under the same key.
-        unsafe {
-            let defaults = NSUserDefaults::standardUserDefaults();
-            let pos_key = NSString::from_str(&format!(
-                "NSStatusItem Preferred Position {STATUS_ITEM_AUTOSAVE}"
-            ));
-            if defaults.objectForKey(&pos_key).is_none() {
-                defaults.setInteger_forKey(550, &pos_key);
-            }
-            status_item.setAutosaveName(Some(&NSString::from_str(STATUS_ITEM_AUTOSAVE)));
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let pos_key = NSString::from_str(&format!(
+            "NSStatusItem Preferred Position {STATUS_ITEM_AUTOSAVE}"
+        ));
+        if defaults.objectForKey(&pos_key).is_none() {
+            defaults.setInteger_forKey(550, &pos_key);
         }
+        status_item.setAutosaveName(Some(&NSString::from_str(STATUS_ITEM_AUTOSAVE)));
 
         // Style the button like a native menu bar extra: a template SF Symbol
         // (auto-adapts to light/dark menu bars and tinting) plus a compact

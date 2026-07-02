@@ -203,9 +203,6 @@ mod macos {
     }
 
     const PROC_PIDLISTFDS: i32 = 1;
-    const PROC_PIDFDVNODEPATHINFO: i32 = 2;
-    const PROC_PIDFDSOCKETINFO: i32 = 3;
-    const PROC_PIDFDPIPEINFO: i32 = 6;
 
     #[repr(C)]
     struct proc_fdinfo {

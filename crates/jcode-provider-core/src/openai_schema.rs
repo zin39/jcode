@@ -29,6 +29,41 @@ fn merge_string_sets(existing: &Value, incoming: &Value) -> Option<Value> {
     }
 }
 
+fn intersect_string_sets(existing: &Value, incoming: &Value) -> Option<Value> {
+    fn collect_strings(value: &Value) -> Option<Vec<String>> {
+        match value {
+            Value::String(s) => Some(vec![s.clone()]),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(ToString::to_string))
+                .collect(),
+            _ => None,
+        }
+    }
+
+    let existing_set: HashSet<String> = collect_strings(existing)?.into_iter().collect();
+    let incoming_set: HashSet<String> = collect_strings(incoming)?.into_iter().collect();
+
+    let mut intersection: Vec<String> = existing_set
+        .intersection(&incoming_set)
+        .cloned()
+        .collect();
+
+    if intersection.is_empty() {
+        return None;
+    }
+
+    intersection.sort();
+
+    if intersection.len() == 1 {
+        Some(Value::String(intersection.remove(0)))
+    } else {
+        Some(Value::Array(
+            intersection.into_iter().map(Value::String).collect(),
+        ))
+    }
+}
+
 fn merge_schema_objects(
     target: &mut serde_json::Map<String, Value>,
     incoming: &serde_json::Map<String, Value>,
@@ -56,10 +91,28 @@ fn merge_schema_objects(
                     }
                 }
             }
-            "required" | "enum" | "type" => match target.get_mut(key) {
+            "required" => match target.get_mut(key) {
                 Some(existing_value) => {
+                    // For required fields, use union: a field is required if EITHER branch requires it
                     if let Some(merged) = merge_string_sets(existing_value, incoming_value) {
                         *existing_value = merged;
+                    }
+                }
+                None => {
+                    target.insert(key.clone(), incoming_value.clone());
+                }
+            },
+            "enum" | "type" => match target.get_mut(key) {
+                Some(existing_value) => {
+                    // For enum and type, use intersection: value must satisfy BOTH branches
+                    if let Some(merged) = intersect_string_sets(existing_value, incoming_value) {
+                        *existing_value = merged;
+                    } else {
+                        // If intersection is empty, keep existing (incompatible constraints)
+                        jcode_logging::warn(&format!(
+                            "[schema] allOf branches have incompatible {} constraints, keeping first",
+                            key
+                        ));
                     }
                 }
                 None => {
@@ -502,5 +555,45 @@ mod tests {
             json!("integer")
         );
         assert_eq!(normalized["required"], json!(["file_path"]));
+    }
+
+    #[test]
+    fn openai_compatible_schema_intersects_enum_in_allof() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "enum": ["active", "pending", "archived"]
+                        }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "enum": ["active", "inactive", "pending"]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let normalized = openai_compatible_schema(&schema);
+
+        // The intersection of ["active", "pending", "archived"] and ["active", "inactive", "pending"]
+        // should be ["active", "pending"] (the values that satisfy BOTH constraints)
+        assert!(normalized.get("allOf").is_none());
+        let status_enum = &normalized["properties"]["status"]["enum"];
+        let enum_values: Vec<&str> = status_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(enum_values.len(), 2);
+        assert!(enum_values.contains(&"active"));
+        assert!(enum_values.contains(&"pending"));
     }
 }

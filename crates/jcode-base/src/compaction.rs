@@ -1201,14 +1201,18 @@ impl CompactionManager {
                     original_turn_count: self.pending_cutoff,
                 };
 
+                // Capture active message chars BEFORE advancing compacted_count
+                // (after advancing, active_messages() will exclude the messages we're about
+                // to compact, so we must capture the pre-advance value to avoid double-subtracting)
+                let pre_advance_active_chars = self.active_message_chars_with(all_messages);
+
                 // Advance the compacted count — these messages are now summarized
                 self.compacted_count = self.compacted_count.saturating_add(self.pending_cutoff);
                 if !all_messages.is_empty() {
                     self.compacted_count = self.compacted_count.min(all_messages.len());
                 }
                 self.active_chars.set_exact(
-                    self.active_message_chars_with(all_messages)
-                        .saturating_sub(compacted_chars),
+                    pre_advance_active_chars.saturating_sub(compacted_chars),
                 );
 
                 // Store summary
@@ -1472,8 +1476,23 @@ impl CompactionManager {
             cutoff = safe_compaction_cutoff(active, cutoff);
 
             if cutoff > 0 {
-                let remaining_tokens = remaining_suffix_chars[cutoff] / CHARS_PER_TOKEN;
-                if remaining_tokens <= self.token_budget {
+                let remaining_message_tokens = remaining_suffix_chars[cutoff] / CHARS_PER_TOKEN;
+                // Account for system overhead (clamped as in estimate_compaction_tokens_from_chars)
+                let overhead = SYSTEM_OVERHEAD_TOKENS.min(self.token_budget.saturating_sub(500));
+                // Account for existing summary which will be included in emergency summary
+                let existing_summary_chars = self.active_summary.as_ref()
+                    .map(|s| summary_payload_char_count(s))
+                    .unwrap_or(0);
+                // Conservative estimate for emergency message additions (message + file/tool hints)
+                let emergency_overhead_chars = 1000usize;
+                let total_summary_chars = existing_summary_chars.saturating_add(emergency_overhead_chars);
+                let summary_tokens = total_summary_chars / CHARS_PER_TOKEN;
+                // Effective tokens accounting for messages, summary, and overhead
+                let total_effective_tokens = remaining_message_tokens
+                    .saturating_add(summary_tokens)
+                    .saturating_add(overhead);
+
+                if total_effective_tokens <= self.token_budget {
                     break;
                 }
             }

@@ -214,8 +214,59 @@ pub(super) async fn spawn_or_resume_await_members(
                                 continue;
                             }
                         }
-                        Err(_) => {
-                            await_members_runtime.clear_active(&key).await;
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // The swarm event broadcast channel has a fixed
+                            // capacity (256); a burst of events can outrun a
+                            // slow-polling waiter and lag this receiver. That
+                            // is not terminal: `awaited_member_statuses` at
+                            // the top of the loop is the source of truth, not
+                            // the events themselves, so just log and loop
+                            // back around to re-check statuses. Previously
+                            // this fell into the same catch-all `Err(_)` arm
+                            // as a closed channel and tore down the waiter
+                            // registration without responding, so a lag
+                            // during a busy swarm left every registered
+                            // waiter on this key hanging forever.
+                            crate::logging::warn(&format!(
+                                "spawn_or_resume_await_members: swarm event receiver lagged by {} event(s) for key {}; re-checking member statuses",
+                                skipped, key
+                            ));
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // The broadcast sender is gone; no further events
+                            // will ever arrive. This is genuinely terminal,
+                            // but registered waiters still need a response
+                            // (previously they were left to hang until the
+                            // deadline, or forever if the deadline had
+                            // already been scheduled past).
+                            let member_statuses = awaited_member_statuses(
+                                &req_session_id,
+                                &swarm_id,
+                                &requested_ids,
+                                &target_status,
+                                &swarm_members,
+                                &swarms_by_id,
+                            )
+                            .await;
+                            let summary = format!(
+                                "Swarm event stream closed while waiting. {}",
+                                timeout_summary(&member_statuses)
+                            );
+                            let _ = persist_final_response(
+                                &state,
+                                false,
+                                member_statuses.clone(),
+                                summary.clone(),
+                            );
+                            respond_to_waiters(
+                                &await_members_runtime,
+                                &key,
+                                false,
+                                member_statuses,
+                                summary,
+                            )
+                            .await;
                             return;
                         }
                     }

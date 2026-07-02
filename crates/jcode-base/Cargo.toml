@@ -122,7 +122,6 @@ jcode-side-panel-types = { path = "../jcode-side-panel-types" }
 # Gzip decoding (used by provider import/helpers)
 flate2 = "1"
 tempfile = "3"
-agentgrep = { git = "https://github.com/1jehuang/agentgrep.git", tag = "v0.1.2" }
 qrcode = { version = "0.14.1", default-features = false }
 
 [features]
@@ -158,3 +157,6 @@ global-hotkey = "0.7"
 # in the upper jcode-app-core layer). Dev-dependency cycles are permitted by
 # Cargo and do not affect the library build.
 jcode-app-core = { path = "../jcode-app-core", default-features = false }
+
+[lints]
+workspace = true

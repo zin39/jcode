@@ -16,3 +16,6 @@ name = "jcode_tui_anim"
 path = "src/lib.rs"
 
 [dependencies]
+
+[lints]
+workspace = true

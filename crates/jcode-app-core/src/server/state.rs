@@ -64,6 +64,52 @@ pub(super) fn remove_background_tool_signal(session_id: &str) {
     }
 }
 
+/// Process-global registry of the stop-current-turn (cancel) signal for each
+/// live session, mirroring [`BACKGROUND_TOOL_SIGNALS`].
+///
+/// The per-connection `shutdown_signals` map is only reachable from the owning
+/// `handle_client` loop, so a *different* task (e.g. the swarm `comm_stop`
+/// operation cancelling another agent's in-flight turn) cannot fire it. This
+/// registry is populated every time a full `SessionControlHandle` is built, so
+/// any server task can cancel a busy session's turn lock-free without holding
+/// the agent mutex.
+static STOP_CURRENT_TURN_SIGNALS: LazyLock<StdMutex<HashMap<String, InterruptSignal>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Register (or replace) the stop-current-turn signal for a session.
+pub(super) fn register_stop_current_turn_signal(session_id: &str, signal: InterruptSignal) {
+    if let Ok(mut map) = STOP_CURRENT_TURN_SIGNALS.lock() {
+        map.insert(session_id.to_string(), signal);
+    }
+}
+
+/// Look up the registered stop-current-turn signal for a session, if any.
+pub(super) fn stop_current_turn_signal_for_session(session_id: &str) -> Option<InterruptSignal> {
+    STOP_CURRENT_TURN_SIGNALS
+        .lock()
+        .ok()
+        .and_then(|map| map.get(session_id).cloned())
+}
+
+/// Move a session's stop-current-turn signal registration to a new session id.
+pub(super) fn rename_stop_current_turn_signal(old_session_id: &str, new_session_id: &str) {
+    if old_session_id == new_session_id {
+        return;
+    }
+    if let Ok(mut map) = STOP_CURRENT_TURN_SIGNALS.lock()
+        && let Some(signal) = map.remove(old_session_id)
+    {
+        map.insert(new_session_id.to_string(), signal);
+    }
+}
+
+/// Drop a session's stop-current-turn signal registration.
+pub(super) fn remove_stop_current_turn_signal(session_id: &str) {
+    if let Ok(mut map) = STOP_CURRENT_TURN_SIGNALS.lock() {
+        map.remove(session_id);
+    }
+}
+
 /// Record of a file access by an agent
 #[derive(Clone, Debug)]
 pub struct FileAccess {
@@ -504,6 +550,11 @@ impl SessionControlHandle {
         // `await_members`) can still fire it. Without this, Alt+B/Ctrl+B silently
         // no-ops for busy turns.
         register_background_tool_signal(&session_id, background_tool_signal.clone());
+        // Mirror the cancel signal into the process-global registry so a
+        // different server task (e.g. swarm `comm_stop` cancelling another
+        // agent's in-flight turn) can fire it lock-free, without the agent
+        // mutex and without access to the owning connection's `shutdown_signals`.
+        register_stop_current_turn_signal(&session_id, stop_current_turn_signal.clone());
         Self {
             session_id,
             soft_interrupt_queue,

@@ -310,9 +310,7 @@ impl Sidecar {
                         );
                         crate::logging::info(&format!(
                             "Sidecar fallback: {} also unavailable in ChatGPT OAuth mode; falling back to Claude {} ({})",
-                            SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL,
-                            SIDECAR_CLAUDE_MODEL,
-                            reason
+                            SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL, SIDECAR_CLAUDE_MODEL, reason
                         ));
                         let claude = Self {
                             client: self.client.clone(),
@@ -730,10 +728,11 @@ async fn collect_openai_sse_text(response: reqwest::Response) -> Result<String> 
     let mut stream = response.bytes_stream();
     let mut text = String::new();
     let mut buf = String::new();
+    let mut utf8_decoder = jcode_core::util::Utf8StreamDecoder::default();
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.context("Error reading SSE stream")?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.push_str(&utf8_decoder.decode(&bytes));
 
         // Process all complete lines in the buffer
         while let Some(newline_pos) = buf.find('\n') {

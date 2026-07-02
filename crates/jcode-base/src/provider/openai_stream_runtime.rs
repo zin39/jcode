@@ -717,6 +717,7 @@ pub(super) async fn try_persistent_ws_continuation(
 
     // Stream the response, extracting the new response_id
     let mut saw_text_delta = false;
+    let mut saw_reasoning_delta = false;
     let mut streaming_tool_calls = HashMap::new();
     let mut completed_tool_items = HashSet::new();
     let mut saw_response_completed = false;
@@ -824,6 +825,7 @@ pub(super) async fn try_persistent_ws_continuation(
                 if let Some(event) = parse_openai_response_event(
                     &text,
                     &mut saw_text_delta,
+                    &mut saw_reasoning_delta,
                     &mut streaming_tool_calls,
                     &mut completed_tool_items,
                     &mut pending,
@@ -1097,6 +1099,7 @@ pub(super) async fn stream_response_websocket_persistent(
     ));
 
     let mut saw_text_delta = false;
+    let mut saw_reasoning_delta = false;
     let mut streaming_tool_calls = HashMap::new();
     let mut completed_tool_items = HashSet::new();
     let mut saw_response_completed = false;
@@ -1214,6 +1217,7 @@ pub(super) async fn stream_response_websocket_persistent(
                     if let Some(event) = parse_openai_response_event(
                         &text,
                         &mut saw_text_delta,
+                        &mut saw_reasoning_delta,
                         &mut streaming_tool_calls,
                         &mut completed_tool_items,
                         &mut pending,
