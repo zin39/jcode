@@ -34,6 +34,7 @@ impl Tool for LoadToolsTool {
             "type": "object",
             "required": ["names"],
             "properties": {
+                "intent": super::intent_schema_property(),
                 "names": {
                     "type": "array",
                     "items": {
