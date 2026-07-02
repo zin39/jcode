@@ -527,6 +527,10 @@ pub struct ToolConfig {
     pub disabled: Vec<String>,
     /// Disable all built-in tools unless `enabled` is provided.
     pub disable_base_tools: bool,
+    /// When true, only core tools are sent with full schemas; other tool
+    /// schemas load on demand via the load_tools meta-tool.
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
