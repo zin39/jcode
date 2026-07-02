@@ -145,7 +145,15 @@ impl Tool for SubagentTool {
         session.save()?;
 
         let mut allowed: HashSet<String> = self.registry.tool_names().await.into_iter().collect();
-        for blocked in ["subagent", "task", "todo", "todowrite", "todoread", "cheap_route"] {
+        for blocked in [
+            "subagent",
+            "task",
+            "todo",
+            "todowrite",
+            "todoread",
+            "cheap_route",
+            "tournament",
+        ] {
             allowed.remove(blocked);
         }
         crate::config::config()
@@ -455,7 +463,7 @@ impl SubagentOutputMode {
 
 /// Best-effort structural check for schema-requested subagent output.
 /// Strips one ```/```json fence pair if present, then requires valid JSON.
-fn enforce_structured_output(final_text: &str) -> Result<String, String> {
+pub(super) fn enforce_structured_output(final_text: &str) -> Result<String, String> {
     let trimmed = final_text.trim();
 
     // Strip markdown fence if present

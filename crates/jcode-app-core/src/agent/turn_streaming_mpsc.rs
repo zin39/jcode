@@ -118,6 +118,8 @@ impl Agent {
         let trace = trace_enabled();
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
+        self.turn_made_edits = false;
+        self.verify_attempts = 0;
 
         loop {
             let repaired = self.repair_missing_tool_outputs();
@@ -842,7 +844,12 @@ impl Agent {
                             crate::telemetry::record_tool_failure();
                         }
                         let native_result = match tool_result {
-                            Ok(output) => NativeToolResult::success(request_id, output.output),
+                            Ok(output) => {
+                                if matches!(tool_name.as_str(), "write" | "edit" | "multiedit" | "patch" | "apply_patch") {
+                                    self.turn_made_edits = true;
+                                }
+                                NativeToolResult::success(request_id, output.output)
+                            }
                             Err(e) => NativeToolResult::error(request_id, e.to_string()),
                         };
                         if let Some(sender) = self.provider.native_result_sender() {
@@ -1133,6 +1140,57 @@ impl Agent {
                     );
                     break;
                 }
+                if self.turn_made_edits {
+                    let vcfg = crate::agent::verify::resolve_verify_config(
+                        self.working_dir().map(std::path::Path::new),
+                    );
+                    if crate::agent::verify::should_verify(
+                        vcfg.enabled,
+                        !vcfg.commands.is_empty(),
+                        self.turn_made_edits,
+                        self.verify_attempts,
+                        vcfg.max_attempts,
+                    ) {
+                        let outcome = crate::agent::verify::run_verification(
+                            &vcfg,
+                            self.working_dir().map(std::path::Path::new),
+                        )
+                        .await;
+                        if outcome.passed {
+                            logging::info("verify-loop: checks passed");
+                            self.turn_made_edits = false;
+                        } else {
+                            self.verify_attempts += 1;
+                            self.turn_made_edits = false;
+                            let notice = format!(
+                                "[jcode verification] checks failed (attempt {}/{}). Fix these before finishing:\n{}",
+                                self.verify_attempts, vcfg.max_attempts, outcome.report
+                            );
+                            self.add_message_with_display_role(
+                                Role::User,
+                                vec![ContentBlock::Text {
+                                    text: notice.clone(),
+                                    cache_control: None,
+                                }],
+                                Some(StoredDisplayRole::System),
+                            );
+                            self.persist_session_best_effort("verify-loop injection");
+                            let _ = event_tx.send(ServerEvent::SoftInterruptInjected {
+                                content: notice,
+                                display_role: Some("system".to_string()),
+                                point: "verify".to_string(),
+                                tools_skipped: None,
+                            });
+                            continue;
+                        }
+                    } else if vcfg.enabled
+                        && !vcfg.commands.is_empty()
+                        && self.verify_attempts >= vcfg.max_attempts
+                    {
+                        logging::warn("verify-loop: attempts exhausted, surfacing failure");
+                        self.turn_made_edits = false;
+                    }
+                }
                 match self.handle_streaming_no_tool_calls(
                     stop_reason.as_deref(),
                     &mut incomplete_continuations,
@@ -1385,6 +1443,9 @@ impl Agent {
 
                     match result {
                         Ok(output) => {
+                            if matches!(tc.name.as_str(), "write" | "edit" | "multiedit" | "patch" | "apply_patch") {
+                                self.turn_made_edits = true;
+                            }
                             let output = cap_tool_output_for_history(&tc.name, &self.session.id, &tc.id, output);
                             let _ = event_tx.send(ServerEvent::ToolDone {
                                 id: tc.id.clone(),

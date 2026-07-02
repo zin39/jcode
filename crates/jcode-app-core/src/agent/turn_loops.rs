@@ -18,6 +18,8 @@ impl Agent {
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
+        self.turn_made_edits = false;
+        self.verify_attempts = 0;
 
         loop {
             let repaired = self.repair_missing_tool_outputs();
@@ -826,7 +828,58 @@ impl Agent {
                 if print_output {
                     println!();
                 }
+                let mut verify_exhausted_note: Option<String> = None;
+                if self.turn_made_edits {
+                    let vcfg = crate::agent::verify::resolve_verify_config(
+                        self.working_dir().map(std::path::Path::new),
+                    );
+                    if crate::agent::verify::should_verify(
+                        vcfg.enabled,
+                        !vcfg.commands.is_empty(),
+                        self.turn_made_edits,
+                        self.verify_attempts,
+                        vcfg.max_attempts,
+                    ) {
+                        let outcome = crate::agent::verify::run_verification(
+                            &vcfg,
+                            self.working_dir().map(std::path::Path::new),
+                        )
+                        .await;
+                        if outcome.passed {
+                            logging::info("verify-loop: checks passed");
+                            self.turn_made_edits = false;
+                        } else {
+                            self.verify_attempts += 1;
+                            self.turn_made_edits = false;
+                            let notice = format!(
+                                "[jcode verification] checks failed (attempt {}/{}). Fix these before finishing:\n{}",
+                                self.verify_attempts, vcfg.max_attempts, outcome.report
+                            );
+                            self.add_message(
+                                Role::User,
+                                vec![ContentBlock::Text {
+                                    text: notice,
+                                    cache_control: None,
+                                }],
+                            );
+                            self.session.save()?;
+                            continue;
+                        }
+                    } else if vcfg.enabled
+                        && !vcfg.commands.is_empty()
+                        && self.verify_attempts >= vcfg.max_attempts
+                    {
+                        logging::warn("verify-loop: attempts exhausted, surfacing failure");
+                        verify_exhausted_note = Some(
+                            "\n\n[jcode verification] checks still failing after max attempts; please review before finishing.".to_string(),
+                        );
+                        self.turn_made_edits = false;
+                    }
+                }
                 final_text = text_content;
+                if let Some(note) = verify_exhausted_note {
+                    final_text.push_str(&note);
+                }
                 break;
             }
 
@@ -1010,6 +1063,9 @@ impl Agent {
 
                 match result {
                     Ok(output) => {
+                        if matches!(tc.name.as_str(), "write" | "edit" | "multiedit" | "patch" | "apply_patch") {
+                            self.turn_made_edits = true;
+                        }
                         let output = cap_tool_output_for_history(&tc.name, &self.session.id, &tc.id, output);
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
