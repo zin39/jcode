@@ -7,3 +7,6 @@ publish = false
 [dependencies]
 anyhow = "1"
 dirs = "5"
+
+[lints]
+workspace = true

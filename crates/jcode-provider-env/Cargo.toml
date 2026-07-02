@@ -16,3 +16,6 @@ jcode-storage = { path = "../jcode-storage" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

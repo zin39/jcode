@@ -8,3 +8,6 @@ publish = false
 chrono = { version = "0.4", features = ["serde"] }
 jcode-message-types = { path = "../jcode-message-types" }
 serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 ratatui = "0.30"
+
+[lints]
+workspace = true
