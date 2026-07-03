@@ -45,6 +45,10 @@ impl App {
             &mut split,
             self.provider.reasoning_effort().as_deref(),
         );
+        crate::prompt::append_web_grounding_directive(
+            &mut split,
+            crate::config::config().features.web_grounding,
+        );
         self.context_info = context_info;
         split
     }

@@ -59,6 +59,11 @@ pub const SWARM_EFFORT_DIRECTIVE: &str = "# Swarm Effort\n\nYou are running at t
 /// task-graph workflow.
 pub const SWARM_DEEP_EFFORT_DIRECTIVE: &str = "# Deep Task Graph\n\nYou are running at maximum reasoning effort with the deep task-graph swarm workflow. Treat the task DAG as the primary object, not ad hoc agent chat. Workflow:\n\n1. Seed a graph with `swarm task_graph` using `mode: \"deep\"`: lay out nodes (kind explore|implement|verify|fix|synthesize) and `depends_on` edges instead of answering directly. (At this effort the server already defaults the plan to deep, but pass `mode: \"deep\"` explicitly anyway.) The engine auto-inserts a plan-wide root gate over your seed: the plan cannot finish until a final adversarial audit passes, and that audit can inject new top-level work.\n2. For any node that is too big, `swarm expand_node` to decompose it into a child sub-DAG (you become its planner/integrator). In deep mode a critique/verify gate is auto-inserted before a composite node can close. The graph is EXPECTED to outgrow its seed, often by several times: growth (expansions and gate-injected gaps) is the system working, not scope creep. plan_status reports seeded-vs-grown counts.\n3. Finish each node with `swarm complete_node` and a typed artifact: `findings`, `evidence` (file:line / commit refs), `validation`, `open_questions`, a required `confidence` (low|medium|high; report low honestly, it routes follow-up work to shore up that scope), and an honest `what_i_did_not_check`. Downstream nodes are hydrated with these artifacts automatically. There is no other way to close a deep node: a turn ending without expand_node/complete_node re-queues the node to a fresh worker and fails it on repeat.\n4. When a critique/verify gate finds gaps or failures, use `swarm inject_gap` to add new nodes; the parent cannot close until they drain. A passing gate artifact must account for EVERY node it audited by id (the server rejects rubber stamps), and cannot pass over a low-confidence sibling without addressing it explicitly, so treat low-confidence siblings as priority probe targets.\n5. Use `swarm run_plan` to drive the graph to completion. It returns immediately and drives the plan as a background task (progress card + wake on completion), so keep working or answer the user while it runs; check `swarm plan_status` or `bg` for progress. Deep mode fans out wide automatically (many workers run in parallel, bounded only by the swarm member cap), so prefer decomposing into MANY independent sibling nodes rather than a few serial ones: keep the ready set wide so run_plan can dispatch lots of agents at once. Only add `depends_on` edges for real data dependencies.\n\nComprehensiveness is structural: prefer decomposition + gates over a single thorough answer, so it is very unlikely any nook or cranny is missed.";
 
+/// System-prompt directive injected when the `web_grounding` feature is on.
+/// Instructs the agent to verify uncertain or fast-changing facts with a
+/// websearch instead of asserting them from memory, cutting hallucinations.
+pub const WEB_GROUNDING_DIRECTIVE: &str = "# Web Grounding\n\nProactively ground your answers in real sources instead of relying on memory. Before stating any fact that is uncertain, could have changed since your training data, or that you are not highly confident about, use the `websearch` tool to verify it and cite what you found. This applies to current events, versions/releases, prices, APIs, library behavior, people, dates, statistics, documentation, and any claim the user is depending on for correctness. When facts conflict, trust the fresher, higher-quality source. It is better to take an extra second to search than to state something wrong from memory. You do not need to search for stable, well-established facts, your own reasoning, or things you can verify directly from the workspace (files, command output, code).";
+
 /// Returns true when `effort` is either swarm sentinel (light or deep),
 /// case-insensitive. Used by providers to map to the strongest real effort.
 pub fn is_swarm_effort(effort: &str) -> bool {
@@ -127,6 +132,19 @@ pub fn append_swarm_effort_directive(split: &mut SplitSystemPrompt, effort: Opti
         split.dynamic_part.push_str("\n\n");
     }
     split.dynamic_part.push_str(directive);
+}
+
+/// Append the web-grounding directive to a split prompt's *static* (cacheable)
+/// part when `enabled`. Static because it depends only on the `web_grounding`
+/// feature flag, not on per-turn state, so it stays in the KV-cached prefix.
+pub fn append_web_grounding_directive(split: &mut SplitSystemPrompt, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if !split.static_part.is_empty() {
+        split.static_part.push_str("\n\n");
+    }
+    split.static_part.push_str(WEB_GROUNDING_DIRECTIVE);
 }
 /// Mission-continuation template (embedded at compile time). Consumed by the
 /// `mission` module in the upper `jcode-app-core` layer; the asset lives here

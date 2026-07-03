@@ -460,6 +460,36 @@ fn swarm_effort_directive_is_appended_only_for_swarm_sentinel() {
 }
 
 #[test]
+fn web_grounding_directive_is_appended_only_when_enabled() {
+    use crate::prompt::append_web_grounding_directive;
+
+    // Disabled: no-op, static part unchanged.
+    let mut off = SplitSystemPrompt {
+        static_part: "base".to_string(),
+        dynamic_part: String::new(),
+    };
+    append_web_grounding_directive(&mut off, false);
+    assert_eq!(off.static_part, "base");
+
+    // Enabled: directive appended to the STATIC (cacheable) part.
+    let mut on = SplitSystemPrompt {
+        static_part: "base".to_string(),
+        dynamic_part: String::new(),
+    };
+    append_web_grounding_directive(&mut on, true);
+    assert!(on.static_part.contains("# Web Grounding"));
+    assert!(on.static_part.contains("websearch"));
+    assert!(
+        on.dynamic_part.is_empty(),
+        "grounding must not touch the dynamic part"
+    );
+    assert!(
+        on.static_part.starts_with("base"),
+        "existing static content is preserved"
+    );
+}
+
+#[test]
 fn swarm_deep_effort_injects_task_graph_directive() {
     use crate::prompt::is_deep_swarm_effort;
 

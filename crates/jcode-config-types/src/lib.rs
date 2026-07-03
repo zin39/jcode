@@ -1110,6 +1110,11 @@ pub struct FeatureConfig {
     pub kv_cache_miss_notices: bool,
     /// Update channel: "stable" (releases only) or "main" (latest commits)
     pub update_channel: UpdateChannel,
+    /// Inject a system-prompt directive instructing the agent to verify
+    /// uncertain or fast-changing facts with a websearch instead of asserting
+    /// them from memory (default: false). Reduces hallucinations for questions
+    /// where the answer may have changed or the model is unsure.
+    pub web_grounding: bool,
 }
 
 impl Default for FeatureConfig {
@@ -1121,6 +1126,7 @@ impl Default for FeatureConfig {
             persist_memory_injections: false,
             kv_cache_miss_notices: true,
             update_channel: UpdateChannel::default(),
+            web_grounding: false,
         }
     }
 }

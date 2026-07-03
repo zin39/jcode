@@ -209,6 +209,10 @@ kv_cache_miss_notices = true
 # Update channel: "stable" (releases only) or "main" (latest commits on push)
 # Set to "main" for bleeding edge updates every time code is pushed
 update_channel = "stable"
+# Web grounding: instruct the agent to verify uncertain or fast-changing facts
+# with a websearch (using the websearch tool) instead of answering from memory.
+# Reduces hallucinations at the cost of extra searches. Default: off.
+web_grounding = false
 
 [websearch]
 # Preferred websearch engine: "hybrid" (default), "tavily", "last30days",
