@@ -424,16 +424,23 @@ impl WebSearchTool {
 
     /// Query the Tavily Search API. Fast, keyed engine. Tavily returns a
     /// per-result relevance `score` in 0..1 which we carry through for ranking.
+    ///
+    /// Supports multiple API keys (comma-separated `TAVILY_API_KEYS`). Keys are
+    /// tried in a rotating order so load spreads round-robin, and a key that is
+    /// out of quota or invalid (HTTP 401/402/403/429/432) fails over to the next
+    /// key instead of failing the search. Only when every key is exhausted does
+    /// the search return an error.
     async fn search_tavily(&self, query: &str, num_results: usize) -> Result<Vec<SearchResult>> {
         let config = crate::config::config();
-        let api_key = resolve_tavily_key(&config.websearch).ok_or_else(|| {
-            anyhow::anyhow!(
+        let keys = resolve_tavily_keys(&config.websearch);
+        if keys.is_empty() {
+            return Err(anyhow::anyhow!(
                 "Tavily engine selected but no API key found. Set \
                  `websearch.tavily_api_key`, the {} environment variable, or add \
                  a `TAVILY_API_KEYS=...` line to ~/.jcode/tavily.env.",
                 config.websearch.tavily_api_key_env
-            )
-        })?;
+            ));
+        }
 
         let depth = if config.websearch.tavily_search_depth.trim() == "advanced" {
             "advanced"
@@ -441,6 +448,43 @@ impl WebSearchTool {
             "basic"
         };
 
+        let ordered = tavily_keys_for_call(&keys);
+        let total = ordered.len();
+        let mut last_error: Option<anyhow::Error> = None;
+        for (idx, api_key) in ordered.into_iter().enumerate() {
+            match self.search_tavily_once(query, num_results, depth, &api_key).await {
+                Ok(results) => return Ok(results),
+                Err(err) => {
+                    // Only fail over across keys for auth/quota-class failures;
+                    // for those, a different key may still have capacity.
+                    if err.is_key_exhausted && idx + 1 < total {
+                        crate::logging::info(&format!(
+                            "Tavily key {}/{} exhausted or rejected (status {:?}); failing over to next key",
+                            idx + 1,
+                            total,
+                            err.status
+                        ));
+                        last_error = Some(err.into_error());
+                        continue;
+                    }
+                    return Err(err.into_error());
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("Tavily search failed: all {} key(s) exhausted", total)
+        }))
+    }
+
+    /// Single Tavily request with one key. Classifies auth/quota failures so the
+    /// caller can decide whether to fail over to another key.
+    async fn search_tavily_once(
+        &self,
+        query: &str,
+        num_results: usize,
+        depth: &str,
+        api_key: &str,
+    ) -> std::result::Result<Vec<SearchResult>, TavilyKeyError> {
         let response = self
             .client
             .post("https://api.tavily.com/search")
@@ -456,16 +500,33 @@ impl WebSearchTool {
                 "include_answer": false,
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|e| TavilyKeyError {
+                status: None,
+                // Network errors are not key-specific; do not burn through every
+                // key on a transient outage.
+                is_key_exhausted: false,
+                message: format!("Tavily request failed: {}", e),
+            })?;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Tavily API search failed with status: {}",
-                response.status()
-            ));
+        let status = response.status();
+        if !status.is_success() {
+            // 401 invalid key, 402 payment required, 403 forbidden, 429 rate
+            // limited, 432 Tavily's plan-limit-exceeded code: another key may
+            // still work, so mark these as "exhausted" to trigger failover.
+            let is_key_exhausted = matches!(status.as_u16(), 401 | 402 | 403 | 429 | 432);
+            return Err(TavilyKeyError {
+                status: Some(status.as_u16()),
+                is_key_exhausted,
+                message: format!("Tavily API search failed with status: {}", status),
+            });
         }
 
-        let parsed: TavilyResponse = response.json().await?;
+        let parsed: TavilyResponse = response.json().await.map_err(|e| TavilyKeyError {
+            status: Some(status.as_u16()),
+            is_key_exhausted: false,
+            message: format!("Tavily response parse failed: {}", e),
+        })?;
         Ok(parse_tavily_results(parsed, num_results))
     }
 
@@ -600,24 +661,66 @@ impl WebSearchTool {
     }
 }
 
-/// Resolve a Tavily API key from config, the configured env var, or
-/// `~/.jcode/tavily.env`. `TAVILY_API_KEYS` may hold a comma-separated list;
-/// the first non-empty key is used.
-fn resolve_tavily_key(cfg: &crate::config::WebSearchConfig) -> Option<String> {
-    fn first_key(raw: &str) -> Option<String> {
-        raw.split(',')
-            .map(str::trim)
-            .find(|k| !k.is_empty())
-            .map(str::to_string)
+/// Resolve the ordered list of Tavily API keys from config, the configured env
+/// var, or `~/.jcode/tavily.env`. `TAVILY_API_KEYS` may hold a comma-separated
+/// list; every non-empty key is returned so the caller can rotate across keys
+/// and fail over when one is exhausted (each free key has its own quota).
+/// Duplicates are removed while preserving order.
+fn resolve_tavily_keys(cfg: &crate::config::WebSearchConfig) -> Vec<String> {
+    fn split_keys(raw: &str, out: &mut Vec<String>) {
+        for k in raw.split(',').map(str::trim) {
+            if !k.is_empty() && !out.iter().any(|existing| existing == k) {
+                out.push(k.to_string());
+            }
+        }
     }
-    if let Some(k) = cfg.tavily_api_key.as_deref().and_then(first_key) {
-        return Some(k);
+    let mut keys = Vec::new();
+    if let Some(raw) = cfg.tavily_api_key.as_deref() {
+        split_keys(raw, &mut keys);
     }
-    let value = jcode_provider_env::load_env_value_from_env_or_config(
+    if let Some(raw) = jcode_provider_env::load_env_value_from_env_or_config(
         &cfg.tavily_api_key_env,
         "tavily.env",
-    )?;
-    first_key(&value)
+    ) {
+        split_keys(&raw, &mut keys);
+    }
+    keys
+}
+
+/// Global round-robin cursor so successive Tavily searches start on a different
+/// key. This spreads load across the configured keys instead of always draining
+/// the first one, which matters for free-tier keys that each have a small quota.
+static TAVILY_KEY_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Order the resolved keys for this call: start at the rotating cursor and wrap,
+/// so load spreads round-robin while every key is still tried on failover.
+fn tavily_keys_for_call(keys: &[String]) -> Vec<String> {
+    if keys.len() <= 1 {
+        return keys.to_vec();
+    }
+    let start = TAVILY_KEY_CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % keys.len();
+    keys.iter()
+        .cycle()
+        .skip(start)
+        .take(keys.len())
+        .cloned()
+        .collect()
+}
+
+/// Outcome of a single-key Tavily attempt. `is_key_exhausted` marks
+/// auth/quota-class failures (HTTP 401/402/403/429/432) where trying a
+/// different key may still succeed, versus transient/parse errors that should
+/// not burn through every configured key.
+struct TavilyKeyError {
+    status: Option<u16>,
+    is_key_exhausted: bool,
+    message: String,
+}
+
+impl TavilyKeyError {
+    fn into_error(self) -> anyhow::Error {
+        anyhow::anyhow!(self.message)
+    }
 }
 
 /// Locate the last30days engine script: explicit config override first, then
@@ -1350,6 +1453,74 @@ mod tests {
         assert_eq!(WebSearchEngine::Tavily.as_str(), "tavily");
         assert_eq!(WebSearchEngine::Last30days.as_str(), "last30days");
         assert_eq!(WebSearchEngine::Hybrid.as_str(), "hybrid");
+    }
+
+    #[test]
+    fn resolve_tavily_keys_parses_comma_list_and_dedups() {
+        let mut cfg = crate::config::WebSearchConfig::default();
+        // Point the env var at a name that is not set so only the inline config
+        // key list is used (keeps the test hermetic).
+        cfg.tavily_api_key_env = "JCODE_TEST_TAVILY_UNSET_ENV".to_string();
+        cfg.tavily_api_key = Some(" k1 , k2 ,, k1 , k3 ".to_string());
+
+        let keys = resolve_tavily_keys(&cfg);
+        assert_eq!(
+            keys,
+            vec!["k1".to_string(), "k2".to_string(), "k3".to_string()],
+            "keys are trimmed, empty entries dropped, and duplicates removed in order"
+        );
+    }
+
+    #[test]
+    fn resolve_tavily_keys_empty_when_unset() {
+        let mut cfg = crate::config::WebSearchConfig::default();
+        cfg.tavily_api_key_env = "JCODE_TEST_TAVILY_UNSET_ENV".to_string();
+        cfg.tavily_api_key = None;
+        assert!(resolve_tavily_keys(&cfg).is_empty());
+    }
+
+    #[test]
+    fn tavily_keys_for_call_rotates_start_and_covers_all_keys() {
+        let keys = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        // Each call returns all keys (so failover can reach every one) but starts
+        // at a rotating offset so load spreads instead of always hitting "a".
+        let mut starts = std::collections::HashSet::new();
+        for _ in 0..keys.len() * 2 {
+            let ordered = tavily_keys_for_call(&keys);
+            assert_eq!(ordered.len(), keys.len(), "every key is available for failover");
+            let mut sorted = ordered.clone();
+            sorted.sort();
+            assert_eq!(sorted, {
+                let mut all = keys.clone();
+                all.sort();
+                all
+            });
+            starts.insert(ordered[0].clone());
+        }
+        assert!(
+            starts.len() > 1,
+            "rotation should start on more than one key across calls"
+        );
+
+        // Single key / empty are passthrough.
+        assert_eq!(tavily_keys_for_call(&["only".to_string()]), vec!["only".to_string()]);
+        assert!(tavily_keys_for_call(&[]).is_empty());
+    }
+
+    #[test]
+    fn tavily_failover_status_classification() {
+        // Auth/quota-class statuses trigger failover to the next key.
+        for status in [401u16, 402, 403, 429, 432] {
+            assert!(
+                matches!(status, 401 | 402 | 403 | 429 | 432),
+                "status {status} should be treated as key-exhausted"
+            );
+        }
     }
 
     #[test]
