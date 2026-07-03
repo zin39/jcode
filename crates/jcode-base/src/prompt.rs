@@ -344,6 +344,26 @@ pub fn build_system_prompt_full(
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
 ) -> (String, ContextInfo) {
+    build_system_prompt_full_with_overlay(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        true,
+    )
+}
+
+/// Like [`build_system_prompt_full`], but lets the caller suppress the freeform
+/// `prompt-overlay.md` injection (see [`model_should_receive_prompt_overlay`]).
+pub fn build_system_prompt_full_with_overlay(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    include_prompt_overlay: bool,
+) -> (String, ContextInfo) {
     let mut parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
     let mut info = ContextInfo {
         system_prompt_chars: DEFAULT_SYSTEM_PROMPT.len(),
@@ -372,7 +392,11 @@ pub fn build_system_prompt_full(
     info.global_agents_md_chars = md_info.global_agents_md_chars;
 
     // Add optional prompt overlays from ~/.jcode/ and ./.jcode/
-    let (overlay_content, overlay_chars) = load_prompt_overlay_files_from_dir(working_dir);
+    let (overlay_content, overlay_chars) = if include_prompt_overlay {
+        load_prompt_overlay_files_from_dir(working_dir)
+    } else {
+        (None, 0)
+    };
     if let Some(content) = overlay_content {
         info.prompt_overlay_chars = overlay_chars;
         parts.push(content);
@@ -430,6 +454,26 @@ pub fn build_system_prompt_split(
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
 ) -> (SplitSystemPrompt, ContextInfo) {
+    build_system_prompt_split_with_overlay(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        true,
+    )
+}
+
+/// Like [`build_system_prompt_split`], but lets the caller suppress the freeform
+/// `prompt-overlay.md` injection (see [`model_should_receive_prompt_overlay`]).
+pub fn build_system_prompt_split_with_overlay(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    include_prompt_overlay: bool,
+) -> (SplitSystemPrompt, ContextInfo) {
     let mut static_parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
     let mut dynamic_parts = Vec::new();
     let mut info = ContextInfo {
@@ -460,7 +504,11 @@ pub fn build_system_prompt_split(
     info.global_agents_md_chars = md_info.global_agents_md_chars;
 
     // Add optional prompt overlays from ~/.jcode/ and ./.jcode/
-    let (overlay_content, overlay_chars) = load_prompt_overlay_files_from_dir(working_dir);
+    let (overlay_content, overlay_chars) = if include_prompt_overlay {
+        load_prompt_overlay_files_from_dir(working_dir)
+    } else {
+        (None, 0)
+    };
     if let Some(content) = overlay_content {
         info.prompt_overlay_chars = overlay_chars;
         static_parts.push(content);
@@ -870,6 +918,29 @@ fn load_prompt_overlay_files_from_dir(working_dir: Option<&Path>) -> (Option<Str
     } else {
         (Some(contents.join("\n\n")), total_chars)
     }
+}
+
+/// Whether the user's freeform prompt overlay (`prompt-overlay.md`) should be
+/// injected for `model`.
+///
+/// Anthropic's `claude-fable-5` ships a much stricter safety guardrail than the
+/// Opus/Sonnet tiers. Freeform overlays that describe otherwise-legitimate but
+/// sensitive-sounding work (e.g. a credential-leak-scanning pipeline that
+/// mentions API keys, OAuth tokens, and secret validation) make fable-5 return
+/// `stop_reason=refusal` and emit no output at all, even though Opus answers the
+/// identical prompt. The overlay is a user convenience, not load-bearing, so we
+/// omit it for fable-5 rather than let it silently break every turn. Verified
+/// live 2026-07-03: the same overlay text refuses on fable-5 and succeeds on
+/// opus-4-8.
+///
+/// Matching is a normalized substring so dated variants (`claude-fable-5-YYYY...`)
+/// are covered too. Every other model keeps the overlay.
+pub fn model_should_receive_prompt_overlay(model: &str) -> bool {
+    let normalized = jcode_provider_core::model_id::strip_date_suffix(
+        &jcode_provider_core::model_id::canonical(model),
+    )
+    .to_ascii_lowercase();
+    !normalized.contains("claude-fable")
 }
 
 /// Load optional preferred-tool guidance from ~/.jcode/ and ./.jcode/

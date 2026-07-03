@@ -99,12 +99,20 @@ impl Agent {
             .as_ref()
             .map(std::path::PathBuf::from);
 
-        let (mut split, _context_info) = crate::prompt::build_system_prompt_split(
+        // Anthropic's `claude-fable-5` refuses (stop_reason=refusal, no output)
+        // on otherwise-benign freeform overlays that mention sensitive-sounding
+        // work (e.g. a credential-leak-scanning pipeline). Omit the user overlay
+        // for models with that stricter guardrail so fable-5 stays usable.
+        let include_prompt_overlay =
+            crate::prompt::model_should_receive_prompt_overlay(&self.provider.model());
+
+        let (mut split, _context_info) = crate::prompt::build_system_prompt_split_with_overlay(
             skill_prompt.as_deref(),
             &available_skills,
             self.session.is_canary,
             memory_prompt,
             working_dir.as_deref(),
+            include_prompt_overlay,
         );
 
         self.append_current_turn_system_reminder(&mut split);

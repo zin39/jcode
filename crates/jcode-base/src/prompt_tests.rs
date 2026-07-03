@@ -182,6 +182,76 @@ fn test_prompt_overlay_files_are_loaded_from_project_and_global_jcode_dirs() {
 }
 
 #[test]
+fn test_prompt_overlay_suppressed_for_fable_but_kept_for_others() {
+    // Regression: `claude-fable-5` refuses (stop_reason=refusal, no output) on
+    // sensitive-sounding freeform overlays, so the overlay is omitted for it.
+    // Every other model still receives it.
+    assert!(
+        !model_should_receive_prompt_overlay("claude-fable-5"),
+        "fable-5 must NOT receive the freeform prompt overlay"
+    );
+    assert!(
+        !model_should_receive_prompt_overlay("claude-fable-5-20260101"),
+        "dated fable variants must also be excluded"
+    );
+    assert!(
+        model_should_receive_prompt_overlay("claude-opus-4-8"),
+        "opus must still receive the overlay"
+    );
+    assert!(
+        model_should_receive_prompt_overlay("claude-sonnet-4-6"),
+        "sonnet must still receive the overlay"
+    );
+    assert!(
+        model_should_receive_prompt_overlay("gpt-5.5"),
+        "non-Anthropic models must still receive the overlay"
+    );
+}
+
+#[test]
+fn test_build_system_prompt_can_suppress_overlay() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+    std::fs::create_dir_all(temp.path()).unwrap();
+    std::fs::write(
+        temp.path().join("prompt-overlay.md"),
+        "global prompt overlay instructions",
+    )
+    .unwrap();
+
+    // include_prompt_overlay = false -> overlay omitted (fable-5 path).
+    let (prompt_no, info_no) =
+        build_system_prompt_full_with_overlay(None, &[], false, None, None, false);
+    assert!(
+        !prompt_no.contains("global prompt overlay instructions"),
+        "overlay must be omitted when include_prompt_overlay=false"
+    );
+    assert_eq!(info_no.prompt_overlay_chars, 0);
+
+    // include_prompt_overlay = true -> overlay present (default path).
+    let (prompt_yes, info_yes) =
+        build_system_prompt_full_with_overlay(None, &[], false, None, None, true);
+    assert!(
+        prompt_yes.contains("global prompt overlay instructions"),
+        "overlay must be present when include_prompt_overlay=true"
+    );
+    assert!(info_yes.prompt_overlay_chars > 0);
+
+    // The split builder honors the same flag.
+    let (split_no, _) =
+        build_system_prompt_split_with_overlay(None, &[], false, None, None, false);
+    assert!(!split_no.static_part.contains("global prompt overlay instructions"));
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
 fn test_preferred_tools_files_are_loaded_from_project_and_global_jcode_dirs() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");

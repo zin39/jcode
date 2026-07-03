@@ -27,12 +27,18 @@ impl App {
                 description: s.description.clone(),
             })
             .collect();
-        let (mut split, context_info) = crate::prompt::build_system_prompt_split(
+        // Mirror the agent-side guardrail: fable-5 refuses on sensitive-sounding
+        // freeform overlays, so it never receives `prompt-overlay.md`. Keep the
+        // TUI's context accounting in sync with what is actually sent.
+        let include_prompt_overlay =
+            crate::prompt::model_should_receive_prompt_overlay(&self.provider.model());
+        let (mut split, context_info) = crate::prompt::build_system_prompt_split_with_overlay(
             skill_prompt.as_deref(),
             &available_skills,
             self.session.is_canary,
             memory_prompt,
             None,
+            include_prompt_overlay,
         );
         self.append_current_turn_system_reminder(&mut split);
         crate::prompt::append_swarm_effort_directive(
