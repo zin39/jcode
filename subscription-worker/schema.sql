@@ -65,3 +65,15 @@ CREATE TABLE IF NOT EXISTS rate_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rate_key_at ON rate_events(key_id, at_ms);
+
+-- Waitlist signups from the public pricing page (POST /v1/waitlist).
+CREATE TABLE IF NOT EXISTS waitlist (
+    email TEXT PRIMARY KEY,
+    tier TEXT NOT NULL,                        -- 'plus' | 'flagship'
+    note TEXT,                                 -- optional, <= 500 chars
+    referrer TEXT,                             -- Referer header at signup
+    status TEXT NOT NULL DEFAULT 'pending',    -- 'pending' | 'invited' | 'converted'
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlist_tier_status ON waitlist(tier, status);

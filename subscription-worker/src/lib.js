@@ -76,6 +76,55 @@ export function sqliteUtc(date) {
 }
 
 // ---------------------------------------------------------------------------
+// Email validation (shared by auth and waitlist).
+// ---------------------------------------------------------------------------
+
+export function isValidEmail(email) {
+  return (
+    typeof email === "string" &&
+    email.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Waitlist signup validation. Pure: takes a parsed JSON body, returns either
+// {error: {code, message}} or the normalized {email, tier, note}.
+// ---------------------------------------------------------------------------
+
+export const WAITLIST_TIERS = ["plus", "flagship"];
+export const WAITLIST_NOTE_MAX_CHARS = 500;
+
+export function validateWaitlistSignup(body) {
+  const email = String(body?.email || "").trim().toLowerCase();
+  if (!isValidEmail(email)) {
+    return { error: { code: "invalid_email", message: "a valid email is required" } };
+  }
+  const tier = String(body?.tier || "");
+  if (!WAITLIST_TIERS.includes(tier)) {
+    return {
+      error: {
+        code: "invalid_tier",
+        message: `tier must be one of: ${WAITLIST_TIERS.join(", ")}`,
+      },
+    };
+  }
+  let note = null;
+  if (body?.note != null && String(body.note).trim() !== "") {
+    note = String(body.note).trim();
+    if (note.length > WAITLIST_NOTE_MAX_CHARS) {
+      return {
+        error: {
+          code: "note_too_long",
+          message: `note must be at most ${WAITLIST_NOTE_MAX_CHARS} characters`,
+        },
+      };
+    }
+  }
+  return { email, tier, note };
+}
+
+// ---------------------------------------------------------------------------
 // API keys: jck_live_<40 lowercase hex>. Only the SHA-256 hex digest of the
 // full key string is stored.
 // ---------------------------------------------------------------------------

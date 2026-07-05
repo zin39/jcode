@@ -34,6 +34,12 @@ webhook, and an OpenAI-compatible metered model router.
 |---|---|
 | `POST /v1/stripe/webhook` | Stripe webhook. Signature verified manually (HMAC-SHA256 of `t.body` against `Stripe-Signature` `v1` entries, 5-minute timestamp tolerance, constant-time compare). Handles `checkout.session.completed` (link customer / create account), `customer.subscription.updated` (set tier from `PRICE_ID_PLUS`/`PRICE_ID_FLAGSHIP` and status), `customer.subscription.deleted` (tier `none`, status `canceled`). |
 
+### Waitlist
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/waitlist` | Body `{email, tier: 'plus'\|'flagship', note?}` (note max 500 chars). Upserts into the `waitlist` table (repeat signups update tier/note, keep original status and `created_at`) and fires a best-effort notification email to `jeremy@solosystems.dev` via `ctx.waitUntil` (subject `jcode waitlist: <tier> signup`; a failed email never fails the signup). Returns `{ok: true}`. CORS: `POST`/`OPTIONS` allowed only from `https://solosystems.dev` and `https://solosystems.pages.dev` (the only browser-facing endpoint; everything else is CLI/webhook traffic). |
+
 ### Router (OpenAI-compatible)
 
 | Endpoint | Description |
@@ -268,4 +274,26 @@ Rate-limit table hygiene (pruned lazily in the worker; manual prune):
 
 ```sql
 DELETE FROM rate_events WHERE at_ms < (strftime('%s','now') - 300) * 1000;
+```
+
+Waitlist signups by tier:
+
+```sql
+SELECT tier, status, COUNT(*) AS signups
+FROM waitlist GROUP BY tier, status ORDER BY tier, status;
+```
+
+Daily waitlist signups (last 30 days):
+
+```sql
+SELECT date(created_at) AS day, tier, COUNT(*) AS signups
+FROM waitlist
+WHERE created_at >= datetime('now', '-30 days')
+GROUP BY day, tier ORDER BY day DESC;
+```
+
+Pending waitlist count (people to invite):
+
+```sql
+SELECT COUNT(*) AS pending FROM waitlist WHERE status = 'pending';
 ```

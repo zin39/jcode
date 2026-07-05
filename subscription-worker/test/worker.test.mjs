@@ -21,7 +21,66 @@ import {
   timingSafeEqualHex,
   usageFromOpenAIChunk,
   verifyStripeSignature,
+  isValidEmail,
+  validateWaitlistSignup,
+  WAITLIST_NOTE_MAX_CHARS,
+  WAITLIST_TIERS,
 } from "../src/lib.js";
+
+// ---------------------------------------------------------------------------
+// Email + waitlist validation
+// ---------------------------------------------------------------------------
+
+test("isValidEmail accepts normal addresses and rejects junk", () => {
+  assert.equal(isValidEmail("user@example.com"), true);
+  assert.equal(isValidEmail("first.last+tag@sub.example.co"), true);
+  assert.equal(isValidEmail(""), false);
+  assert.equal(isValidEmail("no-at-sign"), false);
+  assert.equal(isValidEmail("no-domain@"), false);
+  assert.equal(isValidEmail("@no-local.com"), false);
+  assert.equal(isValidEmail("no-tld@example"), false);
+  assert.equal(isValidEmail("spa ce@example.com"), false);
+  assert.equal(isValidEmail(null), false);
+  // Length cap: 254 chars max.
+  const long = "a".repeat(250) + "@b.co";
+  assert.equal(isValidEmail(long), false);
+});
+
+test("validateWaitlistSignup normalizes valid signups", () => {
+  assert.deepEqual(validateWaitlistSignup({ email: " User@Example.COM ", tier: "plus" }), {
+    email: "user@example.com",
+    tier: "plus",
+    note: null,
+  });
+  assert.deepEqual(
+    validateWaitlistSignup({ email: "a@b.co", tier: "flagship", note: "  team of 5  " }),
+    { email: "a@b.co", tier: "flagship", note: "team of 5" },
+  );
+  // Blank note treated as absent.
+  assert.equal(validateWaitlistSignup({ email: "a@b.co", tier: "plus", note: "  " }).note, null);
+});
+
+test("validateWaitlistSignup rejects bad email, tier, and long notes", () => {
+  assert.equal(validateWaitlistSignup({ email: "junk", tier: "plus" }).error.code, "invalid_email");
+  assert.equal(validateWaitlistSignup({ tier: "plus" }).error.code, "invalid_email");
+  assert.equal(validateWaitlistSignup({ email: "a@b.co", tier: "pro" }).error.code, "invalid_tier");
+  assert.equal(validateWaitlistSignup({ email: "a@b.co" }).error.code, "invalid_tier");
+  assert.equal(validateWaitlistSignup(null).error.code, "invalid_email");
+  const note = "x".repeat(WAITLIST_NOTE_MAX_CHARS + 1);
+  assert.equal(
+    validateWaitlistSignup({ email: "a@b.co", tier: "plus", note }).error.code,
+    "note_too_long",
+  );
+  // Exactly at the cap is fine.
+  assert.equal(
+    validateWaitlistSignup({ email: "a@b.co", tier: "plus", note: "x".repeat(WAITLIST_NOTE_MAX_CHARS) }).note.length,
+    WAITLIST_NOTE_MAX_CHARS,
+  );
+});
+
+test("WAITLIST_TIERS matches the sellable tiers", () => {
+  assert.deepEqual(WAITLIST_TIERS, ["plus", "flagship"]);
+});
 
 // ---------------------------------------------------------------------------
 // API keys
@@ -674,4 +733,136 @@ test("gpt-* streaming passthrough injects include_usage and meters from tail", a
   assert.equal(inTok, 40); // 50 prompt - 10 cached
   assert.equal(outTok, 9);
   assert.equal(cacheRead, 10);
+});
+
+// ---------------------------------------------------------------------------
+// Waitlist endpoint
+// ---------------------------------------------------------------------------
+
+function waitlistRequest(body, { origin = "https://solosystems.dev", referer } = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (origin) headers.Origin = origin;
+  if (referer) headers.Referer = referer;
+  return new Request("https://api.example/v1/waitlist", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+}
+
+test("POST /v1/waitlist upserts and notifies via Resend without blocking", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), body: JSON.parse(init.body) });
+    return new Response("{}", { status: 200 });
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const db = makeDb({});
+  const ctx = makeCtx();
+  const res = await worker.fetch(
+    waitlistRequest(
+      { email: "Fan@Example.com", tier: "flagship", note: "team of 5" },
+      { referer: "https://solosystems.dev/pricing" },
+    ),
+    { DB: db, RESEND_API_KEY: "re_test" },
+    ctx,
+  );
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true });
+  assert.equal(res.headers.get("Access-Control-Allow-Origin"), "https://solosystems.dev");
+
+  const insert = db.executed.find((e) => /INSERT INTO waitlist/.test(e.sql));
+  assert.ok(insert, "waitlist insert missing");
+  assert.deepEqual(insert.values, [
+    "fan@example.com",
+    "flagship",
+    "team of 5",
+    "https://solosystems.dev/pricing",
+  ]);
+  assert.match(insert.sql, /ON CONFLICT\(email\)/);
+
+  await ctx.settle();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, "https://api.resend.com/emails");
+  assert.deepEqual(sent[0].body.to, ["jeremy@solosystems.dev"]);
+  assert.equal(sent[0].body.subject, "jcode waitlist: flagship signup");
+});
+
+test("POST /v1/waitlist succeeds even when the notification email fails", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("boom", { status: 500 });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const db = makeDb({});
+  const ctx = makeCtx();
+  const res = await worker.fetch(
+    waitlistRequest({ email: "a@b.co", tier: "plus" }),
+    { DB: db, RESEND_API_KEY: "re_test" },
+    ctx,
+  );
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true });
+  await ctx.settle(); // must not reject
+});
+
+test("POST /v1/waitlist rejects invalid payloads with 400", async () => {
+  const db = makeDb({});
+  const cases = [
+    [{ email: "junk", tier: "plus" }, "invalid_email"],
+    [{ email: "a@b.co", tier: "pro" }, "invalid_tier"],
+    [{ email: "a@b.co", tier: "plus", note: "x".repeat(501) }, "note_too_long"],
+  ];
+  for (const [body, code] of cases) {
+    const res = await worker.fetch(waitlistRequest(body), { DB: db }, makeCtx());
+    assert.equal(res.status, 400);
+    const json = await res.json();
+    assert.equal(json.error.code, code);
+  }
+  // Nothing was written.
+  assert.equal(db.executed.some((e) => /INSERT INTO waitlist/.test(e.sql)), false);
+});
+
+test("waitlist CORS: allowed origins echoed, others get no CORS headers", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("{}", { status: 200 });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const env = { DB: makeDb({}), RESEND_API_KEY: "re_test" };
+
+  const pages = await worker.fetch(
+    waitlistRequest({ email: "a@b.co", tier: "plus" }, { origin: "https://solosystems.pages.dev" }),
+    env,
+    makeCtx(),
+  );
+  assert.equal(pages.headers.get("Access-Control-Allow-Origin"), "https://solosystems.pages.dev");
+
+  const evil = await worker.fetch(
+    waitlistRequest({ email: "a@b.co", tier: "plus" }, { origin: "https://evil.example" }),
+    env,
+    makeCtx(),
+  );
+  assert.equal(evil.status, 200); // same-origin/no-CORS callers still work
+  assert.equal(evil.headers.get("Access-Control-Allow-Origin"), null);
+
+  // Preflight
+  const preflight = await worker.fetch(
+    new Request("https://api.example/v1/waitlist", {
+      method: "OPTIONS",
+      headers: { Origin: "https://solosystems.dev" },
+    }),
+    env,
+    makeCtx(),
+  );
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("Access-Control-Allow-Origin"), "https://solosystems.dev");
+  assert.match(preflight.headers.get("Access-Control-Allow-Methods"), /POST/);
 });

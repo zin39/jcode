@@ -16,15 +16,27 @@ import {
   computeCostUsd,
   generateApiKey,
   hashApiKey,
+  isValidEmail,
   openaiToAnthropicRequest,
   sqliteUtc,
   usageFromOpenAIChunk,
+  validateWaitlistSignup,
   verifyStripeSignature,
 } from "./lib.js";
 
 const DEVICE_CODE_TTL_SECS = 15 * 60;
 const DEVICE_POLL_INTERVAL_SECS = 5;
 const MAGIC_LINK_FROM = "jcode <login@solosystems.dev>";
+const WAITLIST_NOTIFY_TO = "jeremy@solosystems.dev";
+const WAITLIST_NOTIFY_FROM = "jcode <login@solosystems.dev>";
+
+// Browser origins allowed to POST /v1/waitlist. This is the only
+// cross-origin browser surface; everything else is CLI/webhook traffic
+// with no CORS needs.
+const WAITLIST_ALLOWED_ORIGINS = [
+  "https://solosystems.dev",
+  "https://solosystems.pages.dev",
+];
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -48,6 +60,10 @@ export default {
           return await handleRotateKey(request, env);
         case "POST /v1/stripe/webhook":
           return await handleStripeWebhook(request, env);
+        case "POST /v1/waitlist":
+          return await handleWaitlist(request, env, ctx);
+        case "OPTIONS /v1/waitlist":
+          return waitlistPreflight(request);
         case "GET /v1/models":
           return await handleModels(request, env);
         case "POST /v1/chat/completions":
@@ -369,6 +385,88 @@ function accountStatusFromStripe(stripeStatus) {
     default:
       return "canceled";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Waitlist: public signup form on solosystems.dev (pricing page).
+// ---------------------------------------------------------------------------
+
+function waitlistCorsHeaders(request) {
+  const origin = request.headers.get("Origin");
+  if (!origin || !WAITLIST_ALLOWED_ORIGINS.includes(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+}
+
+function waitlistPreflight(request) {
+  return new Response(null, { status: 204, headers: waitlistCorsHeaders(request) });
+}
+
+async function handleWaitlist(request, env, ctx) {
+  const cors = waitlistCorsHeaders(request);
+  const body = await readJson(request);
+  const parsed = validateWaitlistSignup(body);
+  if (parsed.error) {
+    return errorResponse(400, parsed.error.code, parsed.error.message, {}, cors);
+  }
+  const { email, tier, note } = parsed;
+  const referrer = request.headers.get("Referer") || null;
+
+  // Upsert: repeat signups update tier/note but keep the original status
+  // and created_at (someone already invited stays invited).
+  await env.DB.prepare(
+    `INSERT INTO waitlist (email, tier, note, referrer)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET
+       tier = excluded.tier,
+       note = COALESCE(excluded.note, waitlist.note)`,
+  )
+    .bind(email, tier, note, referrer)
+    .run();
+
+  // Notify, best-effort: a failed email must never fail the signup.
+  ctx.waitUntil(
+    sendWaitlistNotification(env, { email, tier, note }).catch((err) =>
+      console.error("waitlist notification failed:", err),
+    ),
+  );
+
+  return jsonResponse({ ok: true }, 200, cors);
+}
+
+async function sendWaitlistNotification(env, { email, tier, note }) {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: WAITLIST_NOTIFY_FROM,
+      to: [WAITLIST_NOTIFY_TO],
+      subject: `jcode waitlist: ${tier} signup`,
+      html: `<p><strong>${escapeHtml(email)}</strong> joined the <strong>${escapeHtml(tier)}</strong> waitlist.</p>${
+        note ? `<p>Note: ${escapeHtml(note)}</p>` : ""
+      }`,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`resend send failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 // ---------------------------------------------------------------------------
@@ -761,10 +859,6 @@ async function readJson(request) {
   }
 }
 
-function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254;
-}
-
 function round6(n) {
   return Math.round(n * 1e6) / 1e6;
 }
@@ -776,8 +870,8 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
   });
 }
 
-function errorResponse(status, code, message, extra = {}) {
-  return jsonResponse({ error: { code, message, ...extra } }, status);
+function errorResponse(status, code, message, extra = {}, extraHeaders = {}) {
+  return jsonResponse({ error: { code, message, ...extra } }, status, extraHeaders);
 }
 
 function sseResponse(readable, requestId) {
