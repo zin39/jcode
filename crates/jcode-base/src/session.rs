@@ -40,6 +40,7 @@ mod model;
 mod persistence;
 mod render;
 mod storage_paths;
+pub mod task_state;
 pub use crash::{
     CrashedSessionsInfo, detect_crashed_sessions, find_recent_crashed_sessions,
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
