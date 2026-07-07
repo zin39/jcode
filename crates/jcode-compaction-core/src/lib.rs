@@ -18,6 +18,71 @@ pub const MANUAL_COMPACT_MIN_THRESHOLD: f32 = 0.10;
 /// Keep this many recent turns verbatim (not summarized)
 pub const RECENT_TURNS_TO_KEEP: usize = 10;
 
+/// Tool results below this size are left alone — clearing them saves nothing
+/// and destroys cheap, useful context.
+pub const MIN_CLEARABLE_TOOL_RESULT_CHARS: usize = 200;
+
+const CLEARED_MARKER_PREFIX: &str = "[tool result cleared by jcode";
+const SPILL_POINTER_NEEDLE: &str = "FULL output saved to ";
+
+/// Replacement text for a cleared tool result. Preserves the spill-pointer
+/// line (if the original was spilled to disk) so the agent can still retrieve
+/// the full output with the read tool.
+pub fn cleared_tool_result_content(original: &str) -> String {
+    let pointer_line = original
+        .lines()
+        .find(|line| line.contains(SPILL_POINTER_NEEDLE));
+    match pointer_line {
+        Some(line) => {
+            // Keep only from the spill-pointer needle onward — the rest of the
+            // line (e.g. "Tool output truncated by jcode: ...") is redundant
+            // with the marker we're already emitting, and dropping it keeps
+            // the replacement meaningfully smaller than the original.
+            let trimmed = line.trim().trim_end_matches(']');
+            let pointer = trimmed
+                .find(SPILL_POINTER_NEEDLE)
+                .map(|idx| &trimmed[idx..])
+                .unwrap_or(trimmed);
+            format!(
+                "{} under context pressure: {} chars removed. {}]",
+                CLEARED_MARKER_PREFIX,
+                original.chars().count(),
+                pointer,
+            )
+        }
+        None => format!(
+            "{} under context pressure: {} chars removed. Re-run the tool if this output is needed again.]",
+            CLEARED_MARKER_PREFIX,
+            original.chars().count(),
+        ),
+    }
+}
+
+/// True if this tool-result text is worth clearing (big enough, not already cleared).
+pub fn is_clearable_tool_result(text: &str) -> bool {
+    text.chars().count() >= MIN_CLEARABLE_TOOL_RESULT_CHARS
+        && !text.starts_with(CLEARED_MARKER_PREFIX)
+}
+
+/// Clear tool-result payloads in `messages[..up_to_index]` (view-time only —
+/// callers pass a cloned API view, never stored history). Returns how many
+/// results were cleared. Skips already-cleared markers and small results.
+pub fn clear_tool_results_up_to(messages: &mut [Message], up_to_index: usize) -> usize {
+    let mut cleared = 0;
+    let end = up_to_index.min(messages.len());
+    for message in &mut messages[..end] {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && is_clearable_tool_result(content)
+            {
+                *content = cleared_tool_result_content(content);
+                cleared += 1;
+            }
+        }
+    }
+    cleared
+}
+
 /// Absolute minimum turns to keep during emergency compaction
 pub const MIN_TURNS_TO_KEEP: usize = 2;
 
@@ -1192,5 +1257,48 @@ mod tests {
         let stripped = emergency_strip_large_images(&mut messages, 2000);
         assert_eq!(stripped, 1);
         assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
+    }
+
+    fn tool_result_message(id: &str, text: &str) -> Message {
+        Message::tool_result_with_duration(id, text, false, None)
+    }
+
+    fn tool_result_text(message: &Message) -> &str {
+        match &message.content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected ToolResult block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cleared_content_preserves_spill_pointer() {
+        let original = "first 10KB head...\n[Tool output truncated by jcode: tool `bash` produced 80000 chars; kept first 10000 inline. FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt — use the read tool with start_line/limit for targeted sections.]";
+        let cleared = cleared_tool_result_content(original);
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(cleared.contains("FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt"));
+        assert!(cleared.len() < original.len());
+    }
+
+    #[test]
+    fn cleared_content_without_pointer_is_marker_only() {
+        let cleared = cleared_tool_result_content("plain big output");
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(!cleared.contains("FULL output saved"));
+    }
+
+    #[test]
+    fn clear_tool_results_respects_watermark_and_skips_small_results() {
+        let mut messages = vec![
+            tool_result_message("t1", &"a".repeat(1000)),
+            tool_result_message("t2", "short"),
+            tool_result_message("t3", &"b".repeat(1000)),
+        ];
+        let cleared = clear_tool_results_up_to(&mut messages, 2);
+        assert_eq!(cleared, 1);
+        assert!(tool_result_text(&messages[0]).starts_with("[tool result cleared"));
+        assert_eq!(tool_result_text(&messages[1]), "short");
+        assert!(tool_result_text(&messages[2]).starts_with("bbb"));
+        // Idempotent: second pass clears nothing new.
+        assert_eq!(clear_tool_results_up_to(&mut messages, 2), 0);
     }
 }
