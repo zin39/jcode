@@ -7,6 +7,27 @@ fn default_true() -> bool {
     true
 }
 
+/// Wire spec for a task-DAG node submitted by an agent (seed/expand/inject).
+/// Mirrors `jcode_plan::dag::NodeSpec` but kept as an explicit wire type so the
+/// protocol stays self-describing and serde-stable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskGraphNodeSpec {
+    pub id: String,
+    pub content: String,
+    /// "explore" | "implement" | "verify" | "fix" | "synthesize". Defaults to
+    /// "explore" when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub priority: u8,
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 /// Client request to server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -97,6 +118,11 @@ pub enum Request {
         client_has_local_history: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_session_takeover: bool,
+        /// Terminal-identifying env vars (tmux/zellij/kitty/DISPLAY/...) captured
+        /// from the connecting client so the server can route spawn/focus hooks
+        /// to the client's terminal instead of its own stale startup env (#405).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_env: Vec<(String, String)>,
     },
 
     /// Get full conversation history (for TUI sync on connect)
@@ -382,6 +408,10 @@ pub enum Request {
         delivery: Option<CommDeliveryMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wake: Option<bool>,
+        /// Sender-provided one-line summary. Receiving UIs render long
+        /// message bodies collapsed to this with an expand control.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tldr: Option<String>,
     },
 
     /// List agents and their activity
@@ -426,6 +456,49 @@ pub enum Request {
         reason: Option<String>,
     },
 
+    /// Seed the swarm task DAG in one call (the first agent's draft). Replaces or
+    /// initializes the shared plan with a validated graph of nodes + edges.
+    #[serde(rename = "comm_seed_graph")]
+    CommSeedGraph {
+        id: u64,
+        session_id: String,
+        /// "deep" (comprehensive, gated) or "light" (fan-out).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        nodes: Vec<TaskGraphNodeSpec>,
+    },
+
+    /// Decompose a node the caller owns into a child sub-DAG (composite path). In
+    /// deep mode a critique/verify gate is auto-inserted.
+    #[serde(rename = "comm_expand_node")]
+    CommExpandNode {
+        id: u64,
+        session_id: String,
+        node_id: String,
+        children: Vec<TaskGraphNodeSpec>,
+    },
+
+    /// Complete a node the caller owns with a typed handoff artifact. In deep mode
+    /// the artifact is validated for thinness.
+    #[serde(rename = "comm_complete_node")]
+    CommCompleteNode {
+        id: u64,
+        session_id: String,
+        node_id: String,
+        /// Handoff artifact as a JSON object string.
+        artifact_json: String,
+    },
+
+    /// Inject gap/fix nodes from a gate that found a problem, re-blocking the gate
+    /// (and its composite parent) until the new nodes drain.
+    #[serde(rename = "comm_inject_gap")]
+    CommInjectGap {
+        id: u64,
+        session_id: String,
+        gate_id: String,
+        nodes: Vec<TaskGraphNodeSpec>,
+    },
+
     /// Spawn a new agent session (coordinator only)
     #[serde(rename = "comm_spawn")]
     CommSpawn {
@@ -439,7 +512,26 @@ pub enum Request {
         request_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawn_mode: Option<String>,
+        /// Optional per-spawn model override. Takes precedence over
+        /// `agents.swarm_model` config. Supports explicit auth-route prefixes
+        /// (e.g. `openai-api:gpt-5.5`) and the `inherit`/`coordinator`
+        /// sentinels to force coordinator inheritance past a config pin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional reasoning effort for the spawned agent (e.g. `none`,
+        /// `low`, `medium`, `high`, `xhigh`, `max`). Unset = provider default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        /// Optional short human-readable label for the spawned agent shown in
+        /// swarm UI (gallery chips, member lists). Overrides the task label
+        /// otherwise derived from the first line of `initial_message`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
+
+    /// List models/routes available for spawning swarm agents
+    #[serde(rename = "comm_list_models")]
+    CommListModels { id: u64, session_id: String },
 
     /// Stop/destroy an agent session (coordinator only)
     #[serde(rename = "comm_stop")]
@@ -494,6 +586,10 @@ pub enum Request {
         /// Optional blockers/follow-up summary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow_up: Option<String>,
+        /// Reporter-provided one-line summary. Receiving UIs render long
+        /// report bodies collapsed to this with an expand control.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tldr: Option<String>,
     },
 
     /// Read another agent's full conversation context
@@ -540,6 +636,14 @@ pub enum Request {
         spawn_if_needed: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Optional model override for workers spawned by this assignment
+        /// (same semantics as CommSpawn::model).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Optional reasoning effort for workers spawned by this assignment
+        /// (same semantics as CommSpawn::effort).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
 
     /// Control an existing assigned task lifecycle (coordinator only)
@@ -587,6 +691,17 @@ pub enum Request {
         /// Timeout in seconds (default 3600 = 1 hour)
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Run the wait as a detached background watcher instead of blocking the
+        /// requesting turn. Defaults to true so the agent stays responsive.
+        #[serde(default = "default_true")]
+        background: bool,
+        /// When backgrounded, surface a notification card on completion.
+        #[serde(default = "default_true")]
+        notify: bool,
+        /// When backgrounded, wake an idle requesting agent with the result (or
+        /// soft-interrupt it if busy). Defaults to true.
+        #[serde(default = "default_true")]
+        wake: bool,
     },
 }
 
@@ -807,6 +922,20 @@ pub enum ServerEvent {
     /// so it does not blend into streaming model output.
     #[serde(rename = "interrupted")]
     Interrupted,
+
+    /// The provider ended the turn without any visible assistant output,
+    /// typically a model-side guardrail/refusal stop (e.g. Anthropic
+    /// `stop_reason: "refusal"`), or a reasoning-only response with no final
+    /// text. Rendered as a system notice so the user learns why no response
+    /// arrived instead of the turn ending silently.
+    #[serde(rename = "provider_guardrail")]
+    ProviderGuardrail {
+        /// Raw provider stop reason, when known (e.g. "refusal").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        /// Human-readable explanation for display.
+        message: String,
+    },
 
     /// Relevant memory was injected into the conversation
     #[serde(rename = "memory_injected")]
@@ -1228,6 +1357,23 @@ pub enum ServerEvent {
         new_session_id: String,
     },
 
+    /// Response to comm_list_models request
+    #[serde(rename = "comm_list_models_response")]
+    CommListModelsResponse {
+        id: u64,
+        /// The coordinator's currently active model (spawn default when no
+        /// override is configured or requested).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_model: Option<String>,
+        /// The configured `agents.swarm_model` pin, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_swarm_model: Option<String>,
+        /// All model routes known to the server (model + provider + auth
+        /// method + availability + rough cost estimate).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        model_routes: Vec<jcode_provider_core::ModelRoute>,
+    },
+
     /// Response to comm_await_members request
     #[serde(rename = "comm_await_members_response")]
     CommAwaitMembersResponse {
@@ -1238,6 +1384,11 @@ pub enum ServerEvent {
         members: Vec<AwaitedMemberStatus>,
         /// Human-readable summary
         summary: String,
+        /// True when the wait was handed off to a detached background watcher.
+        /// In that case `members`/`completed` describe the current snapshot, not
+        /// a final result; completion is delivered later via notify/wake.
+        #[serde(default)]
+        background_started: bool,
     },
 
     /// Response to split request — new session created with cloned conversation

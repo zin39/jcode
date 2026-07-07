@@ -69,7 +69,20 @@ fn member(session_id: &str, swarm_id: &str, status: &str) -> SwarmMember {
         last_status_change: Instant::now(),
         is_headless: false,
         output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        task_label: None,
     }
+}
+
+/// A swarm worker owned by `owner` (its spawning coordinator). Auto-assignment
+/// only targets such drivable workers, so test fixtures that model a spawned
+/// worker should use this rather than a bare `member()` (which represents a
+/// foreign/independent session and is intentionally not auto-assignable).
+fn owned_member(session_id: &str, swarm_id: &str, status: &str, owner: &str) -> SwarmMember {
+    let mut m = member(session_id, swarm_id, status);
+    m.report_back_to_session_id = Some(owner.to_string());
+    m
 }
 
 fn plan_item(id: &str, status: &str, priority: &str, blocked_by: &[&str]) -> PlanItem {
@@ -131,8 +144,10 @@ async fn test_agent() -> Arc<Mutex<Agent>> {
 
 include!("comm_control_tests/assign_task.rs");
 include!("comm_control_tests/assign_blocked.rs");
+include!("comm_control_tests/assign_double.rs");
 include!("comm_control_tests/assign_ready_agent.rs");
 include!("comm_control_tests/assign_less_loaded.rs");
+include!("comm_control_tests/assign_busy_skip.rs");
 include!("comm_control_tests/task_control.rs");
 include!("comm_control_tests/assign_next_dependency.rs");
 include!("comm_control_tests/assign_next_metadata.rs");
@@ -141,3 +156,10 @@ include!("comm_control_tests/await_disconnect.rs");
 include!("comm_control_tests/await_any.rs");
 include!("comm_control_tests/await_reload_deadline.rs");
 include!("comm_control_tests/await_reload_final.rs");
+include!("comm_control_tests/await_lagged.rs");
+include!("comm_control_tests/await_resume_expired.rs");
+include!("comm_control_tests/await_background_expired.rs");
+include!("comm_control_tests/await_upgrade_background.rs");
+include!("comm_control_tests/dag_e2e.rs");
+include!("comm_control_tests/auto_worker_filter.rs");
+include!("comm_control_tests/client_attached_dispatch.rs");

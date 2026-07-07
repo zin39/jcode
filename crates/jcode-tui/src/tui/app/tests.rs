@@ -25,16 +25,22 @@ include!("tests/remote_events_reload_02/part_02.rs");
 include!("tests/remote_events_reload_03/part_01.rs");
 include!("tests/remote_events_reload_03/part_02.rs");
 include!("tests/remote_events_reload_04.rs");
+include!("tests/remote_events_reload_05.rs");
+include!("tests/swarm_plan_graph_inline.rs");
+include!("tests/remote_model_picker_hotkeys.rs");
 include!("tests/scroll_copy_01/part_01.rs");
 include!("tests/scroll_copy_01/part_02.rs");
 include!("tests/scroll_copy_02/part_01.rs");
 include!("tests/scroll_copy_02/part_02.rs");
 include!("tests/scroll_copy_03.rs");
+include!("tests/input_copy_selection.rs");
 include!("tests/onboarding_flow.rs");
 include!("tests/onboarding_golden.rs");
 include!("tests/onboarding_eval.rs");
+include!("tests/onboarding_sim.rs");
 include!("tests/reasoning_region.rs");
 include!("tests/smoothness_benchmark.rs");
+include!("tests/hotkey_feedback_e2e.rs");
 
 #[test]
 fn kv_cache_signature_prefix_match_allows_appended_messages() {
@@ -160,19 +166,125 @@ fn cold_cache_warning_is_persisted_when_starting_next_request() {
         .display_messages()
         .iter()
         .find(|message| {
-            message.role == "system" && message.content.contains("Prompt cache is cold")
+            message.role == "system" && message.content.contains("Prompt cache went cold")
         })
         .expect("cold cache warning should be persisted in the transcript");
     assert!(warning.content.contains("911K"));
     assert!(
-        warning.content.contains("3600s TTL expired 123s ago")
-            || warning.content.contains("3600s TTL expired 124s ago"),
+        warning.content.contains("went cold 2m ago"),
         "{warning:?}"
     );
     assert!(
-        warning.content.contains("last cache write was 3723s ago")
-            || warning.content.contains("last cache write was 3724s ago"),
+        warning.content.lines().count() == 1,
+        "cold-cache warning must stay one line: {warning:?}"
+    );
+}
+
+#[test]
+fn cold_cache_warning_fires_on_idle_tick_before_next_message() {
+    // The whole point of the warning is to appear *before* the user submits
+    // the next message, so they can decide to /cache-extend or compact. The
+    // idle tick must therefore push it as soon as the TTL expires, not wait
+    // for the next request to start.
+    let mut app = create_test_app();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    app.display_messages.push(DisplayMessage::user("first"));
+    let session_id = app.kv_cache_session_id();
+    app.kv_cache.kv_cache_baseline = Some(KvCacheBaseline {
+        session_id,
+        input_tokens: 42_000,
+        completed_at: Instant::now() - Duration::from_secs(3700),
+        provider: "anthropic".to_string(),
+        model: "claude-opus-4-6".to_string(),
+        upstream_provider: None,
+        signature: None,
+    });
+
+    assert!(
+        app.maybe_push_idle_cold_cache_warning(),
+        "idle tick should push the cold-cache warning once the TTL expires"
+    );
+    let warning = app
+        .display_messages()
+        .iter()
+        .find(|message| {
+            message.role == "system" && message.content.contains("Prompt cache went cold")
+        })
+        .expect("idle cold cache warning should be persisted in the transcript");
+    assert!(
+        warning
+            .content
+            .contains("resent with your next message"),
         "{warning:?}"
+    );
+    assert!(
+        !warning.content.contains("ago"),
+        "idle warning should not report a stale 'went cold N ago' detail: {warning:?}"
+    );
+
+    // Subsequent ticks for the same cold period must not spam the transcript.
+    assert!(!app.maybe_push_idle_cold_cache_warning());
+    let count = app
+        .display_messages()
+        .iter()
+        .filter(|message| message.content.contains("Prompt cache went cold"))
+        .count();
+    assert_eq!(count, 1);
+
+    // And the request-start fallback must not duplicate the idle warning.
+    app.display_messages.push(DisplayMessage::user("second"));
+    app.begin_kv_cache_request(&[Message::user("second")], &[], "system", "");
+    let count = app
+        .display_messages()
+        .iter()
+        .filter(|message| message.content.contains("Prompt cache went cold"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "request start should not repeat the warning for the same cold period"
+    );
+}
+
+#[test]
+fn idle_cold_cache_warning_waits_for_ttl_and_rearms_after_new_cache_write() {
+    let mut app = create_test_app();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    app.display_messages.push(DisplayMessage::user("first"));
+    let session_id = app.kv_cache_session_id();
+    app.kv_cache.kv_cache_baseline = Some(KvCacheBaseline {
+        session_id: session_id.clone(),
+        input_tokens: 42_000,
+        completed_at: Instant::now() - Duration::from_secs(60),
+        provider: "anthropic".to_string(),
+        model: "claude-opus-4-6".to_string(),
+        upstream_provider: None,
+        signature: None,
+    });
+
+    assert!(
+        !app.maybe_push_idle_cold_cache_warning(),
+        "a warm cache must not warn"
+    );
+
+    // TTL expires: warn once.
+    app.kv_cache
+        .kv_cache_baseline
+        .as_mut()
+        .unwrap()
+        .completed_at = Instant::now() - Duration::from_secs(3700);
+    assert!(app.maybe_push_idle_cold_cache_warning());
+    assert!(!app.maybe_push_idle_cold_cache_warning());
+
+    // A new completed call refreshes the baseline (new cache write), which
+    // re-arms the warning for the next cold period.
+    app.kv_cache
+        .kv_cache_baseline
+        .as_mut()
+        .unwrap()
+        .completed_at = Instant::now() - Duration::from_secs(3800);
+    assert!(
+        app.maybe_push_idle_cold_cache_warning(),
+        "a fresh cache write should re-arm the cold warning"
     );
 }
 
@@ -183,6 +295,9 @@ fn harness_caused_kv_cache_miss_pushes_in_chat_alarm() {
     // grew, yet the cached prefix is invalidated. We must surface that loudly.
     let mut app = create_test_app();
     crate::provider::anthropic::set_cache_ttl_1h(true);
+    // No documented invalidation may explain this miss, or the alarm downgrades
+    // to the informational attribution notice.
+    crate::cache_invalidation::clear_for_tests();
 
     let messages = vec![
         Message::user("first prompt"),
@@ -191,8 +306,7 @@ fn harness_caused_kv_cache_miss_pushes_in_chat_alarm() {
     ];
 
     // Baseline captured last turn with a *different* system static hash.
-    let baseline_signature =
-        App::kv_cache_request_signature(&messages, &[], "system PROMPT A", "");
+    let baseline_signature = App::kv_cache_request_signature(&messages, &[], "system PROMPT A", "");
     let session_id = app.kv_cache_session_id();
     // Match the live provider/model exactly so the miss is classified as a
     // harness system change rather than a provider/model switch.
@@ -221,15 +335,97 @@ fn harness_caused_kv_cache_miss_pushes_in_chat_alarm() {
     let alarm = app
         .display_messages()
         .iter()
-        .find(|message| {
-            message.role == "system" && message.content.contains("KV cache miss")
-        })
+        .find(|message| message.role == "system" && message.content.contains("KV cache miss"))
         .expect("harness-caused cache miss should push an in-chat alarm");
     assert!(
         alarm.content.contains("harness: system changed"),
         "{alarm:?}"
     );
     assert!(alarm.content.contains("50K"), "{alarm:?}");
+}
+
+#[test]
+fn documented_invalidation_downgrades_kv_cache_alarm_to_attribution() {
+    // Config/skill reloads legitimately change the system prompt mid-session.
+    // Those sites document the invalidation; a harness-attributed miss that
+    // follows must be surfaced as an informational "refresh" with the cause,
+    // not as the unexplained harness-bust alarm.
+    let mut app = create_test_app();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+    crate::cache_invalidation::clear_for_tests();
+
+    let messages = vec![
+        Message::user("first prompt"),
+        Message::assistant_text("first answer"),
+        Message::user("second prompt"),
+    ];
+    let baseline_signature = App::kv_cache_request_signature(&messages, &[], "system PROMPT A", "");
+    let session_id = app.kv_cache_session_id();
+    let provider = app.kv_cache_provider_name();
+    let model = app.kv_cache_provider_model();
+    app.kv_cache.kv_cache_baseline = Some(KvCacheBaseline {
+        session_id,
+        input_tokens: 50_000,
+        completed_at: Instant::now(),
+        provider,
+        model,
+        upstream_provider: None,
+        signature: Some(baseline_signature),
+    });
+
+    // The documented cause lands between the baseline and the busted request.
+    crate::cache_invalidation::record("config reload", "modified_changed=true");
+
+    app.begin_kv_cache_request(&messages, &[], "system PROMPT B", "");
+    app.streaming.streaming_input_tokens = 50_000;
+    app.streaming.streaming_cache_read_tokens = Some(0);
+    app.streaming.streaming_cache_creation_tokens = Some(50_000);
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    let notice = app
+        .display_messages()
+        .iter()
+        .find(|message| message.role == "system" && message.content.contains("KV cache refresh"))
+        .expect("documented invalidation should push an attribution notice");
+    assert!(notice.content.contains("config reload"), "{notice:?}");
+    assert!(
+        !app.display_messages()
+            .iter()
+            .any(|message| message.role == "system" && message.content.contains("KV cache miss")),
+        "documented invalidation must not also raise the harness alarm"
+    );
+
+    crate::cache_invalidation::clear_for_tests();
+}
+
+#[test]
+fn kv_cache_baseline_stores_effective_prompt_tokens() {
+    // For split-accounting providers (Anthropic), the reported `input` is only
+    // the uncached remainder of the request. The baseline drives the cold-cache
+    // warning's "~N input tokens will be resent" figure, so it must store the
+    // whole effective prompt (input + cache read + cache creation), not the
+    // bare input.
+    let mut app = create_test_app();
+    crate::provider::anthropic::set_cache_ttl_1h(true);
+
+    let messages = vec![Message::user("first prompt")];
+    app.begin_kv_cache_request(&messages, &[], "system", "");
+    app.streaming.streaming_input_tokens = 700;
+    app.streaming.streaming_cache_read_tokens = Some(90_000);
+    app.streaming.streaming_cache_creation_tokens = Some(5_000);
+    app.kv_cache.current_api_usage_recorded = false;
+    app.record_completed_stream_cache_usage();
+
+    let baseline = app
+        .kv_cache
+        .kv_cache_baseline
+        .as_ref()
+        .expect("completed stream should record a baseline");
+    assert_eq!(
+        baseline.input_tokens, 95_700,
+        "baseline must capture input + read + creation, not bare input"
+    );
 }
 
 #[test]
@@ -265,11 +461,9 @@ fn legitimate_model_switch_miss_does_not_push_in_chat_alarm() {
     app.record_completed_stream_cache_usage();
 
     assert!(
-        !app
-            .display_messages()
+        !app.display_messages()
             .iter()
-            .any(|message| message.role == "system"
-                && message.content.contains("KV cache miss")),
+            .any(|message| message.role == "system" && message.content.contains("KV cache miss")),
         "model-switch miss must not raise the harness alarm"
     );
 }
@@ -580,6 +774,43 @@ fn skills_command_marks_active_skill_in_remote_mode() {
     assert!(
         content.contains("/firefox-browser [installed]"),
         "{content}"
+    );
+}
+
+/// Regression for issue #431: skills added on disk after startup (e.g. by the
+/// agent-side `skill_manage reload_all`, which only refreshes the server
+/// process registry) must show up in `/skills` without a session restart.
+#[test]
+fn skills_command_refreshes_registry_from_disk_before_listing() {
+    let mut app = create_test_app();
+
+    // Point the session at a fresh project dir and add a project-local skill
+    // after the app (and its skill snapshot) was created.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let skill_dir = temp.path().join(".jcode").join("skills").join("late-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: late-skill\ndescription: Added after startup\n---\n# Late skill\n",
+    )
+    .expect("write SKILL.md");
+    app.session.working_dir = Some(temp.path().to_string_lossy().to_string());
+
+    assert!(
+        app.current_skills_snapshot().get("late-skill").is_none(),
+        "snapshot must start without the new skill for this regression test"
+    );
+
+    assert!(super::state_ui::handle_info_command(&mut app, "/skills"));
+    let content = app.display_messages().last().unwrap().content.clone();
+
+    assert!(
+        content.contains("- /late-skill"),
+        "expected late-added skill in /skills output:\n{content}"
+    );
+    assert!(
+        app.current_skills_snapshot().get("late-skill").is_some(),
+        "registry snapshot must be synced so /late-skill invocations resolve"
     );
 }
 

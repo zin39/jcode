@@ -6,7 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-const SWARM_STATE_DIR: &str = "jcode-swarm-state";
+/// Directory name under the durable state dir (`~/.jcode/state`).
+const SWARM_STATE_DIR: &str = "swarm";
+/// Pre-0.36 location under the runtime dir (tmpfs on Linux, wiped on reboot).
+const LEGACY_SWARM_STATE_DIR: &str = "jcode-swarm-state";
 
 pub(super) struct LoadedSwarmRuntimeState {
     pub plans: HashMap<String, VersionedPlan>,
@@ -34,6 +37,18 @@ struct PersistedVersionedPlan {
     participants: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     task_progress: HashMap<String, SwarmTaskProgress>,
+    #[serde(default = "default_plan_mode", skip_serializing_if = "is_light_mode")]
+    mode: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    node_meta: HashMap<String, crate::plan::NodeMeta>,
+}
+
+fn default_plan_mode() -> String {
+    "light".to_string()
+}
+
+fn is_light_mode(mode: &str) -> bool {
+    mode == "light"
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -50,7 +65,57 @@ fn now_unix_ms() -> u64 {
 }
 
 fn state_dir() -> PathBuf {
-    storage::runtime_dir().join(SWARM_STATE_DIR)
+    storage::durable_state_dir().join(SWARM_STATE_DIR)
+}
+
+fn legacy_state_dir() -> PathBuf {
+    storage::runtime_dir().join(LEGACY_SWARM_STATE_DIR)
+}
+
+/// One-time migration from the legacy runtime-dir location (tmpfs, wiped on
+/// reboot) to the durable state dir. Copies legacy snapshots only when the
+/// new dir has none, so an already-migrated dir is never clobbered.
+fn migrate_legacy_state() {
+    let new_dir = state_dir();
+    let has_new_state = std::fs::read_dir(&new_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        })
+        .unwrap_or(false);
+    if has_new_state {
+        return;
+    }
+
+    let legacy_dir = legacy_state_dir();
+    let Ok(entries) = std::fs::read_dir(&legacy_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        if let Err(err) = storage::ensure_dir(&new_dir) {
+            crate::logging::warn(&format!(
+                "Failed to create swarm state dir {}: {}",
+                new_dir.display(),
+                err
+            ));
+            return;
+        }
+        if let Err(err) = std::fs::copy(&path, new_dir.join(file_name)) {
+            crate::logging::warn(&format!(
+                "Failed to migrate legacy swarm state {}: {}",
+                path.display(),
+                err
+            ));
+        }
+    }
 }
 
 fn state_path(swarm_id: &str) -> PathBuf {
@@ -83,6 +148,8 @@ fn from_persisted_plan(mut plan: PersistedVersionedPlan, updated_at_unix_ms: u64
         version: plan.version,
         participants: plan.participants.into_iter().collect(),
         task_progress: plan.task_progress,
+        mode: plan.mode,
+        node_meta: plan.node_meta,
     }
 }
 
@@ -94,6 +161,8 @@ fn to_persisted_plan(plan: &VersionedPlan) -> PersistedVersionedPlan {
         version: plan.version,
         participants,
         task_progress: plan.task_progress.clone(),
+        mode: plan.mode.clone(),
+        node_meta: plan.node_meta.clone(),
     }
 }
 
@@ -122,10 +191,18 @@ fn recover_member_status(
         );
     }
 
+    // Ready/Done headless members finished their work before the reload:
+    // nothing in-flight was lost, their completion report is preserved, and
+    // startup recovery re-registers the agent, so the reload is invisible to
+    // them. Marking them crashed here is wrong and races ahead of recovery,
+    // making cleanly-finished workers report as "(crashed)" to await_members
+    // watchers that resume before recovery rewrites the status (#swarm).
     if is_headless
         && !matches!(
             status,
-            SwarmLifecycleStatus::Completed
+            SwarmLifecycleStatus::Ready
+                | SwarmLifecycleStatus::Completed
+                | SwarmLifecycleStatus::Done
                 | SwarmLifecycleStatus::Failed
                 | SwarmLifecycleStatus::Stopped
         )
@@ -159,6 +236,7 @@ fn from_persisted_member(member: PersistedSwarmMember) -> SwarmMember {
 }
 
 pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
+    migrate_legacy_state();
     let dir = state_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return LoadedSwarmRuntimeState {
@@ -176,6 +254,19 @@ pub(super) fn load_runtime_state() -> LoadedSwarmRuntimeState {
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
+            continue;
+        }
+        // `.bak` files are corruption-recovery fallbacks, not co-equal
+        // snapshots. When the primary `.json` still exists, reading the
+        // `.bak` alongside it can resurrect state the primary deliberately
+        // dropped (e.g. a cleared plan: the rotate-on-write keeps the old
+        // plan-bearing snapshot as `.bak`, and a union-load would re-insert
+        // that plan forever). `read_json` already falls back to the `.bak`
+        // internally when the primary is corrupt, so skipping it here loses
+        // nothing.
+        if path.extension().and_then(|ext| ext.to_str()) == Some("bak")
+            && path.with_extension("json").is_file()
+        {
             continue;
         }
         let Ok(state) = storage::read_json::<PersistedSwarmState>(&path) else {

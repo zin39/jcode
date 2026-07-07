@@ -31,8 +31,23 @@ pub struct PersistedAwaitMembersState {
     pub mode: Option<String>,
     pub created_at_unix_ms: u64,
     pub deadline_unix_ms: u64,
+    /// When true, the wait runs as a detached background watcher that delivers
+    /// its result via notify/wake instead of blocking the requesting turn.
+    /// Background watchers are auto-resumed at server startup after a reload.
+    #[serde(default)]
+    pub background: bool,
+    /// Surface a completion notification card to attached clients.
+    #[serde(default = "default_true")]
+    pub notify: bool,
+    /// Wake an idle requesting agent on completion (or soft-interrupt if busy).
+    #[serde(default = "default_true")]
+    pub wake: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response: Option<PersistedAwaitMembersResult>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl PersistedAwaitMembersState {
@@ -154,6 +169,10 @@ pub(super) fn save_state(state: &PersistedAwaitMembersState) {
     save_json_state(AWAIT_MEMBERS_DIR, &state.key, state, "await_members state")
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pending await state mirrors persisted fields and existing call sites"
+)]
 pub(super) fn ensure_pending_state(
     key: &str,
     session_id: &str,
@@ -162,6 +181,9 @@ pub(super) fn ensure_pending_state(
     target_status: &[String],
     mode: Option<&str>,
     deadline_unix_ms: u64,
+    background: bool,
+    notify: bool,
+    wake: bool,
 ) -> PersistedAwaitMembersState {
     if let Some(existing) = load_state(key).filter(PersistedAwaitMembersState::is_pending) {
         return existing;
@@ -176,6 +198,9 @@ pub(super) fn ensure_pending_state(
         mode: mode.map(str::to_string),
         created_at_unix_ms: now_unix_ms(),
         deadline_unix_ms,
+        background,
+        notify,
+        wake,
         final_response: None,
     };
     save_state(&state);
@@ -200,6 +225,31 @@ pub(super) fn persist_final_response(
 }
 
 pub fn pending_await_members_for_session(session_id: &str) -> Vec<PersistedAwaitMembersState> {
+    let mut pending: Vec<PersistedAwaitMembersState> = all_pending_await_members()
+        .into_iter()
+        .filter(|state| state.session_id == session_id)
+        .collect();
+    pending.sort_by_key(|state| state.deadline_unix_ms);
+    pending
+}
+
+/// Load every still-pending await state across all sessions, pruning stale
+/// files as a side effect. Used both for per-session lookups and for resuming
+/// backgrounded watchers after a server reload.
+pub(super) fn all_pending_await_members() -> Vec<PersistedAwaitMembersState> {
+    let now = now_unix_ms();
+    all_pending_await_members_including_expired()
+        .into_iter()
+        .filter(|state| state.deadline_unix_ms > now)
+        .collect()
+}
+
+/// Like [`all_pending_await_members`], but also returns pending states whose
+/// deadline has already passed (still within the pending TTL). Startup resume
+/// uses this so background awaits that expired while the server was down can
+/// be finalized with a timeout instead of silently dropping the promised
+/// notify/wake.
+pub(super) fn all_pending_await_members_including_expired() -> Vec<PersistedAwaitMembersState> {
     let dir = state_dir(AWAIT_MEMBERS_DIR);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -219,14 +269,10 @@ pub fn pending_await_members_for_session(session_id: &str) -> Vec<PersistedAwait
             let _ = std::fs::remove_file(path);
             continue;
         }
-        if state.session_id == session_id
-            && state.is_pending()
-            && state.deadline_unix_ms > now_unix_ms()
-        {
+        if state.is_pending() {
             pending.push(state);
         }
     }
 
-    pending.sort_by_key(|state| state.deadline_unix_ms);
     pending
 }

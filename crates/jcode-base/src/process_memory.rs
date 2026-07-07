@@ -33,6 +33,13 @@ pub struct ProcessMemorySnapshot {
     pub rss_bytes: Option<u64>,
     pub peak_rss_bytes: Option<u64>,
     pub virtual_bytes: Option<u64>,
+    /// Number of OS threads (`Threads:` in `/proc/self/status`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_count: Option<u64>,
+    /// Main thread stack size (`VmStk:` in `/proc/self/status`). Auxiliary
+    /// thread stacks live in anonymous mappings and are not included here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_stack_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os: Option<OsProcessMemoryInfo>,
     pub allocator: AllocatorInfo,
@@ -41,6 +48,22 @@ pub struct ProcessMemorySnapshot {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct OsProcessMemoryInfo {
     pub pss_bytes: Option<u64>,
+    /// Proportional set size of anonymous mappings (`Pss_Anon:` in
+    /// smaps_rollup): heap + thread stacks + other private anon memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pss_anon_bytes: Option<u64>,
+    /// Proportional set size of file-backed mappings (`Pss_File:`): mostly
+    /// the executable text/rodata and shared libraries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pss_file_bytes: Option<u64>,
+    /// Proportional set size of shmem mappings (`Pss_Shmem:`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pss_shmem_bytes: Option<u64>,
+    /// Bytes backed by transparent huge pages (`AnonHugePages:`); a subset of
+    /// anon memory that amplifies allocator retention (one live allocation
+    /// pins a whole 2MB page).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anon_huge_pages_bytes: Option<u64>,
     pub rss_anon_bytes: Option<u64>,
     pub rss_file_bytes: Option<u64>,
     pub rss_shmem_bytes: Option<u64>,
@@ -138,6 +161,8 @@ pub fn snapshot_with_source(source: impl Into<String>) -> ProcessMemorySnapshot 
         rss_bytes: parse_proc_status_value_bytes(&status, "VmRSS:"),
         peak_rss_bytes: parse_proc_status_value_bytes(&status, "VmHWM:"),
         virtual_bytes: parse_proc_status_value_bytes(&status, "VmSize:"),
+        thread_count: parse_proc_status_count(&status, "Threads:"),
+        main_stack_bytes: parse_proc_status_value_bytes(&status, "VmStk:"),
         os: read_linux_memory_info(&status),
         allocator: allocator_info(),
     };
@@ -187,14 +212,83 @@ pub fn allocator_info() -> AllocatorInfo {
 
     #[cfg(not(feature = "jemalloc"))]
     {
+        let stats = glibc_malloc_stats();
         AllocatorInfo {
             name: "system",
-            stats_available: false,
-            stats: None,
+            stats_available: stats.is_some(),
+            stats,
             tuning: None,
             profiling: None,
         }
     }
+}
+
+/// Read glibc malloc statistics via `mallinfo2` (glibc >= 2.33).
+///
+/// This does not attribute memory to app structures, but it splits process
+/// heap into "live" (bytes the app currently holds) and "retained" (bytes
+/// freed by the app but kept by the allocator), which is the distinction that
+/// matters when diagnosing unattributed RSS.
+///
+/// `mallinfo2` is resolved with `dlsym` instead of linked directly: release
+/// binaries are built against a glibc 2.17 (manylinux2014) baseline where the
+/// symbol does not exist, so a direct call fails to link. At runtime on a
+/// modern glibc the lookup succeeds and stats work as before; on an old glibc
+/// this returns `None` and callers already treat stats as unavailable.
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
+fn glibc_malloc_stats() -> Option<AllocatorStats> {
+    // Mirrors glibc's `struct mallinfo2` (all fields `size_t`).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Mallinfo2 {
+        arena: libc::size_t,
+        ordblks: libc::size_t,
+        smblks: libc::size_t,
+        hblks: libc::size_t,
+        hblkhd: libc::size_t,
+        usmblks: libc::size_t,
+        fsmblks: libc::size_t,
+        uordblks: libc::size_t,
+        fordblks: libc::size_t,
+        keepcost: libc::size_t,
+    }
+    type Mallinfo2Fn = unsafe extern "C" fn() -> Mallinfo2;
+
+    static MALLINFO2: std::sync::OnceLock<Option<Mallinfo2Fn>> = std::sync::OnceLock::new();
+    let mallinfo2 = (*MALLINFO2.get_or_init(|| {
+        // Safety: dlsym with a NUL-terminated literal; the default namespace
+        // (RTLD_DEFAULT) searches the already-loaded glibc.
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
+        if sym.is_null() {
+            None
+        } else {
+            // Safety: glibc's mallinfo2 has exactly this signature.
+            Some(unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2Fn>(sym) })
+        }
+    }))?;
+
+    // Totals are summed across all arenas by modern glibc.
+    // uordblks: in-use arena bytes; fordblks: freed-but-retained arena bytes;
+    // hblkhd: mmap-backed allocation bytes; arena: total sbrk/mmap arena size.
+    let info = unsafe { mallinfo2() };
+    let live = (info.uordblks as u64).saturating_add(info.hblkhd as u64);
+    let mapped = (info.arena as u64).saturating_add(info.hblkhd as u64);
+    Some(AllocatorStats {
+        allocated_bytes: Some(live),
+        active_bytes: Some(info.uordblks as u64),
+        metadata_bytes: None,
+        resident_bytes: None,
+        mapped_bytes: Some(mapped),
+        retained_bytes: Some(info.fordblks as u64),
+    })
+}
+
+#[cfg(all(
+    not(all(target_os = "linux", target_env = "gnu")),
+    not(feature = "jemalloc")
+))]
+fn glibc_malloc_stats() -> Option<AllocatorStats> {
+    None
 }
 
 pub fn purge_allocator() -> Result<AllocatorTuningInfo> {
@@ -221,11 +315,24 @@ pub fn purge_allocator() -> Result<AllocatorTuningInfo> {
         }))
     }
 
-    #[cfg(not(feature = "jemalloc"))]
+    #[cfg(all(target_os = "linux", not(feature = "jemalloc")))]
     {
-        logging::warn("allocator purge requested but jemalloc feature is disabled");
+        // glibc has no arena purge API, but malloc_trim(0) walks all arenas
+        // and returns freed pages to the OS (MADV_DONTNEED), which is the
+        // equivalent retained-memory release.
+        logging::info("purging glibc allocator via malloc_trim(0)");
+        release_retained_heap("debug_allocator_purge");
+        Ok(AllocatorTuningInfo {
+            available: true,
+            ..AllocatorTuningInfo::default()
+        })
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(feature = "jemalloc")))]
+    {
+        logging::warn("allocator purge requested but no purge mechanism is available");
         Err(anyhow!(
-            "allocator purge unavailable: rebuild with --features jemalloc"
+            "allocator purge unavailable on this platform: rebuild with --features jemalloc"
         ))
     }
 }
@@ -348,6 +455,198 @@ pub fn estimate_json_bytes<T: Serialize>(value: &T) -> usize {
         .unwrap_or(0)
 }
 
+/// Return freed-but-retained heap pages to the OS.
+///
+/// glibc malloc keeps pages freed by large transient allocations (history
+/// loads, provider payloads, render caches) inside its arenas, which shows up
+/// as unattributed RSS that never shrinks. On jemalloc builds this purges all
+/// arenas; on Linux system-allocator builds it calls `malloc_trim(0)`; on
+/// other platforms it is a no-op.
+pub fn release_retained_heap(reason: &str) {
+    #[cfg(feature = "jemalloc")]
+    {
+        if let Err(err) = purge_allocator() {
+            logging::info(&format!("jemalloc purge ({reason}) failed: {err}"));
+        } else {
+            logging::debug(&format!("jemalloc purge ({reason}) completed"));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "jemalloc")))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        let trimmed = unsafe { malloc_trim(0) };
+        logging::debug(&format!(
+            "malloc_trim ({reason}): {}",
+            if trimmed == 1 {
+                "released pages"
+            } else {
+                "no pages to release"
+            }
+        ));
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(feature = "jemalloc")))]
+    {
+        let _ = reason;
+    }
+
+    // Whatever apparent retention remains after the release is the
+    // unrecoverable floor (fragmentation residual); measure future growth
+    // from it so retention-triggered callers stay quiet at steady state.
+    record_post_trim_retention_baseline();
+}
+
+static LAST_HEAP_RELEASE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Debounced [`release_retained_heap`]: skips the release when one already ran
+/// within `min_interval`. Returns true when a release was performed.
+pub fn release_retained_heap_debounced(reason: &str, min_interval: std::time::Duration) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let last_ms = LAST_HEAP_RELEASE_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < min_interval.as_millis() as u64 {
+        return false;
+    }
+    if LAST_HEAP_RELEASE_MS
+        .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    release_retained_heap(reason);
+    true
+}
+
+/// Default apparent-retention growth threshold that triggers a background trim.
+pub const DEFAULT_RETENTION_TRIM_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Post-trim apparent-retention baseline (bytes). Updated after every
+/// [`release_retained_heap`] and ratcheted down when current apparent
+/// retention falls below it, so growth is always measured from the floor.
+static POST_TRIM_APPARENT_RETENTION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Resident anonymous memory not accounted for by live allocator bytes:
+/// freed-but-still-resident heap pages plus fragmentation overhead. This is
+/// the memory a trim/purge can plausibly return to the OS, measured from the
+/// OS side (RssAnon) minus the allocator's live bytes.
+///
+/// Allocator-reported "retained/free" counters are the wrong trigger metric
+/// on glibc: `malloc_trim` releases the physical pages behind free chunks
+/// (MADV_DONTNEED) but the chunks remain in `fordblks`, so that counter never
+/// drops after a trim and a threshold on it re-fires forever.
+#[cfg(target_os = "linux")]
+fn apparent_heap_retention_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let rss_anon = parse_proc_status_value_bytes(&status, "RssAnon:")?;
+    let live = allocator_info().stats.as_ref()?.allocated_bytes?;
+    Some(rss_anon.saturating_sub(live))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apparent_heap_retention_bytes() -> Option<u64> {
+    None
+}
+
+/// Refresh the post-trim baseline from the current apparent retention.
+fn record_post_trim_retention_baseline() {
+    if let Some(apparent) = apparent_heap_retention_bytes() {
+        POST_TRIM_APPARENT_RETENTION.store(apparent, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Pure trigger decision for retention-based trimming: has apparent retention
+/// grown at least `threshold` bytes above the post-trim `baseline`?
+fn retention_growth_exceeds(apparent: u64, baseline: u64, threshold: u64) -> bool {
+    apparent.saturating_sub(baseline) >= threshold
+}
+
+/// Release retained heap when apparent retention (RssAnon minus live
+/// allocator bytes) has grown at least `threshold_bytes` above the post-trim
+/// baseline. Intended for periodic (heartbeat) callers: cheap when below
+/// threshold (one /proc/self/status read + allocator stats read), debounced
+/// against other release paths when above it. Returns true when a release ran.
+///
+/// This closes the gap left by event-driven trims (turn completion, history
+/// load): a server hosting many mostly-idle sessions can accumulate hundreds
+/// of MB of freed-but-resident pages without ever hitting those event hooks.
+/// Measuring *growth above the post-trim floor* keeps the watchdog quiet at
+/// steady state: the unrecoverable fragmentation residual left after a trim
+/// becomes the new baseline instead of re-triggering every cycle.
+pub fn release_retained_heap_if_excessive(
+    reason: &str,
+    threshold_bytes: u64,
+    min_interval: std::time::Duration,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let Some(apparent) = apparent_heap_retention_bytes() else {
+        // No OS-side metric available (non-Linux, or allocator stats missing):
+        // fall back to the allocator-reported retained counter as an absolute
+        // threshold. Coarse, but better than never trimming.
+        let retained = allocator_info()
+            .stats
+            .and_then(|stats| stats.retained_bytes)
+            .unwrap_or(0);
+        if retained < threshold_bytes {
+            return false;
+        }
+        return release_retained_heap_debounced(reason, min_interval);
+    };
+
+    // Ratchet the baseline down so growth is measured from the true floor
+    // (e.g. after freed pages get reused into live memory).
+    let mut baseline = POST_TRIM_APPARENT_RETENTION.load(Ordering::Relaxed);
+    if apparent < baseline {
+        POST_TRIM_APPARENT_RETENTION.store(apparent, Ordering::Relaxed);
+        baseline = apparent;
+    }
+
+    if !retention_growth_exceeds(apparent, baseline, threshold_bytes) {
+        return false;
+    }
+
+    let released = release_retained_heap_debounced(reason, min_interval);
+    if released {
+        let after = apparent_heap_retention_bytes().unwrap_or(apparent);
+        logging::info(&format!(
+            "retained-heap trim ({reason}): apparent retention {} MB grew {} MB above post-trim baseline {} MB (threshold {} MB); recovered ~{} MB",
+            apparent / (1024 * 1024),
+            (apparent - baseline) / (1024 * 1024),
+            baseline / (1024 * 1024),
+            threshold_bytes / (1024 * 1024),
+            apparent.saturating_sub(after) / (1024 * 1024),
+        ));
+    }
+    released
+}
+
+/// Retention trim threshold in bytes, from `JCODE_HEAP_RETENTION_TRIM_MB`
+/// (in MiB), falling back to [`DEFAULT_RETENTION_TRIM_THRESHOLD_BYTES`].
+/// `0` disables retention-triggered trimming (returns `u64::MAX`).
+pub fn retention_trim_threshold_bytes() -> u64 {
+    parse_retention_trim_threshold(
+        std::env::var("JCODE_HEAP_RETENTION_TRIM_MB")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_retention_trim_threshold(value: Option<&str>) -> u64 {
+    match value.and_then(|value| value.trim().parse::<u64>().ok()) {
+        Some(0) => u64::MAX,
+        Some(mb) => mb.saturating_mul(1024 * 1024),
+        None => DEFAULT_RETENTION_TRIM_THRESHOLD_BYTES,
+    }
+}
+
 fn record_snapshot(source: String, snapshot: ProcessMemorySnapshot) {
     let Ok(mut history) = memory_history().lock() else {
         logging::error("process memory history lock poisoned; dropping snapshot");
@@ -374,6 +673,18 @@ fn read_linux_memory_info(status: &str) -> Option<OsProcessMemoryInfo> {
         pss_bytes: smaps
             .as_deref()
             .and_then(|text| parse_proc_value_bytes(text, "Pss:")),
+        pss_anon_bytes: smaps
+            .as_deref()
+            .and_then(|text| parse_proc_value_bytes(text, "Pss_Anon:")),
+        pss_file_bytes: smaps
+            .as_deref()
+            .and_then(|text| parse_proc_value_bytes(text, "Pss_File:")),
+        pss_shmem_bytes: smaps
+            .as_deref()
+            .and_then(|text| parse_proc_value_bytes(text, "Pss_Shmem:")),
+        anon_huge_pages_bytes: smaps
+            .as_deref()
+            .and_then(|text| parse_proc_value_bytes(text, "AnonHugePages:")),
         rss_anon_bytes: parse_proc_status_value_bytes(status, "RssAnon:"),
         rss_file_bytes: parse_proc_status_value_bytes(status, "RssFile:"),
         rss_shmem_bytes: parse_proc_status_value_bytes(status, "RssShmem:"),
@@ -562,6 +873,15 @@ fn parse_proc_status_value_bytes(status: &str, key: &str) -> Option<u64> {
     parse_proc_value_bytes(status, key)
 }
 
+/// Parse a unit-less `/proc` counter such as `Threads:\t10`.
+#[cfg(target_os = "linux")]
+fn parse_proc_status_count(status: &str, key: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix(key)?;
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn parse_proc_value_bytes(status: &str, key: &str) -> Option<u64> {
     status.lines().find_map(|line| {
@@ -587,6 +907,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn release_retained_heap_is_safe_to_call() {
+        // Allocate and drop a large transient buffer, then release. This must
+        // not crash on any allocator configuration.
+        let buffer = vec![0u8; 8 * 1024 * 1024];
+        drop(buffer);
+        release_retained_heap("unit_test");
+    }
+
+    #[test]
+    fn release_retained_heap_debounced_skips_within_interval() {
+        // First call resets the shared debounce clock; the immediate second
+        // call within a long interval must be skipped.
+        release_retained_heap_debounced("unit_test_first", std::time::Duration::ZERO);
+        let ran = release_retained_heap_debounced(
+            "unit_test_second",
+            std::time::Duration::from_secs(3600),
+        );
+        assert!(
+            !ran,
+            "second call within debounce interval should be skipped"
+        );
+    }
+
+    #[test]
+    fn parse_retention_trim_threshold_handles_default_disable_and_values() {
+        assert_eq!(
+            parse_retention_trim_threshold(None),
+            DEFAULT_RETENTION_TRIM_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            parse_retention_trim_threshold(Some("garbage")),
+            DEFAULT_RETENTION_TRIM_THRESHOLD_BYTES
+        );
+        // 0 disables retention trimming entirely.
+        assert_eq!(parse_retention_trim_threshold(Some("0")), u64::MAX);
+        assert_eq!(
+            parse_retention_trim_threshold(Some(" 128 ")),
+            128 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn release_retained_heap_if_excessive_skips_below_threshold() {
+        // u64::MAX growth threshold can never be exceeded, so no release
+        // should run regardless of current allocator state.
+        let ran = release_retained_heap_if_excessive(
+            "unit_test_below_threshold",
+            u64::MAX,
+            std::time::Duration::ZERO,
+        );
+        assert!(!ran, "release should not run below threshold");
+    }
+
+    #[test]
+    fn retention_growth_trigger_measures_growth_above_baseline() {
+        let mb = 1024 * 1024;
+        // At or below baseline: no growth.
+        assert!(!retention_growth_exceeds(100 * mb, 100 * mb, 64 * mb));
+        assert!(!retention_growth_exceeds(50 * mb, 100 * mb, 64 * mb));
+        // Growth below threshold stays quiet (the post-trim residual case).
+        assert!(!retention_growth_exceeds(163 * mb, 100 * mb, 64 * mb));
+        // Growth at/above threshold fires.
+        assert!(retention_growth_exceeds(164 * mb, 100 * mb, 64 * mb));
+        assert!(retention_growth_exceeds(300 * mb, 100 * mb, 64 * mb));
+        // Threshold 0 always fires.
+        assert!(retention_growth_exceeds(0, 0, 0));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
+    #[test]
+    fn release_retained_heap_if_excessive_runs_above_threshold_then_requires_regrowth() {
+        // Threshold 0 means any growth (>= 0) triggers; with a zero debounce
+        // the release must run and reset the baseline to the current level.
+        let ran = release_retained_heap_if_excessive(
+            "unit_test_above_threshold",
+            0,
+            std::time::Duration::ZERO,
+        );
+        assert!(ran, "release should run when growth exceeds threshold");
+
+        // Immediately after the trim the baseline equals current apparent
+        // retention, so a huge growth threshold cannot be met: steady state
+        // must not re-trigger.
+        let ran_again = release_retained_heap_if_excessive(
+            "unit_test_steady_state",
+            u64::MAX,
+            std::time::Duration::ZERO,
+        );
+        assert!(
+            !ran_again,
+            "steady-state retention must not re-trigger the watchdog"
+        );
+    }
+
+    #[test]
     fn allocator_info_matches_enabled_allocator_features() {
         let info = allocator_info();
         if cfg!(feature = "jemalloc") {
@@ -595,10 +1010,28 @@ mod tests {
             assert!(info.profiling.is_some());
         } else {
             assert_eq!(info.name, "system");
-            assert!(!info.stats_available);
-            assert!(info.stats.is_none());
+            assert_eq!(info.stats_available, info.stats.is_some());
             assert!(info.profiling.is_none());
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "jemalloc")))]
+    #[test]
+    fn glibc_malloc_stats_report_live_and_retained_bytes() {
+        // Hold a live allocation so uordblks cannot be zero, then check the
+        // mallinfo2-backed stats are populated and internally consistent.
+        let held = vec![0u8; 1024 * 1024];
+        let stats = glibc_malloc_stats().expect("mallinfo2 stats on glibc");
+        assert!(
+            stats.allocated_bytes.unwrap() > 0,
+            "live bytes should be nonzero"
+        );
+        assert!(stats.retained_bytes.is_some());
+        assert!(
+            stats.mapped_bytes.unwrap() >= stats.active_bytes.unwrap(),
+            "arena total should cover in-use arena bytes"
+        );
+        drop(held);
     }
 
     #[cfg(target_os = "linux")]
@@ -613,6 +1046,39 @@ mod tests {
         assert_eq!(
             parse_proc_value_bytes(text, "Retained:"),
             Some(1024 * 1024 * 1024)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_status_count_reads_unitless_counters() {
+        let text = "Name:\tjcode\nThreads:\t10\nVmStk:\t     132 kB\n";
+        assert_eq!(parse_proc_status_count(text, "Threads:"), Some(10));
+        assert_eq!(parse_proc_status_count(text, "Missing:"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_populates_thread_and_stack_and_pss_split_fields() {
+        let snapshot = snapshot_with_source("unit_test_coverage_fields");
+        assert!(
+            snapshot.thread_count.unwrap_or(0) >= 1,
+            "a live process has at least one thread"
+        );
+        assert!(
+            snapshot.main_stack_bytes.unwrap_or(0) > 0,
+            "main stack should be nonzero"
+        );
+        let os = snapshot.os.expect("linux os info");
+        // smaps_rollup reports Pss_Anon/Pss_File on kernels >= 4.14; both
+        // should be present and their sum should not exceed total PSS by more
+        // than rounding.
+        let pss = os.pss_bytes.expect("pss");
+        let anon = os.pss_anon_bytes.expect("pss_anon");
+        let file = os.pss_file_bytes.expect("pss_file");
+        assert!(
+            anon + file <= pss + 2 * 1024 * 1024,
+            "pss split should be consistent"
         );
     }
 }

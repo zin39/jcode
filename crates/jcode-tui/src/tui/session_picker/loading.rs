@@ -348,7 +348,10 @@ pub(super) fn session_matches_query(session: &SessionInfo, query: &str) -> bool 
 /// session's cached `search_index` from the loaded preview.
 pub(super) fn session_matches_picker_query(session: &SessionInfo, query: &str) -> bool {
     let tokens = search_query_tokens(query);
-    tokens.is_empty() || tokens.iter().all(|token| session.search_index.contains(token))
+    tokens.is_empty()
+        || tokens
+            .iter()
+            .all(|token| session.search_index.contains(token))
 }
 
 /// Split a raw query into normalized (lowercased, whitespace-trimmed) search
@@ -382,7 +385,8 @@ fn transcript_paths_for_session(session: &SessionInfo) -> Vec<PathBuf> {
         ResumeTarget::ClaudeCodeSession { session_path, .. }
         | ResumeTarget::CodexSession { session_path, .. }
         | ResumeTarget::PiSession { session_path }
-        | ResumeTarget::OpenCodeSession { session_path, .. } => {
+        | ResumeTarget::OpenCodeSession { session_path, .. }
+        | ResumeTarget::CursorSession { session_path, .. } => {
             vec![PathBuf::from(session_path)]
         }
     }
@@ -570,6 +574,9 @@ fn classify_session_source(
     }
     if provider_key.contains("codex") || model.contains("codex") || model.contains("openai-codex") {
         return SessionSource::Codex;
+    }
+    if provider_key == "cursor" || provider_key == "cursor-agent" {
+        return SessionSource::Cursor;
     }
 
     SessionSource::Jcode
@@ -1591,6 +1598,7 @@ fn parse_jcode_session_info(
         || stem.starts_with("imported_codex_")
         || stem.starts_with("imported_pi_")
         || stem.starts_with("imported_opencode_")
+        || stem.starts_with("imported_cursor_")
     {
         return None;
     }
@@ -1714,6 +1722,7 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
         let codex_handle = scope.spawn(|| load_external_codex_sessions(scan_limit));
         let pi_handle = scope.spawn(|| load_external_pi_sessions(scan_limit));
         let opencode_handle = scope.spawn(|| load_external_opencode_sessions(scan_limit));
+        let cursor_handle = scope.spawn(|| load_external_cursor_sessions(scan_limit));
 
         // Phase 1: walk the recency-ordered candidates in parallel windows until
         // we have collected `scan_limit` non-empty sessions. `boundary` marks the
@@ -1769,6 +1778,7 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
         external.extend(codex_handle.join().unwrap_or_default());
         external.extend(pi_handle.join().unwrap_or_default());
         external.extend(opencode_handle.join().unwrap_or_default());
+        external.extend(cursor_handle.join().unwrap_or_default());
         (sessions, external)
     });
     sessions.extend(external_sessions);
@@ -1809,7 +1819,9 @@ fn load_external_claude_code_sessions(scan_limit: usize) -> Vec<SessionInfo> {
                 .and_then(|dir| Path::new(dir).file_name())
                 .and_then(|name| name.to_str())
                 .map(|name| name.to_string())
-                .unwrap_or_else(|| format!("claude {}", &session_id[..session_id.len().min(8)]));
+                .unwrap_or_else(|| {
+                    format!("claude {}", jcode_core::util::truncate_str(&session_id, 8))
+                });
             // Keep /resume startup focused on cheap metadata. Transcript-backed
             // search text is intentionally loaded lazily through preview loading;
             // reading tens of KiB from every external transcript can dominate the
@@ -1945,6 +1957,7 @@ pub(crate) fn latest_external_cli_session_secs(
         ExternalCli::ClaudeCode => (".claude/projects", "jsonl"),
         ExternalCli::Pi => (".pi/agent/sessions", "jsonl"),
         ExternalCli::OpenCode => (".local/share/opencode/storage/session", "json"),
+        ExternalCli::Cursor => (".cursor/projects", "jsonl"),
     };
     let root = crate::storage::user_home_path(rel_root).ok()?;
     if !root.exists() {
@@ -1991,8 +2004,11 @@ fn load_codex_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let short_name = format!("codex {}", &session_id[..session_id.len().min(8)]);
-    let title = format!("Codex session {}", &session_id[..session_id.len().min(8)]);
+    let short_name = format!("codex {}", jcode_core::util::truncate_str(&session_id, 8));
+    let title = format!(
+        "Codex session {}",
+        jcode_core::util::truncate_str(&session_id, 8)
+    );
     let search_index = build_search_index(
         &format!("codex:{session_id}"),
         &short_name,
@@ -2185,8 +2201,11 @@ fn load_pi_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let short_name = format!("pi {}", &session_id[..session_id.len().min(8)]);
-    let title = format!("Pi session {}", &session_id[..session_id.len().min(8)]);
+    let short_name = format!("pi {}", jcode_core::util::truncate_str(&session_id, 8));
+    let title = format!(
+        "Pi session {}",
+        jcode_core::util::truncate_str(&session_id, 8)
+    );
     let search_index = build_search_index(
         &format!("pi:{session_id}"),
         &short_name,
@@ -2340,9 +2359,13 @@ fn load_pi_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         return Ok(None);
     }
 
-    let short_name = format!("pi {}", &session_id[..session_id.len().min(8)]);
-    let title =
-        title.unwrap_or_else(|| format!("Pi session {}", &session_id[..session_id.len().min(8)]));
+    let short_name = format!("pi {}", jcode_core::util::truncate_str(&session_id, 8));
+    let title = title.unwrap_or_else(|| {
+        format!(
+            "Pi session {}",
+            jcode_core::util::truncate_str(&session_id, 8)
+        )
+    });
     let search_index = build_search_index(
         &format!("pi:{session_id}"),
         &short_name,
@@ -2442,7 +2465,10 @@ fn load_opencode_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         .get("directory")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let short_name = format!("opencode {}", &session_id[..session_id.len().min(8)]);
+    let short_name = format!(
+        "opencode {}",
+        jcode_core::util::truncate_str(&session_id, 8)
+    );
     let title = value
         .get("title")
         .and_then(|v| v.as_str())
@@ -2450,7 +2476,7 @@ fn load_opencode_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         .unwrap_or_else(|| {
             format!(
                 "OpenCode session {}",
-                &session_id[..session_id.len().min(8)]
+                jcode_core::util::truncate_str(&session_id, 8)
             )
         });
     let search_index = build_search_index(
@@ -2532,7 +2558,7 @@ fn load_opencode_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         .unwrap_or_else(|| {
             format!(
                 "OpenCode session {}",
-                &session_id[..session_id.len().min(8)]
+                jcode_core::util::truncate_str(&session_id, 8)
             )
         });
 
@@ -2595,7 +2621,10 @@ fn load_opencode_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         return Ok(None);
     }
 
-    let short_name = format!("opencode {}", &session_id[..session_id.len().min(8)]);
+    let short_name = format!(
+        "opencode {}",
+        jcode_core::util::truncate_str(&session_id, 8)
+    );
     let search_index = build_search_index(
         &format!("opencode:{session_id}"),
         &short_name,
@@ -2638,6 +2667,181 @@ fn load_opencode_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         server_icon: None,
         source: SessionSource::OpenCode,
         resume_target: ResumeTarget::OpenCodeSession {
+            session_id,
+            session_path: path.to_string_lossy().to_string(),
+        },
+        external_path: Some(path.to_string_lossy().to_string()),
+    }))
+}
+
+fn load_external_cursor_sessions(scan_limit: usize) -> Vec<SessionInfo> {
+    let Ok(root) = crate::storage::user_home_path(".cursor/projects") else {
+        return Vec::new();
+    };
+    if !root.exists() {
+        return Vec::new();
+    }
+
+    let paths = collect_recent_files_recursive(&root, "jsonl", scan_limit);
+    parallel_map(paths, |path| load_cursor_session_stub(&path).ok().flatten())
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+pub(super) fn load_cursor_preview_from_path(path: &Path) -> Option<Vec<PreviewMessage>> {
+    // Only parse the tail of the transcript like the other external CLIs: the
+    // preview shows the last ~20 messages, so reparsing large transcripts on
+    // every selection change would make picker navigation lag.
+    let (text, truncated) = read_file_tail_text(path, EXTERNAL_PREVIEW_TAIL_BYTES)?;
+    let mut preview = Vec::new();
+    let skip = usize::from(truncated);
+    for line in text.lines().skip(skip) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let role = match value
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+        {
+            "user" | "human" => "user",
+            "assistant" | "model" => "assistant",
+            _ => continue,
+        };
+        let content = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .or_else(|| value.get("content"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let text = crate::import::extract_external_text_from_json_value(&content, false);
+        push_preview_message(&mut preview, role, text);
+    }
+    if preview.is_empty() {
+        None
+    } else {
+        Some(preview)
+    }
+}
+
+fn load_cursor_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
+    // Cursor nests subagent runs under `agent-transcripts/<parent>/subagents/`.
+    // Those are not independently resumable, so skip them in the resume list.
+    if crate::import::is_cursor_subagent_transcript(path) {
+        return Ok(None);
+    }
+    // Cursor transcripts have no header line: the session id is the file stem
+    // (a UUID) and metadata is enriched from the path / file mtime.
+    let session_id = crate::import::cursor_session_id_from_path(path);
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+
+    // A transcript counts as resumable only if it has at least one visible
+    // user/assistant message; otherwise skip it (mirrors the other CLIs).
+    let mut first_user_text: Option<String> = None;
+    let mut has_message = false;
+    let file = File::open(path)?;
+    for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let role = match value
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+        {
+            "user" | "human" => "user",
+            "assistant" | "model" => "assistant",
+            _ => continue,
+        };
+        let content = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .or_else(|| value.get("content"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let text = crate::import::extract_external_text_from_json_value(&content, false);
+        if text.trim().is_empty() {
+            continue;
+        }
+        has_message = true;
+        if first_user_text.is_none() && role == "user" {
+            first_user_text = Some(text);
+        }
+    }
+    if !has_message {
+        return Ok(None);
+    }
+
+    let last_message_time = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .unwrap_or_else(|_| chrono::Utc::now());
+    let created_at = last_message_time;
+    let working_dir = crate::import::cursor_cwd_from_transcript_path(path);
+    let short_name = working_dir
+        .as_deref()
+        .and_then(|dir| Path::new(dir).file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| format!("cursor {}", jcode_core::util::truncate_str(&session_id, 8)));
+    let title = first_user_text
+        .as_deref()
+        .map(|text| truncate_title_text(text, 72))
+        .unwrap_or_else(|| {
+            format!(
+                "Cursor session {}",
+                jcode_core::util::truncate_str(&session_id, 8)
+            )
+        });
+    let search_index = build_search_index(
+        &format!("cursor:{session_id}"),
+        &short_name,
+        &title,
+        working_dir.as_deref(),
+        None,
+        &[],
+    );
+
+    Ok(Some(SessionInfo {
+        id: format!("cursor:{session_id}"),
+        parent_id: None,
+        short_name,
+        icon: "▮".to_string(),
+        title,
+        message_count: 0,
+        user_message_count: 0,
+        assistant_message_count: 0,
+        created_at,
+        last_message_time,
+        last_active_at: Some(last_message_time),
+        working_dir,
+        model: None,
+        provider_key: Some("cursor".to_string()),
+        is_canary: false,
+        is_debug: false,
+        saved: false,
+        save_label: None,
+        status: SessionStatus::Closed,
+        needs_catchup: false,
+        estimated_tokens: 0,
+        first_user_prompt: first_user_text,
+        messages_preview: Vec::new(),
+        search_index,
+        server_name: None,
+        server_icon: None,
+        source: SessionSource::Cursor,
+        resume_target: ResumeTarget::CursorSession {
             session_id,
             session_path: path.to_string_lossy().to_string(),
         },
@@ -2736,6 +2940,7 @@ pub(crate) fn load_external_cli_sessions_grouped(
         ExternalCli::ClaudeCode => load_external_claude_code_sessions(scan_limit),
         ExternalCli::Pi => load_external_pi_sessions(scan_limit),
         ExternalCli::OpenCode => load_external_opencode_sessions(scan_limit),
+        ExternalCli::Cursor => load_external_cursor_sessions(scan_limit),
     };
     (Vec::new(), sessions)
 }
@@ -2759,6 +2964,7 @@ pub(crate) fn load_external_cli_sessions_grouped_multi(
     let mut seen_claude = false;
     let mut seen_pi = false;
     let mut seen_opencode = false;
+    let mut seen_cursor = false;
     for cli in clis {
         match cli {
             ExternalCli::Codex if !seen_codex => {
@@ -2776,6 +2982,10 @@ pub(crate) fn load_external_cli_sessions_grouped_multi(
             ExternalCli::OpenCode if !seen_opencode => {
                 seen_opencode = true;
                 sessions.extend(load_external_opencode_sessions(scan_limit));
+            }
+            ExternalCli::Cursor if !seen_cursor => {
+                seen_cursor = true;
+                sessions.extend(load_external_cursor_sessions(scan_limit));
             }
             _ => {}
         }

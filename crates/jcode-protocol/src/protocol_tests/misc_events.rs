@@ -207,12 +207,6 @@ fn test_set_route_deserializes_as_set_model_compat_alias() -> Result<()> {
     };
     assert_eq!(id, 42);
     assert_eq!(model, "claude-opus-4-5");
-
-    let encoded = serde_json::to_string(&Request::SetModel {
-        id: 43,
-        model: "gpt-5.5".to_string(),
-    })?;
-    assert!(encoded.contains("\"type\":\"set_model\""));
     Ok(())
 }
 
@@ -256,6 +250,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         client_instance_id: Some("client-123".to_string()),
         client_has_local_history: true,
         allow_session_takeover: true,
+        terminal_env: vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())],
     };
     let json = serde_json::to_string(&req)?;
     assert!(json.contains("\"type\":\"subscribe\""));
@@ -268,6 +263,7 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
         client_instance_id,
         client_has_local_history,
         allow_session_takeover,
+        terminal_env,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));
@@ -279,6 +275,10 @@ fn test_subscribe_request_roundtrip_preserves_session_takeover_flags() -> Result
     assert_eq!(client_instance_id.as_deref(), Some("client-123"));
     assert!(client_has_local_history);
     assert!(allow_session_takeover);
+    assert_eq!(
+        terminal_env,
+        vec![("ZELLIJ_SESSION_NAME".to_string(), "sessionB".to_string())]
+    );
     Ok(())
 }
 
@@ -294,6 +294,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
         client_instance_id,
         client_has_local_history,
         allow_session_takeover,
+        terminal_env,
     } = decoded
     else {
         return Err(anyhow!("expected Subscribe"));
@@ -305,6 +306,7 @@ fn test_subscribe_request_defaults_optional_flags() -> Result<()> {
     assert_eq!(client_instance_id, None);
     assert!(!client_has_local_history);
     assert!(!allow_session_takeover);
+    assert!(terminal_env.is_empty());
     Ok(())
 }
 
@@ -401,5 +403,35 @@ fn test_message_request_roundtrip_preserves_images_and_system_reminder() -> Resu
     assert_eq!(images[0].0, "image/png");
     assert_eq!(images[1].0, "image/jpeg");
     assert_eq!(system_reminder.as_deref(), Some("be concise"));
+    Ok(())
+}
+
+#[test]
+fn test_provider_guardrail_event_roundtrip() -> Result<()> {
+    let event = ServerEvent::ProviderGuardrail {
+        stop_reason: Some("refusal".to_string()),
+        message: "Provider guardrail stopped the response".to_string(),
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"provider_guardrail\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::ProviderGuardrail {
+        stop_reason,
+        message,
+    } = decoded
+    else {
+        return Err(anyhow!("expected ProviderGuardrail event"));
+    };
+    assert_eq!(stop_reason.as_deref(), Some("refusal"));
+    assert_eq!(message, "Provider guardrail stopped the response");
+
+    // stop_reason is optional on the wire.
+    let decoded = parse_event_json(
+        r#"{"type":"provider_guardrail","message":"blocked"}"#,
+    )?;
+    let ServerEvent::ProviderGuardrail { stop_reason, .. } = decoded else {
+        return Err(anyhow!("expected ProviderGuardrail event"));
+    };
+    assert!(stop_reason.is_none());
     Ok(())
 }

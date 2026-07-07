@@ -1,13 +1,15 @@
 /// Available Claude models used by model lists and provider routing.
 ///
-/// NOTE: `claude-fable-5` (and the Mythos preview family) were retired by
-/// Anthropic and now 404 with "Please use Opus 4.8", so they are intentionally
-/// NOT listed here. The list is curated best-first; position 0 is the flagship
+/// NOTE: The Mythos preview family was retired by Anthropic and 404s, so it is
+/// intentionally NOT listed here. `claude-fable-5` was briefly retired but is
+/// live again. The list is curated best-first; position 0 is the flagship
 /// used for post-login default selection.
 pub const ALL_CLAUDE_MODELS: &[&str] = &[
+    "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-6",
     "claude-opus-4-6[1m]",
+    "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-6[1m]",
     "claude-haiku-4-5",
@@ -154,6 +156,7 @@ fn base_is_known_claude_model(base: &str) -> bool {
         "claude-opus-4.6",
         "claude-opus-4-5",
         "claude-opus-4.5",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-sonnet-4.6",
         "claude-sonnet-4-5",
@@ -466,6 +469,16 @@ mod tests {
         assert_eq!(
             anthropic_context_mode("claude-opus-4-6"),
             AnthropicContextMode::OptIn1M
+        );
+        // Sonnet 5 is native 1M: 1M is both the default and the maximum
+        // (issue #450).
+        assert_eq!(
+            anthropic_context_mode("claude-sonnet-5"),
+            AnthropicContextMode::Native1M
+        );
+        assert_eq!(
+            anthropic_context_mode("claude-sonnet-5-20260701"),
+            AnthropicContextMode::Native1M
         );
         assert_eq!(
             anthropic_context_mode("claude-sonnet-4-6"),

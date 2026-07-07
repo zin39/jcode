@@ -26,6 +26,7 @@ pub fn default_comm_cleanup_target_statuses() -> Vec<String> {
         "completed".to_string(),
         "failed".to_string(),
         "stopped".to_string(),
+        "crashed".to_string(),
     ]
 }
 
@@ -35,6 +36,7 @@ pub fn default_comm_run_await_statuses() -> Vec<String> {
         "completed".to_string(),
         "failed".to_string(),
         "stopped".to_string(),
+        "crashed".to_string(),
     ]
 }
 
@@ -44,6 +46,7 @@ pub fn default_comm_await_target_statuses() -> Vec<String> {
         "completed".to_string(),
         "stopped".to_string(),
         "failed".to_string(),
+        "crashed".to_string(),
     ]
 }
 
@@ -161,6 +164,17 @@ pub fn format_comm_members(current_session_id: &str, members: &[AgentInfo]) -> S
                 .as_deref()
                 .map(|detail| format!(" — {}", detail))
                 .unwrap_or_default();
+            // Stable task label: what this agent was spawned/assigned for.
+            // Skip when the transient detail already says the same thing.
+            let task_suffix = match member.task_label.as_deref() {
+                Some(task)
+                    if !task.trim().is_empty()
+                        && member.detail.as_deref().is_none_or(|d| !d.contains(task)) =>
+                {
+                    format!("\n    Task: {}", task)
+                }
+                _ => String::new(),
+            };
             let age_suffix = match member.status_age_secs {
                 Some(age) if status == "ready" || status == "idle" => {
                     format!(" · idle {}", format_secs(age))
@@ -168,6 +182,15 @@ pub fn format_comm_members(current_session_id: &str, members: &[AgentInfo]) -> S
                 Some(age) if status == "running" => format!(" · {}", format_secs(age)),
                 Some(age) => format!(" · {} ago", format_secs(age)),
                 None => String::new(),
+            };
+            // Last observed activity (tokens/tools/heartbeats). status_age only
+            // tracks lifecycle transitions, so a worker mid-turn for minutes
+            // looks stale without this even while it streams tokens.
+            let activity_age_suffix = match member.last_activity_age_secs {
+                Some(age) if status == "running" || status == "queued" => {
+                    format!(" · active {} ago", format_secs(age))
+                }
+                _ => String::new(),
             };
 
             // Live activity: what the agent is doing right now.
@@ -248,13 +271,15 @@ pub fn format_comm_members(current_session_id: &str, members: &[AgentInfo]) -> S
             };
 
             output.push_str(&format!(
-                "  {}{} ({})\n    Status: {}{}{}{}{}{}{}{}{}{}\n",
+                "  {}{} ({})\n    Status: {}{}{}{}{}{}{}{}{}{}{}{}\n",
                 name,
                 role_label,
                 if is_me { "you" } else { session },
                 status,
                 detail_suffix,
                 age_suffix,
+                activity_age_suffix,
+                task_suffix,
                 activity_suffix,
                 progress_suffix,
                 work_suffix,
@@ -365,6 +390,9 @@ pub fn format_comm_status_snapshot(snapshot: &AgentStatusSnapshot) -> String {
     if let Some(attachments) = snapshot.live_attachments {
         meta.push(format!("attachments={attachments}"));
     }
+    if let Some(age_secs) = snapshot.last_activity_age_secs {
+        meta.push(format!("active={} ago", format_secs(age_secs)));
+    }
     if let Some(age_secs) = snapshot.status_age_secs {
         meta.push(format!("status_age={}s", age_secs));
     }
@@ -393,9 +421,25 @@ pub fn format_comm_status_snapshot(snapshot: &AgentStatusSnapshot) -> String {
 pub fn format_comm_plan_status(summary: &PlanGraphStatus) -> String {
     let swarm_id = summary.swarm_id.as_deref().unwrap_or("unknown");
     let mut output = format!(
-        "Plan status for swarm {}\n\n  Version: {}\n  Items: {}\n",
-        swarm_id, summary.version, summary.item_count
+        "Plan status for swarm {}\n\n  Version: {}\n  Mode: {}\n  Items: {}\n",
+        swarm_id, summary.version, summary.mode, summary.item_count
     );
+    // Growth accounting: deep mode is meant to outgrow its seed (decomposition,
+    // gate-injected gaps). Surfacing seeded-vs-grown makes a plan that never
+    // grew visibly under-explored.
+    if summary.mode.eq_ignore_ascii_case("deep") && summary.item_count > 0 {
+        output.push_str(&format!(
+            "  Growth: {} seeded -> {} nodes ({} machinery-grown)",
+            summary.seeded_count, summary.item_count, summary.grown_count
+        ));
+        if summary.grown_count == 0 {
+            output.push_str(
+                " — the graph has not grown beyond its seed yet; \
+                 expect expand_node decomposition and gate-injected gaps",
+            );
+        }
+        output.push('\n');
+    }
 
     output.push_str(&format!(
         "  Ready: {}\n",
@@ -429,6 +473,26 @@ pub fn format_comm_plan_status(summary: &PlanGraphStatus) -> String {
         output.push_str(&format!(
             "  Completed: {}\n",
             summary.completed_ids.join(", ")
+        ));
+    }
+    if !summary.failed_ids.is_empty() {
+        output.push_str(&format!(
+            "  Failed (terminal without completing): {}\n",
+            summary.failed_ids.join(", ")
+        ));
+        // Recorded failure reasons (from the durable task progress): a run
+        // that burned nodes on e.g. a 401 credential wave must explain itself
+        // here instead of only listing ids.
+        for id in &summary.failed_ids {
+            if let Some(reason) = summary.failed_reasons.get(id) {
+                output.push_str(&format!("    {}: {}\n", id, reason));
+            }
+        }
+    }
+    if !summary.low_confidence_ids.is_empty() {
+        output.push_str(&format!(
+            "  Low confidence (completed but shaky; widen with follow-up nodes): {}\n",
+            summary.low_confidence_ids.join(", ")
         ));
     }
     if !summary.cycle_ids.is_empty() {
@@ -510,8 +574,13 @@ pub fn format_comm_awaited_members_with_reports(
     members: &[AwaitedMemberStatus],
     reports: &HashMap<String, String>,
 ) -> String {
-    let mut output = if completed {
+    // An any-mode wait can complete while some members are still pending, so
+    // only claim "All members done" when every member actually matched.
+    let all_done = members.iter().all(|member| member.done);
+    let mut output = if completed && all_done {
         format!("All members done. {}\n", summary)
+    } else if completed {
+        format!("Await satisfied. {}\n", summary)
     } else {
         format!("Await incomplete. {}\n", summary)
     };

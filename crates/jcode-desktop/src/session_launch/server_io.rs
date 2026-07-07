@@ -769,15 +769,14 @@ fn validate_server_event_value(value: &Value, context: &str) -> Result<()> {
                 );
             }
         }
-        "reloading" => {
+        "reloading"
             if value
                 .get("new_socket")
-                .is_some_and(|new_socket| !new_socket.is_string())
-            {
-                anyhow::bail!(
-                    "jcode server sent reloading event with non-string new_socket while {context}"
-                );
-            }
+                .is_some_and(|new_socket| !new_socket.is_string()) =>
+        {
+            anyhow::bail!(
+                "jcode server sent reloading event with non-string new_socket while {context}"
+            );
         }
         _ => {}
     }

@@ -25,6 +25,28 @@ type TodosCache = std::collections::HashMap<String, (std::time::Instant, Vec<Tod
 static TODOS_CACHE: std::sync::LazyLock<Mutex<TodosCache>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Backdate `Instant::now()` by up to `amount`, saturating instead of
+/// panicking when the clock's epoch is too recent.
+///
+/// `Instant` counts from boot on Windows (QPC) and Linux (CLOCK_MONOTONIC), so
+/// `Instant::now() - one_hour` panics with "overflow when subtracting duration
+/// from instant" when the machine booted more recently than that. This hit
+/// real users right after a reboot: the git cache invalidation below runs
+/// after every bash/edit tool, crashing the whole TUI (issue #424).
+pub(crate) fn backdated_now(amount: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let mut backdate = amount;
+    loop {
+        if let Some(instant) = now.checked_sub(backdate) {
+            return instant;
+        }
+        if backdate < Duration::from_millis(1) {
+            return now;
+        }
+        backdate /= 2;
+    }
+}
+
 /// Force the git-status widget cache to refetch on its next read.
 ///
 /// Call this right after the app changes the working tree or HEAD (commits,
@@ -38,7 +60,7 @@ pub(crate) fn invalidate_git_info_cache() {
         // Backdate the timestamp past the TTL so the next `gather_git_info`
         // treats the entry as expired and spawns a refresh, while still
         // returning the last-known value (no flicker to empty).
-        *ts = std::time::Instant::now() - Duration::from_secs(3600);
+        *ts = backdated_now(Duration::from_secs(3600));
         *refreshing = false;
     }
 }
@@ -51,7 +73,7 @@ pub(crate) fn invalidate_todos_cache(session_id: &str) {
     if let Ok(mut cache) = TODOS_CACHE.lock()
         && let Some((ts, _todos, refreshing)) = cache.get_mut(session_id)
     {
-        *ts = std::time::Instant::now() - Duration::from_secs(3600);
+        *ts = backdated_now(Duration::from_secs(3600));
         *refreshing = false;
     }
 }
@@ -65,7 +87,7 @@ pub(crate) fn invalidate_ambient_info_cache() {
     if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock()
         && let Some((ts, _enabled, _cached, refreshing)) = guard.as_mut()
     {
-        *ts = std::time::Instant::now() - Duration::from_secs(3600);
+        *ts = backdated_now(Duration::from_secs(3600));
         *refreshing = false;
     }
 }
@@ -398,8 +420,10 @@ fn copy_to_clipboard_osc52(text: &str) -> bool {
 
 pub(super) fn effort_display_label(effort: &str) -> &str {
     match effort {
+        "swarm" => "Swarm (light fan-out)",
+        "swarm-deep" => "Swarm Deep (Max + task graph)",
         "max" => "Max",
-        "xhigh" => "xHigh (Max)",
+        "xhigh" => "xHigh",
         "high" => "High",
         "medium" => "Medium",
         "low" => "Low",
@@ -500,17 +524,26 @@ pub(super) fn inferred_reasoning_efforts(
     let model = model_name.unwrap_or_default().to_ascii_lowercase();
 
     if provider.contains("openrouter") {
-        return vec!["none", "low", "medium", "high", "xhigh"];
+        return vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "swarm",
+            "swarm-deep",
+        ];
     }
 
     let is_anthropic = provider.contains("anthropic")
         || provider.contains("claude")
         || model.starts_with("claude-");
     if is_anthropic {
-        // NOTE: `claude-fable-5` is intentionally excluded. The live Messages
-        // API rejects both an adaptive `thinking` block and an `output_config`
-        // effort for it, so it exposes no reasoning-effort levels.
-        let supports_effort = model.contains("claude-mythos")
+        // `claude-fable-5` rejected reasoning fields during its preview, but
+        // the released model accepts effort low..xhigh (verified live
+        // 2026-07-01).
+        let supports_effort = model.contains("claude-fable-5")
+            || model.contains("claude-mythos")
             || model.contains("claude-opus-4-8")
             || model.contains("claude-opus-4-7")
             || model.contains("claude-opus-4-6")
@@ -521,15 +554,52 @@ pub(super) fn inferred_reasoning_efforts(
         if !supports_effort {
             return Vec::new();
         }
-        if model.contains("claude-opus-4-8") || model.contains("claude-opus-4-7") {
-            return vec!["none", "low", "medium", "high", "xhigh"];
+        if model.contains("claude-fable-5")
+            || model.contains("claude-opus-4-8")
+            || model.contains("claude-opus-4-7")
+        {
+            return vec![
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "swarm",
+                "swarm-deep",
+            ];
         }
-        return vec!["none", "low", "medium", "high"];
+        // `output_config` effort models without xhigh (Opus/Sonnet 4.6, Mythos)
+        // still support the real `max` API level. Manual-thinking models
+        // (Opus 4.5, Claude 3.7 Sonnet) top out at high.
+        if model.contains("claude-mythos")
+            || model.contains("claude-opus-4-6")
+            || model.contains("claude-sonnet-4-6")
+        {
+            return vec![
+                "none",
+                "low",
+                "medium",
+                "high",
+                "max",
+                "swarm",
+                "swarm-deep",
+            ];
+        }
+        return vec!["none", "low", "medium", "high", "swarm", "swarm-deep"];
     }
 
     let is_deepseek = provider.contains("deepseek") || model.contains("deepseek");
     if is_deepseek {
-        return vec!["none", "low", "medium", "high", "max"];
+        return vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "max",
+            "swarm",
+            "swarm-deep",
+        ];
     }
 
     let is_openai = provider.contains("openai")
@@ -540,7 +610,15 @@ pub(super) fn inferred_reasoning_efforts(
         || model.starts_with("o4")
         || model.starts_with("o5");
     if is_openai {
-        return vec!["none", "low", "medium", "high", "xhigh"];
+        return vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "swarm",
+            "swarm-deep",
+        ];
     }
 
     Vec::new()
@@ -674,14 +752,17 @@ pub(super) fn build_resume_command(
             let exe = launch_client_executable();
             let imported_id = crate::import::imported_claude_code_session_id(session_id);
             let args = resume_invocation_args(&imported_id, socket);
-            let title = format!("🧵 Claude Code {}", &session_id[..session_id.len().min(8)]);
+            let title = format!(
+                "🧵 Claude Code {}",
+                jcode_core::util::truncate_str(session_id, 8)
+            );
             (exe, args, title)
         }
         ResumeTarget::CodexSession { session_id, .. } => {
             let exe = launch_client_executable();
             let imported_id = crate::import::imported_codex_session_id(session_id);
             let args = resume_invocation_args(&imported_id, socket);
-            let title = format!("🧠 Codex {}", &session_id[..session_id.len().min(8)]);
+            let title = format!("🧠 Codex {}", jcode_core::util::truncate_str(session_id, 8));
             (exe, args, title)
         }
         ResumeTarget::PiSession { session_path } => {
@@ -701,7 +782,17 @@ pub(super) fn build_resume_command(
             let exe = launch_client_executable();
             let imported_id = crate::import::imported_opencode_session_id(session_id);
             let args = resume_invocation_args(&imported_id, socket);
-            let title = format!("◌ OpenCode {}", &session_id[..session_id.len().min(8)]);
+            let title = format!(
+                "◌ OpenCode {}",
+                jcode_core::util::truncate_str(session_id, 8)
+            );
+            (exe, args, title)
+        }
+        ResumeTarget::CursorSession { session_id, .. } => {
+            let exe = launch_client_executable();
+            let imported_id = crate::import::imported_cursor_session_id(session_id);
+            let args = resume_invocation_args(&imported_id, socket);
+            let title = format!("▮ Cursor {}", jcode_core::util::truncate_str(session_id, 8));
             (exe, args, title)
         }
     }
@@ -863,7 +954,7 @@ pub(super) fn clipboard_image() -> Option<(String, String)> {
             if let Some(url) = extract_image_url(&html) {
                 crate::logging::info(&format!(
                     "clipboard_image: found image URL in HTML: {}",
-                    &url[..url.len().min(80)]
+                    jcode_core::util::truncate_str(&url, 80)
                 ));
                 if let Some(result) = download_image_url(&url) {
                     return Some(result);
@@ -1032,7 +1123,7 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
             return stale;
         }
 
-        *guard = Some((Instant::now() - TTL - Duration::from_secs(1), None, true));
+        *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
         std::thread::spawn(|| {
             let result = gather_git_info_inner();
             if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
@@ -1076,7 +1167,7 @@ pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem
         cache.insert(
             session_id.clone(),
             (
-                Instant::now() - TTL - Duration::from_secs(1),
+                backdated_now(TTL + Duration::from_secs(1)),
                 Vec::new(),
                 true,
             ),
@@ -1146,7 +1237,7 @@ pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
             return stale;
         }
 
-        *guard = Some((Instant::now() - TTL - Duration::from_secs(1), None, true));
+        *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
         std::thread::spawn(|| {
             let result = gather_memory_info_inner();
             if let Ok(mut guard) = CACHE.lock() {
@@ -1271,7 +1362,7 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
         }
 
         *guard = Some((
-            Instant::now() - TTL - Duration::from_secs(1),
+            backdated_now(TTL + Duration::from_secs(1)),
             ambient_enabled,
             None,
             true,

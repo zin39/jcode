@@ -163,6 +163,91 @@ fn pending_memory_per_session_isolation() {
 }
 
 #[test]
+fn pending_memory_suppresses_payload_when_all_ids_already_known() {
+    let _guard = PENDING_MEMORY_TEST_LOCK
+        .lock()
+        .expect("pending memory test lock poisoned");
+    clear_all_pending_memory();
+
+    let sid = "test-session-known";
+    mark_memories_known(sid, &["mem-x".to_string(), "mem-y".to_string()], "test");
+
+    // Wait out the short-term signature/set suppression windows by using
+    // distinct payload text; the id-level known check must trigger on its own.
+    set_pending_memory_with_ids(
+        sid,
+        "brand new formatting of old knowledge".to_string(),
+        2,
+        vec!["mem-y".to_string(), "mem-x".to_string()],
+    );
+    assert!(
+        take_pending_memory(sid).is_none(),
+        "payload made entirely of already-known memories must not inject"
+    );
+
+    // A payload with at least one genuinely new memory still injects.
+    set_pending_memory_with_ids(
+        sid,
+        "mix of old and new".to_string(),
+        2,
+        vec!["mem-x".to_string(), "mem-new".to_string()],
+    );
+    assert!(
+        take_pending_memory(sid).is_some(),
+        "payload containing an unknown memory should inject"
+    );
+
+    clear_all_pending_memory();
+}
+
+#[test]
+fn injected_memory_dedup_expires_after_ttl() {
+    let _guard = PENDING_MEMORY_TEST_LOCK
+        .lock()
+        .expect("pending memory test lock poisoned");
+    clear_all_pending_memory();
+
+    let sid = "test-session-ttl";
+    mark_memories_injected(sid, &["mem-ttl".to_string()]);
+    assert!(is_memory_injected(sid, "mem-ttl"));
+
+    // Backdate past the TTL: the memory may surface again.
+    backdate_injected_memory_for_test(sid, "mem-ttl", Duration::from_secs(46 * 60));
+    assert!(
+        !is_memory_injected(sid, "mem-ttl"),
+        "injected-memory dedup must expire after the TTL"
+    );
+    assert!(!is_memory_injected_any("mem-ttl"));
+
+    clear_all_pending_memory();
+}
+
+#[test]
+fn mark_memories_known_blocks_reinjection_like_injection() {
+    let _guard = PENDING_MEMORY_TEST_LOCK
+        .lock()
+        .expect("pending memory test lock poisoned");
+    clear_all_pending_memory();
+
+    let sid = "test-session-self-echo";
+    let other = "test-session-other";
+
+    // Simulates extraction: the memory came from sid's own transcript.
+    mark_memories_known(sid, &["mem-echo".to_string()], "extracted from transcript");
+
+    assert!(
+        is_memory_injected(sid, "mem-echo"),
+        "known memory must count as injected for its source session"
+    );
+    assert!(
+        !is_memory_injected(other, "mem-echo"),
+        "other sessions are unaffected by another session's known-marking"
+    );
+
+    clear_all_pending_memory();
+}
+
+#[test]
 fn format_context_includes_roles_and_tools() {
     let messages = vec![
         Message::user("Hello world"),

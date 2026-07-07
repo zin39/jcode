@@ -1,49 +1,49 @@
 use super::*;
 
 impl MultiProvider {
-    pub(super) fn claude_provider(&self) -> Option<Arc<claude::ClaudeProvider>> {
+    pub(super) fn claude_provider(&self) -> Option<Arc<dyn Provider>> {
         self.claude
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(super) fn anthropic_provider(&self) -> Option<Arc<anthropic::AnthropicProvider>> {
+    pub(super) fn anthropic_provider(&self) -> Option<Arc<dyn Provider>> {
         self.anthropic
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(super) fn openai_provider(&self) -> Option<Arc<openai::OpenAIProvider>> {
+    pub(super) fn openai_provider(&self) -> Option<Arc<dyn Provider>> {
         self.openai
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(super) fn antigravity_provider(&self) -> Option<Arc<antigravity::AntigravityProvider>> {
+    pub(super) fn antigravity_provider(&self) -> Option<Arc<dyn Provider>> {
         self.antigravity
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(super) fn gemini_provider(&self) -> Option<Arc<gemini::GeminiProvider>> {
+    pub(super) fn gemini_provider(&self) -> Option<Arc<dyn Provider>> {
         self.gemini
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(super) fn copilot_provider(&self) -> Option<Arc<copilot::CopilotApiProvider>> {
+    pub(super) fn copilot_provider(&self) -> Option<Arc<dyn Provider>> {
         self.copilot_api
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(super) fn cursor_provider(&self) -> Option<Arc<cursor::CursorCliProvider>> {
+    pub(super) fn cursor_provider(&self) -> Option<Arc<dyn Provider>> {
         self.cursor
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -57,13 +57,11 @@ impl MultiProvider {
             .clone()
     }
 
-    pub(super) fn openrouter_provider(&self) -> Option<Arc<openrouter::OpenRouterProvider>> {
+    pub(super) fn openrouter_provider(&self) -> Option<Arc<dyn Provider>> {
         ProviderRegistry::new(self).real_openrouter()
     }
 
-    pub(super) fn active_openrouter_execution_provider(
-        &self,
-    ) -> Option<Arc<openrouter::OpenRouterProvider>> {
+    pub(super) fn active_openrouter_execution_provider(&self) -> Option<Arc<dyn Provider>> {
         ProviderRegistry::new(self).active_openrouter_execution()
     }
 

@@ -20,7 +20,7 @@ Built for multi-session workflows, infinite customizability, and performance.
 
 <br>
 
-[Features](#features) · [Install](#installation) · [Quick Start](#quick-start) · [Further Reading](#further-reading) · [Contributing](CONTRIBUTING.md)
+[Website](https://solosystems.dev/jcode) · [Features](#features) · [Install](#installation) · [Quick Start](#quick-start) · [Further Reading](#further-reading) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -501,15 +501,19 @@ Primary config files:
 - `~/.jcode/mcp.json` for global MCP servers
 - `.jcode/mcp.json` for project-local MCP servers
 
-Compatibility fallback:
+Claude Code compatibility:
 
-- `.claude/mcp.json`
+- `~/.claude.json` (Claude Code's user config): top-level `mcpServers`, plus per-project servers under `projects.<abs_path>.mcpServers` for the current directory
+- `.mcp.json` at the repo root (Claude Code's project config)
+- `.claude/mcp.json` (legacy fallback)
+
+Both the canonical `mcpServers` key and jcode's historical `servers` key are accepted. jcode currently supports stdio (command-based) servers only; HTTP/SSE entries (`"type": "http"`/`"sse"`) are recognized and skipped with a log line.
 
 Example MCP config:
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "filesystem": {
       "command": "/path/to/mcp-server",
       "args": ["--root", "/workspace"],
@@ -520,7 +524,7 @@ Example MCP config:
 }
 ```
 
-On first run, jcode also tries to import MCP servers from `~/.claude/mcp.json` and `~/.codex/config.toml` if `~/.jcode/mcp.json` does not exist yet.
+On first run, jcode also tries to import MCP servers from `~/.claude.json` (falling back to the legacy `~/.claude/mcp.json`) and `~/.codex/config.toml` if `~/.jcode/mcp.json` does not exist yet.
 
 For headless or SSH sessions, OAuth-style providers support `jcode login --provider <provider> --no-browser` (alias: `--headless`) so jcode prints the auth URL/QR and falls back to manual code or callback paste instead of trying to launch a local browser.
 
@@ -825,6 +829,24 @@ Then symlink to your PATH:
 ```bash
 scripts/install_release.sh
 ```
+
+### Uninstall
+
+Removes installed binaries and the launcher but keeps your config, auth, and
+sessions so a clean reinstall picks up where you left off:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/uninstall.sh | bash -s -- --yes
+```
+
+For a full wipe of everything including config, auth, sessions, logs, and
+memory (useful for recovering from a broken install):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/uninstall.sh | bash -s -- --purge --yes
+```
+
+Add `--dry-run` to preview what would be removed without deleting anything.
 
 ### Platform Support
 

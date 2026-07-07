@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+pub mod bridge;
+pub mod dag;
+pub mod mermaid;
+
 /// A swarm plan item.
 ///
 /// This is intentionally separate from session todos: plan data is shared at the
@@ -48,6 +52,19 @@ pub struct SwarmTaskProgress {
     pub heartbeat_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_count: Option<u64>,
+    /// How many times this node was re-queued because a deep-mode worker's turn
+    /// ended without a `complete_node` artifact. Deep mode gives the node one
+    /// fresh attempt, then fails it: there must be no path to "done" that skips
+    /// artifact validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_artifact_requeues: Option<u32>,
+    /// How many times this node's assignment was reclaimed because its assignee
+    /// session was dead (failed/stopped/crashed or gone). Caps automatic
+    /// re-dispatch so a node whose workers keep dying cannot spawn workers
+    /// forever; past the cap, explicit `retry`/`assign_task` remain the
+    /// recovery paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_assignee_reclaims: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +102,42 @@ pub struct SwarmExecutionState {
     pub items: Vec<SwarmExecutionItemState>,
 }
 
+/// Per-node task-DAG metadata, stored as a side map on `VersionedPlan` keyed by
+/// plan item id. This mirrors the `task_progress` side-map pattern so existing
+/// `PlanItem` construction sites stay unchanged while the DAG engine gains the
+/// extra structure it needs (composite/gate mechanics + typed artifacts).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeMeta {
+    /// Terminal-action kind: "explore" | "implement" | "verify" | "fix" |
+    /// "synthesize" | "critique". Defaults to a plain task when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The composite node this was decomposed from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// True once decomposed into children (composite join/synthesis point).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expanded: bool,
+    /// True if this node is an auto-inserted critique/verify gate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_gate: bool,
+    /// The agent that planned this node's decomposition (composite owner). Kept
+    /// separately from `PlanItem.assigned_to` so a re-queued composite can be
+    /// auto-scheduled (assigned_to cleared) while still preferring its original
+    /// planner for the synthesis step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
+    /// The typed handoff artifact, present once the node completes. Serialized as
+    /// JSON text so the protocol/persistence layers need no extra types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_json: Option<String>,
+    /// Where the node came from: "seed" | "expand" | "gap" | "gate". Powers the
+    /// growth accounting (seeded vs machinery-grown) on status surfaces. Absent
+    /// on legacy plans, which count as seeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
 /// Versioned shared swarm plan state.
 #[derive(Clone, Debug)]
 pub struct VersionedPlan {
@@ -94,6 +147,11 @@ pub struct VersionedPlan {
     pub participants: HashSet<String>,
     /// Durable runtime task progress keyed by plan item id.
     pub task_progress: HashMap<String, SwarmTaskProgress>,
+    /// Engine mode: "deep" (comprehensive, gated) or "light" (fan-out). Defaults
+    /// to light so legacy plans behave as before.
+    pub mode: String,
+    /// Per-node task-DAG metadata keyed by plan item id.
+    pub node_meta: HashMap<String, NodeMeta>,
 }
 
 impl VersionedPlan {
@@ -103,6 +161,8 @@ impl VersionedPlan {
             version: 0,
             participants: HashSet::new(),
             task_progress: HashMap::new(),
+            mode: "light".to_string(),
+            node_meta: HashMap::new(),
         }
     }
 
@@ -155,6 +215,9 @@ pub struct PlanGraphSummary {
     pub blocked_ids: Vec<String>,
     pub active_ids: Vec<String>,
     pub completed_ids: Vec<String>,
+    /// Terminal without completing: failed, stopped, or crashed items. These are
+    /// finished from the scheduler's perspective but must not read as success.
+    pub failed_ids: Vec<String>,
     pub terminal_ids: Vec<String>,
     pub unresolved_dependency_ids: Vec<String>,
     pub cycle_ids: Vec<String>,
@@ -173,6 +236,12 @@ pub fn is_terminal_status(status: &str) -> bool {
 
 pub fn is_active_status(status: &str) -> bool {
     matches!(status, "running" | "running_stale")
+}
+
+/// Terminal without completing: the item is finished from the scheduler's
+/// perspective but did not succeed (failed, stopped, or crashed).
+pub fn is_failed_status(status: &str) -> bool {
+    is_terminal_status(status) && !is_completed_status(status)
 }
 
 pub fn is_runnable_status(status: &str) -> bool {
@@ -261,8 +330,11 @@ pub fn task_control_action_allows_status(action: TaskControlAction, status: &str
         TaskControlAction::Start | TaskControlAction::Wake => status == "queued",
         TaskControlAction::Resume => matches!(status, "queued" | "running" | "running_stale"),
         TaskControlAction::Retry => matches!(status, "failed" | "running_stale"),
+        // A completed node must never be reopened by handoff actions: deep-mode
+        // complete_node persists "completed" (not just "done"), and reassigning
+        // it would re-queue finished work and clobber its artifact.
         TaskControlAction::Reassign | TaskControlAction::Replace | TaskControlAction::Salvage => {
-            !matches!(status, "done")
+            !is_completed_status(status)
         }
     }
 }
@@ -410,6 +482,7 @@ pub fn summarize_plan_graph(items: &[PlanItem]) -> PlanGraphSummary {
     let mut blocked_ids = Vec::new();
     let mut active_ids = Vec::new();
     let mut completed = BTreeSet::new();
+    let mut failed = BTreeSet::new();
     let mut terminal = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
 
@@ -425,6 +498,9 @@ pub fn summarize_plan_graph(items: &[PlanItem]) -> PlanGraphSummary {
         }
         if is_completed_status(&item.status) {
             completed.insert(item.id.clone());
+        }
+        if is_failed_status(&item.status) {
+            failed.insert(item.id.clone());
         }
         if is_terminal_status(&item.status) {
             terminal.insert(item.id.clone());
@@ -450,6 +526,7 @@ pub fn summarize_plan_graph(items: &[PlanItem]) -> PlanGraphSummary {
         blocked_ids,
         active_ids,
         completed_ids: completed.into_iter().collect(),
+        failed_ids: failed.into_iter().collect(),
         terminal_ids: terminal.into_iter().collect(),
         unresolved_dependency_ids: unresolved.into_iter().collect(),
         cycle_ids,
@@ -499,6 +576,67 @@ pub fn next_unassigned_runnable_item_id(plan: &VersionedPlan) -> Option<String> 
                 .map(|item| item.assigned_to.is_none())
                 .unwrap_or(false)
         })
+}
+
+/// Cap on automatic reclaims of a node stranded on a dead assignee. Past this,
+/// only explicit `retry`/`assign_task` can move the node, so a node whose
+/// workers keep dying cannot spawn replacements forever.
+pub const MAX_DEAD_ASSIGNEE_RECLAIMS: u32 = 3;
+
+/// The highest-priority runnable (ready) item that is *stranded*: it carries an
+/// assignment, but the assignee is dead per `assignee_is_dead` (terminal
+/// lifecycle status or no longer a swarm member). Such items are invisible to
+/// [`next_unassigned_runnable_item_id`] (which requires `assigned_to == None`),
+/// which is how `task_control retry` against a dead worker used to strand a
+/// Ready node: retry keeps the assignee, the re-dispatch dies with the session,
+/// and automatic assignment skips the node forever. Items at or over
+/// [`MAX_DEAD_ASSIGNEE_RECLAIMS`] are excluded.
+pub fn next_stranded_runnable_item_id(
+    plan: &VersionedPlan,
+    assignee_is_dead: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    next_runnable_item_ids(&plan.items, None)
+        .into_iter()
+        .find(|candidate_id| {
+            let Some(item) = plan.items.iter().find(|item| item.id == *candidate_id) else {
+                return false;
+            };
+            let Some(assignee) = item.assigned_to.as_deref() else {
+                return false;
+            };
+            if !assignee_is_dead(assignee) {
+                return false;
+            }
+            plan.task_progress
+                .get(candidate_id)
+                .and_then(|progress| progress.dead_assignee_reclaims)
+                .unwrap_or(0)
+                < MAX_DEAD_ASSIGNEE_RECLAIMS
+        })
+}
+
+/// Clear a stranded assignment so the node becomes eligible for normal
+/// automatic dispatch again, bumping the per-node reclaim counter and the plan
+/// version. Prior run history (heartbeats, checkpoints, details) is preserved;
+/// only the assignment binding is released. Returns `false` when the item is
+/// missing or not actually assigned.
+pub fn reclaim_stranded_assignment(plan: &mut VersionedPlan, task_id: &str) -> bool {
+    let Some(item) = plan.items.iter_mut().find(|item| item.id == task_id) else {
+        return false;
+    };
+    if item.assigned_to.is_none() {
+        return false;
+    }
+    let previous_assignee = item.assigned_to.take();
+    let progress = plan.task_progress.entry(task_id.to_string()).or_default();
+    progress.assigned_session_id = None;
+    progress.dead_assignee_reclaims = Some(progress.dead_assignee_reclaims.unwrap_or(0) + 1);
+    progress.checkpoint_summary = Some(format!(
+        "assignment reclaimed: previous assignee {} is dead",
+        previous_assignee.as_deref().unwrap_or("<unknown>")
+    ));
+    plan.version += 1;
+    true
 }
 
 pub fn task_control_target_item_id(
@@ -716,6 +854,39 @@ mod tests {
     }
 
     #[test]
+    fn summarize_plan_graph_reports_failed_items_separately_from_completed() {
+        let items = vec![
+            item("ok", "completed", &[]),
+            item("boom", "failed", &[]),
+            item("halted", "stopped", &[]),
+            item("crashed-task", "crashed", &[]),
+            item("pending-task", "queued", &[]),
+        ];
+
+        let summary = summarize_plan_graph(&items);
+        assert_eq!(summary.completed_ids, vec!["ok".to_string()]);
+        assert_eq!(
+            summary.failed_ids,
+            vec![
+                "boom".to_string(),
+                "crashed-task".to_string(),
+                "halted".to_string()
+            ]
+        );
+        // Terminal covers both success and failure; failed is the non-success subset.
+        assert_eq!(
+            summary.terminal_ids,
+            vec![
+                "boom".to_string(),
+                "crashed-task".to_string(),
+                "halted".to_string(),
+                "ok".to_string()
+            ]
+        );
+        assert_eq!(summary.ready_ids, vec!["pending-task".to_string()]);
+    }
+
+    #[test]
     fn summarize_plan_graph_reports_cycles() {
         let items = vec![
             item("a", "queued", &["c"]),
@@ -883,5 +1054,99 @@ mod tests {
         assert_eq!(affinities.dependency_carryover.get("agent-a"), Some(&2));
         assert_eq!(affinities.metadata_carryover.get("agent-b"), Some(&3));
         assert_eq!(affinities.loads.get("agent-b"), Some(&1));
+    }
+
+    #[test]
+    fn stranded_runnable_item_requires_dead_assignee_and_respects_reclaim_cap() {
+        let dead = |session: &str| session == "dead-session";
+
+        // Ready but unassigned: not stranded (normal path handles it).
+        let mut plan = VersionedPlan {
+            items: vec![item("a", "queued", &[])],
+            ..VersionedPlan::new()
+        };
+        assert_eq!(next_stranded_runnable_item_id(&plan, &dead), None);
+
+        // Assigned to a live session: not stranded.
+        plan.items[0].assigned_to = Some("live-session".to_string());
+        assert_eq!(next_stranded_runnable_item_id(&plan, &dead), None);
+
+        // Assigned to a dead session: stranded.
+        plan.items[0].assigned_to = Some("dead-session".to_string());
+        assert_eq!(
+            next_stranded_runnable_item_id(&plan, &dead),
+            Some("a".to_string())
+        );
+
+        // Blocked items never count even with a dead assignee.
+        let blocked_plan = VersionedPlan {
+            items: vec![item("gate", "queued", &[]), {
+                let mut blocked = item("b", "queued", &["gate"]);
+                blocked.assigned_to = Some("dead-session".to_string());
+                blocked
+            }],
+            ..VersionedPlan::new()
+        };
+        assert_eq!(next_stranded_runnable_item_id(&blocked_plan, &dead), None);
+
+        // At the reclaim cap: excluded, so repeat failures cannot loop forever.
+        plan.task_progress.insert(
+            "a".to_string(),
+            SwarmTaskProgress {
+                dead_assignee_reclaims: Some(MAX_DEAD_ASSIGNEE_RECLAIMS),
+                ..SwarmTaskProgress::default()
+            },
+        );
+        assert_eq!(next_stranded_runnable_item_id(&plan, &dead), None);
+    }
+
+    #[test]
+    fn reclaim_stranded_assignment_releases_owner_and_counts_reclaims() {
+        let mut plan = VersionedPlan {
+            items: vec![{
+                let mut stranded = item("a", "queued", &[]);
+                stranded.assigned_to = Some("dead-session".to_string());
+                stranded
+            }],
+            ..VersionedPlan::new()
+        };
+        plan.task_progress.insert(
+            "a".to_string(),
+            SwarmTaskProgress {
+                assigned_session_id: Some("dead-session".to_string()),
+                last_heartbeat_unix_ms: Some(42),
+                ..SwarmTaskProgress::default()
+            },
+        );
+        let version_before = plan.version;
+
+        assert!(reclaim_stranded_assignment(&mut plan, "a"));
+
+        let item = &plan.items[0];
+        assert_eq!(item.assigned_to, None, "assignment binding released");
+        assert_eq!(item.status, "queued", "lifecycle status untouched");
+        let progress = plan.task_progress.get("a").unwrap();
+        assert_eq!(progress.assigned_session_id, None);
+        assert_eq!(progress.dead_assignee_reclaims, Some(1));
+        assert_eq!(
+            progress.last_heartbeat_unix_ms,
+            Some(42),
+            "prior run history preserved"
+        );
+        assert_eq!(plan.version, version_before + 1, "version bump for pollers");
+
+        // The reclaimed item is now visible to the normal unassigned picker.
+        assert_eq!(
+            next_unassigned_runnable_item_id(&plan),
+            Some("a".to_string())
+        );
+
+        // Reclaiming an unassigned item is a no-op failure, not a counter bump.
+        assert!(!reclaim_stranded_assignment(&mut plan, "a"));
+        assert_eq!(
+            plan.task_progress.get("a").unwrap().dead_assignee_reclaims,
+            Some(1)
+        );
+        assert!(!reclaim_stranded_assignment(&mut plan, "missing"));
     }
 }

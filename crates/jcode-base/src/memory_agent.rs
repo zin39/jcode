@@ -604,15 +604,21 @@ impl MemoryAgent {
                                 .await;
                             let ss = self.session_state(session_id);
                             ss.surfaced_memories.clear();
-                            memory::clear_injected_memories(session_id);
                         } else {
                             ss.surfaced_memories.clear();
-                            memory::clear_injected_memories(session_id);
                         }
                     } else {
                         ss.surfaced_memories.clear();
-                        memory::clear_injected_memories(session_id);
                     }
+                    // NOTE: injected-memory tracking is intentionally NOT
+                    // cleared here. Topic changes fire frequently on real
+                    // sessions (consecutive coding turns often drop below the
+                    // similarity threshold), and the previously injected
+                    // memories are still in the transcript, so the model
+                    // already knows them. `surfaced_memories` (pending
+                    // payloads that may never have been consumed) is cleared
+                    // so a new topic can re-surface them; actually-injected
+                    // IDs age out via the TTL in `memory::pending` instead.
                 }
             }
         }
@@ -807,7 +813,7 @@ impl MemoryAgent {
         let retrieval_ctx = RetrievalContext {
             verified_ids: verified_ids.clone(),
             rejected_ids,
-            context_snippet: context[..context.len().min(200)].to_string(),
+            context_snippet: jcode_core::util::truncate_str(&context, 200).to_string(),
         };
 
         // Step 4: Format and store for main agent
@@ -879,7 +885,7 @@ impl MemoryAgent {
                 "[{}] Memory relevant (semantic sim={:.2}): {}",
                 session_id,
                 sim,
-                &entry.content[..entry.content.len().min(40)]
+                jcode_core::util::truncate_str(&entry.content, 40)
             ));
         }
         selected.into_iter().map(|(entry, _)| entry).collect()
@@ -940,6 +946,7 @@ impl MemoryAgent {
 
         let memory_manager = self.manager_for_session(session_id);
         let context_owned = context.to_string();
+        let session_id_owned = session_id.to_string();
 
         let existing: Vec<String> = {
             let context_summary = if context_owned.len() > 2000 {
@@ -975,6 +982,7 @@ impl MemoryAgent {
                 Ok(extracted) if !extracted.is_empty() => {
                     let mut stored_count = 0;
                     let mut stored_ids: Vec<String> = Vec::new();
+                    let mut known_ids: Vec<String> = Vec::new();
                     let mut reinforced_count = 0;
                     let mut superseded_count = 0;
 
@@ -1044,6 +1052,7 @@ impl MemoryAgent {
 
                             if did_reinforce {
                                 reinforced_count += 1;
+                                known_ids.push(existing_id.clone());
                             }
                             continue;
                         }
@@ -1142,6 +1151,19 @@ impl MemoryAgent {
                         ));
                         memory::add_event(MemoryEventKind::ExtractionComplete { count: total });
                     }
+
+                    // The session this transcript came from already contains
+                    // this information verbatim; re-injecting freshly
+                    // extracted (or just-reinforced) memories back into it
+                    // would be a pure echo. Mark them as known so retrieval
+                    // skips them for this session (other sessions still see
+                    // them normally).
+                    known_ids.extend(stored_ids.iter().cloned());
+                    memory::mark_memories_known(
+                        &session_id_owned,
+                        &known_ids,
+                        "extracted from this session's transcript",
+                    );
                     memory::set_state(MemoryState::Idle);
                 }
                 Ok(_) => {
@@ -1220,7 +1242,7 @@ impl MemoryAgent {
                 crate::logging::info(&format!(
                     "Memory gap detected: {} candidates retrieved but none relevant. Context: {}...",
                     ctx.rejected_ids.len(),
-                    &ctx.context_snippet[..ctx.context_snippet.len().min(100)]
+                    jcode_core::util::truncate_str(&ctx.context_snippet, 100)
                 ));
             }
 
@@ -1337,7 +1359,7 @@ async fn refine_clusters(
                 let member_contents: Vec<String> = project_ids
                     .iter()
                     .filter_map(|id| project_graph.get_memory(id))
-                    .map(|m| m.content[..m.content.len().min(80)].to_string())
+                    .map(|m| jcode_core::util::truncate_str(&m.content, 80).to_string())
                     .collect();
                 if let Ok(name) = name_cluster_with_sidecar(&member_contents).await
                     && let Some(cluster) = project_graph.clusters.get_mut(cluster_id)

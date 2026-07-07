@@ -119,6 +119,13 @@ pub(super) fn emit_lifecycle_event(
                 current_turn: None,
                 resumed_session: s.resumed_session,
                 start_event_sent: s.start_event_sent,
+                error_provider_timeout: s.error_provider_timeout,
+                error_auth_failed: s.error_auth_failed,
+                error_tool_error: s.error_tool_error,
+                error_mcp_error: s.error_mcp_error,
+                error_rate_limited: s.error_rate_limited,
+                provider_switches: s.provider_switches,
+                model_switches: s.model_switches,
             },
             None => return,
         };
@@ -127,9 +134,8 @@ pub(super) fn emit_lifecycle_event(
         }
         state
     };
-    let errors = current_error_counts();
+    let errors = current_error_counts(&state);
     if !session_has_meaningful_activity(&state, &errors) {
-        reset_counters();
         return;
     }
     if !state.start_event_sent {
@@ -190,8 +196,8 @@ pub(super) fn emit_lifecycle_event(
         provider_end: sanitize_telemetry_label(provider_end),
         model_start: state.model_start,
         model_end: sanitize_telemetry_label(model_end),
-        provider_switches: PROVIDER_SWITCHES.load(Ordering::Relaxed),
-        model_switches: MODEL_SWITCHES.load(Ordering::Relaxed),
+        provider_switches: state.provider_switches,
+        model_switches: state.model_switches,
         duration_mins: duration.as_secs() / 60,
         duration_secs: duration.as_secs(),
         turns: state.turns,
@@ -322,5 +328,4 @@ pub(super) fn emit_lifecycle_event(
     if session_success {
         emit_onboarding_step_once("first_session_success", None, None);
     }
-    reset_counters();
 }

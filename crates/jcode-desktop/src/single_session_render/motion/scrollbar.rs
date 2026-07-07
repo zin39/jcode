@@ -55,7 +55,9 @@ impl SingleSessionScrollbarMotionRegistry {
         smooth_scroll_lines: f32,
         now: Instant,
     ) -> SingleSessionScrollbarMotionFrame {
-        let metrics = single_session_body_scroll_metrics_for_total_lines(app, size, total_lines);
+        let metrics = (!single_session_scrollbar_suppressed(app))
+            .then(|| single_session_body_scroll_metrics_for_total_lines(app, size, total_lines))
+            .flatten();
         self.frame_for_metrics(size, smooth_scroll_lines, metrics, now)
     }
 

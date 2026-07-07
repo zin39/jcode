@@ -8,7 +8,11 @@
 //! [`GalleryMember`] (label + body lines).
 
 use crate::protocol::SwarmMemberStatus;
-use jcode_tui_render::swarm_gallery::{humanize_age, render_gallery, GalleryMember};
+use jcode_tui_render::swarm_gallery::{
+    GalleryMember, SwarmStripHint, display_order, humanize_age, render_gallery,
+    render_swarm_compact, render_swarm_dock, render_swarm_panel, render_swarm_strip,
+    render_swarm_strip_vertical,
+};
 use ratatui::prelude::*;
 
 fn member_label(member: &SwarmMemberStatus) -> String {
@@ -16,6 +20,32 @@ fn member_label(member: &SwarmMemberStatus) -> String {
         .friendly_name
         .clone()
         .unwrap_or_else(|| member.session_id.chars().take(8).collect())
+}
+
+/// Session icon (emoji) for a member, derived from its friendly name (session
+/// names come from the shared `SESSION_NAMES` word list, e.g. "fox" -> 🦊).
+/// Falls back to `None` when the name is unknown so the strip shows the name.
+fn member_icon(member: &SwarmMemberStatus) -> Option<String> {
+    let name = member.friendly_name.as_deref()?;
+    let icon = crate::id::session_icon(name);
+    if icon == "💫" {
+        // Unknown word: don't show the generic fallback, keep the name.
+        None
+    } else {
+        Some(icon.to_string())
+    }
+}
+
+/// Age marker appended to member bodies, e.g. "· 7s ago" or "· now".
+/// `humanize_age` already yields "now" for fresh updates, which reads wrong
+/// with an "ago" suffix.
+fn age_marker(age: u64) -> String {
+    let human = humanize_age(age);
+    if human == "now" {
+        "· now".to_string()
+    } else {
+        format!("· {human} ago")
+    }
 }
 
 /// Build the body lines shown inside a member's viewport. Prefers live streamed
@@ -26,7 +56,7 @@ fn member_body(member: &SwarmMemberStatus) -> Vec<String> {
     if let Some(tail) = member.output_tail.as_ref().filter(|t| !t.trim().is_empty()) {
         let mut body: Vec<String> = tail.lines().map(|l| l.to_string()).collect();
         if let Some(age) = member.status_age_secs {
-            body.push(format!("· {} ago", humanize_age(age)));
+            body.push(age_marker(age));
         }
         return body;
     }
@@ -35,7 +65,7 @@ fn member_body(member: &SwarmMemberStatus) -> Vec<String> {
         body.push(detail.clone());
     }
     if let Some(age) = member.status_age_secs {
-        body.push(format!("· {} ago", humanize_age(age)));
+        body.push(age_marker(age));
     }
     body
 }
@@ -46,15 +76,27 @@ fn members_to_gallery(members: &[SwarmMemberStatus]) -> Vec<GalleryMember> {
         .iter()
         .map(|member| GalleryMember {
             label: member_label(member),
+            icon: member_icon(member),
             status: member.status.clone(),
+            task: member.task_label.clone(),
             role: member.role.clone(),
             body: member_body(member),
             sort_key: member.session_id.clone(),
+            todo: member.todo_progress,
+            todo_items: member
+                .todo_items
+                .iter()
+                .map(|t| jcode_tui_render::swarm_gallery::GalleryTodo {
+                    content: t.content.clone(),
+                    status: t.status.clone(),
+                })
+                .collect(),
         })
         .collect()
 }
 
 /// Render the inline swarm gallery for the given members into `area`-width lines.
+#[allow(dead_code)]
 pub(crate) fn render_swarm_gallery_lines(
     members: &[SwarmMemberStatus],
     width: usize,
@@ -66,22 +108,190 @@ pub(crate) fn render_swarm_gallery_lines(
     render_gallery(&members_to_gallery(members), width, max_height)
 }
 
+/// Render the list+detail swarm panel: a compact list of managed agents plus a
+/// detail viewport for the `selected` one. `focused` adds an interaction hint.
+#[allow(dead_code)]
+pub(crate) fn render_swarm_panel_lines(
+    members: &[SwarmMemberStatus],
+    selected: usize,
+    focused: bool,
+    width: usize,
+    max_height: usize,
+) -> Vec<Line<'static>> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    render_swarm_panel(
+        &members_to_gallery(members),
+        selected,
+        focused,
+        width,
+        max_height,
+    )
+}
+
+/// Render the compact swarm strip (agent chips + status glyphs + todo counts)
+/// shown directly above the status line.
+///
+/// The layout follows `agents.swarm_strip_layout`: `vertical` (default) lists
+/// one agent per row (session icon + task, capped to a few rows), while
+/// `horizontal` packs all agents as chips on a single row.
+///
+/// `focus_key` is the configured chord to enter the controls (e.g. "ctrl+t"),
+/// used both for the unfocused enter-hint and as the first focused hint.
+/// `spinner_frame` animates active agents' glyphs. `max_height` bounds the
+/// focused strip (chips + expanded hovered-agent detail + hints).
+pub(crate) fn render_swarm_strip_lines(
+    members: &[SwarmMemberStatus],
+    selected: usize,
+    focused: bool,
+    focus_key: &str,
+    spinner_frame: usize,
+    width: usize,
+    max_height: usize,
+) -> Vec<Line<'static>> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let enter_hint = format!("{focus_key} controls");
+    // Focused hints: only Alt-chords (plus esc) are claimed so plain typing
+    // keeps flowing to the chat input while the panel is focused.
+    let hints = vec![
+        SwarmStripHint {
+            key: focus_key.to_string(),
+            label: "next".into(),
+        },
+        SwarmStripHint {
+            key: "alt+↑/↓".into(),
+            label: "select".into(),
+        },
+        SwarmStripHint {
+            key: "alt+o".into(),
+            label: "open".into(),
+        },
+        SwarmStripHint {
+            key: "esc".into(),
+            label: "exit".into(),
+        },
+    ];
+    match crate::config::config().agents.swarm_strip_layout {
+        crate::config::SwarmStripLayout::Vertical => render_swarm_strip_vertical(
+            &members_to_gallery(members),
+            selected,
+            focused,
+            &hints,
+            if focused {
+                None
+            } else {
+                Some(enter_hint.as_str())
+            },
+            spinner_frame,
+            width,
+            SWARM_STRIP_VERTICAL_MAX_ROWS,
+            max_height,
+        ),
+        crate::config::SwarmStripLayout::Horizontal => render_swarm_strip(
+            &members_to_gallery(members),
+            selected,
+            focused,
+            &hints,
+            if focused {
+                None
+            } else {
+                Some(enter_hint.as_str())
+            },
+            spinner_frame,
+            width,
+            max_height,
+        ),
+    }
+}
+
+/// Row cap for the vertical strip: agents beyond this collapse into a
+/// `+N more` line (the cap includes that overflow row).
+const SWARM_STRIP_VERTICAL_MAX_ROWS: usize = 4;
+
+/// Render the compact swarm widget body: at most two lines, an agents/nodes
+/// summary plus a green/yellow/empty plan progress bar. `plan` is the
+/// coordinator's task-graph progress as (done, running, total).
+pub(crate) fn render_swarm_compact_lines(
+    members: &[SwarmMemberStatus],
+    plan: Option<(u32, u32, u32)>,
+    width: usize,
+    max_height: usize,
+) -> Vec<Line<'static>> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    render_swarm_compact(&members_to_gallery(members), plan, width, max_height)
+}
+
+/// Render the swarm dock widget body: a narrow vertical agent list for the
+/// info-widget margins. `plan` is the coordinator's swarm plan progress
+/// (completed, total), shown in the header when present.
+#[allow(dead_code)]
+pub(crate) fn render_swarm_dock_lines(
+    members: &[SwarmMemberStatus],
+    selected: usize,
+    focused: bool,
+    plan: Option<(u32, u32)>,
+    spinner_frame: usize,
+    width: usize,
+    max_height: usize,
+) -> Vec<Line<'static>> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    render_swarm_dock(
+        &members_to_gallery(members),
+        selected,
+        focused,
+        plan,
+        spinner_frame,
+        width,
+        max_height,
+    )
+}
+
+/// Session ids of `members` in the same order the panel/gallery displays them
+/// (coordinator first, then worktree manager, then by session id). Lets the TUI
+/// map a selected panel index back to a concrete session for pop-out.
+///
+/// Delegates to the renderer's [`display_order`] on the exact same
+/// [`GalleryMember`] conversion used for rendering, so the pop-out index can
+/// never drift from what is on screen.
+pub(crate) fn members_display_order(members: &[SwarmMemberStatus]) -> Vec<String> {
+    display_order(&members_to_gallery(members))
+        .into_iter()
+        .map(|i| members[i].session_id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use jcode_tui_render::swarm_gallery::members_to_tiles;
 
-    fn member(id: &str, status: &str, detail: Option<&str>, role: Option<&str>) -> SwarmMemberStatus {
+    fn member(
+        id: &str,
+        status: &str,
+        detail: Option<&str>,
+        role: Option<&str>,
+    ) -> SwarmMemberStatus {
         SwarmMemberStatus {
             session_id: id.to_string(),
             friendly_name: Some(id.to_string()),
             status: status.to_string(),
             detail: detail.map(str::to_string),
+            task_label: None,
             role: role.map(str::to_string),
             is_headless: Some(true),
             live_attachments: None,
             status_age_secs: Some(3),
             output_tail: None,
+            report_back_to_session_id: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
         }
     }
 
@@ -94,6 +304,59 @@ mod tests {
         let tiles = members_to_tiles(&members_to_gallery(&members));
         assert_eq!(tiles[0].title, "alpha");
         assert_eq!(tiles[0].role_glyph.as_deref(), Some("★"));
+    }
+
+    /// Regression: pop-out selection resolves `swarm_panel_selected` through
+    /// `members_display_order`, so its order must match what the renderer
+    /// actually draws (tile order) for mixed roles, ties, and unnamed
+    /// sessions. If this ever diverges, pop-out opens the wrong agent.
+    #[test]
+    fn members_display_order_matches_rendered_tile_order() {
+        let mut members = vec![
+            member("zeta-session", "running", None, None),
+            member("wt-session", "done", None, Some("mystery_role_2")),
+            member("coord-session", "running", None, Some("coordinator")),
+            member("mystery-session", "thinking", None, Some("mystery_role")),
+            member("alpha-session", "failed", None, None),
+        ];
+        // Unnamed session: label falls back to a session-id prefix.
+        let mut unnamed = member("beta-session-long-id", "ready", None, None);
+        unnamed.friendly_name = None;
+        members.push(unnamed);
+
+        let order = members_display_order(&members);
+        assert_eq!(order.len(), members.len());
+
+        // Map each ordered session id to the label the renderer would show.
+        let ordered_labels: Vec<String> = order
+            .iter()
+            .map(|id| {
+                let m = members.iter().find(|m| &m.session_id == id).unwrap();
+                member_label(m)
+            })
+            .collect();
+        let tile_titles: Vec<String> = members_to_tiles(&members_to_gallery(&members))
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(
+            ordered_labels, tile_titles,
+            "pop-out order must match rendered tile order"
+        );
+
+        // Sanity: coordinator first, then the rest active-first
+        // (thinking/running), then failed, then idle/finished, ties by id.
+        assert_eq!(order[0], "coord-session");
+        assert_eq!(
+            &order[1..],
+            &[
+                "mystery-session".to_string(),
+                "zeta-session".to_string(),
+                "alpha-session".to_string(),
+                "beta-session-long-id".to_string(),
+                "wt-session".to_string(),
+            ]
+        );
     }
 
     #[test]

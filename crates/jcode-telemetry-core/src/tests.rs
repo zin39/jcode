@@ -1,20 +1,29 @@
 use super::*;
 use std::sync::{Mutex, OnceLock};
 
-fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_ENV_LOCK
+// All of these tests mutate process-global state: the env-var opt-out tests
+// flip `JCODE_NO_TELEMETRY` / `DO_NOT_TRACK`, while the session tests drive the
+// global `SESSION_STATE`. They must be serialized against *each other* with a
+// single shared lock. Using two separate locks previously let an env test
+// disable telemetry (`is_enabled() == false`) while a session test was calling
+// `begin_session_with_mode`, which then returned early and left `SESSION_STATE`
+// as `None`; the session test's `expect(...)` panicked while holding the
+// `SESSION_STATE` lock and poisoned it, cascading into `PoisonError` failures
+// in every other session test.
+fn global_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    global_test_lock()
+}
+
 fn lock_telemetry_test_state() -> std::sync::MutexGuard<'static, ()> {
-    static TELEMETRY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TELEMETRY_TEST_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    global_test_lock()
 }
 
 #[test]
@@ -63,13 +72,72 @@ fn test_is_ci_detects_ci_env() {
 #[test]
 fn test_error_counters() {
     let _guard = lock_telemetry_test_state();
-    reset_counters();
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+    begin_session_with_mode("openai", "gpt-5.4", None, false);
     record_error(ErrorCategory::ProviderTimeout);
     record_error(ErrorCategory::ProviderTimeout);
     record_error(ErrorCategory::ToolError);
-    assert_eq!(ERROR_PROVIDER_TIMEOUT.load(Ordering::Relaxed), 2);
-    assert_eq!(ERROR_TOOL_ERROR.load(Ordering::Relaxed), 1);
-    reset_counters();
+    {
+        let guard = SESSION_STATE.lock().unwrap();
+        let state = guard.as_ref().expect("session telemetry state");
+        assert_eq!(state.error_provider_timeout, 2);
+        assert_eq!(state.error_tool_error, 1);
+        let errors = current_error_counts(state);
+        assert_eq!(errors.provider_timeout, 2);
+        assert_eq!(errors.tool_error, 1);
+    }
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+}
+
+#[test]
+fn test_error_counter_caps_per_session() {
+    let _guard = lock_telemetry_test_state();
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+    begin_session_with_mode("openai", "gpt-5.4", None, false);
+    // A runaway retry loop once logged 18k+ auth failures in one session and
+    // distorted daily aggregates. The counter must saturate at the cap.
+    for _ in 0..600 {
+        record_error(ErrorCategory::AuthFailed);
+    }
+    {
+        let guard = SESSION_STATE.lock().unwrap();
+        let state = guard.as_ref().expect("session telemetry state");
+        assert_eq!(state.error_auth_failed, 500);
+    }
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+}
+
+#[test]
+fn test_error_counters_no_session_is_noop() {
+    let _guard = lock_telemetry_test_state();
+    // Errors recorded with no active session must not bump any counter that a
+    // future session could observe (issue #394: counts drifting across the
+    // session boundary).
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
+    record_error(ErrorCategory::AuthFailed);
+    record_provider_switch();
+    record_model_switch();
+    begin_session_with_mode("openai", "gpt-5.4", None, false);
+    {
+        let guard = SESSION_STATE.lock().unwrap();
+        let state = guard.as_ref().expect("session telemetry state");
+        assert_eq!(state.error_auth_failed, 0);
+        assert_eq!(state.provider_switches, 0);
+        assert_eq!(state.model_switches, 0);
+    }
+    if let Ok(mut session) = SESSION_STATE.lock() {
+        *session = None;
+    }
 }
 
 #[test]
@@ -283,7 +351,6 @@ fn test_session_end_event_serialization() {
 #[test]
 fn test_record_token_usage_aggregates_session_and_turn() {
     let _guard = lock_telemetry_test_state();
-    reset_counters();
     if let Ok(mut session) = SESSION_STATE.lock() {
         *session = None;
     }
@@ -310,13 +377,11 @@ fn test_record_token_usage_aggregates_session_and_turn() {
     if let Ok(mut session) = SESSION_STATE.lock() {
         *session = None;
     }
-    reset_counters();
 }
 
 #[test]
 fn test_record_connection_type_buckets_transport() {
     let _guard = lock_telemetry_test_state();
-    reset_counters();
     if let Ok(mut session) = SESSION_STATE.lock() {
         *session = None;
     }
@@ -341,7 +406,6 @@ fn test_record_connection_type_buckets_transport() {
     if let Ok(mut session) = SESSION_STATE.lock() {
         *session = None;
     }
-    reset_counters();
 }
 
 #[test]

@@ -204,7 +204,36 @@ impl Tool for SubagentTool {
         };
 
         let start = std::time::Instant::now();
-        let final_text = agent.run_once_capture(&augmented_prompt).await.map_err(|err| {
+        // Bound the wait so a stuck/hung child turn (e.g. a model that never
+        // emits a final answer) cannot block the caller indefinitely. `0`
+        // disables the bound. See issue #365.
+        let timeout_secs = crate::config::config().agents.subagent_timeout_secs;
+        let run_fut = agent.run_once_capture(&augmented_prompt);
+        let run_result = if timeout_secs == 0 {
+            run_fut.await
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_fut).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    logging::warn(&format!(
+                        "[tool:subagent] subagent timed out after {}s description={} type={} session_id={} model={}",
+                        timeout_secs,
+                        params.description,
+                        params.subagent_type,
+                        agent.session_id(),
+                        resolved_model
+                    ));
+                    listener.abort();
+                    return Err(anyhow::anyhow!(
+                        "subagent '{}' timed out after {}s without producing a final answer",
+                        params.description,
+                        timeout_secs
+                    ));
+                }
+            }
+        };
+        let final_text = run_result.map_err(|err| {
             logging::warn(&format!(
                 "[tool:subagent] subagent failed description={} type={} session_id={} model={} error={}",
                 params.description,

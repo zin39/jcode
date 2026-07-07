@@ -225,6 +225,39 @@ fn primary_font_family(fonts: &str) -> String {
         .to_string()
 }
 
+/// Pick the first family in the comma-separated `fonts` list that is actually
+/// present in `db`, so usvg's default-font fallback resolves to an installed
+/// face. Generic CSS keywords (sans-serif, etc.) are skipped. Falls back to the
+/// first listed family when none are installed (preserving prior behavior).
+#[cfg(feature = "renderer")]
+fn primary_font_family_in_db(fonts: &str, db: &usvg::fontdb::Database) -> String {
+    const GENERIC: [&str; 6] = [
+        "ui-sans-serif",
+        "system-ui",
+        "-apple-system",
+        "sans-serif",
+        "serif",
+        "monospace",
+    ];
+    let mut first_specific: Option<String> = None;
+    for family in fonts.split(',').map(|s| s.trim().trim_matches('"')) {
+        if family.is_empty() || GENERIC.contains(&family) {
+            continue;
+        }
+        if first_specific.is_none() {
+            first_specific = Some(family.to_string());
+        }
+        let query = usvg::fontdb::Query {
+            families: &[usvg::fontdb::Family::Name(family)],
+            ..usvg::fontdb::Query::default()
+        };
+        if db.query(&query).is_some() {
+            return family.to_string();
+        }
+    }
+    first_specific.unwrap_or_else(|| primary_font_family(fonts))
+}
+
 #[cfg(feature = "renderer")]
 fn parse_hex_color_for_png(input: &str) -> Option<resvg::tiny_skia::Color> {
     let color = input.trim();
@@ -269,7 +302,7 @@ pub(super) fn write_output_png_cached_fonts(
     theme: &Theme,
 ) -> anyhow::Result<()> {
     let opt = usvg::Options {
-        font_family: primary_font_family(&theme.font_family),
+        font_family: primary_font_family_in_db(&theme.font_family, &SVG_FONT_DB),
         default_size: usvg::Size::from_wh(render_cfg.width, render_cfg.height)
             .or_else(|| usvg::Size::from_wh(800.0, 600.0))
             .ok_or_else(|| anyhow::anyhow!("invalid mermaid render size"))?,

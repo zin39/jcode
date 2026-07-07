@@ -17,9 +17,11 @@ impl InitiativeTool {
 
 fn default_display_for_action(action: &str) -> crate::goal::GoalDisplayMode {
     match action {
-        "list" | "create" | "show" | "focus" | "resume" => crate::goal::GoalDisplayMode::Focus,
+        // The tool must never open (spawn) the side panel on its own; users
+        // open it explicitly via /goals. UpdateOnly refreshes pages that are
+        // already open without stealing focus.
         "update" | "checkpoint" => crate::goal::GoalDisplayMode::UpdateOnly,
-        _ => crate::goal::GoalDisplayMode::Auto,
+        _ => crate::goal::GoalDisplayMode::None,
     }
 }
 

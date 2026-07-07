@@ -98,7 +98,25 @@ pub(super) fn save_preferred_macos_terminal(terminal: MacTerminalKind) -> Result
 }
 
 pub(super) fn effective_macos_terminal() -> MacTerminalKind {
-    load_preferred_macos_terminal().unwrap_or_else(detect_macos_terminal)
+    // Precedence: config.toml `[terminal] preferred` (discoverable, documented)
+    // > legacy `~/.jcode/preferred_terminal.json` > runtime detection.
+    config_preferred_macos_terminal()
+        .or_else(load_preferred_macos_terminal)
+        .unwrap_or_else(detect_macos_terminal)
+}
+
+/// Read `[terminal] preferred` from `~/.jcode/config.toml`, if present and valid.
+fn config_preferred_macos_terminal() -> Option<MacTerminalKind> {
+    #[derive(Deserialize, Default)]
+    struct Wrapper {
+        #[serde(default)]
+        terminal: jcode_config_types::TerminalConfig,
+    }
+    let dir = storage::jcode_dir().ok()?;
+    let text = std::fs::read_to_string(dir.join("config.toml")).ok()?;
+    let wrapper = toml::from_str::<Wrapper>(&text).ok()?;
+    let preferred = wrapper.terminal.preferred?;
+    MacTerminalKind::from_cli_value(&preferred)
 }
 
 fn detect_macos_terminal() -> MacTerminalKind {
@@ -161,109 +179,40 @@ pub(super) fn paused_jcode_shell_command_with_args(exe_path: &str, args: &[Strin
     )
 }
 
-/// Which global launch hotkey a generated script/registration serves.
-///
-/// The three system-wide hotkeys open a fresh jcode in a different working
-/// directory:
-/// - [`HotkeyTarget::Home`] (`Cmd+;`): the user's home directory.
-/// - [`HotkeyTarget::LastDir`] (`Cmd+'`): the last project directory jcode was
-///   launched from (recorded on each non-home launch).
-/// - [`HotkeyTarget::SelfDev`] (`Cmd+Shift+'`): a self-dev session in the last
-///   jcode repository the user worked in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HotkeyTarget {
-    Home,
-    LastDir,
-    SelfDev,
-}
-
-impl HotkeyTarget {
-    pub(super) const ALL: [HotkeyTarget; 3] =
-        [HotkeyTarget::Home, HotkeyTarget::LastDir, HotkeyTarget::SelfDev];
-
-    /// File name of the per-target launch script written into the hotkey
-    /// support dir and executed by the listener when the chord fires.
-    pub(super) fn script_file_name(self) -> &'static str {
-        match self {
-            Self::Home => "launch_jcode_home.sh",
-            Self::LastDir => "launch_jcode_last_dir.sh",
-            Self::SelfDev => "launch_jcode_selfdev.sh",
-        }
-    }
-
-    /// Human-readable chord label for notices and CLI output.
-    pub(super) fn chord_label(self) -> &'static str {
-        match self {
-            Self::Home => "Cmd+;",
-            Self::LastDir => "Cmd+'",
-            Self::SelfDev => "Cmd+Shift+'",
-        }
-    }
-
-    /// Short description of what the hotkey opens.
-    pub(super) fn description(self) -> &'static str {
-        match self {
-            Self::Home => "a new jcode in your home directory",
-            Self::LastDir => "a new jcode in your last project directory",
-            Self::SelfDev => "a new jcode self-dev session",
-        }
-    }
-}
-
-/// Shell snippet (run inside the freshly opened terminal) that `cd`s into the
-/// directory stored in `dir_file`, falling back to `$HOME` when the file is
-/// missing or points at a directory that no longer exists.
-///
-/// Reading the directory at launch time (rather than baking it into the script)
-/// means the "last project" / "self-dev" hotkeys always open the most recent
-/// directory without rewriting the scripts on every jcode launch.
-fn cd_from_dir_file_prefix(dir_file: &str) -> String {
-    let escaped = escape_shell_single_quotes(dir_file);
-    format!(
-        "__jc_dir=\"$(cat '{escaped}' 2>/dev/null)\"; if [ -n \"$__jc_dir\" ] && [ -d \"$__jc_dir\" ]; then cd \"$__jc_dir\"; else cd \"$HOME\"; fi; "
-    )
-}
-
-/// Build the shell command (executed inside the new terminal window) for a
-/// global launch hotkey. `last_dir_file`/`last_repo_file` are paths to the
-/// plaintext files the launch scripts read at fire time.
-pub(super) fn hotkey_shell_command(
-    exe_path: &str,
-    target: HotkeyTarget,
-    last_dir_file: &str,
-    last_repo_file: &str,
-) -> String {
-    let cd_prefix = match target {
-        HotkeyTarget::Home => "cd \"$HOME\"; ".to_string(),
-        HotkeyTarget::LastDir => cd_from_dir_file_prefix(last_dir_file),
-        HotkeyTarget::SelfDev => cd_from_dir_file_prefix(last_repo_file),
-    };
-    let args: Vec<String> = match target {
-        HotkeyTarget::SelfDev => vec!["self-dev".to_string()],
-        HotkeyTarget::Home | HotkeyTarget::LastDir => Vec::new(),
-    };
-    format!(
-        "{cd_prefix}{}",
-        paused_jcode_shell_command_with_args(exe_path, &args)
-    )
-}
-
 fn open_command_for_terminal(app_name: &str, app_args: &str, shell_command: &str) -> String {
     let escaped_shell = escape_shell_single_quotes(shell_command);
     format!("/usr/bin/open -na {app_name} --args {app_args} '{escaped_shell}'")
 }
 
+/// Wrap a POSIX/bash launcher snippet so it always runs under bash, regardless
+/// of the user's login shell.
+///
+/// macOS `do script` (Terminal.app/Warp/VS Code) and iTerm's `command` run the
+/// string in the user's *default login shell*. Our launcher snippet is plain
+/// bash (`status=$?`, `[ ... ]`, `read -r _`), which non-POSIX shells like fish
+/// cannot parse (`fish: Unsupported use of '='`). Running it through
+/// `/bin/bash -lc` makes the launcher shell-agnostic, matching what the
+/// open-command terminals (Ghostty/Alacritty/WezTerm) already do.
+fn run_in_bash_login(shell_command: &str) -> String {
+    format!(
+        "/bin/bash -lc '{}'",
+        escape_shell_single_quotes(shell_command)
+    )
+}
+
 fn applescript_command_for_terminal(app_name: &str, shell_command: &str) -> String {
+    let bash_command = run_in_bash_login(shell_command);
     format!(
         "/usr/bin/osascript <<'APPLESCRIPT'\ntell application \"{app_name}\"\n    activate\n    do script \"{}\"\nend tell\nAPPLESCRIPT",
-        escape_applescript_text(shell_command)
+        escape_applescript_text(&bash_command)
     )
 }
 
 fn applescript_command_for_iterm(shell_command: &str) -> String {
+    let bash_command = run_in_bash_login(shell_command);
     format!(
         "/usr/bin/osascript <<'APPLESCRIPT'\ntell application \"iTerm2\"\n    create window with default profile command \"{}\"\n    activate\nend tell\nAPPLESCRIPT",
-        escape_applescript_text(shell_command)
+        escape_applescript_text(&bash_command)
     )
 }
 
@@ -336,6 +285,32 @@ mod tests {
     };
 
     #[test]
+    fn from_cli_value_maps_documented_config_values() {
+        // These are the values documented for `[terminal] preferred` in
+        // config.toml; they must round-trip to a known terminal kind (#401).
+        let cases = [
+            ("ghostty", MacTerminalKind::Ghostty),
+            ("iterm2", MacTerminalKind::Iterm2),
+            ("iterm", MacTerminalKind::Iterm2),
+            ("terminal", MacTerminalKind::AppleTerminal),
+            ("wezterm", MacTerminalKind::WezTerm),
+            ("warp", MacTerminalKind::Warp),
+            ("alacritty", MacTerminalKind::Alacritty),
+            ("vscode", MacTerminalKind::Vscode),
+            ("code", MacTerminalKind::Vscode),
+            ("  Ghostty  ", MacTerminalKind::Ghostty),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                MacTerminalKind::from_cli_value(value),
+                Some(expected),
+                "config value {value:?} should map to {expected:?}"
+            );
+        }
+        assert_eq!(MacTerminalKind::from_cli_value("nope"), None);
+    }
+
+    #[test]
     fn open_command_terminals_use_open_with_expected_args() {
         let shell_command = "printf 'hi'";
         assert_eq!(
@@ -393,5 +368,47 @@ mod tests {
             launch_command_for_macos_terminal(MacTerminalKind::Warp, shell_command),
             applescript_command_for_terminal("Terminal", shell_command)
         );
+    }
+
+    #[test]
+    fn applescript_launchers_run_under_bash_for_non_bash_login_shells() {
+        // The launcher snippet is bash-specific (`status=$?`). `do script` and
+        // iTerm `command` run in the user's login shell, so a fish/zsh-quirky
+        // login shell would otherwise choke ("fish: Unsupported use of '='").
+        // Both must wrap the snippet in `/bin/bash -lc`.
+        let shell_command = super::paused_jcode_shell_command("/usr/local/bin/jcode");
+        assert!(shell_command.contains("status=$?"));
+
+        for terminal in [
+            MacTerminalKind::AppleTerminal,
+            MacTerminalKind::Warp,
+            MacTerminalKind::Vscode,
+            MacTerminalKind::Unknown,
+            MacTerminalKind::Iterm2,
+        ] {
+            let launcher = launch_command_for_macos_terminal(terminal, &shell_command);
+            assert!(
+                launcher.contains("/bin/bash -lc"),
+                "{terminal:?} launcher must run under bash: {launcher}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_command_terminals_pass_snippet_to_bash_not_login_shell() {
+        // Ghostty/Alacritty/WezTerm wrap via `open -na ... -e /bin/bash -lc`,
+        // so the bash-specific snippet never reaches the login shell.
+        let shell_command = super::paused_jcode_shell_command("/usr/local/bin/jcode");
+        for terminal in [
+            MacTerminalKind::Ghostty,
+            MacTerminalKind::Alacritty,
+            MacTerminalKind::WezTerm,
+        ] {
+            let launcher = launch_command_for_macos_terminal(terminal, &shell_command);
+            assert!(
+                launcher.contains("/bin/bash -lc"),
+                "{terminal:?} launcher must run under bash: {launcher}"
+            );
+        }
     }
 }

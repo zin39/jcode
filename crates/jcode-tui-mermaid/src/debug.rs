@@ -28,6 +28,14 @@ pub fn debug_flicker_benchmark(steps: usize) -> MermaidFlickerBenchmark {
     debug_support::debug_flicker_benchmark(steps)
 }
 
+pub fn debug_image_scroll_benchmark(
+    images: usize,
+    frames: usize,
+    visible_per_frame: usize,
+) -> ImageScrollBenchmark {
+    debug_support::debug_image_scroll_benchmark(images, frames, visible_per_frame)
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 fn parse_proc_status_value_bytes(status: &str, key: &str) -> Option<u64> {
@@ -46,6 +54,7 @@ pub fn clear_cache() -> Result<(), String> {
         cache.entries.clear();
         cache.order.clear();
     }
+    clear_layout_cache();
     if let Ok(mut state) = IMAGE_STATE.lock() {
         state.clear();
     }

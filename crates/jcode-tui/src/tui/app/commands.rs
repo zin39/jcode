@@ -16,10 +16,10 @@ pub(super) use super::commands_review::{
     autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
     build_judge_startup_message, build_review_startup_message, current_feedback_target_session_id,
     handle_autojudge_command_local, handle_autoreview_command_local, handle_judge_command_local,
-    handle_observe_command, handle_review_command_local, launch_prompt_in_new_session_local,
-    maybe_trigger_autojudge_local, maybe_trigger_autoreview_local,
-    preferred_one_shot_review_override, prepare_review_spawned_session, queue_review_spawn_remote,
-    reset_current_session,
+    handle_observe_command, handle_review_command_local, launch_forked_session_local,
+    launch_prompt_in_new_session_local, maybe_trigger_autojudge_local,
+    maybe_trigger_autoreview_local, preferred_one_shot_review_override,
+    prepare_review_spawned_session, queue_review_spawn_remote, reset_current_session,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
 use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
@@ -30,11 +30,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-const BTW_PAGE_ID: &str = "btw";
 pub(super) const REVIEW_PREFERRED_MODEL: &str = "gpt-5.5";
 const POKE_OFF_UI_HINT: &str = "/poke off to stop.";
 const TODO_CONFIDENCE_THRESHOLD: u8 = 90;
-const TODO_CONFIDENCE_SUMMARY_PREFIX: &str = "All todos are done. Todo confidence summary:";
+const TODO_CONFIDENCE_SUMMARY_PREFIX: &str = crate::todo::TODO_CONFIDENCE_SUMMARY_PREFIX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TodoConfidenceSummary {
@@ -71,10 +70,7 @@ pub(super) fn parse_poke_command(trimmed: &str) -> Option<Result<PokeCommand, St
 }
 
 pub(super) fn is_poke_message(message: &str) -> bool {
-    (message.starts_with("You have ")
-        && message.contains(" incomplete todo")
-        && message.ends_with("update the todo tool."))
-        || message.starts_with(TODO_CONFIDENCE_SUMMARY_PREFIX)
+    crate::todo::is_auto_poke_message(message)
 }
 
 pub(super) fn is_todo_confidence_summary_message(message: &str) -> bool {
@@ -128,6 +124,10 @@ pub(super) fn is_non_retryable_auto_poke_error(error: &str) -> bool {
         "invalid model",
         "model_not_found",
         "model_not_supported",
+        "unsupportedmodel",
+        "unsupported model",
+        "does not support the coding plan",
+        "coding plan feature",
         "unsupported parameter",
         "unsupported_value",
         "invalid parameter",
@@ -168,22 +168,51 @@ pub(super) fn is_non_retryable_auto_poke_error(error: &str) -> bool {
 /// [`is_non_retryable_auto_poke_error`] precisely so a transient disconnect is
 /// never treated as a permanent failure.
 pub(super) fn is_auto_poke_connectivity_error(error: &str) -> bool {
+    // Delegate to the shared connectivity classifier (jcode-app-core's
+    // network_retry) so this list can never drift out of sync with the wait-
+    // for-network path, then add wrappers specific to this call site.
+    if crate::network_retry::classify_message(error).is_some() {
+        return true;
+    }
+
     let lower = error.to_ascii_lowercase();
 
     let connectivity_markers = [
         "failed to send openai-compatible chat request",
-        "dns error",
-        "failed to lookup address information",
-        "name or service not known",
-        "temporary failure in name resolution",
-        "no route to host",
-        "network is unreachable",
-        "host is unreachable",
         "could not resolve host",
         "couldn't resolve host",
     ];
 
     connectivity_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Whether `error` is a deterministic model/endpoint-capability failure that can
+/// never succeed by resending the identical request: the configured model is not
+/// valid for the configured endpoint (e.g. Volcengine Ark's coding-plan endpoint
+/// returning `404 UnsupportedModel` for a model that lacks the coding plan
+/// feature, or a plain model-not-found). Unlike the broader
+/// [`is_non_retryable_auto_poke_error`] set (which also covers billing, payload
+/// size, auth, etc.), this is narrow enough that we can fail fast *regardless of
+/// auto-poke* during reconnect/recovery continuation instead of burning the
+/// retry budget on a request that is structurally guaranteed to 4xx. See #387.
+pub(super) fn is_fatal_model_endpoint_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+
+    let model_endpoint_markers = [
+        "unsupportedmodel",
+        "unsupported model",
+        "does not support the coding plan",
+        "coding plan feature",
+        "model_not_found",
+        "model_not_supported",
+        "invalid model",
+        "the model does not exist",
+        "model does not exist",
+    ];
+
+    model_endpoint_markers
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -1276,37 +1305,8 @@ fn disconnect_ssh_remote(app: &mut App, name: &str) {
     }
 }
 
-fn build_btw_loading_markdown(question: &str) -> String {
-    format!(
-        "# `/btw`\n\n## Question\n{}\n\n## Status\nThinking…\n",
-        question.trim()
-    )
-}
-
-fn build_btw_system_reminder(question: &str) -> String {
-    format!(
-        "The user invoked `/btw`, which is a side question about the current session. \
-Answer ONLY from the existing conversation/context already in memory for this session. \
-Do not read files, run commands, search the web, or call any tool except `side_panel`.\n\n\
-Use the `side_panel` tool exactly once with:\n\
-- `action`: `write`\n\
-- `page_id`: `{}`\n\
-- `title`: ``/btw``\n\
-- `focus`: `true`\n\n\
-Write markdown with this shape:\n\
-# `/btw`\n\
-## Question\n<repeat the question>\n\
-## Answer\n<your concise answer>\n\n\
-If the answer is not already knowable from the current session context, say so clearly in the Answer section and explain that a normal prompt is needed.\n\n\
-After writing the side panel content, do not add any normal chat response text.\n\n\
-Question: {}",
-        BTW_PAGE_ID,
-        question.trim()
-    )
-}
-
 fn handle_btw_command(app: &mut App, trimmed: &str) -> bool {
-    if !trimmed.starts_with("/btw") {
+    if trimmed != "/btw" && !trimmed.starts_with("/btw ") {
         return false;
     }
 
@@ -1316,39 +1316,38 @@ fn handle_btw_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    match crate::side_panel::write_markdown_page(
-        active_session_id(app).as_str(),
-        BTW_PAGE_ID,
-        Some("/btw"),
-        &build_btw_loading_markdown(question),
-        true,
-    ) {
-        Ok(snapshot) => app.set_side_panel_snapshot(snapshot),
-        Err(error) => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "Failed to prepare /btw side panel: {}",
-                error
-            )));
-            return true;
-        }
-    }
-
-    app.hidden_queued_system_messages
-        .push(build_btw_system_reminder(question));
-    if app.is_processing {
-        app.push_display_message(DisplayMessage::system(
-            "/btw noted - answer will appear in the side panel.".to_string(),
-        ));
-        app.set_status_notice("/btw noted");
-    } else {
-        app.push_display_message(DisplayMessage::system(
-            "Running /btw - answer will appear in the side panel.".to_string(),
-        ));
-        app.pending_queued_dispatch = true;
-        app.set_status_notice("Running /btw");
-    }
-
+    fork_session_with_prompt_local(app, Some(question));
     true
+}
+
+/// `/fork [prompt]` and `/split`: fork the current session into a new window.
+/// With a prompt, the forked session starts by answering it.
+fn handle_fork_command(app: &mut App, trimmed: &str) -> bool {
+    let rest = if trimmed == "/fork" || trimmed == "/split" {
+        ""
+    } else if let Some(rest) = trimmed.strip_prefix("/fork ") {
+        rest
+    } else {
+        return false;
+    };
+
+    let prompt = rest.trim();
+    fork_session_with_prompt_local(app, (!prompt.is_empty()).then_some(prompt));
+    true
+}
+
+/// Fork the current session (like `/split`) and, when given, deliver `prompt`
+/// as the first message of the forked session. Shared by `/btw <question>`,
+/// `/fork [prompt]`, and `/split`.
+pub(super) fn fork_session_with_prompt_local(app: &mut App, prompt: Option<&str>) {
+    let staged = prompt.map(|prompt| (prompt.to_string(), Vec::new()));
+    if let Err(error) = launch_forked_session_local(app, staged) {
+        app.push_display_message(DisplayMessage::error(format!(
+            "Failed to fork session: {}",
+            error
+        )));
+        app.set_status_notice("Fork failed");
+    }
 }
 
 fn load_catchup_candidates(app: &App) -> Vec<crate::tui::session_picker::SessionInfo> {
@@ -1638,12 +1637,14 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
 
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     if handle_subagent_model_command(app, trimmed)
+        || app.handle_hotkeys_command(trimmed)
         || handle_subagent_command(app, trimmed)
         || handle_observe_command(app, trimmed)
         || handle_todos_view_command(app, trimmed)
         || super::commands_overnight::handle_overnight_command(app, trimmed)
         || super::split_view::handle_split_view_command(app, trimmed)
         || handle_btw_command(app, trimmed)
+        || handle_fork_command(app, trimmed)
         || handle_transcript_command(app, trimmed)
         || handle_git_command(app, trimmed)
         || handle_catchup_command(app, trimmed)
@@ -1667,9 +1668,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if trimmed == "/cut-release" || trimmed == "/commit-push-release" {
+        handle_cut_release_command_local(app);
+        return true;
+    }
+
     if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
         app.open_session_picker();
-        app.hint_resume_shortcut();
+        app.record_keybinding_slow(super::shortcut_hints::LearnableAction::Resume);
         return true;
     }
 
@@ -1915,7 +1921,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             return true;
         };
 
-        let current_count = app.session.visible_conversation_message_count();
+        let current_count = app.session.rewind_target_count();
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
         app.session.replace_messages(snapshot.messages);
         app.provider_session_id = snapshot.provider_session_id;
@@ -1925,6 +1931,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         app.replace_provider_messages(provider_messages);
 
         app.clear_display_messages();
+        // Drop any streaming mermaid preview tied to the transcript being
+        // replaced (defensive: submit_input's commit already clears it on the
+        // slash-command path, but direct callers must not leak the slot).
+        // ACTIVE_DIAGRAMS deliberately survives: undo RESTORES messages whose
+        // diagrams are already registered, and the body-cache prefix reuse in
+        // ui_prepare.rs means re-rendered-identical messages do not re-run the
+        // mermaid path (and so would never re-register if we cleared here).
+        app.clear_streaming_render_state();
         for rendered in crate::session::render_messages(&app.session) {
             app.push_display_message(DisplayMessage {
                 role: rendered.role,
@@ -1946,8 +1960,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/rewind" {
-        let visible_messages = app.session.visible_conversation_messages();
-        if visible_messages.is_empty() {
+        // Number the same rendered transcript entries `/rewind N` targets so
+        // the printed numbers always match what a rewind actually does
+        // (issue #432).
+        let rendered_targets: Vec<_> = crate::session::render_messages(&app.session)
+            .into_iter()
+            .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+            .collect();
+        if rendered_targets.is_empty() {
             app.push_display_message(DisplayMessage::system(
                 "No messages in conversation.".to_string(),
             ));
@@ -1955,13 +1975,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         }
 
         let mut history = String::from("Conversation history:\n\n");
-        for (i, msg) in visible_messages.iter().enumerate() {
-            let role_str = match msg.role {
-                Role::User => "👤 User",
-                Role::Assistant => "🤖 Assistant",
+        for (i, msg) in rendered_targets.iter().enumerate() {
+            let role_str = match msg.role.as_str() {
+                "user" => "👤 User",
+                "assistant" => "🤖 Assistant",
+                _ => "💬 Message",
             };
-            let content = msg.content_preview();
-            let preview = crate::util::truncate_str(&content, 80);
+            let content = msg.content.replace('\n', " ");
+            let preview = crate::util::truncate_str(content.trim(), 80);
             history.push_str(&format!("  {} {} - {}\n", i + 1, role_str, preview));
         }
         history.push_str("\nUse /rewind N to rewind to message N (removes all messages after). After rewinding, use /rewind undo to restore the removed messages.");
@@ -1972,7 +1993,8 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if let Some(num_str) = trimmed.strip_prefix("/rewind ") {
         let num_str = num_str.trim();
-        let visible_count = app.session.visible_conversation_message_count();
+        let targets = app.session.rewind_target_stored_indices();
+        let visible_count = targets.len();
         match num_str.parse::<usize>() {
             Ok(n) if n > 0 && n <= visible_count => {
                 let removed = visible_count - n;
@@ -1982,15 +2004,22 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
                     session_provider_session_id: app.session.provider_session_id.clone(),
                     visible_message_count: visible_count,
                 });
-                if let Some(stored_len) = app.session.stored_len_for_visible_conversation_message(n)
-                {
-                    app.session.truncate_messages(stored_len);
-                }
+                app.session.truncate_messages(targets[n - 1] + 1);
                 let provider_messages = app.session.messages_for_provider_uncached();
                 app.replace_provider_messages(provider_messages);
                 app.session.updated_at = chrono::Utc::now();
 
                 app.clear_display_messages();
+                // Same defensive preview clear as /rewind undo above.
+                // ACTIVE_DIAGRAMS survives here too: messages BEFORE the
+                // rewind point are retained, and body-cache prefix reuse
+                // (ui_prepare.rs build_body_from_base) skips re-rendering
+                // them, so clearing the registry would orphan the pinned
+                // pane / margin widget for diagrams that are still in the
+                // transcript. Diagrams from rewound-away messages leak until
+                // eviction (ACTIVE_DIAGRAMS_MAX) - a pinned, known tradeoff
+                // (tests/swarm_plan_graph_inline.rs).
+                app.clear_streaming_render_state();
                 for rendered in crate::session::render_messages(&app.session) {
                     app.push_display_message(DisplayMessage {
                         role: rendered.role,
@@ -2080,6 +2109,15 @@ pub(super) fn build_commit_push_prompt() -> String {
     prompt
 }
 
+pub(super) fn build_cut_release_prompt() -> String {
+    let mut prompt = build_commit_push_prompt();
+    prompt.push(' ');
+    prompt.push_str(
+        "Then cut a release. Find the last release tag (git describe --tags --abbrev=0 or gh release list) and review everything that changed since it to pick the semver bump: patch for fixes and small internal changes, minor for new features, major only for breaking changes. Bump the version in the root Cargo.toml, refresh Cargo.lock (for example with cargo check), and, if the repo has a changelog/ directory, write a user-facing changelog entry changelog/v<version>.json following changelog/README.md (translate commits into user-visible effects, skip internal-only changes, update changelog/index.json). Commit the version bump together with the changelog entry, and push. Then run scripts/quick-release.sh v<version> to tag, build, and publish the GitHub release, using the changelog entry as the basis for the release notes when possible. Do not force-push or move existing tags. Finally, report the new version, the commits created, and the release result.",
+    );
+    prompt
+}
+
 pub(super) fn commit_launch_notice(interrupted: bool) -> String {
     if interrupted {
         "👉 Interrupting and starting logical commits...".to_string()
@@ -2093,6 +2131,14 @@ pub(super) fn commit_push_launch_notice(interrupted: bool) -> String {
         "👉 Interrupting and starting logical commits + push...".to_string()
     } else {
         "🚀 Starting logical commits + push...".to_string()
+    }
+}
+
+pub(super) fn cut_release_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting logical commits + push + release cut...".to_string()
+    } else {
+        "🚀 Starting logical commits + push + release cut...".to_string()
     }
 }
 
@@ -2122,6 +2168,21 @@ fn handle_commit_push_command_local(app: &mut App) {
         );
     } else {
         app.push_display_message(DisplayMessage::system(commit_push_launch_notice(false)));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_cut_release_command_local(app: &mut App) {
+    let prompt = build_cut_release_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /cut-release...",
+            cut_release_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(cut_release_launch_notice(false)));
         super::commands_improve::start_synthetic_user_turn(app, prompt);
     }
 }
@@ -2434,11 +2495,7 @@ pub(super) fn incomplete_poke_todos(app: &App) -> Vec<crate::todo::TodoItem> {
 }
 
 pub(super) fn build_poke_message(incomplete: &[crate::todo::TodoItem]) -> String {
-    format!(
-        "You have {} incomplete todo{}. Continue working, or update the todo tool.",
-        incomplete.len(),
-        if incomplete.len() == 1 { "" } else { "s" },
-    )
+    crate::todo::build_auto_poke_message(incomplete.len())
 }
 
 fn todo_confidence_weight(priority: &str) -> u32 {
@@ -2665,6 +2722,104 @@ fn parse_alignment_value(raw: &str) -> Option<bool> {
     }
 }
 
+fn parse_on_off_value(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "compact" | "true" | "1" | "yes" | "enable" | "enabled" => Some(true),
+        "off" | "full" | "false" | "0" | "no" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn handle_compact_notifications_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/compact-notifications" && !trimmed.starts_with("/compact-notifications ") {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/compact-notifications")
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.compact_notifications;
+        app.push_display_message(DisplayMessage::system(format!(
+            "Compact notifications are currently {}.\n\nWhen on, swarm/file-activity notifications collapse to a single line (path · summary) instead of the full multi-line card with diff preview.\n\nUse /compact-notifications on or /compact-notifications off to change it.",
+            if current { "on" } else { "off" }
+        )));
+        return true;
+    }
+
+    let Some(enabled) = parse_on_off_value(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /compact-notifications (show), /compact-notifications on, or /compact-notifications off".to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!(
+        "Compact notifications: {}",
+        if enabled { "on" } else { "off" }
+    ));
+    match crate::config::Config::set_compact_notifications(enabled) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved compact notifications: {}. Applied to this session immediately.",
+            if enabled { "on" } else { "off" }
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied compact notifications {} for this session, but failed to save it as the default: {}",
+            if enabled { "on" } else { "off" },
+            error
+        ))),
+    }
+
+    true
+}
+
+fn handle_show_agentgrep_output_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/show-agentgrep-output" && !trimmed.starts_with("/show-agentgrep-output ") {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/show-agentgrep-output")
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.show_agentgrep_output;
+        app.push_display_message(DisplayMessage::system(format!(
+            "Show agentgrep output is currently {}.\n\nWhen on, the full agentgrep search results render inline in the transcript instead of just the one-line summary.\n\nUse /show-agentgrep-output on or /show-agentgrep-output off to change it.",
+            if current { "on" } else { "off" }
+        )));
+        return true;
+    }
+
+    let Some(enabled) = parse_on_off_value(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /show-agentgrep-output (show), /show-agentgrep-output on, or /show-agentgrep-output off".to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!(
+        "Show agentgrep output: {}",
+        if enabled { "on" } else { "off" }
+    ));
+    match crate::config::Config::set_show_agentgrep_output(enabled) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved show agentgrep output: {}. Applied to this session immediately.",
+            if enabled { "on" } else { "off" }
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied show agentgrep output {} for this session, but failed to save it as the default: {}",
+            if enabled { "on" } else { "off" },
+            error
+        ))),
+    }
+
+    true
+}
+
 fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "swarm" | "agent" | "agents" | "subagent" | "subagents" => {
@@ -2733,6 +2888,7 @@ fn handle_alignment_command(app: &mut App, trimmed: &str) -> bool {
 
     app.set_centered(centered);
     app.set_status_notice(alignment_status_notice(centered));
+    app.record_keybinding_slow(super::shortcut_hints::LearnableAction::Alignment);
 
     match crate::config::Config::set_display_centered(centered) {
         Ok(()) => app.push_display_message(DisplayMessage::system(format!(
@@ -2808,6 +2964,14 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if handle_reasoning_display_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_compact_notifications_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_show_agentgrep_output_command(app, trimmed) {
         return true;
     }
 
@@ -3027,7 +3191,31 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
                 tool_data: None,
             });
 
-            let _ = std::process::Command::new(&editor).arg(&path).spawn();
+            // $EDITOR may contain arguments (e.g. "zed --wait" or "code -w"), so
+            // split on whitespace and use the first token as the binary, passing
+            // the rest as leading args before the file path. Report spawn errors
+            // instead of swallowing them so the user is not left confused.
+            let mut parts = editor.split_whitespace();
+            match parts.next() {
+                Some(bin) => {
+                    let extra: Vec<&str> = parts.collect();
+                    if let Err(e) = std::process::Command::new(bin)
+                        .args(&extra)
+                        .arg(&path)
+                        .spawn()
+                    {
+                        app.push_display_message(DisplayMessage::error(format!(
+                            "Failed to launch editor '{}': {}",
+                            editor, e
+                        )));
+                    }
+                }
+                None => {
+                    app.push_display_message(DisplayMessage::error(
+                        "$EDITOR is set to an empty value; cannot open config.".to_string(),
+                    ));
+                }
+            }
         }
         return true;
     }

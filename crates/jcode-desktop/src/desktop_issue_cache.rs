@@ -646,10 +646,10 @@ fn issue_priority(
     issue: &CachedGitHubIssue,
     override_: Option<&CachedGitHubIssueOverride>,
 ) -> String {
-    if let Some(priority) = override_.and_then(|override_| override_.priority.as_deref()) {
-        if let Some(normalized) = normalize_priority(priority) {
-            return normalized.to_string();
-        }
+    if let Some(priority) = override_.and_then(|override_| override_.priority.as_deref())
+        && let Some(normalized) = normalize_priority(priority)
+    {
+        return normalized.to_string();
     }
     let labels = issue_label_names(issue);
     if labels.iter().any(|label| {

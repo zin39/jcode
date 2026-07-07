@@ -7,8 +7,8 @@ use jcode_update_core::{
     verify_asset_checksum_text, version_is_newer,
 };
 pub use jcode_update_core::{
-    DownloadProgress, GitHubAsset, GitHubRelease, PreparedUpdate, UpdateCheckResult,
-    UpdateEstimate, format_download_progress_bar,
+    DownloadProgress, GIT_PULL_DIVERGED_SUMMARY, GitHubAsset, GitHubRelease, PreparedUpdate,
+    UpdateCheckResult, UpdateEstimate, format_download_progress_bar, summary_is_divergence,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -1319,8 +1319,11 @@ mod tests {
         let stderr = b"hint: You have divergent branches and need to specify how to reconcile them.\nfatal: Need to specify how to reconcile divergent branches.\n";
         assert_eq!(
             summarize_git_pull_failure(stderr),
-            "git pull requires manual reconciliation (local and upstream have diverged)"
+            jcode_update_core::GIT_PULL_DIVERGED_SUMMARY
         );
+        assert!(jcode_update_core::summary_is_divergence(
+            &summarize_git_pull_failure(stderr)
+        ));
     }
 
     #[test]

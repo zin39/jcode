@@ -8,6 +8,17 @@ pub(super) fn render_swarm_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
         return Vec::new();
     };
 
+    // Dock mode: this session manages agents, render the compact two-line
+    // summary (agents tally + task-graph node bar).
+    if !info.managed_members.is_empty() {
+        return crate::tui::info_widget::swarm_gallery::render_swarm_compact_lines(
+            &info.managed_members,
+            info.plan_progress,
+            inner.width as usize,
+            inner.height as usize,
+        );
+    }
+
     let mut lines: Vec<Line> = vec![render_swarm_stats_line(info)];
 
     if info.members.is_empty()
@@ -73,7 +84,6 @@ fn swarm_status_style(status: &str) -> (Color, &'static str) {
 fn swarm_role_prefix(member: &SwarmMemberStatus) -> &'static str {
     match member.role.as_deref() {
         Some("coordinator") => "★ ",
-        Some("worktree_manager") => "◆ ",
         _ => "  ",
     }
 }

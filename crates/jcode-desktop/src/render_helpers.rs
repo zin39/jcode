@@ -502,6 +502,7 @@ pub(crate) fn workspace_digit_segment_rects(x: f32, y: f32) -> [Rect; 7] {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn push_status_preview(
     vertices: &mut Vec<Vertex>,
     workspace: &Workspace,
@@ -700,6 +701,7 @@ fn status_preview_should_draw_column(column: i32, lane: &StatusPreviewLane, stri
         == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_status_preview_surface_tick(
     vertices: &mut Vec<Vertex>,
     surface: &workspace::Surface,

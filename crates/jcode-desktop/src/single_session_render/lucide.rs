@@ -4,7 +4,7 @@ use super::{Rect, Vertex, push_stroke_segment};
 use winit::dpi::PhysicalSize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum LucideIcon {
+pub(crate) enum LucideIcon {
     Bot,
     BookmarkCheck,
     CircleCheck,

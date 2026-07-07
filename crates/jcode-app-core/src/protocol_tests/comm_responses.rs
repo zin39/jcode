@@ -23,10 +23,13 @@ fn test_swarm_plan_event_roundtrip_with_summary() -> Result<()> {
             blocked_ids: Vec::new(),
             active_ids: Vec::new(),
             completed_ids: Vec::new(),
+            failed_ids: Vec::new(),
             cycle_ids: Vec::new(),
             unresolved_dependency_ids: Vec::new(),
             next_ready_ids: vec!["task-1".to_string()],
             newly_ready_ids: Vec::new(),
+            low_confidence_ids: Vec::new(),
+            mode: "light".to_string(),
         }),
     };
     let json = encode_event(&event);
@@ -71,10 +74,13 @@ fn test_comm_task_control_response_roundtrip() -> Result<()> {
             blocked_ids: Vec::new(),
             active_ids: vec!["task-1".to_string()],
             completed_ids: vec!["setup".to_string()],
+            failed_ids: Vec::new(),
             cycle_ids: Vec::new(),
             unresolved_dependency_ids: Vec::new(),
             next_ready_ids: vec!["task-2".to_string()],
             newly_ready_ids: vec!["task-2".to_string()],
+            low_confidence_ids: Vec::new(),
+            mode: "deep".to_string(),
         },
     };
     let json = encode_event(&event);
@@ -214,6 +220,7 @@ fn test_comm_status_response_roundtrip() -> Result<()> {
             is_headless: Some(true),
             live_attachments: Some(0),
             status_age_secs: Some(5),
+            last_activity_age_secs: Some(2),
             joined_age_secs: Some(30),
             files_touched: vec!["src/main.rs".to_string()],
             activity: Some(SessionActivitySnapshot {

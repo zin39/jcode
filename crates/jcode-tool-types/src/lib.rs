@@ -81,8 +81,11 @@ pub fn resolve_tool_name(name: &str) -> &str {
         "file_write" => "write",
         "edit_file" => "edit",
         "file_edit" => "edit",
-        "file_glob" => "glob",
-        "file_grep" => "grep",
+        // The native grep tool was removed in favor of agentgrep, but models
+        // still frequently call `grep` (and OAuth's `file_grep`). agentgrep's
+        // grep mode accepts `pattern` as an alias for `query`, so these calls
+        // work as-is.
+        "grep" | "file_grep" => "agentgrep",
         "skill" | "Skill" => "skill_manage",
         "todoread" | "todowrite" | "todo_read" | "todo_write" | "todos" => "todo",
         other => other,

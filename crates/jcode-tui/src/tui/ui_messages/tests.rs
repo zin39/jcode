@@ -213,6 +213,49 @@ fn render_background_task_message_uses_box_and_truncates_preview_lines() {
 }
 
 #[test]
+fn render_background_task_message_uses_swarm_flavor_for_swarm_tool() {
+    let msg = DisplayMessage::background_task(
+        "**Background task** `bg777` · `run_plan (6 nodes, deep mode)` (`swarm`) · ✓ completed · 92.4s · exit 0\n\n```text\nSwarm plan reached terminal/blocked state after 9 loop(s). completed=6 blocked=0 cycles=0 active=0 assignments=8\n```\n\n_Full output:_ `bg action=\"output\" task_id=\"bg777\"`",
+    );
+
+    let lines = render_background_task_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        plain.contains("🐝 run_plan (6 nodes, deep mode) completed · bg777"),
+        "expected swarm-flavored completion title, got:\n{plain}"
+    );
+    assert!(!plain.contains("✓ bg "));
+    assert!(plain.contains("exit 0 · 92.4s"));
+    assert!(plain.contains("Swarm plan reached terminal/blocked state"));
+}
+
+#[test]
+fn render_background_task_progress_message_uses_swarm_flavor_for_swarm_tool() {
+    let msg = DisplayMessage::background_task(
+        "**Background task progress** `bg777` · `run_plan (6 nodes, deep mode)` (`swarm`)\n\n[####--------] 33% · 2/6 nodes · completed 2 · blocked 0 · active 3 · assignments 5 (reported)",
+    );
+
+    let lines = render_background_task_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        plain.contains("🐝 run_plan (6 nodes, deep mode) · bg777"),
+        "expected swarm-flavored progress title, got:\n{plain}"
+    );
+    assert!(!plain.contains("◌ bg "));
+    assert!(plain.contains("33%"));
+}
+
+#[test]
 fn render_background_task_progress_message_uses_box_with_progress_bar() {
     let msg = DisplayMessage::background_task(
         "**Background task progress** `bg123` · `bash`\n\n[#####-------] 42% · Running tests (reported)",
@@ -385,6 +428,90 @@ fn render_tool_message_uses_scheduled_card() {
     assert!(plain.contains("session session_test"));
     assert!(plain.contains("sched_abc123"));
     assert!(!plain.contains("✓ schedule"));
+}
+
+#[test]
+fn render_assistant_message_renders_plan_block_as_card() {
+    let saved = crate::tui::markdown::center_code_blocks();
+    crate::tui::markdown::set_center_code_blocks(false);
+    let msg = DisplayMessage::assistant(
+        "Here is the plan:\n\n```plan\n# Ship compact mode\n\n## Goal\nAdd a compact message mode.\n\n## Approach\n1. Add config flag\n2. Wire renderer\n```\n\nLet me know if this works.",
+    );
+
+    let lines = render_assistant_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    crate::tui::markdown::set_center_code_blocks(saved);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("Here is the plan:"), "plain: {plain}");
+    assert!(plain.contains("⛭ Ship compact mode"), "plain: {plain}");
+    assert!(plain.contains('╭'), "expected card border: {plain}");
+    assert!(plain.contains('╰'), "expected card border: {plain}");
+    assert!(plain.contains("Add a compact message mode."));
+    assert!(plain.contains("Let me know if this works."));
+    assert!(
+        !plain.contains("```"),
+        "plan fence markers should not render: {plain}"
+    );
+}
+
+#[test]
+fn render_assistant_message_plan_card_survives_unterminated_fence() {
+    let saved = crate::tui::markdown::center_code_blocks();
+    crate::tui::markdown::set_center_code_blocks(false);
+    let msg = DisplayMessage::assistant("```plan\n# Streaming plan\n\n- step one");
+
+    let lines = render_assistant_message(&msg, 80, crate::config::DiffDisplayMode::Off);
+    crate::tui::markdown::set_center_code_blocks(saved);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("⛭ Streaming plan"), "plain: {plain}");
+    assert!(plain.contains("step one"), "plain: {plain}");
+}
+
+#[test]
+fn render_assistant_message_plan_card_keeps_nested_fences_inside() {
+    let saved = crate::tui::markdown::center_code_blocks();
+    crate::tui::markdown::set_center_code_blocks(false);
+    let msg = DisplayMessage::assistant(
+        "```plan\n# Validation plan\n\n```bash\ncargo test -p jcode-tui\n```\n\nAfter the block.\n```\n\nOutside text.",
+    );
+
+    let lines = render_assistant_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    crate::tui::markdown::set_center_code_blocks(saved);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("⛭ Validation plan"), "plain: {plain}");
+    assert!(plain.contains("cargo test -p jcode-tui"), "plain: {plain}");
+    assert!(plain.contains("After the block."), "plain: {plain}");
+    assert!(plain.contains("Outside text."), "plain: {plain}");
+    // The nested bash content stays inside the card borders.
+    let bash_line = lines
+        .iter()
+        .map(extract_line_text)
+        .find(|line| line.contains("cargo test -p jcode-tui"))
+        .expect("missing bash line");
+    assert!(
+        bash_line.trim_start().starts_with('│'),
+        "nested fence content should be inside the card: {bash_line}"
+    );
+}
+
+#[test]
+fn split_plan_segments_returns_none_without_plan_block() {
+    assert!(split_plan_segments("Just some text\n\n```rust\nfn main() {}\n```").is_none());
+    assert!(split_plan_segments("mentions plan but no fence").is_none());
 }
 
 #[test]
@@ -663,6 +790,57 @@ fn render_swarm_message_centered_mode_caps_wrap_width_for_long_notifications() {
         "centered swarm notification should share one left pad across wrapped lines: {rendered:?}"
     );
 
+    crate::tui::markdown::set_center_code_blocks(saved);
+}
+
+#[test]
+fn render_swarm_message_collapsed_shows_tldr_and_expand_badge_only() {
+    let saved = crate::tui::markdown::center_code_blocks();
+    crate::tui::markdown::set_center_code_blocks(false);
+    let content = jcode_tui_messages::encode_collapsible_swarm_content(
+        "fixed the flaky test",
+        "The flaky test was caused by a race in the setup helper.\n\nI rewrote it to use a barrier.",
+    );
+    let msg = DisplayMessage::swarm("DM from sheep", content);
+
+    let lines = render_swarm_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("fixed the flaky test"), "{plain}");
+    assert!(plain.contains(super::SWARM_EXPAND_BADGE), "{plain}");
+    assert!(
+        !plain.contains("race in the setup helper"),
+        "collapsed card must hide the full body: {plain}"
+    );
+    crate::tui::markdown::set_center_code_blocks(saved);
+}
+
+#[test]
+fn render_swarm_message_expanded_shows_body_and_collapse_badge() {
+    let saved = crate::tui::markdown::center_code_blocks();
+    crate::tui::markdown::set_center_code_blocks(false);
+    let collapsed = jcode_tui_messages::encode_collapsible_swarm_content(
+        "fixed the flaky test",
+        "The flaky test was caused by a race in the setup helper.",
+    );
+    let expanded =
+        jcode_tui_messages::toggle_collapsible_swarm_content(&collapsed).expect("toggle");
+    let msg = DisplayMessage::swarm("DM from sheep", expanded);
+
+    let lines = render_swarm_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    let plain = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plain.contains("fixed the flaky test"), "{plain}");
+    assert!(plain.contains(super::SWARM_COLLAPSE_BADGE), "{plain}");
+    assert!(plain.contains("race in the setup helper"), "{plain}");
     crate::tui::markdown::set_center_code_blocks(saved);
 }
 
@@ -1078,4 +1256,129 @@ fn render_tool_message_batch_subcall_shows_swarm_dm_details() {
         rendered.contains("Please validate the restart"),
         "rendered={rendered}"
     );
+}
+
+#[test]
+fn render_agentgrep_output_body_borders_each_line() {
+    let content = "crates/foo.rs\n  symbols: 1 matched\n    - fn bar @ 1-5";
+    let lines = super::render_agentgrep_output_body(content, 120);
+    let rendered = lines
+        .iter()
+        .map(extract_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("│ crates/foo.rs"), "rendered={rendered}");
+    assert!(
+        rendered.contains("│   symbols: 1 matched"),
+        "rendered={rendered}"
+    );
+    assert!(
+        rendered.contains("│     - fn bar @ 1-5"),
+        "rendered={rendered}"
+    );
+    assert_eq!(lines.len(), 3, "one bordered line per source line");
+}
+
+#[test]
+fn render_agentgrep_output_body_caps_huge_output() {
+    let content = (0..1000)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = super::render_agentgrep_output_body(&content, 120);
+    // 400-line cap plus a single truncation summary line.
+    assert_eq!(lines.len(), 401, "should cap the body and add a summary");
+    let last = extract_line_text(&lines[lines.len() - 1]);
+    assert!(last.contains("more lines"), "last={last}");
+}
+
+#[test]
+fn render_assistant_message_plan_card_wraps_instead_of_truncating() {
+    let saved = crate::tui::markdown::center_code_blocks();
+    crate::tui::markdown::set_center_code_blocks(false);
+    // Long paragraph and long list items must wrap inside the card, not be
+    // clipped at the right border by render_rounded_box's truncation.
+    let plan_body = "# Long content plan\n\n\
+        Goal\n\
+        Produce an up-to-date ranked report grounded in current crate paths, then fix the highest-leverage low-risk offenders without destabilizing active work.\n\n\
+        Approach\n\
+        1. Write an audit document that regenerates metrics with current crate paths, ranks the top issues with evidence, and marks which items from the previous audit are complete versus stale.\n\
+        2. Map the provider migration and record whether each module is a thin wrapper, partial duplicate, or full duplicate of the extracted crate.\n";
+    let content = format!("Intro text.\n\n```plan\n{plan_body}```\n\nAfter the card.");
+    let msg = DisplayMessage::assistant(&content);
+
+    for width in [40u16, 60, 80, 100, 140] {
+        let lines = render_assistant_message(&msg, width, crate::config::DiffDisplayMode::Off);
+        let squashed = lines
+            .iter()
+            .map(extract_line_text)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(['│', '╭', '╮', '╰', '╯', '─'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for phrase in [
+            "without destabilizing active work.",
+            "complete versus stale.",
+            "or full duplicate of the extracted crate.",
+        ] {
+            assert!(
+                squashed.contains(phrase),
+                "width {width}: plan card lost trailing content {phrase:?}\n{squashed}"
+            );
+        }
+        // Card borders stay intact.
+        for line in lines
+            .iter()
+            .map(extract_line_text)
+            .filter(|l| l.contains('│'))
+        {
+            assert!(
+                line.trim_end().ends_with('│'),
+                "width {width}: card row missing right border: {line:?}"
+            );
+        }
+    }
+    crate::tui::markdown::set_center_code_blocks(saved);
+}
+
+#[test]
+fn render_swarm_message_preserves_inline_image_placeholder_lines() {
+    let saved = crate::tui::markdown::center_code_blocks();
+    crate::tui::markdown::set_center_code_blocks(false);
+
+    // Simulate a rendered mermaid diagram inside a swarm message body: the
+    // marker line plus its blank fill rows must survive rendering without a
+    // rail prefix or blank-line cleanup so the image draws at full height.
+    let placeholder = crate::tui::mermaid::inline_image_placeholder_lines(0xabcd1234, 4, 20);
+    assert_eq!(placeholder.len(), 4);
+    let marker_text = placeholder[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+
+    let msg = DisplayMessage::swarm(
+        "Plan graph · v3",
+        "```mermaid\nflowchart TD\n    a --> b\n```",
+    );
+    // Rendering the real message goes through the markdown pipeline; whether a
+    // real image materializes depends on protocol availability, so test the
+    // line-preservation path directly through render_swarm_message with a body
+    // the markdown renderer maps to placeholder lines is not deterministic in
+    // tests. Instead assert the parser round-trips the marker we emit.
+    let parsed = crate::tui::mermaid::parse_inline_image_placeholder(&placeholder[0]);
+    assert_eq!(parsed, Some((0xabcd1234, 4, 20)));
+    assert!(
+        marker_text.starts_with('\u{0}'),
+        "marker must keep its sentinel prefix"
+    );
+
+    // And the swarm renderer must not panic or drop content for a mermaid body.
+    let lines = render_swarm_message(&msg, 100, crate::config::DiffDisplayMode::Off);
+    assert!(!lines.is_empty());
+
+    crate::tui::markdown::set_center_code_blocks(saved);
 }

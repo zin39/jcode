@@ -6885,8 +6885,8 @@ fn single_session_model_picker_loads_filters_and_selects_model() {
     assert!(picker.contains("Current  Claude · claude-sonnet-4-5"));
     assert!(picker.contains("type to filter"));
     assert!(picker.contains("2 models"));
-    assert!(picker.contains("      claude-sonnet-4-5"));
-    assert!(picker.contains("      claude-opus-4-5"));
+    assert!(picker.contains("   claude-sonnet-4-5"));
+    assert!(picker.contains("   claude-opus-4-5"));
     assert!(picker.contains("Anthropic"));
     assert!(picker.contains("claude-oauth"));
 
@@ -8845,9 +8845,29 @@ fn headless_chat_smoke_message_parses_hidden_flag() {
 }
 
 #[test]
+fn desktop_user_facing_surfaces_are_marked_beta() {
+    // Window/status titles, help text, and in-app version labels must all
+    // carry the beta channel until the desktop app graduates.
+    assert!(DESKTOP_PRODUCT_NAME.contains("Beta"));
+    assert!(desktop_help_text().contains("Beta"));
+    assert!(SingleSessionApp::new(None).status_title().contains("Beta"));
+    assert!(
+        crate::single_session_render::desktop_header_version_label()
+            .starts_with(DESKTOP_RELEASE_CHANNEL)
+    );
+    assert!(
+        crate::single_session_render::fresh_welcome_version_label()
+            .starts_with(DESKTOP_RELEASE_CHANNEL)
+    );
+    let workspace = workspace::Workspace::fake();
+    assert!(workspace.status_title().contains("Beta"));
+}
+
+#[test]
 fn desktop_help_text_documents_desktop_options() {
     let help = desktop_help_text();
 
+    assert!(help.starts_with(DESKTOP_PRODUCT_NAME));
     assert!(help.contains("Usage:"));
     assert!(help.contains("--fullscreen"));
     assert!(help.contains("--workspace"));
@@ -9500,7 +9520,7 @@ fn inline_widget_card_never_overlaps_body_clip_during_reveal() {
     for size in sizes {
         let body_base_bottom = single_session_body_bottom(size);
         for kind in kinds {
-            let visible_lines = kind.visible_line_limit().min(8).max(1);
+            let visible_lines = kind.visible_line_limit().clamp(1, 8);
             for activity_reserved_height in [0.0, 22.0] {
                 for reveal_progress in reveal_steps {
                     let Some((body_bottom, card_top)) =
@@ -9666,7 +9686,7 @@ fn long_transcript_keeps_welcome_visual_only() {
 fn single_session_without_session_is_native_fresh_draft() {
     let mut app = SingleSessionApp::new(None);
 
-    assert_eq!(app.status_title(), "Jcode · fresh session");
+    assert_eq!(app.status_title(), "Jcode Desktop (Beta) · fresh session");
     assert!(!app.status_title().contains("Enter send"));
     assert!(!app.status_title().contains("Ctrl+"));
     assert_eq!(

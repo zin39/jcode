@@ -4,6 +4,50 @@ use super::*;
 /// even if the panel is a bit narrow, so small lists are never normalized.
 const EXACT_PIP_FLOOR: usize = 12;
 
+/// Map swarm plan items into the todo-widget model so the persistent info
+/// widget renders live plan state (this is the durable surface backing the
+/// transient 3s "Swarm plan synced" status notice).
+///
+/// Plan statuses use the scheduler vocabulary (`queued`, `ready`, `running`,
+/// `running_stale`, `done`, `failed`, `stopped`, `crashed`, ...) while the todo
+/// renderer only distinguishes `in_progress`/`completed`/`cancelled`/other.
+/// Without normalization, `running` plan tasks render as open `○` items and
+/// sort *after* completed work, so large plans hide all live activity behind
+/// the "+N more" footer.
+pub(crate) fn swarm_plan_todos(items: &[crate::plan::PlanItem]) -> Vec<crate::todo::TodoItem> {
+    items
+        .iter()
+        .map(|item| crate::todo::TodoItem {
+            content: item.content.clone(),
+            status: normalize_plan_status_for_todo(&item.status),
+            priority: item.priority.clone(),
+            id: item.id.clone(),
+            group: None,
+            blocked_by: item.blocked_by.clone(),
+            assigned_to: item.assigned_to.clone(),
+            confidence: None,
+            completion_confidence: None,
+            confidence_history: Vec::new(),
+        })
+        .collect()
+}
+
+/// Collapse the scheduler's status vocabulary onto the todo renderer's:
+/// active → `in_progress` (▶ amber, sorts first), terminal success →
+/// `completed` (✓), terminal failure → `cancelled` (✗), runnable →
+/// `pending` (○). Statuses the todo renderer already understands (and any
+/// arbitrary strings) pass through unchanged. Blocked items still get their
+/// ⊳ marker from `blocked_by`.
+fn normalize_plan_status_for_todo(status: &str) -> String {
+    match status {
+        "running" | "running_stale" => "in_progress".to_string(),
+        "done" => "completed".to_string(),
+        "failed" | "stopped" | "crashed" => "cancelled".to_string(),
+        "queued" | "ready" | "todo" | "blocked" => "pending".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn todo_confidence_weight(priority: &str) -> u32 {
     match priority {
         "high" => 3,
@@ -340,6 +384,16 @@ fn render_grouped_todo_lines(
     (lines, shown)
 }
 
+/// Header label for the todo slot: "Plan" when the items are the shared
+/// swarm plan projection, "Todos" for the session's own private list.
+fn todos_widget_label(data: &InfoWidgetData) -> &'static str {
+    if data.todos_are_swarm_plan {
+        "Plan"
+    } else {
+        "Todos"
+    }
+}
+
 /// Render todos widget content
 pub(super) fn render_todos_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     if data.todos.is_empty() {
@@ -361,7 +415,10 @@ pub(super) fn render_todos_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
 
     // Header with progress + inline pip meter
     let mut header = vec![
-        Span::styled("Todos ", Style::default().fg(rgb(180, 180, 190)).bold()),
+        Span::styled(
+            format!("{} ", todos_widget_label(data)),
+            Style::default().fg(rgb(180, 180, 190)).bold(),
+        ),
         Span::styled(
             format!("{}/{}", completed, total),
             Style::default().fg(rgb(140, 140, 150)),
@@ -431,7 +488,10 @@ pub(super) fn render_todos_expanded(data: &InfoWidgetData, inner: Rect) -> Vec<L
 
     // Header with progress + inline pip meter
     let mut header = vec![
-        Span::styled("Todos ", Style::default().fg(rgb(180, 180, 190)).bold()),
+        Span::styled(
+            format!("{} ", todos_widget_label(data)),
+            Style::default().fg(rgb(180, 180, 190)).bold(),
+        ),
         Span::styled(
             format!("{}/{}", completed, total),
             Style::default().fg(rgb(140, 140, 150)),
@@ -526,7 +586,7 @@ pub(super) fn render_todos_compact(data: &InfoWidgetData, _inner: Rect) -> Vec<L
 
     vec![
         Line::from(vec![Span::styled(
-            "Todos",
+            todos_widget_label(data),
             Style::default().fg(rgb(180, 180, 190)).bold(),
         )]),
         Line::from(summary),

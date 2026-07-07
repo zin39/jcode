@@ -33,7 +33,7 @@ const WALK_SIZE: PhysicalSize<u32> = PhysicalSize::new(1280, 800);
 /// Additional sizes exercised by the render oracle to catch layout
 /// panics/overflows that only reproduce at small or narrow windows.
 const RENDER_ORACLE_SIZES: &[PhysicalSize<u32>] = &[
-    PhysicalSize::new(1280, 800),
+    WALK_SIZE,
     PhysicalSize::new(1000, 720),
     PhysicalSize::new(640, 400),
     PhysicalSize::new(320, 240),
@@ -371,9 +371,7 @@ fn check_escape_recovery(app: &DesktopApp) -> Option<String> {
         if outcome.is_err() {
             return Some(format!("escape recovery from {open} panicked"));
         }
-        if overlay_open(&probe.snapshot().surface).is_none() {
-            return None;
-        }
+        overlay_open(&probe.snapshot().surface)?;
     }
     Some(format!(
         "overlay {open} still open after {ESCAPE_RECOVERY_PRESSES} Escape presses"
@@ -433,14 +431,16 @@ fn walk_seed(
     queue.push_back((seed, 0, "<seed>".to_string()));
 
     while let Some((state, depth, path)) = queue.pop_front() {
-        if depth >= MAX_DEPTH
-            || visited.len() >= MAX_UNIQUE_STATES_PER_SEED
-            || started.elapsed() > SEED_TIME_BUDGET
+        if depth >= budget.max_depth
+            || visited.len() >= budget.max_unique_states
+            || started.elapsed() > budget.seed_time_budget
         {
             break;
         }
         for key in alphabet {
-            if visited.len() >= MAX_UNIQUE_STATES_PER_SEED || started.elapsed() > SEED_TIME_BUDGET {
+            if visited.len() >= budget.max_unique_states
+                || started.elapsed() > budget.seed_time_budget
+            {
                 break;
             }
             let mut next = clone_app(&state);

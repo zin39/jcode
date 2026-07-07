@@ -231,6 +231,12 @@ pub const KEYBINDING_DEFAULTS: &[KeybindingDefault] = &[
         other: PlatformDefault::dev("ctrl+shift+tab"),
     },
     KeybindingDefault {
+        id: "fallback_switch",
+        description: "Accept the post-error fallback offer (switch model/auth-method and resend)",
+        macos: PlatformDefault::dev("ctrl+y"),
+        other: PlatformDefault::dev("ctrl+y"),
+    },
+    KeybindingDefault {
         id: "effort_increase",
         description: "Increase reasoning effort",
         // macOS uses Cmd+Right so Option+Right stays free for word navigation.
@@ -322,9 +328,9 @@ pub const KEYBINDING_DEFAULTS: &[KeybindingDefault] = &[
     KeybindingDefault {
         id: "open_resume",
         description: "Open the /resume session picker",
-        // Cmd+R is free in jcode on macOS. On Windows/Linux, Ctrl+R is already
+        // Cmd+B is free in jcode on macOS. On Windows/Linux, Ctrl+R is already
         // taken by session recovery, so use Alt+R there.
-        macos: PlatformDefault::dev("cmd+r"),
+        macos: PlatformDefault::dev("cmd+b"),
         other: PlatformDefault::dev("alt+r"),
     },
 ];

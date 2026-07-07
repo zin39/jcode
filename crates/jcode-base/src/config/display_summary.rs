@@ -50,6 +50,7 @@ impl Config {
 - Debug socket: {}
 - Idle animation: {}
 - Prompt entry animation: {}
+- Compact notifications: {}
 - Chat native scrollbar: {}
 - Side panel native scrollbar: {}
 - Disabled animations: {}
@@ -57,6 +58,7 @@ impl Config {
 - Animation FPS: {}
 - Redraw FPS: {}
 - Copy badge Alt label: {}
+- Show agentgrep output: {}
 
 **Features:**
 - Memory: {}
@@ -162,6 +164,7 @@ impl Config {
             self.display.debug_socket,
             self.display.idle_animation,
             self.display.prompt_entry_animation,
+            self.display.compact_notifications,
             self.display.native_scrollbars.chat,
             self.display.native_scrollbars.side_panel,
             if self.display.disabled_animations.is_empty() {
@@ -181,6 +184,7 @@ impl Config {
             } else {
                 self.display.copy_badge_alt_label.trim()
             },
+            self.display.show_agentgrep_output,
             self.features.memory,
             self.features.swarm,
             self.features.message_timestamps,

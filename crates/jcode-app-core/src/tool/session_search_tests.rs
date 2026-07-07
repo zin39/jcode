@@ -219,6 +219,29 @@ fn bench_real_session_search_corpus() {
             report.truncated
         );
     }
+
+    // Repeat with external sources included; on real machines the external
+    // stores (codex/claude/etc.) are the dominant IO cost.
+    options.include_external = true;
+    for query in ["session_search", "nonexistentneedle123"] {
+        let start = Instant::now();
+        let report = search_sessions_blocking(
+            &sessions_dir,
+            &QueryProfile::new(query),
+            &options,
+            "benchmark-log-session",
+        )
+        .expect("search succeeds");
+        eprintln!(
+            "BENCH_EXTERNAL query={query} elapsed_ms={} scanned_jcode={} scanned_external={} sources={:?} results={} truncated={}",
+            start.elapsed().as_millis(),
+            report.scanned_jcode_sessions,
+            report.scanned_external_sessions,
+            report.external_sources,
+            report.results.len(),
+            report.truncated
+        );
+    }
 }
 
 #[test]
@@ -584,6 +607,51 @@ fn external_codex_sessions_are_searchable_without_jcode_session_dir() {
                 .iter()
                 .any(|line| line.text.contains("external after context"))
         );
+    });
+}
+
+#[test]
+fn external_cursor_sessions_are_searchable_without_jcode_session_dir() {
+    with_temp_home(|home| {
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let cursor_dir = home.join(format!(
+            "external/.cursor/projects/tmp-proj/agent-transcripts/{session_id}"
+        ));
+        std::fs::create_dir_all(&cursor_dir).expect("create cursor dir");
+        let lines = [
+            json!({
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "cursor before context"}]}
+            }),
+            json!({
+                "role": "assistant",
+                "message": {"content": [{"type": "text", "text": "external-cursor-needle answer"}]}
+            }),
+            json!({
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "cursor after context"}]}
+            }),
+        ];
+        let body = lines
+            .iter()
+            .map(|line| serde_json::to_string(line).expect("serialize cursor line"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(cursor_dir.join(format!("{session_id}.jsonl")), body)
+            .expect("write cursor jsonl");
+        std::fs::remove_dir_all(home.join("sessions")).expect("remove jcode sessions dir");
+
+        let mut options = SearchOptions::for_test("current-session");
+        options.source_filter = Some("cursor".to_string());
+        let report = run_report(home, "external-cursor-needle", &options);
+
+        assert_eq!(report.scanned_jcode_sessions, 0);
+        assert!(report.scanned_external_sessions >= 1);
+        assert_eq!(report.external_sources, vec!["cursor"]);
+        assert_eq!(report.results.len(), 1);
+        let result = &report.results[0];
+        assert_eq!(result.source, "cursor");
+        assert_eq!(result.session_id, format!("cursor:{session_id}"));
     });
 }
 

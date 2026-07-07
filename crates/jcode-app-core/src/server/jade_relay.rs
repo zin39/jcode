@@ -518,11 +518,14 @@ impl RelayClient {
                     self.config.session_id
                 );
             }
-            control.request_cancel();
+            let cancel_epoch = control.request_cancel();
             let reset_control = control.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(CANCEL_SIGNAL_RESET).await;
-                reset_control.reset_cancel();
+                // Epoch-guarded so a newer cancel (e.g. the user pressing Esc
+                // in an attached TUI) fired during the window is not erased
+                // before the running turn observes it (issue #428).
+                reset_control.reset_cancel_if_epoch(cancel_epoch);
             });
             ("signalled", Some(CANCEL_SIGNAL_RESET.as_millis() as u64))
         } else if live_agent {

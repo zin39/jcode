@@ -549,13 +549,8 @@ impl Tool for SelfDevTool {
             }
             "build-reload" | "build_reload" => {
                 if is_selfdev {
-                    self.do_build_reload(
-                        params.reason,
-                        params.target,
-                        params.context,
-                        &ctx,
-                    )
-                    .await
+                    self.do_build_reload(params.reason, params.target, params.context, &ctx)
+                        .await
                 } else {
                     Ok(ToolOutput::new(SelfDevTool::selfdev_only_action_message(
                         "build-reload",

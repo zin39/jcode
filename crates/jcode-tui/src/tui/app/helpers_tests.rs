@@ -73,24 +73,65 @@ fn partition_queued_messages_moves_system_messages_into_reminders() {
 fn inferred_reasoning_efforts_use_provider_specific_order_and_max_semantics() {
     assert_eq!(
         inferred_reasoning_efforts(Some("anthropic"), Some("claude-sonnet-4-6")),
-        vec!["none", "low", "medium", "high"]
+        vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "max",
+            "swarm",
+            "swarm-deep"
+        ]
     );
     assert_eq!(
         inferred_reasoning_efforts(Some("anthropic"), Some("claude-opus-4-7")),
-        vec!["none", "low", "medium", "high", "xhigh"]
+        vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "swarm",
+            "swarm-deep"
+        ]
     );
     assert_eq!(
         inferred_reasoning_efforts(Some("openrouter"), Some("anthropic/claude-sonnet-4.6")),
-        vec!["none", "low", "medium", "high", "xhigh"]
+        vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "swarm",
+            "swarm-deep"
+        ]
     );
     assert_eq!(
         inferred_reasoning_efforts(Some("openrouter"), Some("deepseek/deepseek-r1")),
-        vec!["none", "low", "medium", "high", "xhigh"],
+        vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "swarm",
+            "swarm-deep"
+        ],
         "OpenRouter uses unified reasoning where max is only an alias, not a cycle level"
     );
     assert_eq!(
         inferred_reasoning_efforts(Some("deepseek"), Some("deepseek-v4-pro")),
-        vec!["none", "low", "medium", "high", "max"],
+        vec![
+            "none",
+            "low",
+            "medium",
+            "high",
+            "max",
+            "swarm",
+            "swarm-deep"
+        ],
         "DeepSeek direct keeps max as a real provider level"
     );
     assert!(inferred_reasoning_efforts(Some("ollama"), Some("llama3")).is_empty());
@@ -146,8 +187,28 @@ fn resume_invocation_args_omits_blank_socket() {
     );
 }
 
+/// Pin JCODE_HOME to a tempdir containing a `builds/current/jcode` binary so
+/// `launch_client_executable()` resolves deterministically, independent of
+/// whether the developer machine has a published local build channel and of
+/// other tests mutating JCODE_HOME in parallel. Returns the guards that keep
+/// the environment pinned for the duration of the test.
+fn pinned_resume_test_home() -> (
+    std::sync::MutexGuard<'static, ()>,
+    tempfile::TempDir,
+    EnvVarGuard,
+) {
+    let env_lock = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let current = temp.path().join("builds").join("current");
+    std::fs::create_dir_all(&current).expect("create builds/current");
+    std::fs::write(current.join("jcode"), b"#!/bin/sh\n").expect("write fake jcode binary");
+    let home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    (env_lock, temp, home)
+}
+
 #[test]
 fn build_resume_command_uses_imported_jcode_session_for_claude_code() {
+    let _pinned = pinned_resume_test_home();
     let (program, args, title) = build_resume_command(
         &ResumeTarget::ClaudeCodeSession {
             session_id: "claude-session-123".to_string(),
@@ -174,6 +235,7 @@ fn build_resume_command_uses_imported_jcode_session_for_claude_code() {
 
 #[test]
 fn build_resume_command_uses_imported_jcode_session_for_codex() {
+    let _pinned = pinned_resume_test_home();
     let (program, args, title) = build_resume_command(
         &ResumeTarget::CodexSession {
             session_id: "codex-session-123".to_string(),
@@ -400,4 +462,32 @@ fn fresh_session_command_omits_blank_socket() {
     assert_eq!(command.args, vec!["--fresh-spawn".to_string()]);
     let command = super::build_fresh_session_command(None);
     assert_eq!(command.args, vec!["--fresh-spawn".to_string()]);
+}
+
+/// Regression for issue #424: `Instant::now() - Duration` panics with
+/// "overflow when subtracting duration from instant" when the monotonic clock
+/// epoch (boot time) is more recent than the backdate amount. `backdated_now`
+/// must saturate instead of panicking, and still return a value in the past
+/// when possible so TTL checks treat the entry as expired.
+#[test]
+fn backdated_now_never_panics_and_prefers_past_instants() {
+    use std::time::{Duration, Instant};
+
+    let now = Instant::now();
+
+    // Typical case: small backdate should land in the past.
+    let recent = super::backdated_now(Duration::from_millis(10));
+    assert!(recent <= now, "backdated instant must not be in the future");
+
+    // Huge backdate (longer than any plausible uptime) must not panic and
+    // must still return something no later than now.
+    let ancient = super::backdated_now(Duration::from_secs(60 * 60 * 24 * 365 * 100));
+    assert!(
+        ancient <= now,
+        "saturated backdate must not be in the future"
+    );
+
+    // Zero backdate is a no-op.
+    let zero = super::backdated_now(Duration::ZERO);
+    assert!(zero <= Instant::now());
 }

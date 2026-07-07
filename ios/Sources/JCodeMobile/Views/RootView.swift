@@ -7,13 +7,16 @@ struct RootView: View {
     @State private var deepLinkError: String?
 
     var body: some View {
-        ZStack {
-            Theme.background.ignoresSafeArea()
-            if model.activeServer == nil {
-                PairingView()
-            } else {
-                ChatView()
+        GeometryReader { proxy in
+            ZStack {
+                Theme.background.ignoresSafeArea()
+                if model.activeServer == nil {
+                    PairingView()
+                } else {
+                    ChatView()
+                }
             }
+            .environment(\.compactEdgePads, CompactEdgePads(safeArea: proxy.safeAreaInsets))
         }
         .task {
             // Auto-connect to the most recent server on launch.
@@ -51,19 +54,23 @@ struct StatusPill: View {
     let phase: ConnectionPhase
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Circle()
                 .fill(color)
                 .frame(width: 8, height: 8)
+                .accessibilityHidden(true)
             Text(label)
                 .font(Theme.mono(12))
                 .foregroundStyle(Theme.textSecondary)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 4)
         .background(Theme.surface)
         .clipShape(Capsule())
         .overlay(Capsule().stroke(Theme.border, lineWidth: 1))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Connection")
+        .accessibilityValue(label)
     }
 
     private var color: Color {
@@ -91,9 +98,10 @@ struct ErrorBanner: View {
     let dismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(Theme.error)
+                .accessibilityHidden(true)
             Text(message)
                 .font(.footnote)
                 .foregroundStyle(Theme.textPrimary)
@@ -103,15 +111,90 @@ struct ErrorBanner: View {
                 Image(systemName: "xmark")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Theme.textSecondary)
+                    .frame(width: 44, height: 44)
             }
+            .accessibilityLabel("Dismiss error")
+            .accessibilityHint("Hides this error message")
         }
         .padding(12)
         .background(Theme.error.opacity(0.12))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 14)
                 .stroke(Theme.error.opacity(0.35), lineWidth: 1)
         )
         .padding(.horizontal)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Stack of dismissible notices for out-of-band server signals
+/// (push notifications, interrupts, context compaction).
+struct NoticeStack: View {
+    let notices: [Notice]
+    let onDismiss: (UUID) -> Void
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ForEach(notices) { notice in
+                NoticeRow(notice: notice) { onDismiss(notice.id) }
+            }
+        }
+        .padding(.horizontal)
+    }
+}
+
+private struct NoticeRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let notice: Notice
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
+            Text(notice.message)
+                .font(.footnote)
+                .foregroundStyle(Theme.textPrimary)
+                .lineLimit(3)
+            Spacer(minLength: 0)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.textSecondary)
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Dismiss notice")
+            .accessibilityHint("Hides this notice")
+        }
+        .padding(12)
+        .background(tint.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(tint.opacity(0.35), lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+        // Honor Reduce Motion: skip the slide/fade for motion-sensitive users.
+        .transition(reduceMotion
+            ? .opacity
+            : .move(edge: .top).combined(with: .opacity))
+    }
+
+    private var icon: String {
+        switch notice.kind {
+        case .info: "info.circle.fill"
+        case .notification: "bell.fill"
+        case .compaction: "arrow.down.right.and.arrow.up.left"
+        }
+    }
+
+    private var tint: Color {
+        switch notice.kind {
+        case .info: Theme.textSecondary
+        case .notification: Theme.mint
+        case .compaction: Theme.warning
+        }
     }
 }

@@ -143,14 +143,53 @@ fn format_file_activity_message(
     message
 }
 
+/// Single-line file-activity body for compact notifications mode: keeps the
+/// compacted path and the summary line, dropping the intent and diff preview.
+fn format_file_activity_message_compact(
+    path: &str,
+    operation: &str,
+    summary: Option<&str>,
+) -> String {
+    format!(
+        "`{}` · {}",
+        compact_swarm_path(path),
+        file_activity_summary_line(operation, summary)
+    )
+}
+
 pub(super) fn present_swarm_notification(
     sender: &str,
     notification_type: &NotificationType,
     message: &str,
+    compact: bool,
+) -> SwarmNotificationPresentation {
+    let mut presentation =
+        present_swarm_notification_inner(sender, notification_type, message, compact);
+    // Sender-provided tldr: store the full body but render it collapsed to the
+    // tldr line with an expand control. The status line shows the tldr too.
+    if let NotificationType::Message {
+        tldr: Some(tldr), ..
+    } = notification_type
+    {
+        let tldr = tldr.trim();
+        if !tldr.is_empty() && !presentation.message.trim().is_empty() {
+            presentation.status_notice = format!("{} · {}", presentation.status_notice, tldr);
+            presentation.message =
+                jcode_tui_messages::encode_collapsible_swarm_content(tldr, &presentation.message);
+        }
+    }
+    presentation
+}
+
+fn present_swarm_notification_inner(
+    sender: &str,
+    notification_type: &NotificationType,
+    message: &str,
+    compact: bool,
 ) -> SwarmNotificationPresentation {
     let trimmed = message.trim();
     match notification_type {
-        NotificationType::Message { scope, channel } => match scope.as_deref() {
+        NotificationType::Message { scope, channel, .. } => match scope.as_deref() {
             Some("dm") => {
                 if let Some(task_body) =
                     strip_message_prefix(trimmed, "Task assigned to you by coordinator: ")
@@ -215,6 +254,15 @@ pub(super) fn present_swarm_notification(
                     "Background task update".to_string()
                 },
             },
+            Some("swarm_await") => SwarmNotificationPresentation {
+                title: "🐝 Swarm await".to_string(),
+                message: strip_message_prefix(trimmed, "🐝 **Swarm await finished**")
+                    .map(str::trim)
+                    .filter(|body| !body.is_empty())
+                    .unwrap_or(trimmed)
+                    .to_string(),
+                status_notice: "Swarm await finished".to_string(),
+            },
             Some(other) => SwarmNotificationPresentation {
                 title: format!("{} · {}", capitalize(other), sender),
                 message: trimmed.to_string(),
@@ -239,13 +287,17 @@ pub(super) fn present_swarm_notification(
             detail,
         } => SwarmNotificationPresentation {
             title: format!("File activity · {}", sender),
-            message: format_file_activity_message(
-                path,
-                operation,
-                intent.as_deref(),
-                summary.as_deref(),
-                detail.as_deref(),
-            ),
+            message: if compact {
+                format_file_activity_message_compact(path, operation, summary.as_deref())
+            } else {
+                format_file_activity_message(
+                    path,
+                    operation,
+                    intent.as_deref(),
+                    summary.as_deref(),
+                    detail.as_deref(),
+                )
+            },
             status_notice: format!("File activity · {}", compact_swarm_path(path)),
         },
     }
@@ -271,14 +323,59 @@ mod tests {
     }
 
     #[test]
+    fn present_swarm_notification_with_tldr_encodes_collapsed_content() {
+        let presentation = present_swarm_notification(
+            "sheep",
+            &NotificationType::Message {
+                scope: Some("dm".to_string()),
+                channel: None,
+                tldr: Some("fixed the flaky test".to_string()),
+            },
+            "DM from sheep: The flaky test was caused by a race in the setup helper. I rewrote it to use a barrier and verified 200 consecutive runs pass.",
+            false,
+        );
+
+        let parsed = jcode_tui_messages::parse_collapsible_swarm_content(&presentation.message)
+            .expect("tldr message should encode collapsible content");
+        assert!(!parsed.expanded);
+        assert_eq!(parsed.tldr, "fixed the flaky test");
+        assert!(parsed.body.contains("race in the setup helper"));
+        assert!(
+            presentation.status_notice.contains("fixed the flaky test"),
+            "{}",
+            presentation.status_notice
+        );
+    }
+
+    #[test]
+    fn present_swarm_notification_without_tldr_keeps_plain_content() {
+        let presentation = present_swarm_notification(
+            "sheep",
+            &NotificationType::Message {
+                scope: Some("dm".to_string()),
+                channel: None,
+                tldr: None,
+            },
+            "DM from sheep: short note",
+            false,
+        );
+        assert!(
+            jcode_tui_messages::parse_collapsible_swarm_content(&presentation.message).is_none()
+        );
+        assert_eq!(presentation.message, "short note");
+    }
+
+    #[test]
     fn present_swarm_notification_formats_task_assignments_as_tasks() {
         let presentation = present_swarm_notification(
             "sheep",
             &NotificationType::Message {
                 scope: Some("dm".to_string()),
                 channel: None,
+                tldr: None,
             },
             "Task assigned to you by coordinator: Implement compaction asymptotic fixes - You own the compaction task.",
+            false,
         );
 
         assert_eq!(presentation.title, "Task · sheep");
@@ -290,14 +387,37 @@ mod tests {
     }
 
     #[test]
+    fn present_swarm_notification_formats_swarm_await_scope_with_bee_title() {
+        let presentation = present_swarm_notification(
+            "swarm await",
+            &NotificationType::Message {
+                scope: Some("swarm_await".to_string()),
+                channel: None,
+                tldr: None,
+            },
+            "🐝 **Swarm await finished**\n\nAll members done. All 2 members are done: fox, wolf",
+            false,
+        );
+
+        assert_eq!(presentation.title, "🐝 Swarm await");
+        assert_eq!(
+            presentation.message,
+            "All members done. All 2 members are done: fox, wolf"
+        );
+        assert_eq!(presentation.status_notice, "Swarm await finished");
+    }
+
+    #[test]
     fn present_swarm_notification_formats_background_task_scope_cleanly() {
         let presentation = present_swarm_notification(
             "background task",
             &NotificationType::Message {
                 scope: Some("background_task".to_string()),
                 channel: None,
+                tldr: None,
             },
             "Background task failed · selfdev-build · exit 101",
+            false,
         );
 
         assert_eq!(presentation.title, "Background task");
@@ -315,8 +435,10 @@ mod tests {
             &NotificationType::Message {
                 scope: Some("background_task".to_string()),
                 channel: None,
+                tldr: None,
             },
             "**Background task progress** `bg123` · `bash`\n\n[#####-------] 42% · Running tests (reported)",
+            false,
         );
 
         assert_eq!(presentation.title, "Background task progress");
@@ -333,8 +455,10 @@ mod tests {
             &NotificationType::Message {
                 scope: Some("dm".to_string()),
                 channel: None,
+                tldr: None,
             },
             "DM from sheep: I can see your worktree diff.",
+            false,
         );
 
         assert_eq!(presentation.title, "DM from sheep");
@@ -349,8 +473,10 @@ mod tests {
             &NotificationType::Message {
                 scope: Some("plan".to_string()),
                 channel: None,
+                tldr: None,
             },
             "Plan updated by sheep (4 items, v1)",
+            false,
         );
 
         assert_eq!(presentation.title, "Plan · sheep");
@@ -370,6 +496,7 @@ mod tests {
                 detail: Some("323- old line\n323+ new line".to_string()),
             },
             "⚠ File activity: /home/jeremy/jcode/src/tool/communicate.rs - moss just edited this file you previously worked with: edited lines 323-348 (1 occurrence)",
+            false,
         );
 
         assert_eq!(presentation.title, "File activity · moss");
@@ -392,6 +519,47 @@ mod tests {
             presentation
                 .message
                 .contains("```text\n323- old line\n323+ new line\n```")
+        );
+        assert_eq!(
+            presentation.status_notice,
+            "File activity · …/jcode/src/tool/communicate.rs"
+        );
+    }
+
+    #[test]
+    fn present_swarm_notification_compact_mode_collapses_file_activity_to_single_line() {
+        let presentation = present_swarm_notification(
+            "moss",
+            &NotificationType::FileConflict {
+                path: "/home/jeremy/jcode/src/tool/communicate.rs".to_string(),
+                operation: "edited".to_string(),
+                intent: Some("wire swarm intent display".to_string()),
+                summary: Some("edited lines 323-348 (1 occurrence)".to_string()),
+                detail: Some("323- old line\n323+ new line".to_string()),
+            },
+            "⚠ File activity: /home/jeremy/jcode/src/tool/communicate.rs - moss just edited this file you previously worked with: edited lines 323-348 (1 occurrence)",
+            true,
+        );
+
+        assert_eq!(presentation.title, "File activity · moss");
+        assert_eq!(
+            presentation.message,
+            "`…/jcode/src/tool/communicate.rs` · Edited lines 323-348 (1 occurrence)"
+        );
+        assert!(
+            !presentation.message.contains('\n'),
+            "compact file activity body should be a single line: {:?}",
+            presentation.message
+        );
+        assert!(
+            !presentation.message.contains("Intent:"),
+            "compact mode should drop the intent line: {:?}",
+            presentation.message
+        );
+        assert!(
+            !presentation.message.contains("```"),
+            "compact mode should drop the diff preview: {:?}",
+            presentation.message
         );
         assert_eq!(
             presentation.status_notice,

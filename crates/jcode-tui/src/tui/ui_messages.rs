@@ -50,7 +50,11 @@ pub(crate) fn render_assistant_message(
 ) -> Vec<Line<'static>> {
     let centered = markdown::center_code_blocks();
     let wrap_width = centered_wrap_width(width, centered, 96);
-    let mut lines = markdown::render_markdown_with_width(&msg.content, Some(wrap_width));
+    let mut lines = if let Some(segments) = split_plan_segments(&msg.content) {
+        render_assistant_segments(&segments, width, wrap_width)
+    } else {
+        markdown::render_markdown_with_width(&msg.content, Some(wrap_width))
+    };
     if centered {
         markdown::recenter_structured_blocks_for_display(&mut lines, width as usize);
     }
@@ -69,6 +73,192 @@ pub(crate) fn render_assistant_message(
         ));
     }
     lines
+}
+
+/// One piece of an assistant message that contains ```plan fenced blocks:
+/// either ordinary markdown text or the inner markdown of a plan block.
+#[derive(Debug, PartialEq, Eq)]
+enum AssistantSegment {
+    Markdown(String),
+    Plan(String),
+}
+
+/// Split assistant content into markdown/plan segments when it contains at
+/// least one ```plan fenced block. Returns `None` when there is no plan block
+/// so the common path stays on the plain markdown renderer.
+fn split_plan_segments(content: &str) -> Option<Vec<AssistantSegment>> {
+    if !content.contains("```plan") {
+        return None;
+    }
+
+    let mut segments: Vec<AssistantSegment> = Vec::new();
+    let mut current = String::new();
+    let mut plan_body: Option<String> = None;
+    let mut plan_nested_fence = false;
+    let mut in_other_fence = false;
+    let mut saw_plan = false;
+
+    for line in content.split('\n') {
+        let trimmed = line.trim_start();
+        if let Some(body) = plan_body.as_mut() {
+            let is_fence_line = trimmed.starts_with("```");
+            let is_bare_fence = is_fence_line && trimmed.trim_end() == "```";
+            if is_bare_fence && !plan_nested_fence {
+                let body = plan_body.take().unwrap_or_default();
+                segments.push(AssistantSegment::Plan(body));
+            } else {
+                if is_fence_line {
+                    // A nested fenced block inside the plan (e.g. ```bash ...
+                    // ```). Its closing bare fence must not end the plan.
+                    plan_nested_fence = !plan_nested_fence;
+                }
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(line);
+            }
+            continue;
+        }
+
+        if !in_other_fence
+            && trimmed
+                .strip_prefix("```plan")
+                .is_some_and(|rest| rest.trim().is_empty())
+        {
+            saw_plan = true;
+            plan_nested_fence = false;
+            if !current.trim().is_empty() {
+                segments.push(AssistantSegment::Markdown(std::mem::take(&mut current)));
+            } else {
+                current.clear();
+            }
+            plan_body = Some(String::new());
+            continue;
+        }
+
+        if trimmed.starts_with("```") {
+            in_other_fence = !in_other_fence;
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+
+    // Unterminated plan fence (e.g. mid-stream): render what we have as a card.
+    if let Some(body) = plan_body.take() {
+        segments.push(AssistantSegment::Plan(body));
+    }
+    if !current.trim().is_empty() {
+        segments.push(AssistantSegment::Markdown(current));
+    }
+
+    saw_plan.then_some(segments)
+}
+
+fn render_assistant_segments(
+    segments: &[AssistantSegment],
+    width: u16,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for segment in segments {
+        match segment {
+            AssistantSegment::Markdown(text) => {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.extend(markdown::render_markdown_with_width(text, Some(wrap_width)));
+            }
+            AssistantSegment::Plan(body) => {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.extend(render_plan_card(body, width));
+            }
+        }
+    }
+    lines
+}
+
+/// Render the inner markdown of a ```plan block as a bordered plan card.
+fn render_plan_card(body: &str, width: u16) -> Vec<Line<'static>> {
+    let border_style = Style::default().fg(rgb(158, 135, 255));
+    let max_box_width = (width.saturating_sub(4) as usize).clamp(28, 100);
+    let inner_width = max_box_width.saturating_sub(4).max(8);
+
+    let title = plan_card_title(body);
+    let body_without_title = plan_card_body_without_title(body, &title);
+
+    // `render_markdown_with_width` sizes block elements (code, tables, rules)
+    // but does not hard-wrap paragraph text; the normal message path wraps
+    // later in the pipeline. The card boxes its content immediately and
+    // `render_rounded_box` truncates over-long lines, so wrap here to avoid
+    // cutting plan text off at the border.
+    let rendered = markdown::render_markdown_with_width(&body_without_title, Some(inner_width));
+    let mut content: Vec<Line<'static>> = markdown::wrap_lines(rendered, inner_width);
+    // Trim leading/trailing blank rows inside the card.
+    while content.first().is_some_and(|line| line.width() == 0) {
+        content.remove(0);
+    }
+    while content.last().is_some_and(|line| line.width() == 0) {
+        content.pop();
+    }
+    if content.is_empty() {
+        content.push(Line::from(Span::styled(
+            "(empty plan)",
+            Style::default().fg(dim_color()),
+        )));
+    }
+
+    render_rounded_box(&title, content, max_box_width, border_style)
+}
+
+/// Title for the plan card: the first markdown heading in the body, else "Plan".
+fn plan_card_title(body: &str) -> String {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed
+            .strip_prefix("# ")
+            .or_else(|| trimmed.strip_prefix("## "))
+            .or_else(|| trimmed.strip_prefix("### "))
+        {
+            let heading = heading.trim();
+            if !heading.is_empty() {
+                return format!("⛭ {}", heading);
+            }
+        }
+        if !trimmed.is_empty() {
+            break;
+        }
+    }
+    "⛭ Plan".to_string()
+}
+
+/// Remove the first heading line when it was promoted to the card title.
+fn plan_card_body_without_title(body: &str, title: &str) -> String {
+    if title == "⛭ Plan" {
+        return body.to_string();
+    }
+    let mut removed = false;
+    body.lines()
+        .filter(|line| {
+            if removed {
+                return true;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            if trimmed.starts_with('#') {
+                removed = true;
+                return false;
+            }
+            removed = true;
+            true
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render a collapsed/collapsing reasoning trace ("current" mode). The content is
@@ -252,6 +442,62 @@ fn render_plaintext_lines(content: &str, wrap_width: usize) -> Vec<Line<'static>
         lines.push(Line::from(String::new()));
     }
     lines
+}
+
+/// Render the full agentgrep tool output inline beneath the tool summary line.
+/// Each output line is prefixed with a dim left border and indented so it reads
+/// as a nested block. Long lines are hard-split to the available width and the
+/// block is capped so a giant search result cannot flood the transcript.
+fn render_agentgrep_output_body(content: &str, row_width: usize) -> Vec<Line<'static>> {
+    const MAX_BODY_LINES: usize = 400;
+    let border = "    │ ";
+    let border_width = UnicodeWidthStr::width(border);
+    let avail = row_width.saturating_sub(border_width).max(1);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let source_lines: Vec<&str> = content.split('\n').collect();
+    let total = source_lines.len();
+    let mut truncated_extra = 0usize;
+
+    for raw_line in source_lines {
+        if out.len() >= MAX_BODY_LINES {
+            truncated_extra = total.saturating_sub(out.len());
+            break;
+        }
+        let raw_line = raw_line.trim_end_matches('\r');
+        if raw_line.is_empty() {
+            out.push(Line::from(Span::styled(
+                border.to_string(),
+                Style::default().fg(dim_color()),
+            )));
+            continue;
+        }
+        if UnicodeWidthStr::width(raw_line) <= avail {
+            out.push(Line::from(vec![
+                Span::styled(border.to_string(), Style::default().fg(dim_color())),
+                Span::styled(raw_line.to_string(), Style::default().fg(dim_color())),
+            ]));
+        } else {
+            for chunk in split_by_display_width(raw_line, avail) {
+                if out.len() >= MAX_BODY_LINES {
+                    break;
+                }
+                out.push(Line::from(vec![
+                    Span::styled(border.to_string(), Style::default().fg(dim_color())),
+                    Span::styled(chunk, Style::default().fg(dim_color())),
+                ]));
+            }
+        }
+    }
+
+    if truncated_extra > 0 {
+        out.push(Line::from(Span::styled(
+            format!("    │ … {} more lines …", truncated_extra),
+            Style::default().fg(dim_color()),
+        )));
+    }
+
+    out
 }
 
 pub(crate) fn render_system_message(
@@ -1234,23 +1480,36 @@ pub(crate) fn render_background_task_message(
         &parsed.tool_name,
         parsed.display_name.as_deref(),
     );
+    let is_swarm = parsed.tool_name == "swarm";
     let (title, border_color, status_color, preview_color) = if parsed.status.starts_with('✓') {
         (
-            format!("✓ bg {} completed · {}", task_label, parsed.task_id),
+            if is_swarm {
+                format!("🐝 {} completed · {}", task_label, parsed.task_id)
+            } else {
+                format!("✓ bg {} completed · {}", task_label, parsed.task_id)
+            },
             rgb(100, 180, 100),
             rgb(120, 210, 140),
             rgb(214, 240, 220),
         )
     } else if parsed.status.starts_with('✗') {
         (
-            format!("✗ bg {} failed · {}", task_label, parsed.task_id),
+            if is_swarm {
+                format!("🐝 {} failed · {}", task_label, parsed.task_id)
+            } else {
+                format!("✗ bg {} failed · {}", task_label, parsed.task_id)
+            },
             rgb(220, 100, 100),
             rgb(255, 150, 150),
             rgb(255, 225, 225),
         )
     } else {
         (
-            format!("◌ bg {} running · {}", task_label, parsed.task_id),
+            if is_swarm {
+                format!("🐝 {} running · {}", task_label, parsed.task_id)
+            } else {
+                format!("◌ bg {} running · {}", task_label, parsed.task_id)
+            },
             rgb(255, 193, 94),
             rgb(255, 214, 120),
             rgb(255, 241, 214),
@@ -1414,6 +1673,8 @@ fn render_background_task_progress_message(
         progress.task_id == "refresh-model-list" && progress.tool_name == "catalog";
     let title = if is_model_refresh {
         format!("◌ model refresh · {}", task_label)
+    } else if progress.tool_name == "swarm" {
+        format!("🐝 {} · {}", task_label, progress.task_id)
     } else {
         format!("◌ bg {} · {}", task_label, progress.task_id)
     };
@@ -1452,10 +1713,22 @@ fn swarm_notification_style(title: Option<&str>) -> (&'static str, Color, Color)
         t if t.starts_with("Shared context") => ("🧠", rgb(120, 210, 160), rgb(221, 247, 232)),
         t if t.starts_with("File activity") => ("⚠", rgb(255, 160, 120), rgb(255, 228, 214)),
         t if t.starts_with("Task") => ("⚑", rgb(130, 184, 255), rgb(220, 236, 255)),
-        t if t.starts_with("Plan") => ("☰", rgb(186, 139, 255), rgb(238, 228, 255)),
+        // U+2261 IDENTICAL TO, not U+2630 TRIGRAM FOR HEAVEN: the trigram
+        // changed from narrow to wide in Unicode 16, so terminals with newer
+        // width tables (kitty >= 0.40) render it 2 cells wide while
+        // unicode-width crates pinned to older Unicode call it 1. That one-cell
+        // disagreement shears every row it appears on (issue seen 2026-07-02:
+        // info-widget borders pushed off-screen). Stick to glyphs whose width
+        // is stable across Unicode versions.
+        t if t.starts_with("Plan") => ("≡", rgb(186, 139, 255), rgb(238, 228, 255)),
         _ => ("◦", rgb(160, 160, 180), rgb(225, 225, 235)),
     }
 }
+
+/// Trailing badge text appended to a collapsed swarm tldr line. Kept as
+/// constants so click hit-testing and rendering stay in sync.
+pub(crate) const SWARM_EXPAND_BADGE: &str = "▸ expand";
+pub(crate) const SWARM_COLLAPSE_BADGE: &str = "▾ collapse";
 
 pub(crate) fn render_swarm_message(
     msg: &DisplayMessage,
@@ -1464,7 +1737,16 @@ pub(crate) fn render_swarm_message(
 ) -> Vec<Line<'static>> {
     let centered = markdown::center_code_blocks();
     let title = msg.title.as_deref().unwrap_or("Swarm").trim();
-    let content = msg.content.trim();
+    let collapsible = jcode_tui_messages::parse_collapsible_swarm_content(&msg.content);
+    let (content, tldr_line): (String, Option<(String, bool)>) = match collapsible {
+        Some(parsed) if !parsed.expanded => (String::new(), Some((parsed.tldr.to_string(), false))),
+        Some(parsed) => (
+            parsed.body.trim().to_string(),
+            Some((parsed.tldr.to_string(), true)),
+        ),
+        None => (msg.content.trim().to_string(), None),
+    };
+    let content = content.as_str();
     let (icon, rail_color, text_color) = swarm_notification_style(msg.title.as_deref());
     let rail_style = Style::default().fg(rail_color);
     let header_style = Style::default().fg(rail_color).bold();
@@ -1489,24 +1771,82 @@ pub(crate) fn render_swarm_message(
         Span::styled(format!("{} {}", icon, title), header_style),
     ]));
 
+    // Collapsed/expanded tldr line with its toggle badge. The badge is a
+    // click target (see `swarm_expand_target_from_screen`) and must stay the
+    // trailing token of this line.
+    if let Some((tldr, expanded)) = &tldr_line {
+        let badge = if *expanded {
+            SWARM_COLLAPSE_BADGE
+        } else {
+            SWARM_EXPAND_BADGE
+        };
+        lines.push(Line::from(vec![
+            Span::styled("│ ", rail_style),
+            Span::styled(tldr.clone(), body_style),
+            Span::styled(
+                format!("  {}", badge),
+                Style::default().fg(rail_color).dim(),
+            ),
+        ]));
+    }
+
     let mut body_lines = if content.is_empty() {
-        vec![Line::from(Span::styled(String::new(), body_style))]
+        if tldr_line.is_some() {
+            Vec::new()
+        } else {
+            vec![Line::from(Span::styled(String::new(), body_style))]
+        }
     } else {
         markdown::render_markdown_with_width(content, Some(content_width))
     };
 
     if !content.is_empty() {
+        // Mermaid/image placeholders must survive untouched: the marker has to
+        // stay the first non-empty span (no rail prefix) and the blank fill
+        // rows after it reserve the image's height, so they are exempt from
+        // the blank-line cleanup below.
+        let mut placeholder_fill_rows = 0usize;
+        let placeholder_exempt: Vec<bool> = body_lines
+            .iter()
+            .map(|line| {
+                if let Some((_, rows, _)) = mermaid::parse_inline_image_placeholder(line) {
+                    placeholder_fill_rows = rows.saturating_sub(1) as usize;
+                    true
+                } else if placeholder_fill_rows > 0 {
+                    placeholder_fill_rows -= 1;
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+        let mut keep = placeholder_exempt.iter();
         body_lines.retain(|line| {
-            line.spans
-                .iter()
-                .any(|span| !span.content.trim().is_empty())
+            *keep.next().unwrap_or(&false)
+                || line
+                    .spans
+                    .iter()
+                    .any(|span| !span.content.trim().is_empty())
         });
         if body_lines.is_empty() {
             body_lines.push(Line::from(Span::styled(content.to_string(), body_style)));
         }
     }
 
-    for line in &mut body_lines {
+    let mut placeholder_fill_rows = 0usize;
+    for line in body_lines {
+        // Placeholder lines bypass the rail/color pass entirely.
+        if let Some((_, rows, _)) = mermaid::parse_inline_image_placeholder(&line) {
+            placeholder_fill_rows = rows.saturating_sub(1) as usize;
+            lines.push(line);
+            continue;
+        }
+        if placeholder_fill_rows > 0 {
+            placeholder_fill_rows -= 1;
+            lines.push(line);
+            continue;
+        }
+        let mut line = line;
         if line.spans.is_empty() {
             line.spans.push(Span::styled(String::new(), body_style));
         }
@@ -1515,16 +1855,24 @@ pub(crate) fn render_swarm_message(
                 span.style.fg = Some(text_color);
             }
         }
-    }
-
-    for line in body_lines {
         let mut spans = vec![Span::styled("│ ", rail_style)];
         spans.extend(line.spans);
         lines.push(Line::from(spans));
     }
 
     let mut wrapped_lines = Vec::new();
+    let mut wrap_fill_rows = 0usize;
     for line in lines {
+        if let Some((_, rows, _)) = mermaid::parse_inline_image_placeholder(&line) {
+            wrap_fill_rows = rows.saturating_sub(1) as usize;
+            wrapped_lines.push(line);
+            continue;
+        }
+        if wrap_fill_rows > 0 {
+            wrap_fill_rows -= 1;
+            wrapped_lines.push(line);
+            continue;
+        }
         wrapped_lines.extend(markdown::wrap_line(line, block_wrap_width));
     }
 
@@ -1797,6 +2145,18 @@ pub(crate) fn render_tool_message(
     );
     let rendered_tool_line_text = super::line_plain_text(&rendered_tool_line);
     lines.push(rendered_tool_line);
+
+    // Optionally render the full agentgrep search output inline in the
+    // transcript. Gated behind `display.show_agentgrep_output` (default false)
+    // so most users keep the compact one-line summary.
+    if tools_ui::canonical_tool_name(&tc.name) == "agentgrep"
+        && crate::config::config().display.show_agentgrep_output
+        && !msg.content.trim().is_empty()
+    {
+        for line in render_agentgrep_output_body(&msg.content, row_width) {
+            lines.push(line);
+        }
+    }
 
     if tools_ui::canonical_tool_name(&tc.name) == "bash"
         && !rendered_tool_line_text.contains('$')

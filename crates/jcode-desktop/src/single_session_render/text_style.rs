@@ -647,10 +647,9 @@ pub(super) fn assistant_markdown_list_marker_span(
             rest.chars().take(2).map(char::len_utf8).sum(),
             MARKDOWN_LIST_MARKER_COLOR,
         )
-    } else if let Some(marker_len) = ordered_list_marker_len(rest) {
-        (marker_len, MARKDOWN_LIST_MARKER_COLOR)
     } else {
-        return None;
+        let marker_len = ordered_list_marker_len(rest)?;
+        (marker_len, MARKDOWN_LIST_MARKER_COLOR)
     };
 
     Some(AssistantMarkdownListMarkerSpan {

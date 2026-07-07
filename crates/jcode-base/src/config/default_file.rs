@@ -66,6 +66,11 @@ diagram_pane_toggle = "alt+t"
 typing_scroll_lock_toggle = "alt+s"
 diff_mode_cycle = "alt+g"
 info_widget_toggle = "alt+i"
+# Focus the inline swarm panel (list of agents this session manages). Press
+# again to cycle agents. While focused: alt+↑/↓ select, alt+o pops the agent
+# out to a new terminal, esc exits. Plain typing still goes to the chat input.
+# Active only with agents.swarm_spawn_mode = "inline".
+swarm_panel_focus = "alt+n"
 
 # Spawn a fresh jcode session in a new terminal window, reusing the current
 # session's working directory. Companion to the system-wide launch hotkeys.
@@ -78,8 +83,8 @@ info_widget_toggle = "alt+i"
 # new_terminal = "cmd+shift+;"
 
 # Open the /resume session picker.
-# Default: Cmd+R on macOS, Alt+R on Windows/Linux. Set "" to disable.
-# open_resume = "cmd+r"
+# Default: Cmd+B on macOS, Alt+R on Windows/Linux. Set "" to disable.
+# open_resume = "cmd+b"
 
 # /resume picker Enter behavior. Options: "current-terminal" or "new-terminal".
 # By default Enter resumes in this terminal; Ctrl+Enter performs the alternate action.
@@ -150,6 +155,20 @@ idle_animation = true
 # Briefly animate a user prompt line when it enters the viewport (default: true)
 prompt_entry_animation = true
 
+# Render swarm/file-activity notifications in a compact single-line form
+# instead of the full multi-line card with diff preview (default: false)
+# compact_notifications = false
+
+# Show the full agentgrep tool output inline in the transcript instead of just
+# the one-line summary (default: false). Useful when you want to read search
+# results directly in the chat.
+# show_agentgrep_output = false
+
+# Occasionally surface a "learn this keybinding" nudge (in a distinct color)
+# when you keep doing something the slow way (e.g. /resume) instead of using
+# its configured shortcut. Set false to disable all such hints (default: true).
+# keybinding_hints = true
+
 # Disable specific animation variants by name.
 # Examples: ["donut"] or ["donut", "orbit_rings"]
 # Legacy aliases such as "three_rings" and "gyroscope" are still accepted.
@@ -190,12 +209,24 @@ kv_cache_miss_notices = true
 # Update channel: "stable" (releases only) or "main" (latest commits on push)
 # Set to "main" for bleeding edge updates every time code is pushed
 update_channel = "stable"
+# Web grounding: instruct the agent to verify uncertain or fast-changing facts
+# with a websearch (using the websearch tool) instead of answering from memory.
+# Reduces hallucinations at the cost of extra searches. Default: off.
+web_grounding = false
 
 [websearch]
-# Preferred websearch engine: "duckduckgo", "bing", or "searxng".
-engine = "duckduckgo"
-# Keyless HTML engines to try if the preferred engine fails. Default falls back to Bing HTML.
-fallback_engines = ["bing"]
+# Preferred websearch engine: "hybrid" (default), "tavily", "last30days",
+# "duckduckgo", "bing", or "searxng".
+#
+# hybrid runs Tavily (fast, keyed) and the last30days skill (deep social:
+# Reddit/HN/GitHub/etc.) concurrently, cross-verifies their results (pages found
+# by both engines are marked "verified" and float to the top), and returns one
+# best-first ranking. If a leg has no key / is not installed it is skipped; if
+# both legs fail the fallback_engines below are used.
+engine = "hybrid"
+# Engines to try if the preferred engine fails. Default: Tavily, then keyless
+# DuckDuckGo/Bing HTML search.
+fallback_engines = ["tavily", "duckduckgo", "bing"]
 # Bring your own Bing Search API key for primary Bing searches. Prefer using an env var.
 # Fallback Bing searches intentionally use keyless HTML search.
 # bing_api_key_env = "JCODE_BING_API_KEY"
@@ -209,6 +240,23 @@ bing_market = "en-US"
 # this. Configure here or via the JCODE_SEARXNG_URL environment variable, then
 # set engine = "searxng" or add it to fallback_engines.
 # searxng_url = "https://searx.example.org"
+#
+# Tavily Search API (fast, keyed). Reads the key from tavily_api_key below, the
+# TAVILY_API_KEYS env var (comma-separated keys allowed), or ~/.jcode/tavily.env.
+# tavily_api_key = ""
+# tavily_api_key_env = "TAVILY_API_KEYS"
+# Tavily search depth: "basic" (fast, cheap) or "advanced" (deeper).
+tavily_search_depth = "basic"
+#
+# last30days deep engine. Shells out to the installed last30days skill under
+# ~/.jcode/skills/last30days/ (or ./.jcode/skills/last30days/). It is slow (tens
+# of seconds) so the hybrid engine bounds it with last30days_timeout_secs and
+# returns the fast (Tavily) results if it does not finish in time.
+last30days_enabled = true
+# last30days_script = ""  # explicit path to last30days.py (overrides skill lookup)
+last30days_timeout_secs = 75
+# Keyless/free last30days sources used for the deep leg.
+last30days_sources = "reddit,hackernews,github,grounding"
 
 [tools]
 # Controls which built-in tools are sent to the model.
@@ -219,10 +267,10 @@ bing_market = "en-US"
 profile = "full"
 # Explicit allow-list. When non-empty, only these tools are exposed.
 # enabled = ["bash", "read", "write", "apply_patch", "agentgrep", "ls"]
-# Privacy-sensitive or stub tools such as gmail and lsp are disabled by default.
+# Privacy-sensitive tools such as gmail are disabled by default.
 # To expose every tool including default-disabled tools, use: enabled = ["*"]
 # Hide selected tools after applying the profile/allow-list.
-# disabled = ["browser", "gmail", "lsp", "swarm"]
+# disabled = ["browser", "gmail", "swarm"]
 # Disable all built-in tools unless enabled is set.
 disable_base_tools = false
 
@@ -250,8 +298,9 @@ tool_profile = "acp"
 # default_provider = "copilot"
 # OpenAI reasoning effort (none|low|medium|high|xhigh)
 openai_reasoning_effort = "low"
-# Anthropic reasoning effort for Claude reasoning models (none|low|medium|high; xhigh on Opus 4.7; max aliases to the strongest supported level)
-# Defaults to the strongest supported level for Claude Opus models (xhigh on Opus 4.7/4.8, high on older Opus) when unset; other models keep their own default.
+# Anthropic reasoning effort for Claude reasoning models (none|low|medium|high|xhigh|max)
+# xhigh needs Opus 4.7/4.8 or Fable 5; max needs an output_config effort model (Opus/Sonnet 4.6+).
+# Defaults to xhigh for Claude Opus 4.7/4.8 (high on older Opus) when unset; other models keep their own default.
 # anthropic_reasoning_effort = "medium"
 # OpenAI transport mode (auto|websocket|https)
 # openai_transport = "auto"
@@ -275,7 +324,9 @@ cross_provider_failover = "countdown"
 # Max seconds to wait for streaming data before timing out a request with no
 # data received. Raise this for slow reasoning models (e.g. DeepSeek) that think
 # silently for minutes before emitting tokens. Default: 180.
-# Also overridable per-launch via JCODE_STREAM_IDLE_TIMEOUT_SECS.
+# Applies to every streaming provider path (OpenAI native, Anthropic, Copilot,
+# OpenRouter/OpenAI-compatible). The TUI's client-side stall guard also extends
+# to match this value. Also overridable per-launch via JCODE_STREAM_IDLE_TIMEOUT_SECS.
 # stream_idle_timeout_secs = 600
 
 [agents]
@@ -289,18 +340,33 @@ cross_provider_failover = "countdown"
 # swarm_model = "inherit"
 #
 # How swarm-created agents are spawned:
-#   "visible"  - open a headed terminal window (default; alias: "headed")
+#   "inline"   - in-process (no window), shown as a live gallery viewport in the coordinator (default)
+#   "visible"  - open a headed terminal window (alias: "headed")
 #   "headless" - create the worker in-process with no terminal window
-#   "inline"   - in-process (no window), shown as a live gallery viewport in the coordinator
 #   "auto"     - try visible first, fall back to headless if no window can open
 # The swarm tool's per-call `spawn_mode` overrides this when set.
 # Env override: JCODE_SWARM_SPAWN_MODE
-swarm_spawn_mode = "visible"
+swarm_spawn_mode = "inline"
+#
+# Max swarm worker agents run_plan keeps active AT ONCE in a deep-mode task graph.
+# This bounds parallelism, not the total agents spawned over the run (that is the
+# per-swarm member cap of 1000). Deep mode is meant to fan out wide, so the default
+# is high (32). 0 = no extra cap: dispatch the whole ready set each loop, bounded
+# only by the member cap. Light mode uses a small fixed fan-out and ignores this.
+# Env override: JCODE_SWARM_MAX_CONCURRENT_AGENTS
+swarm_max_concurrent_agents = 32
 #
 # Max percentage (1-90) of the chat height the inline swarm gallery band may use.
 # Unset = built-in default (40%). Lower values keep more transcript visible; set
 # near the minimum to collapse the gallery to a thin strip.
 # swarm_gallery_max_pct = 40
+#
+# Layout of the inline swarm strip above the status line:
+#   "vertical"   - one agent per row (session icon + status + task), capped to
+#                  a few rows with a "+N more" overflow marker (default)
+#   "horizontal" - all agents packed as chips on a single row
+# Env override: JCODE_SWARM_STRIP_LAYOUT
+# swarm_strip_layout = "vertical"
 #
 # Model for the memory sidecar (relevance/extraction). Unset = sidecar auto-select.
 # Env override: JCODE_MEMORY_MODEL
@@ -370,6 +436,13 @@ swarm_spawn_mode = "visible"
 # Example:
 #   focus_hook = "~/bin/jcode-focus-router"
 # focus_hook = ""
+#
+# macOS only: terminal that the Cmd+; launch hotkey and in-app session spawns
+# open jcode into. One of: ghostty, iterm2, wezterm, warp, alacritty, vscode,
+# terminal (Apple Terminal). Preferred over the legacy
+# ~/.jcode/preferred_terminal.json file. After changing this, re-run
+# `jcode setup-hotkey` so the generated launcher script (Cmd+;) picks it up.
+# preferred = "ghostty"
 
 [notifications]
 # Desktop notifications for interactive sessions (macOS Notification Center /
@@ -397,17 +470,23 @@ swarm_spawn_mode = "visible"
 # programs can observe or gate agent behavior. Commands are parsed shell-style
 # (quotes work) but executed directly, with JCODE_HOOK_* env vars describing
 # the event:
-#   JCODE_HOOK_EVENT       - "turn_end", "session_start", "session_end",
-#                            "pre_tool", "post_tool"
+#   JCODE_HOOK_EVENT       - "turn_start", "turn_end", "session_start",
+#                            "session_end", "pre_tool", "post_tool"
 #   JCODE_HOOK_SESSION_ID  - the session the event belongs to
 #   JCODE_HOOK_CWD         - session working directory (also the hook's cwd)
 #   JCODE_HOOK_PAYLOAD     - JSON mirror of all fields
 # Hook processes get JCODE_HOOKS_DISABLED=1 so nested jcode calls don't recurse.
 #
 # All hooks except pre_tool are observers: detached, fire-and-forget, failures
-# only logged. Env overrides: JCODE_HOOK_TURN_END, JCODE_HOOK_SESSION_START,
-# JCODE_HOOK_SESSION_END, JCODE_HOOK_PRE_TOOL, JCODE_HOOK_POST_TOOL (set empty
-# to disable a config hook).
+# only logged. Env overrides: JCODE_HOOK_TURN_START, JCODE_HOOK_TURN_END,
+# JCODE_HOOK_SESSION_START, JCODE_HOOK_SESSION_END, JCODE_HOOK_PRE_TOOL,
+# JCODE_HOOK_POST_TOOL (set empty to disable a config hook).
+#
+# Runs when an agent turn begins, before the model starts generating and before
+# the first pre_tool. Lets integrations detect the agent is working during the
+# think/stream window before any tool call. Extra fields: JCODE_HOOK_MODEL,
+# JCODE_HOOK_SOURCE ("chat"/"resume"/"ambient").
+# turn_start = "~/bin/jcode-turn-start"
 #
 # Runs when an agent turn completes. Extra fields: JCODE_HOOK_STATUS
 # ("ok"/"error"), JCODE_HOOK_DURATION_MS, JCODE_HOOK_MODEL,
@@ -520,6 +599,17 @@ desktop_notifications = true
 # jade_relay_reply_enabled = false   # Deliver cloud prompts to one configured live session.
 # jade_relay_launch_enabled = false  # Allow cloud device commands to open headed local sessions.
 # jade_relay_launch_working_dir = "" # Optional default cwd for launched sessions.
+
+# [sponsors]
+# Sponsored discovery (enabled by default; set enabled = false to opt out).
+# When enabled, the agent gains a `discover_tools` tool listing third-party
+# developer tools from jcode's hosted sponsor manifest. Sponsors buy
+# placement (discoverability), never recommendations; each session's first
+# use of discover_tools is disclosed in the UI with a (sponsored discovery)
+# tag.
+# See https://solosystems.dev/sponsored-discovery
+# enabled = true
+# endpoint = "https://api.solosystems.dev/v1/discovery"
 	"#;
 
         // Substitute platform-specific defaults from the keybinding registry.

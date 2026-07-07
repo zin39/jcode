@@ -169,6 +169,9 @@ pub struct ResourceContent {
 /// MCP server configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
+    /// Command for stdio servers. Empty for HTTP/SSE servers, which jcode does
+    /// not yet support (such entries are skipped at load time).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -179,6 +182,48 @@ pub struct McpServerConfig {
     /// Stateful servers (Playwright browser) should not be shared.
     #[serde(default = "default_shared")]
     pub shared: bool,
+    /// Transport type from Claude Code configs ("stdio", "http", "sse"). Used
+    /// only to recognize and skip non-stdio servers; defaults to stdio.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// URL for HTTP/SSE servers (Claude Code compat). Unused by jcode today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Whether this server is enabled (default: true). Disabled servers stay
+    /// registered in config but are not spawned or connected at load time
+    /// until re-enabled (issue #436). opencode-style `"enabled": false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Claude Code style alias: `"disabled": true`. Wins over `enabled` when
+    /// both are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<bool>,
+}
+
+impl McpServerConfig {
+    /// jcode currently only supports stdio (command-based) MCP servers. A config
+    /// entry is stdio when it has a command and is not explicitly an http/sse
+    /// transport.
+    pub fn is_stdio(&self) -> bool {
+        if let Some(t) = &self.transport {
+            let t = t.to_ascii_lowercase();
+            if t == "http" || t == "sse" || t == "streamable-http" {
+                return false;
+            }
+        }
+        !self.command.trim().is_empty()
+    }
+
+    /// Whether this server should be spawned/connected automatically.
+    /// Defaults to true. `"disabled": true` (Claude Code style) wins over
+    /// `"enabled"` (opencode style) when both are present. Disabled servers
+    /// stay in config and can still be connected on demand by name.
+    pub fn is_enabled(&self) -> bool {
+        if let Some(disabled) = self.disabled {
+            return !disabled;
+        }
+        self.enabled.unwrap_or(true)
+    }
 }
 
 fn default_shared() -> bool {
@@ -188,7 +233,9 @@ fn default_shared() -> bool {
 /// Full MCP configuration file
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct McpConfig {
-    #[serde(default)]
+    /// Server map. Accepts the canonical Claude Code key `mcpServers` as well as
+    /// jcode's historical `servers` key.
+    #[serde(default, alias = "mcpServers")]
     pub servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
@@ -228,13 +275,26 @@ impl McpConfig {
         let mut imported = Self::default();
         let mut sources = Vec::new();
 
-        // Import from Claude Code (~/.claude/mcp.json)
+        // Import from Claude Code. The canonical user config is `~/.claude.json`
+        // (top-level `mcpServers` + per-project entries); fall back to the older
+        // `~/.claude/mcp.json` layout for users who still have it.
+        if let Ok(claude_json) = crate::storage::user_home_path(".claude.json") {
+            if claude_json.exists() {
+                let cwd = std::env::current_dir().ok();
+                let config = Self::load_claude_json(&claude_json, cwd.as_deref());
+                let count = config.servers.len();
+                if count > 0 {
+                    sources.push(format!("{} from Claude Code", count));
+                    imported.servers.extend(config.servers);
+                }
+            }
+        }
         if let Ok(claude_mcp) = crate::storage::user_home_path(".claude/mcp.json") {
             if claude_mcp.exists() {
                 if let Ok(config) = Self::load_from_file(&claude_mcp) {
                     let count = config.servers.len();
                     if count > 0 {
-                        sources.push(format!("{} from Claude Code", count));
+                        sources.push(format!("{} from Claude Code (legacy)", count));
                         imported.servers.extend(config.servers);
                     }
                 }
@@ -316,6 +376,10 @@ impl McpConfig {
                             args,
                             env,
                             shared,
+                            transport: None,
+                            url: None,
+                            enabled: None,
+                            disabled: None,
                         },
                     );
                 }
@@ -324,12 +388,84 @@ impl McpConfig {
         Ok(config)
     }
 
-    /// Load from default locations (merges jcode global + local, local overrides)
+    /// Parse MCP servers from Claude Code's `~/.claude.json`.
+    ///
+    /// Claude Code stores a global set under the top-level `mcpServers` key, and
+    /// per-project sets under `projects.<abs_path>.mcpServers`. We merge the
+    /// global set first, then overlay the entry for `cwd` (if any) so a
+    /// project-specific server wins for the active directory.
+    fn load_claude_json(path: &std::path::Path, cwd: Option<&std::path::Path>) -> Self {
+        let mut config = Self::default();
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return config;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return config;
+        };
+
+        // Global servers under top-level `mcpServers`.
+        if let Some(map) = value.get("mcpServers")
+            && let Ok(servers) = serde_json::from_value::<
+                std::collections::HashMap<String, McpServerConfig>,
+            >(map.clone())
+        {
+            config.servers.extend(servers);
+        }
+
+        // Per-project servers under `projects.<abs_path>.mcpServers`.
+        if let (Some(cwd), Some(projects)) =
+            (cwd, value.get("projects").and_then(|p| p.as_object()))
+        {
+            let cwd_str = cwd.to_string_lossy();
+            if let Some(project) = projects.get(cwd_str.as_ref())
+                && let Some(map) = project.get("mcpServers")
+                && let Ok(servers) = serde_json::from_value::<
+                    std::collections::HashMap<String, McpServerConfig>,
+                >(map.clone())
+            {
+                config.servers.extend(servers);
+            }
+        }
+
+        config
+    }
+
+    /// Load project-local MCP config files from `project_root`, in override
+    /// order: `.jcode/mcp.json`, then `.mcp.json` (Claude Code project config),
+    /// then `.claude/mcp.json` (legacy compatibility). Later files override
+    /// same-named servers from earlier ones.
+    fn load_project_locals(project_root: &std::path::Path) -> Self {
+        let mut merged = Self::default();
+        for relative in [".jcode/mcp.json", ".mcp.json", ".claude/mcp.json"] {
+            let path = project_root.join(relative);
+            if path.exists()
+                && let Ok(config) = Self::load_from_file(&path)
+            {
+                merged.servers.extend(config.servers);
+            }
+        }
+        merged
+    }
+
+    /// Load from default locations (merges jcode global + local, local overrides),
+    /// resolving project-local config against the process working directory.
+    pub fn load() -> Self {
+        Self::load_for_dir(None)
+    }
+
+    /// Load from default locations, resolving project-local config
+    /// (`.jcode/mcp.json`, `.mcp.json`, `.claude/mcp.json`, and the per-project
+    /// entries in `~/.claude.json`) against `project_dir` instead of the
+    /// process working directory when provided.
+    ///
+    /// Remote/client sessions run inside a long-lived server whose cwd is
+    /// unrelated to the session's project, so the session working directory
+    /// must be threaded through explicitly (issue #420).
     #[expect(
         clippy::collapsible_if,
         reason = "Import logic keeps source-specific MCP config merge order explicit"
     )]
-    pub fn load() -> Self {
+    pub fn load_for_dir(project_dir: Option<&std::path::Path>) -> Self {
         // First-run import from Claude Code / Codex CLI
         Self::import_from_external();
 
@@ -345,21 +481,41 @@ impl McpConfig {
             }
         }
 
-        // Load project-local jcode config (.jcode/mcp.json)
-        let local_jcode = std::path::Path::new(".jcode/mcp.json");
-        if local_jcode.exists() {
-            if let Ok(config) = Self::load_from_file(local_jcode) {
+        // Claude Code user/global config (~/.claude.json): top-level mcpServers
+        // plus per-project entries for the project directory.
+        if let Ok(claude_json) = crate::storage::user_home_path(".claude.json") {
+            if claude_json.exists() {
+                let cwd = match project_dir {
+                    Some(dir) => Some(dir.to_path_buf()),
+                    None => std::env::current_dir().ok(),
+                };
+                let config = Self::load_claude_json(&claude_json, cwd.as_deref());
                 merged.servers.extend(config.servers);
             }
         }
 
-        // Fallback: project-local Claude config (.claude/mcp.json) for compatibility
-        let local_claude = std::path::Path::new(".claude/mcp.json");
-        if local_claude.exists() {
-            if let Ok(config) = Self::load_from_file(local_claude) {
-                merged.servers.extend(config.servers);
+        // Project-local config files, resolved against the project directory.
+        let project_root = project_dir
+            .map(|dir| dir.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        merged
+            .servers
+            .extend(Self::load_project_locals(&project_root).servers);
+
+        // jcode only supports stdio servers today. Drop HTTP/SSE entries (common
+        // in Claude Code configs) so they don't fail to spawn, but log them so
+        // the omission is visible.
+        merged.servers.retain(|name, cfg| {
+            let keep = cfg.is_stdio();
+            if !keep {
+                crate::logging::info(&format!(
+                    "MCP: Skipping non-stdio server '{}' ({}); HTTP/SSE transports are not yet supported",
+                    name,
+                    cfg.transport.as_deref().unwrap_or("http")
+                ));
             }
-        }
+            keep
+        });
 
         merged
     }

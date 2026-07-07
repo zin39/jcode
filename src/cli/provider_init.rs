@@ -599,7 +599,7 @@ fn maybe_enable_config_default_provider_for_auto() -> Result<bool> {
         crate::provider_catalog::resolve_openai_compatible_profile_selection(default_provider)
     {
         apply_openai_compatible_profile_env(Some(profile));
-        return Ok(provider::openrouter::OpenRouterProvider::has_credentials());
+        return Ok(provider::openrouter::has_credentials());
     }
 
     if cfg.providers.contains_key(default_provider) {
@@ -607,7 +607,7 @@ fn maybe_enable_config_default_provider_for_auto() -> Result<bool> {
             default_provider,
             cfg,
         )?;
-        return Ok(provider::openrouter::OpenRouterProvider::has_credentials());
+        return Ok(provider::openrouter::has_credentials());
     }
 
     Ok(false)
@@ -727,7 +727,7 @@ fn direct_env_file_contains_key(env_key: &str, env_file: &str) -> bool {
 }
 
 fn maybe_enable_external_api_key_auth_for_auto(has_other_provider: bool) -> Result<bool> {
-    if provider::openrouter::OpenRouterProvider::has_credentials() {
+    if provider::openrouter::has_credentials() {
         return Ok(true);
     }
     if has_other_provider {
@@ -753,7 +753,7 @@ fn maybe_enable_external_api_key_auth_for_auto(has_other_provider: bool) -> Resu
         }
         if prompt_to_trust_external_auth(&provider_name, source.display_name(), &path)? {
             auth::external::trust_external_auth_source(source)?;
-            return Ok(provider::openrouter::OpenRouterProvider::has_credentials());
+            return Ok(provider::openrouter::has_credentials());
         }
         return Ok(false);
     }
@@ -1278,7 +1278,7 @@ pub async fn login_and_bootstrap_provider(
             disable_subscription_runtime_mode();
             unlock_model_provider();
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "cursor");
-            Arc::new(provider::cursor::CursorCliProvider::new())
+            Arc::new(jcode_provider_cursor_runtime::CursorCliProvider::new())
         }
         LoginProviderTarget::Copilot => {
             disable_subscription_runtime_mode();
@@ -1288,13 +1288,13 @@ pub async fn login_and_bootstrap_provider(
             disable_subscription_runtime_mode();
             unlock_model_provider();
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "gemini");
-            Arc::new(provider::gemini::GeminiProvider::new())
+            Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new())
         }
         LoginProviderTarget::Antigravity => {
             disable_subscription_runtime_mode();
             unlock_model_provider();
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "antigravity");
-            Arc::new(provider::antigravity::AntigravityProvider::new())
+            Arc::new(jcode_provider_antigravity_runtime::AntigravityProvider::new())
         }
         LoginProviderTarget::Google => {
             anyhow::bail!("Google login cannot be used as a model provider bootstrap");
@@ -1348,6 +1348,15 @@ async fn init_provider_with_options(
     show_init_messages: bool,
     allow_login_bootstrap: bool,
 ) -> Result<Arc<dyn provider::Provider>> {
+    // Provider construction resolves concrete runtimes through the base
+    // crate's external-runtime registry (composition-root pattern). The
+    // binary's normal path registers them in `startup::run()`, but this
+    // function is also entered directly by validation/login/test flows that
+    // never run startup. Registration is idempotent, so do it here too;
+    // otherwise Auto-init silently loses registry-backed runtimes (e.g. the
+    // OpenRouter/OpenAI-compatible factory) and their model-picker routes.
+    super::startup::register_external_provider_runtimes();
+
     if let Ok(profile_name) = std::env::var("JCODE_PROVIDER_PROFILE_NAME")
         && !profile_name.trim().is_empty()
     {
@@ -1423,7 +1432,7 @@ async fn init_provider_with_options(
             init_notice("Using Cursor native HTTPS provider (experimental)");
             unlock_model_provider();
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "cursor");
-            Arc::new(provider::cursor::CursorCliProvider::new())
+            Arc::new(jcode_provider_cursor_runtime::CursorCliProvider::new())
         }
         ProviderChoice::Copilot => {
             disable_subscription_runtime_mode();
@@ -1444,7 +1453,7 @@ async fn init_provider_with_options(
             }
             unlock_model_provider();
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "gemini");
-            Arc::new(provider::gemini::GeminiProvider::new())
+            Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new())
         }
         ProviderChoice::Openrouter => {
             disable_subscription_runtime_mode();
@@ -1540,13 +1549,13 @@ async fn init_provider_with_options(
                     anyhow::anyhow!("Unknown provider profile '{}'", profile_name)
                 })?;
                 Arc::new(
-                    provider::openrouter::OpenRouterProvider::new_named_openai_compatible(
+                    jcode_provider_openrouter_runtime::OpenRouterProvider::new_named_openai_compatible(
                         &profile_name,
                         profile,
                     )?,
                 )
             } else {
-                Arc::new(provider::openrouter::OpenRouterProvider::new()?)
+                Arc::new(jcode_provider_openrouter_runtime::OpenRouterProvider::new()?)
             }
         }
         ProviderChoice::Antigravity => {
@@ -1555,7 +1564,7 @@ async fn init_provider_with_options(
             init_notice("Using Antigravity provider (experimental)");
             unlock_model_provider();
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "antigravity");
-            Arc::new(provider::antigravity::AntigravityProvider::new())
+            Arc::new(jcode_provider_antigravity_runtime::AntigravityProvider::new())
         }
         ProviderChoice::Google => {
             disable_subscription_runtime_mode();

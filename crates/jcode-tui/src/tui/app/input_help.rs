@@ -50,7 +50,7 @@ impl App {
                 "/splitview\nToggle a transient split view that mirrors the current chat in the side panel.\n\n/splitview on\nEnable split view and focus the mirrored chat page.\n\n/splitview off\nDisable split view.\n\n/splitview status\nShow whether split view is enabled.\n\nThis gives the side panel its own scroll position for the same conversation so you can read older context while keeping the main composer active."
             }
             "btw" => {
-                "/btw <question>\nAsk a side question about the current session and route the answer into the side panel.\n\nCurrent v1 behavior:\n  - uses the side panel as the response surface\n  - asks only from current session context\n  - should not read files or run tools other than side_panel"
+                "/btw <question>\nAsk a side question without derailing the current session.\n\nForks (splits) the session into a new window with the full conversation cloned, and the forked session starts by answering the question. The original session keeps working uninterrupted."
             }
             "git" => {
                 "/git\nShow git status --short --branch for the current session working directory.\n\n/git status\nAlias for /git."
@@ -60,6 +60,9 @@ impl App {
             }
             "commit-push" | "commit-and-push" => {
                 "/commit-push\nSame as /commit, then push the new commits to the remote tracking branch.\n\nThe agent groups related changes into logical commits, preserves unrelated work, then runs git push (using git push -u if the branch has no upstream). It will not force-push or rewrite already-pushed history, and reports the commits created plus the push result."
+            }
+            "cut-release" | "commit-push-release" => {
+                "/cut-release\nSame as /commit-push, then cut a release.\n\nThe agent reviews the changes since the last release tag to pick the semver bump (patch/minor/major), bumps the version in Cargo.toml, writes a user-facing changelog entry (changelog/v<version>.json) when the repo has a changelog/ directory, commits and pushes the bump, then runs scripts/quick-release.sh to tag, build, and publish the GitHub release. It never force-pushes or moves existing tags, and reports the new version plus the release result."
             }
             "catchup" => {
                 "/catchup\nOpen the Catch Up picker for finished sessions that need attention.\n\n/catchup next\nTeleport to the next session needing attention and open a Catch Up brief in the side panel.\n\n/catchup list\nAlias for opening the picker."
@@ -83,7 +86,7 @@ impl App {
                 "/judge\nLaunch a one-shot headed judge session immediately.\n\nThe judge will DM this session when done. If OpenAI ChatGPT OAuth is available, it prefers gpt-5.5."
             }
             "effort" => {
-                "/effort\nShow current reasoning effort.\n\n/effort <level>\nSet reasoning effort (none|low|medium|high|xhigh).\n\nAlso: {effort_keys} to cycle."
+                "/effort\nShow current effort.\n\n/effort <level>\nSet effort (none|low|medium|high|xhigh|max|swarm|swarm-deep). Which levels apply depends on the model. The swarm rungs run at max reasoning and turn on swarm orchestration (light fan-out or the deep task graph).\n\nAlso: {effort_keys} to cycle."
             }
             "fast" => {
                 "/fast\nShow whether fast mode is enabled, plus the saved default.\n\n/fast on\nEnable fast mode (service_tier = priority) for the current session.\n\n/fast off\nDisable fast mode for the current session.\n\n/fast status\nShow current fast-mode status.\n\n/fast default on\nSave fast mode as the default on startup.\n\n/fast default off\nSave fast mode as the default off on startup.\n\n/fast default status\nShow the saved fast-mode default."
@@ -116,7 +119,7 @@ impl App {
                 "/transfer\nCompact the current session into a summary-only handoff, copy the current todo list to a fresh session, and open that transferred session in a new window.\n\nIf a turn is currently running, jcode first soft-pauses the current session at the next safe point, then performs the transfer."
             }
             "plan" => {
-                "/plan [goal]\nDraft a plan without implementing anything. The model inspects the repo, then writes a structured plan (Goal, Scope, Approach, Validation, Open questions) to the side panel for review.\n\nNothing is edited: it stops after writing the plan. Once you approve, it converts the plan into a todo list and starts the work.\n\n/plan with no goal plans the task currently in focus."
+                "/plan [goal]\nDraft a plan without implementing anything. The model inspects the repo, then presents a structured plan (Goal, Scope, Approach, Validation, Open questions) as a dedicated plan card in the conversation.\n\nNothing is edited: it stops after presenting the plan. Once you approve, it converts the plan into a todo list and starts the work.\n\n/plan with no goal plans the task currently in focus."
             }
             "improve" => {
                 "/improve [focus]\nStart an autonomous repo-improvement loop. The model inspects the project, writes a ranked todo list, implements the highest-leverage safe improvements, validates them, then keeps going until further work has diminishing returns.\n\n/improve plan [focus]\nGenerate a ranked improve todo list only, without editing files.\n\n/improve resume\nResume the last saved improve mode for this session using the current improve todos.\n\n/improve status\nShow the inferred status of the current improve run and todo batch.\n\n/improve stop\nAsk the model to stop after the next safe point, update todos, and summarize remaining work."
@@ -136,8 +139,8 @@ impl App {
             "selfdev" => {
                 "/selfdev\nSpawn a new self-dev jcode session in a separate terminal.\n\n/selfdev <prompt>\nSpawn a new self-dev session and auto-deliver the prompt to it.\n\n/selfdev status\nShow current self-dev/build status."
             }
-            "split" => {
-                "/split\nSplit the current session into a new window. Clones the full conversation history so both sessions continue from the same point."
+            "fork" | "split" => {
+                "/fork\nFork the current session into a new window. Clones the full conversation history so both sessions continue from the same point.\n\n/fork <prompt>\nFork the session and start the new window by answering the prompt. The original session keeps working uninterrupted.\n\n/split\nAlias for /fork."
             }
             "resume" | "sessions" => {
                 "/resume\nOpen the interactive session picker. Browse and search all sessions, preview conversation history, and resume the highlighted session. By default, Enter resumes in the current terminal and Ctrl+Enter opens a new terminal; keybindings.session_picker_enter can swap those actions.{resume_shortcut}\n\nPress Esc to return to your current session."
@@ -160,6 +163,12 @@ impl App {
             }
             "alignment" => {
                 "/alignment\nShow the current alignment and the saved default.\n\n/alignment centered\nSave centered alignment as the default and apply it immediately.\n\n/alignment left\nSave left-aligned mode as the default and apply it immediately.\n\nPress Alt+C anytime to toggle alignment just for the current session."
+            }
+            "compact-notifications" => {
+                "/compact-notifications\nShow whether swarm/file-activity notifications are compact.\n\n/compact-notifications on\nCollapse file-activity notifications to a single line (path · summary), dropping the intent and diff preview.\n\n/compact-notifications off\nRestore the full multi-line notification cards."
+            }
+            "show-agentgrep-output" => {
+                "/show-agentgrep-output\nShow whether full agentgrep search output renders inline in the transcript.\n\n/show-agentgrep-output on\nRender the full agentgrep search results inline beneath each agentgrep call instead of just the one-line summary.\n\n/show-agentgrep-output off\nShow only the compact one-line agentgrep summary."
             }
             "auth" | "login" => {
                 "/auth\nShow authentication status for all providers.\n\n/login\nInteractive provider selection - pick a provider to log into.\n\n/login <provider>\nStart login flow directly for any provider shown by /login or the /login completions.\n\nUse /login jcode for curated jcode subscription access via your router, not OpenRouter BYOK."

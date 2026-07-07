@@ -62,6 +62,179 @@ fn test_active_overscroll_keeps_redrawing_at_deep_idle() {
     );
 }
 
+#[test]
+fn test_cold_cache_warning_keeps_redrawing_at_deep_idle() {
+    // Regression: the notification line renders a `🧊 cache cold` warning once
+    // the prompt cache TTL expires, but the cache only goes cold long after the
+    // 30s deep-idle cutoff. Without a dedicated wakeup the idle loop short-
+    // circuits to `false` and never repaints to reveal the warning before the
+    // user submits their next prompt.
+    let deep_idle = crate::tui::REDRAW_DEEP_IDLE_AFTER + Duration::from_secs(1);
+
+    let idle = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::periodic_redraw_required(&idle),
+        "a quiet deep-idle session should not require periodic redraws"
+    );
+
+    let cold = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        cache_ttl_status: Some(crate::tui::CacheTtlInfo {
+            remaining_secs: 0,
+            ttl_secs: 300,
+            is_cold: true,
+            cold_for_secs: 90,
+            cached_tokens: Some(4000),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::periodic_redraw_required(&cold),
+        "a cold prompt cache must keep driving redraws so the warning appears at deep idle"
+    );
+    assert_ne!(
+        crate::tui::redraw_interval(&cold),
+        crate::tui::REDRAW_DEEP_IDLE,
+        "a cold cache should bump the redraw interval above the deep-idle cadence"
+    );
+
+    // The same applies to the final-minute `⏳ cache Ns` countdown.
+    let warm_countdown = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        cache_ttl_status: Some(crate::tui::CacheTtlInfo {
+            remaining_secs: 30,
+            ttl_secs: 300,
+            is_cold: false,
+            cold_for_secs: 0,
+            cached_tokens: Some(4000),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::periodic_redraw_required(&warm_countdown),
+        "the last-minute cache countdown must keep driving redraws at deep idle"
+    );
+
+    // For long TTLs the countdown window scales (10% of TTL, capped at 10min):
+    // a 1h cache with 5 minutes left is about to expire and must warn.
+    let warm_countdown_1h = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        cache_ttl_status: Some(crate::tui::CacheTtlInfo {
+            remaining_secs: 300,
+            ttl_secs: 3600,
+            is_cold: false,
+            cold_for_secs: 0,
+            cached_tokens: Some(4000),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::periodic_redraw_required(&warm_countdown_1h),
+        "a 1h cache within its scaled countdown window must keep driving redraws"
+    );
+
+    // A comfortably warm cache should not defeat the deep-idle short-circuit.
+    let warm = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        cache_ttl_status: Some(crate::tui::CacheTtlInfo {
+            remaining_secs: 200,
+            ttl_secs: 300,
+            is_cold: false,
+            cold_for_secs: 0,
+            cached_tokens: Some(4000),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::periodic_redraw_required(&warm),
+        "a warm cache far from expiry should stay deep-idle"
+    );
+}
+
+#[test]
+fn test_active_swarm_spinner_keeps_redrawing_at_deep_idle() {
+    // Regression: the swarm strip/dock animates an ~8 fps status spinner for
+    // active agents off the wall clock. A coordinator that is just watching
+    // its agents goes deep-idle itself, and without a dedicated wakeup the
+    // idle loop stops repainting, freezing every agent's spinner mid-frame.
+    fn swarm_member(status: &str) -> crate::protocol::SwarmMemberStatus {
+        crate::protocol::SwarmMemberStatus {
+            session_id: format!("session-{status}"),
+            friendly_name: Some("worker".to_string()),
+            status: status.to_string(),
+            detail: None,
+            task_label: None,
+            role: None,
+            is_headless: Some(true),
+            live_attachments: None,
+            status_age_secs: Some(3),
+            output_tail: None,
+            report_back_to_session_id: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+        }
+    }
+
+    let deep_idle = crate::tui::REDRAW_DEEP_IDLE_AFTER + Duration::from_secs(1);
+
+    let quiet = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::periodic_redraw_required(&quiet),
+        "a quiet deep-idle session should not require periodic redraws"
+    );
+
+    // Every active status must keep the spinner animating.
+    for status in ["running", "streaming", "thinking"] {
+        let animating = TestState {
+            display_messages: vec![DisplayMessage::system("seed".to_string())],
+            time_since_activity: Some(deep_idle),
+            swarm_members: vec![swarm_member(status)],
+            ..Default::default()
+        };
+        assert!(
+            crate::tui::periodic_redraw_required(&animating),
+            "an {status} swarm agent must keep driving redraws at deep idle"
+        );
+        assert_eq!(
+            crate::tui::redraw_interval(&animating),
+            crate::tui::REDRAW_SWARM_SPINNER,
+            "an {status} swarm agent should repaint at the spinner cadence"
+        );
+    }
+
+    // Terminal statuses render fixed glyphs: no animation frames needed, the
+    // deep-idle short-circuit must stay in effect.
+    for status in ["completed", "failed", "stopped", "ready", "blocked"] {
+        let settled = TestState {
+            display_messages: vec![DisplayMessage::system("seed".to_string())],
+            time_since_activity: Some(deep_idle),
+            swarm_members: vec![swarm_member(status)],
+            ..Default::default()
+        };
+        assert!(
+            !crate::tui::periodic_redraw_required(&settled),
+            "a {status} swarm agent renders a static glyph and should stay deep-idle"
+        );
+        assert_eq!(
+            crate::tui::redraw_interval(&settled),
+            crate::tui::REDRAW_DEEP_IDLE,
+            "a {status} swarm agent should not bump the redraw cadence"
+        );
+    }
+}
+
 fn record_test_chat_snapshot(text: &str) {
     clear_copy_viewport_snapshot();
     let width = line_display_width(text);
@@ -101,6 +274,7 @@ fn make_prepared_messages_with_content_bytes(bytes: usize, marker: &str) -> Arc<
         edit_tool_ranges: Vec::new(),
         copy_targets: Vec::new(),
         message_boundaries: Vec::new(),
+        mermaid_pending_epoch: None,
     })
 }
 

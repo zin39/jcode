@@ -58,6 +58,12 @@ public actor Connection {
     private var continuation: AsyncStream<ConnectionOutput>.Continuation?
     private var targetSessionID: String?
     private var stopped = false
+    /// Set when the server announced a reload; the next reconnect attempt
+    /// skips backoff because the drop is expected and the server returns fast.
+    private var expectServerReload = false
+    /// Set when the server asked this client to close; reconnecting would
+    /// fight the server, so the loop ends with a failed phase instead.
+    private var closeRequestedReason: String?
 
     public init(
         configuration: Configuration,
@@ -74,6 +80,8 @@ public actor Connection {
     public func start(resumeSessionID: String? = nil) -> AsyncStream<ConnectionOutput> {
         targetSessionID = resumeSessionID
         stopped = false
+        expectServerReload = false
+        closeRequestedReason = nil
         let (stream, continuation) = AsyncStream.makeStream(of: ConnectionOutput.self)
         self.continuation = continuation
         runTask = Task { await runLoop() }
@@ -131,10 +139,22 @@ public actor Connection {
             }
             self.transport = nil
             if Task.isCancelled || stopped { break }
+            if let reason = closeRequestedReason {
+                await transport.close()
+                yield(.phase(.failed(reason: reason)))
+                return
+            }
             attempt += 1
             if let max = configuration.maxReconnectAttempts, attempt > max {
                 yield(.phase(.failed(reason: "Could not reach server after \(max) attempts")))
                 return
+            }
+            if expectServerReload {
+                // The server told us it is restarting: reconnect eagerly with a
+                // short fixed delay instead of exponential backoff.
+                expectServerReload = false
+                try? await Task.sleep(nanoseconds: UInt64(configuration.baseBackoffSeconds * 500_000_000))
+                continue
             }
             let delay = min(
                 configuration.baseBackoffSeconds * pow(2.0, Double(attempt - 1)), 30.0)
@@ -154,10 +174,19 @@ public actor Connection {
             // A frame may contain multiple newline-delimited events.
             for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
                 if let event = try? ServerEvent.decode(line: String(line)) {
-                    if case let .sessionID(sessionID) = event {
+                    switch event {
+                    case .sessionID(let sessionID):
                         targetSessionID = sessionID
+                    case .reloading:
+                        expectServerReload = true
+                    case .sessionCloseRequested(let reason):
+                        closeRequestedReason =
+                            reason.isEmpty ? "Server closed this session" : reason
+                    default:
+                        break
                     }
                     yield(.event(event))
+                    if closeRequestedReason != nil { return }
                 }
             }
         }

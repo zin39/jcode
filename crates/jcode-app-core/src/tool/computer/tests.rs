@@ -212,6 +212,34 @@ async fn live_ui_tree() {
         .unwrap();
     eprintln!("{}", out.output);
     assert!(out.output.contains("App:"));
+    // Regression for #396: empty AX titles must not surface as the literal
+    // string "missing value".
+    assert!(
+        !out.output.contains("\"missing value\""),
+        "AX dump leaked literal 'missing value' for an empty title"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires GUI + permissions"]
+async fn live_ocr_full_screen() {
+    let out = run_action(json!({ "action": "ocr" })).await.unwrap();
+    eprintln!("{}", out.output);
+    // Should not bail; either text or the explicit "no text" message.
+    assert!(out.output.contains("text") || !out.output.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires GUI + permissions"]
+async fn live_ocr_region() {
+    // Regression for #395: region OCR must not fail via `screencapture -R` on
+    // macOS 26.x. We crop in-process instead, so a region request should
+    // succeed and report the cropped image size.
+    let out = run_action(json!({ "action": "ocr", "region": [0.0, 0.0, 400.0, 80.0] }))
+        .await
+        .unwrap();
+    eprintln!("{}", out.output);
+    assert!(!out.output.contains("could not create image from rect"));
 }
 
 #[tokio::test]

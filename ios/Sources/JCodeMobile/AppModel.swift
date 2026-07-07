@@ -70,9 +70,20 @@ final class AppModel {
     // MARK: - Connection lifecycle
 
     func connect(to credential: ServerCredential, sessionID: String? = nil) {
+        session = SessionState()
+        open(credential, sessionID: sessionID)
+    }
+
+    /// Reconnects to the active server without discarding the rendered
+    /// transcript; the history resync replaces it once the socket is back.
+    func retryConnection() {
+        guard let activeServer else { return }
+        open(activeServer, sessionID: session.sessionID)
+    }
+
+    private func open(_ credential: ServerCredential, sessionID: String?) {
         disconnect()
         activeServer = credential
-        session = SessionState()
         let connection = Connection(
             configuration: .init(
                 gateway: credential.gateway,
@@ -126,12 +137,37 @@ final class AppModel {
         send { .setModel(id: $0, model: model) }
     }
 
+    func setReasoningEffort(_ effort: String) {
+        send { .setReasoningEffort(id: $0, effort: effort) }
+    }
+
+    /// Asks the server to compact the conversation context.
+    func compactConversation() {
+        send { .compact(id: $0) }
+    }
+
     func renameSession(_ title: String) {
         send { .renameSession(id: $0, title: title.isEmpty ? nil : title) }
     }
 
     func dismissError() {
         session = SessionReducer.reduce(session, intent: .dismissError)
+    }
+
+    func dismissNotice(_ id: UUID) {
+        session = SessionReducer.reduce(session, intent: .dismissNotice(id))
+    }
+
+    /// Clears the current conversation on the server and optimistically locally.
+    func clearConversation() {
+        session = SessionReducer.reduce(session, intent: .clearedConversation)
+        send { .clear(id: $0) }
+    }
+
+    /// Drops any soft-interrupt messages queued mid-run before they inject.
+    func cancelQueuedInterrupts() {
+        session = SessionReducer.reduce(session, intent: .cancelledQueuedInterrupts)
+        send { .cancelSoftInterrupts(id: $0) }
     }
 
     // MARK: - Helpers

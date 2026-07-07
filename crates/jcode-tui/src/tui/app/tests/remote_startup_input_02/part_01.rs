@@ -861,6 +861,7 @@ fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_cont
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1025,6 +1026,7 @@ fn test_escape_interrupt_disables_auto_poke_while_processing() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             },
         ]));
 
@@ -1141,6 +1143,37 @@ fn test_retrieve_pending_message_edits_queued_message() {
 }
 
 #[test]
+fn test_retrieve_pending_message_with_alt_and_super_up() {
+    // Ctrl+Up, Alt(Option)+Up and Cmd(Super)+Up must all recall a queued message
+    // so the gesture works regardless of which modifier the terminal forwards.
+    for modifier in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
+        let mut app = create_test_app();
+        app.queue_mode = true;
+        app.is_processing = true;
+
+        for c in "hello".chars() {
+            app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+                .unwrap();
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(app.queued_count(), 1, "modifier {modifier:?}");
+        assert!(app.input().is_empty(), "modifier {modifier:?}");
+
+        app.handle_key(KeyCode::Up, modifier).unwrap();
+
+        assert_eq!(app.queued_count(), 0, "modifier {modifier:?}");
+        assert_eq!(app.input(), "hello", "modifier {modifier:?}");
+        assert_eq!(app.cursor_pos(), 5, "modifier {modifier:?}");
+    }
+}
+
+#[test]
 fn test_retrieve_pending_message_prefers_pending_interleave_for_editing() {
     let mut app = create_test_app();
     app.is_processing = true;
@@ -1223,5 +1256,92 @@ fn test_handle_input_shell_completed_renders_markdown_blocks() {
     assert_eq!(
         app.status_notice(),
         Some("Shell command completed".to_string())
+    );
+}
+
+/// Regression for issue #427: selecting an effort-variant model row (e.g.
+/// "gpt-5.5 (high)") in the remote model picker must stage the chosen effort
+/// alongside the pending model switch. Previously only the model spec was
+/// staged, so the server kept its configured default effort (low) and the
+/// session silently ran gpt-5.5 at low effort.
+#[test]
+fn test_model_picker_effort_variant_selection_stages_effort_in_remote_mode() {
+    let mut app = create_test_app();
+    configure_test_remote_models_with_openai_recommendations(&mut app);
+
+    app.open_model_picker();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("model picker should be open");
+
+    let entry_idx = picker
+        .entries
+        .iter()
+        .position(|m| m.name == "gpt-5.5 (high)")
+        .expect("gpt-5.5 (high) should be in picker");
+    assert_eq!(
+        picker.entries[entry_idx].effort.as_deref(),
+        Some("high"),
+        "effort variant rows must carry their effort"
+    );
+
+    let filtered_pos = picker
+        .filtered
+        .iter()
+        .position(|&i| i == entry_idx)
+        .expect("gpt-5.5 (high) should be in filtered list");
+    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(app.inline_interactive_state.is_none(), "picker should close");
+    assert!(
+        app.pending_route_selection.is_some(),
+        "model switch should be staged for the remote dispatcher"
+    );
+    assert_eq!(
+        app.pending_reasoning_effort.as_deref(),
+        Some("high"),
+        "the picked effort variant must be staged so it reaches the server (issue #427)"
+    );
+}
+
+/// Plain model rows (no effort suffix) must not stage a reasoning effort.
+#[test]
+fn test_model_picker_plain_selection_stages_no_effort_in_remote_mode() {
+    let mut app = create_test_app();
+    configure_test_remote_models_with_openai_recommendations(&mut app);
+
+    app.open_model_picker();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("model picker should be open");
+
+    // claude-opus-4-8 rows are built without effort variants in this fixture.
+    let entry_idx = picker
+        .entries
+        .iter()
+        .position(|m| m.name == "claude-opus-4-8" && m.effort.is_none())
+        .expect("claude-opus-4-8 should be in picker without an effort variant");
+
+    let filtered_pos = picker
+        .filtered
+        .iter()
+        .position(|&i| i == entry_idx)
+        .expect("claude-opus-4-8 should be in filtered list");
+    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(app.inline_interactive_state.is_none(), "picker should close");
+    assert!(
+        app.pending_reasoning_effort.is_none(),
+        "plain rows must not override the server's effort"
     );
 }

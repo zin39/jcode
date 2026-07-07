@@ -1166,6 +1166,7 @@ pub(super) fn draw_pinned_content_cached(
     super::set_pinned_pane_total_lines(total_lines);
 
     let max_scroll = total_lines.saturating_sub(inner.height as usize);
+    super::set_last_diff_pane_max_scroll(max_scroll);
     let clamped_scroll = scroll.min(max_scroll);
     super::set_last_diff_pane_effective_scroll(clamped_scroll);
 
@@ -1428,6 +1429,7 @@ pub(super) fn draw_side_panel_markdown(
         .lines
         .len()
         .saturating_sub(content_inner.height as usize);
+    super::set_last_diff_pane_max_scroll(max_scroll);
     let clamped_scroll = scroll.min(max_scroll);
     super::set_last_diff_pane_effective_scroll(clamped_scroll);
 
@@ -1855,13 +1857,17 @@ fn render_side_panel_markdown_lines_cached(
         debug.stats.markdown_cache_misses += 1;
     });
 
-    let saved_override = markdown::get_diagram_mode_override();
     let saved_centered = markdown::center_code_blocks();
-    markdown::set_diagram_mode_override(Some(crate::config::DiagramDisplayMode::None));
     markdown::set_center_code_blocks(centered);
-    let rendered_lines = mermaid::with_preferred_aspect_ratio(mermaid_aspect_ratio, || {
-        markdown::render_markdown_with_width(&page.content, Some(inner_width as usize))
-    });
+    // Pin the diagram mode for this render only (thread-local scope): the
+    // side panel always renders diagrams inline. Using the process-global
+    // override here would race concurrent renders/tests that read or set it.
+    let rendered_lines =
+        markdown::with_diagram_mode_scope(crate::config::DiagramDisplayMode::None, || {
+            mermaid::with_preferred_aspect_ratio(mermaid_aspect_ratio, || {
+                markdown::render_markdown_with_width(&page.content, Some(inner_width as usize))
+            })
+        });
     let rendered_lines = if has_protocol {
         rendered_lines
             .into_iter()
@@ -1872,10 +1878,19 @@ fn render_side_panel_markdown_lines_cached(
     };
     let lines = wrap_side_panel_markdown_lines(rendered_lines, inner_width as usize);
     markdown::set_center_code_blocks(saved_centered);
-    markdown::set_diagram_mode_override(saved_override);
 
     let placeholder_hashes: Vec<Option<u64>> = if has_protocol {
-        lines.iter().map(mermaid::parse_image_placeholder).collect()
+        lines
+            .iter()
+            .map(|line| {
+                mermaid::parse_image_placeholder(line).or_else(|| {
+                    // Mermaid diagrams now emit inline-fit markers (same as
+                    // raster images); the side panel draws them through its
+                    // own placement machinery, keyed by hash.
+                    mermaid::parse_inline_image_placeholder(line).map(|(hash, _, _)| hash)
+                })
+            })
+            .collect()
     } else {
         vec![None; lines.len()]
     };
@@ -1912,7 +1927,10 @@ fn wrap_side_panel_markdown_lines(lines: Vec<Line<'static>>, width: usize) -> Ve
     lines
         .into_iter()
         .flat_map(|line| {
-            if is_rendered_table_line(&line) || mermaid::parse_image_placeholder(&line).is_some() {
+            if is_rendered_table_line(&line)
+                || mermaid::parse_image_placeholder(&line).is_some()
+                || mermaid::parse_inline_image_placeholder(&line).is_some()
+            {
                 vec![line]
             } else {
                 markdown::wrap_line(line, width)

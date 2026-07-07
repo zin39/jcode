@@ -11,5 +11,8 @@ path = "src/lib.rs"
 thiserror = "1"
 tokio = { version = "1", features = ["sync"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "time", "macros"] }
+
 [lints]
 workspace = true

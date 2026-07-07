@@ -4,8 +4,8 @@ use std::collections::BinaryHeap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
-use tract_hir::prelude::*;
 use tract_hir::infer::Factoid as _;
+use tract_hir::prelude::*;
 
 pub const MODEL_NAME: &str = "all-MiniLM-L6-v2";
 
@@ -446,8 +446,11 @@ impl CrossEncoder {
             .tokenizer
             .encode((query, passage), true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-        let inputs =
-            build_bert_inputs(&self.input_plan, encoding.get_ids(), encoding.get_type_ids())?;
+        let inputs = build_bert_inputs(
+            &self.input_plan,
+            encoding.get_ids(),
+            encoding.get_type_ids(),
+        )?;
         let outputs = self.model.run(inputs)?;
         let view = outputs[0].to_array_view::<f32>()?;
         // logits shape is [1, 1] (relevance) or [1, N]; take the first/primary.
@@ -459,7 +462,11 @@ impl CrossEncoder {
 
     /// Rerank `(id, text)` candidates by cross-encoder score against `query`.
     /// Returns ids sorted by descending relevance.
-    pub fn rerank(&self, query: &str, candidates: &[(String, String)]) -> Result<Vec<(String, f32)>> {
+    pub fn rerank(
+        &self,
+        query: &str,
+        candidates: &[(String, String)],
+    ) -> Result<Vec<(String, f32)>> {
         let mut scored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
         for (id, text) in candidates {
             let s = self.score(query, text)?;
@@ -701,7 +708,9 @@ mod tests {
         };
         let ce = CrossEncoder::load_from_dir(&d).expect("load cross-encoder");
         let q = "how do I set the cargo build profile";
-        let rel = ce.score(q, "The build uses the selfdev cargo profile").unwrap();
+        let rel = ce
+            .score(q, "The build uses the selfdev cargo profile")
+            .unwrap();
         let unrel = ce.score(q, "Bees pollinate flowers in spring").unwrap();
         eprintln!("cross-encoder: relevant={rel:.3} irrelevant={unrel:.3}");
         assert!(

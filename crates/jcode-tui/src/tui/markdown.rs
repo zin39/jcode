@@ -1,10 +1,12 @@
 pub use jcode_tui_markdown::{
-    CopyTargetKind, IncrementalMarkdownRenderer, MarkdownDebugStats, MarkdownMemoryProfile,
-    RawCopyTarget, center_code_blocks, debug_memory_profile, debug_stats, debug_stats_json,
-    extract_copy_targets_from_rendered_lines, highlight_file_lines, highlight_line, progress_bar,
-    progress_line, recenter_structured_blocks_for_display, render_markdown, render_markdown_lazy,
-    render_markdown_with_width, render_table_with_width, reset_debug_stats, set_center_code_blocks,
-    wrap_line, wrap_lines,
+    CopyTargetKind, IncrementalMarkdownRenderer, MERMAID_PENDING_PLACEHOLDER_TEXT,
+    MarkdownDebugStats, MarkdownMemoryProfile, RawCopyTarget, center_code_blocks,
+    debug_memory_profile, debug_stats, debug_stats_json, extract_copy_targets_from_rendered_lines,
+    highlight_file_lines, highlight_line, line_is_mermaid_pending_placeholder,
+    mermaid_rendering_enabled, progress_bar, progress_line, recenter_structured_blocks_for_display,
+    render_markdown, render_markdown_lazy, render_markdown_with_width, render_table_with_width,
+    reset_debug_stats, set_center_code_blocks, thread_render_count,
+    with_mermaid_rendering_override, wrap_line, wrap_lines,
 };
 
 fn to_markdown_diagram_mode(
@@ -64,6 +66,16 @@ pub fn set_diagram_mode_override(mode: Option<crate::config::DiagramDisplayMode>
 
 pub fn get_diagram_mode_override() -> Option<crate::config::DiagramDisplayMode> {
     jcode_tui_markdown::get_diagram_mode_override().map(from_markdown_diagram_mode)
+}
+
+/// Run `f` with the diagram display mode pinned on the current thread only.
+/// Unlike `set_diagram_mode_override`, this never mutates process-global
+/// state, so concurrent renders (and parallel tests) are unaffected.
+pub fn with_diagram_mode_scope<T>(
+    mode: crate::config::DiagramDisplayMode,
+    f: impl FnOnce() -> T,
+) -> T {
+    jcode_tui_markdown::with_diagram_mode_scope(to_markdown_diagram_mode(mode), f)
 }
 
 pub fn with_deferred_mermaid_render_context<T>(f: impl FnOnce() -> T) -> T {

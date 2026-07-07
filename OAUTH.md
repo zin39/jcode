@@ -13,7 +13,7 @@ rewrite, or permission mutation). Symlinked external auth files are rejected.
 
 Credentials are stored locally:
 - J-Code Claude OAuth (if logged in via `jcode login --provider claude`): `~/.jcode/auth.json`
-- Claude Code CLI: `~/.claude/.credentials.json`
+- Claude Code CLI: `~/.claude/.credentials.json` (Linux/Windows), or the **macOS login Keychain** item `Claude Code-credentials` (the default on macOS, where the JSON file usually does not exist), or the `CLAUDE_CODE_OAUTH_TOKEN` env var (set by `claude setup-token`)
 - OpenCode (optional provider/OAuth import source): `~/.local/share/opencode/auth.json`
 - pi (optional provider/OAuth import source): `~/.pi/agent/auth.json`
 - J-Code OpenAI/Codex OAuth: `~/.jcode/openai-auth.json`
@@ -40,14 +40,15 @@ Relevant code:
 1. Run `jcode login --provider claude` (recommended), or `jcode login` and choose Claude.
    - For headless / SSH use: `jcode login --provider claude --no-browser`
    - For scriptable remote flows: `jcode login --provider claude --print-auth-url`, then later complete with `--callback-url` or `--auth-code`
-2. Alternative: run `claude` (or `claude setup-token`). jcode can detect `~/.claude/.credentials.json`, ask before reading it, and remember that approval for future sessions.
+2. Alternative: run `claude` (or `claude setup-token`). jcode can detect Claude Code's credentials, ask before reading them, and remember that approval for future sessions. This works whether Claude Code stored them in `~/.claude/.credentials.json` (Linux/Windows), the macOS login Keychain (`Claude Code-credentials`), or the `CLAUDE_CODE_OAUTH_TOKEN` env var. On macOS, approving the Keychain source copies the credentials into `~/.jcode/auth.json` once so later sessions never re-prompt the Keychain.
 3. Verify with `jcode --provider claude run "Say hello from jcode"`.
 
 Credential discovery order is:
 1. `~/.jcode/auth.json`
 2. `~/.claude/.credentials.json`
-3. `~/.local/share/opencode/auth.json`
-4. `~/.pi/agent/auth.json`
+3. Claude Code native credentials (macOS Keychain `Claude Code-credentials`, or `CLAUDE_CODE_OAUTH_TOKEN` env var) once approved
+4. `~/.local/share/opencode/auth.json`
+5. `~/.pi/agent/auth.json`
 
 ### Direct Anthropic API (default)
 `--provider claude` uses the direct Anthropic Messages API by default.
@@ -68,18 +69,21 @@ Required behaviors (applied by the Anthropic provider):
   - `You are Claude Code, Anthropic's official CLI for Claude.`
 
 Tool name allow-list:
-Claude OAuth requests reject certain tool names. jcode remaps tool names on the
-wire and maps them back on responses so native tools continue to work. The
-mapping is:
-- `bash` → `shell_exec`
-- `read` → `file_read`
-- `write` → `file_write`
-- `edit` → `file_edit`
-- `glob` → `file_glob`
-- `grep` → `file_grep`
-- `task` → `task_runner`
-- `todoread` → `todo_read`
-- `todowrite` → `todo_write`
+Claude OAuth requests reject certain tool names. jcode remaps a small set of
+builtin tool names on the wire to the Claude-Code builtin names and maps them
+back on responses so native tools continue to work. Every other tool is
+forwarded under its own name, so the full custom toolset (websearch, webfetch,
+browser, codesearch, memory, swarm, multiedit, open, ...) stays available on
+OAuth. The remapped names are:
+- `bash` → `Bash`
+- `read` → `Read`
+- `write` → `Write`
+- `edit` → `Edit`
+- `glob` → `Glob`
+- `grep` → `Grep`
+- `subagent` → `Agent`
+- `schedule` → `ScheduleWakeup`
+- `skill_manage` → `Skill`
 
 Notes:
 - If the OAuth token expires, refresh via the Claude OAuth refresh endpoint.

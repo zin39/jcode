@@ -288,6 +288,14 @@ struct Args {
     /// Keep any existing mermaid cache instead of forcing a cold-cache benchmark start
     #[arg(long, default_value_t = false)]
     keep_mermaid_cache: bool,
+
+    /// Number of inline images in the simulated transcript (--mode image-scroll)
+    #[arg(long, default_value = "60")]
+    images: usize,
+
+    /// Number of inline images visible per frame (--mode image-scroll)
+    #[arg(long, default_value = "3")]
+    images_visible: usize,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -299,6 +307,7 @@ enum BenchMode {
     CopySelection,
     MermaidUi,
     MermaidFlicker,
+    ImageScroll,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1262,6 +1271,36 @@ fn main() -> Result<()> {
             "fit_protocol_rebuild_rate: {:.4}",
             result.fit_protocol_rebuild_rate
         );
+        return Ok(());
+    }
+
+    if matches!(args.mode, BenchMode::ImageScroll) {
+        let result = jcode::tui::mermaid::debug_image_scroll_benchmark(
+            args.images,
+            args.frames.max(4),
+            args.images_visible,
+        );
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        println!("mode: {:?}", args.mode);
+        println!("protocol: {}", result.protocol.as_deref().unwrap_or("none"));
+        println!("images: {}", result.images);
+        println!("frames: {}", result.frames);
+        println!("visible_per_frame: {}", result.visible_per_frame);
+        println!("frame_avg_ms: {:.4}", result.frame_timing.avg_ms);
+        println!("frame_p95_ms: {:.4}", result.frame_timing.p95_ms);
+        println!("frame_p99_ms: {:.4}", result.frame_timing.p99_ms);
+        println!("frame_max_ms: {:.4}", result.frame_timing.max_ms);
+        println!("cache_stat_syscalls: {}", result.cache_stat_syscalls);
+        println!(
+            "cache_stat_syscalls_per_frame: {:.4}",
+            result.cache_stat_syscalls_per_frame
+        );
+        println!("visible_draw_skips: {}", result.visible_draw_skips);
+        println!("fit_protocol_rebuilds: {}", result.fit_protocol_rebuilds);
+        println!("fit_state_reuse_hits: {}", result.fit_state_reuse_hits);
         return Ok(());
     }
 

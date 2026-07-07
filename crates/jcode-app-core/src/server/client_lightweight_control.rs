@@ -12,7 +12,7 @@ use super::comm_control::{
 use super::comm_plan::{
     handle_comm_approve_plan, handle_comm_propose_plan, handle_comm_reject_plan,
 };
-use super::comm_session::{handle_comm_spawn, handle_comm_stop};
+use super::comm_session::{handle_comm_list_models, handle_comm_spawn, handle_comm_stop};
 use super::comm_sync::{
     CommResyncPlanContext, handle_comm_plan_status, handle_comm_read_context,
     handle_comm_resync_plan, handle_comm_status, handle_comm_summary,
@@ -21,7 +21,7 @@ use super::{
     AwaitMembersRuntime, ChannelSubscriptions, ClientConnectionInfo, FileTouchService,
     SessionAgents, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
     SwarmMutationRuntime, VersionedPlan, format_structured_completion_report, truncate_detail,
-    update_member_status_with_report,
+    update_member_status_with_report_tldr,
 };
 use crate::config::SwarmSpawnMode;
 use crate::protocol::{Request, ServerEvent};
@@ -114,9 +114,12 @@ pub(super) async fn handle_lightweight_control_request(
     let event_handle = tokio::spawn(async move {
         while let Some(event) = client_event_rx.recv().await {
             if let Err(error) = write_direct_event(&writer_clone, &event).await {
+                // Routine on client reload/disconnect; avoid dumping the full
+                // event (an await response can embed whole completion reports).
+                let event_desc = crate::logging::truncate_for_log(&format!("{:?}", event), 200);
                 crate::logging::warn(&format!(
-                    "lightweight control writer failed while sending {:?}: {}",
-                    event, error
+                    "lightweight control writer failed while sending {}: {}",
+                    event_desc, error
                 ));
                 break;
             }
@@ -170,6 +173,7 @@ pub(super) async fn handle_lightweight_control_request(
             channel,
             delivery,
             wake,
+            tldr,
         } => {
             handle_comm_message(
                 id,
@@ -179,6 +183,7 @@ pub(super) async fn handle_lightweight_control_request(
                 channel,
                 delivery,
                 wake,
+                tldr,
                 &client_event_tx,
                 sessions,
                 soft_interrupt_queues,
@@ -308,6 +313,94 @@ pub(super) async fn handle_lightweight_control_request(
             )
             .await;
         }
+        Request::CommSeedGraph {
+            id,
+            session_id: req_session_id,
+            mode,
+            nodes,
+        } => {
+            super::comm_graph::handle_comm_seed_graph(
+                id,
+                req_session_id,
+                mode,
+                nodes,
+                &client_event_tx,
+                swarm_members,
+                swarms_by_id,
+                swarm_plans,
+                swarm_coordinators,
+                event_history,
+                event_counter,
+                swarm_event_tx,
+            )
+            .await;
+        }
+        Request::CommExpandNode {
+            id,
+            session_id: req_session_id,
+            node_id,
+            children,
+        } => {
+            super::comm_graph::handle_comm_expand_node(
+                id,
+                req_session_id,
+                node_id,
+                children,
+                &client_event_tx,
+                swarm_members,
+                swarms_by_id,
+                swarm_plans,
+                swarm_coordinators,
+                event_history,
+                event_counter,
+                swarm_event_tx,
+            )
+            .await;
+        }
+        Request::CommCompleteNode {
+            id,
+            session_id: req_session_id,
+            node_id,
+            artifact_json,
+        } => {
+            super::comm_graph::handle_comm_complete_node(
+                id,
+                req_session_id,
+                node_id,
+                artifact_json,
+                &client_event_tx,
+                swarm_members,
+                swarms_by_id,
+                swarm_plans,
+                swarm_coordinators,
+                event_history,
+                event_counter,
+                swarm_event_tx,
+            )
+            .await;
+        }
+        Request::CommInjectGap {
+            id,
+            session_id: req_session_id,
+            gate_id,
+            nodes,
+        } => {
+            super::comm_graph::handle_comm_inject_gap(
+                id,
+                req_session_id,
+                gate_id,
+                nodes,
+                &client_event_tx,
+                swarm_members,
+                swarms_by_id,
+                swarm_plans,
+                swarm_coordinators,
+                event_history,
+                event_counter,
+                swarm_event_tx,
+            )
+            .await;
+        }
         Request::CommSpawn {
             id,
             session_id: req_session_id,
@@ -315,6 +408,9 @@ pub(super) async fn handle_lightweight_control_request(
             initial_message,
             request_nonce,
             spawn_mode,
+            model,
+            effort,
+            label,
         } => {
             let spawn_mode = match parse_swarm_spawn_mode(id, spawn_mode, &client_event_tx) {
                 Some(spawn_mode) => spawn_mode,
@@ -327,6 +423,9 @@ pub(super) async fn handle_lightweight_control_request(
                 initial_message,
                 request_nonce,
                 spawn_mode,
+                model,
+                effort,
+                label,
                 &client_event_tx,
                 sessions,
                 global_session_id,
@@ -343,7 +442,17 @@ pub(super) async fn handle_lightweight_control_request(
                 mcp_pool,
                 soft_interrupt_queues,
                 swarm_mutation_runtime,
+                client_connections,
             )
+            .await;
+        }
+        Request::CommListModels {
+            id,
+            session_id: req_session_id,
+        } => {
+            handle_comm_list_models(id, &req_session_id, sessions, provider_template, |event| {
+                let _ = client_event_tx.send(event);
+            })
             .await;
         }
         Request::CommStop {
@@ -438,6 +547,7 @@ pub(super) async fn handle_lightweight_control_request(
             message,
             validation,
             follow_up,
+            tldr,
         } => {
             let status = status.unwrap_or_else(|| "ready".to_string());
             let report = format_structured_completion_report(
@@ -446,11 +556,12 @@ pub(super) async fn handle_lightweight_control_request(
                 follow_up.as_deref(),
             );
             let detail = Some(truncate_detail(&message, 160));
-            update_member_status_with_report(
+            update_member_status_with_report_tldr(
                 &req_session_id,
                 &status,
                 detail,
                 Some(report.clone()),
+                tldr,
                 swarm_members,
                 swarms_by_id,
                 Some(event_history),
@@ -549,6 +660,8 @@ pub(super) async fn handle_lightweight_control_request(
             prefer_spawn,
             spawn_if_needed,
             message,
+            model,
+            effort,
         } => {
             handle_comm_assign_next(
                 id,
@@ -558,6 +671,8 @@ pub(super) async fn handle_lightweight_control_request(
                 prefer_spawn,
                 spawn_if_needed,
                 message,
+                model,
+                effort,
                 &client_event_tx,
                 sessions,
                 global_session_id,
@@ -651,6 +766,9 @@ pub(super) async fn handle_lightweight_control_request(
             session_ids: requested_ids,
             mode,
             timeout_secs,
+            background,
+            notify,
+            wake,
         } => {
             handle_comm_await_members(
                 id,
@@ -659,6 +777,9 @@ pub(super) async fn handle_lightweight_control_request(
                 requested_ids,
                 mode,
                 timeout_secs,
+                background,
+                notify,
+                wake,
                 CommAwaitMembersContext {
                     client_event_tx: &client_event_tx,
                     swarm_members,

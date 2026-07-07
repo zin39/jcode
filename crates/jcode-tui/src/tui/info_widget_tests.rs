@@ -2,9 +2,10 @@ use super::{
     BackgroundInfo, CacheHitInfo, CacheMissAttribution, GraphEdge, GraphNode, InfoWidgetData,
     Margins, MemoryActivity, MemoryEvent, MemoryEventKind, MemoryInfo, MemoryState, PipelineState,
     StepStatus, SwarmInfo, UsageInfo, UsageProvider, WidgetKind, calculate_placements,
-    effective_prompt_tokens, occasional_status_tip, render_kv_cache_widget, render_memory_compact,
-    render_memory_widget, render_model_widget, render_todos_compact, render_todos_expanded,
-    render_todos_widget, render_usage_compact, render_usage_widget, truncate_smart,
+    calculate_widget_height, effective_prompt_tokens, occasional_status_tip,
+    render_kv_cache_widget, render_memory_compact, render_memory_widget, render_model_widget,
+    render_todos_compact, render_todos_expanded, render_todos_widget, render_usage_compact,
+    render_usage_widget, swarm_plan_todos, truncate_smart,
 };
 use crate::protocol::SwarmMemberStatus;
 use ratatui::layout::Rect;
@@ -106,6 +107,7 @@ fn todos_widgets_show_item_and_aggregate_confidence() {
                 priority: "high".to_string(),
                 confidence: Some(80),
                 completion_confidence: None,
+                confidence_history: Vec::new(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
             },
@@ -117,6 +119,7 @@ fn todos_widgets_show_item_and_aggregate_confidence() {
                 priority: "medium".to_string(),
                 confidence: Some(70),
                 completion_confidence: Some(95),
+                confidence_history: Vec::new(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
             },
@@ -148,6 +151,7 @@ fn todos_widgets_render_group_headers_when_groups_present() {
         priority: "medium".to_string(),
         confidence: Some(80),
         completion_confidence: None,
+        confidence_history: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
     };
@@ -185,6 +189,7 @@ fn todos_widgets_stay_flat_without_groups() {
         priority: "medium".to_string(),
         confidence: Some(80),
         completion_confidence: None,
+        confidence_history: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
     };
@@ -206,6 +211,7 @@ fn todos_widget_renders_exact_pips_for_small_lists() {
         priority: "medium".to_string(),
         confidence: Some(80),
         completion_confidence: None,
+        confidence_history: Vec::new(),
         blocked_by: Vec::new(),
         assigned_to: None,
     };
@@ -241,6 +247,193 @@ fn todos_widget_renders_exact_pips_for_small_lists() {
     let all = lines_text(&lines);
     assert!(!all.contains('█'), "old block bar should be gone: {all}");
     assert!(!all.contains('░'), "old empty bar should be gone: {all}");
+}
+
+fn plan_item(id: &str, status: &str) -> crate::plan::PlanItem {
+    crate::plan::PlanItem {
+        content: format!("task {id}"),
+        status: status.to_string(),
+        priority: "medium".to_string(),
+        id: id.to_string(),
+        subsystem: None,
+        file_scope: Vec::new(),
+        blocked_by: Vec::new(),
+        assigned_to: None,
+    }
+}
+
+#[test]
+fn swarm_plan_todos_normalizes_scheduler_statuses() {
+    let items = vec![
+        plan_item("a", "running"),
+        plan_item("b", "running_stale"),
+        plan_item("c", "done"),
+        plan_item("d", "completed"),
+        plan_item("e", "failed"),
+        plan_item("f", "stopped"),
+        plan_item("g", "crashed"),
+        plan_item("h", "queued"),
+        plan_item("i", "ready"),
+        plan_item("j", "blocked"),
+        plan_item("k", "pending"),
+        plan_item("l", "in_progress"),
+        plan_item("m", "weird_custom_status"),
+    ];
+    let todos = swarm_plan_todos(&items);
+    let status_of = |id: &str| {
+        todos
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.status.clone())
+            .unwrap()
+    };
+    // Active scheduler states surface as in_progress (▶ amber, sorts first).
+    assert_eq!(status_of("a"), "in_progress");
+    assert_eq!(status_of("b"), "in_progress");
+    // Terminal success maps onto completed (✓).
+    assert_eq!(status_of("c"), "completed");
+    assert_eq!(status_of("d"), "completed");
+    // Terminal failure maps onto cancelled (✗) instead of an open circle.
+    assert_eq!(status_of("e"), "cancelled");
+    assert_eq!(status_of("f"), "cancelled");
+    assert_eq!(status_of("g"), "cancelled");
+    // Runnable / blocked states render as pending (○).
+    assert_eq!(status_of("h"), "pending");
+    assert_eq!(status_of("i"), "pending");
+    assert_eq!(status_of("j"), "pending");
+    // Statuses the todo renderer already understands pass through.
+    assert_eq!(status_of("k"), "pending");
+    assert_eq!(status_of("l"), "in_progress");
+    // Arbitrary strings pass through unchanged (rendered as open ○).
+    assert_eq!(status_of("m"), "weird_custom_status");
+}
+
+#[test]
+fn swarm_plan_todos_preserve_blockers_and_assignee_and_flow_to_renderer() {
+    let mut blocked = plan_item("audit-x", "queued");
+    blocked.blocked_by = vec!["audit-y".to_string()];
+    let mut running = plan_item("audit-y", "running");
+    running.assigned_to = Some("worker-1".to_string());
+    let items = vec![blocked, running];
+
+    let todos = swarm_plan_todos(&items);
+    assert_eq!(todos[0].blocked_by, vec!["audit-y".to_string()]);
+    assert_eq!(todos[1].assigned_to.as_deref(), Some("worker-1"));
+
+    let data = InfoWidgetData {
+        todos,
+        ..Default::default()
+    };
+    let text = lines_text(&render_todos_expanded(&data, Rect::new(0, 0, 80, 14)));
+    // Blocked items get the dependency marker and suffix.
+    assert!(text.contains("⊳"), "blocked glyph missing: {text}");
+    assert!(text.contains("(blocked)"), "blocked suffix missing: {text}");
+    // The running item sorts first as in_progress.
+    let running_idx = text.find("task audit-y").unwrap();
+    let blocked_idx = text.find("task audit-x").unwrap();
+    assert!(running_idx < blocked_idx, "active-first order: {text}");
+}
+
+#[test]
+fn swarm_plan_running_items_render_before_completed_in_large_plans() {
+    // 120-item deep plan: 100 completed, 1 running near the end, rest queued.
+    // The running item must be visible in the small line budget instead of
+    // hiding behind the "+N more" footer.
+    let mut items: Vec<crate::plan::PlanItem> = (0..100)
+        .map(|i| plan_item(&format!("done-{i}"), "completed"))
+        .collect();
+    items.push(plan_item("hot-task", "running"));
+    for i in 0..19 {
+        items.push(plan_item(&format!("queued-{i}"), "queued"));
+    }
+
+    let data = InfoWidgetData {
+        todos: swarm_plan_todos(&items),
+        ..Default::default()
+    };
+    let text = lines_text(&render_todos_widget(&data, Rect::new(0, 0, 60, 8)));
+    assert!(
+        text.contains("task hot-task"),
+        "running plan item should be visible in the budgeted list: {text}"
+    );
+    assert!(text.contains("+"), "footer summarizes the rest: {text}");
+}
+
+#[test]
+fn todo_widget_header_says_plan_when_showing_swarm_plan_projection() {
+    let items = vec![plan_item("a", "running"), plan_item("b", "queued")];
+    let plan_data = InfoWidgetData {
+        todos: swarm_plan_todos(&items),
+        todos_are_swarm_plan: true,
+        ..Default::default()
+    };
+    for text in [
+        lines_text(&render_todos_widget(&plan_data, Rect::new(0, 0, 60, 8))),
+        lines_text(&render_todos_expanded(&plan_data, Rect::new(0, 0, 60, 14))),
+        lines_text(&render_todos_compact(&plan_data, Rect::new(0, 0, 60, 3))),
+    ] {
+        assert!(text.contains("Plan"), "plan header missing: {text}");
+        assert!(!text.contains("Todos"), "plan must not claim Todos: {text}");
+    }
+
+    let todo_data = InfoWidgetData {
+        todos: swarm_plan_todos(&items),
+        todos_are_swarm_plan: false,
+        ..Default::default()
+    };
+    let text = lines_text(&render_todos_widget(&todo_data, Rect::new(0, 0, 60, 8)));
+    assert!(text.contains("Todos"), "todos header missing: {text}");
+}
+
+#[test]
+fn swarm_plan_gate_items_render_like_normal_items() {
+    // Deep-mode critique gates share the plan item shape; only the id differs.
+    let mut gate = plan_item("explore-root::gate", "queued");
+    gate.content = "Critique the work of 'explore-root' adversarially.".to_string();
+    gate.blocked_by = vec!["explore-root".to_string()];
+    let items = vec![plan_item("explore-root", "running"), gate];
+
+    let data = InfoWidgetData {
+        todos: swarm_plan_todos(&items),
+        ..Default::default()
+    };
+    let text = lines_text(&render_todos_expanded(&data, Rect::new(0, 0, 80, 14)));
+    assert!(text.contains("Critique the work"), "{text}");
+    assert!(text.contains("(blocked)"), "gate blocked on parent: {text}");
+}
+
+#[test]
+fn swarm_plan_todos_render_safely_at_extreme_sizes() {
+    // Panic-safety sweep: long ids, wide glyphs, huge plans, tiny rects.
+    let mut items: Vec<crate::plan::PlanItem> = (0..300)
+        .map(|i| {
+            let mut item = plan_item(
+                &format!("very-long-node-id-{i}::gate::retry::{}", "x".repeat(80)),
+                match i % 5 {
+                    0 => "running",
+                    1 => "completed",
+                    2 => "failed",
+                    3 => "queued",
+                    _ => "blocked",
+                },
+            );
+            item.content = format!("宽字符 emoji 🚀 test {} {}", i, "汉".repeat(40));
+            item.blocked_by = vec!["dep".to_string()];
+            item
+        })
+        .collect();
+    items.push(plan_item("", ""));
+
+    let data = InfoWidgetData {
+        todos: swarm_plan_todos(&items),
+        ..Default::default()
+    };
+    for (w, h) in [(0, 0), (1, 1), (2, 5), (7, 3), (20, 8), (200, 50)] {
+        let rect = Rect::new(0, 0, w, h);
+        let _ = render_todos_widget(&data, rect);
+        let _ = render_todos_expanded(&data, rect);
+        let _ = render_todos_compact(&data, rect);
+    }
 }
 
 #[test]
@@ -923,6 +1116,80 @@ fn render_context_compact_reports_updating_when_snapshot_is_stale() {
     );
 }
 
+fn managed_member(id: &str, status: &str, role: Option<&str>) -> SwarmMemberStatus {
+    SwarmMemberStatus {
+        session_id: id.to_string(),
+        friendly_name: Some(id.to_string()),
+        status: status.to_string(),
+        detail: None,
+        task_label: None,
+        role: role.map(str::to_string),
+        is_headless: Some(true),
+        live_attachments: None,
+        status_age_secs: Some(3),
+        output_tail: Some("streaming some work".to_string()),
+        report_back_to_session_id: Some("parent".to_string()),
+        todo_progress: Some((2, 5)),
+        todo_items: Vec::new(),
+    }
+}
+
+/// With managed members present, the SwarmStatus widget switches to compact
+/// mode: agents tally + node progress bar, and has_data_for admits the
+/// widget into layout.
+#[test]
+fn swarm_widget_dock_mode_lists_managed_agents() {
+    let data = InfoWidgetData {
+        swarm_info: Some(SwarmInfo {
+            managed_members: vec![
+                managed_member("researcher", "running", Some("coordinator")),
+                managed_member("reviewer", "completed", None),
+            ],
+            plan_progress: Some((3, 2, 7)),
+            selected: 0,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(data.has_data_for(WidgetKind::SwarmStatus));
+    // Managing agents bumps the dock's effective priority near the top.
+    assert!(data.effective_priority(WidgetKind::SwarmStatus) < WidgetKind::SwarmStatus.priority());
+
+    let lines = super::render_swarm_widget(&data, Rect::new(0, 0, 34, 10));
+    let text = lines_text(&lines);
+    assert!(text.contains("1/2 agents"), "got: {text}");
+    assert!(text.contains("nodes 3/7"), "got: {text}");
+    // Second line is the plan progress bar (low-profile underline cells).
+    assert_eq!(lines.len(), 2, "compact widget is exactly two lines");
+    let bar: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        bar.chars().all(|c| c == '▁') && !bar.is_empty(),
+        "expected underline bar cells: {bar}"
+    );
+    // Height: summary line + bar (+ borders).
+    let h = calculate_widget_height(WidgetKind::SwarmStatus, &data, 34, 20);
+    assert_eq!(h, 4, "compact height should be 2 content + 2 border: {h}");
+}
+
+/// Without managed members the legacy session-list rendering is preserved and
+/// the widget stays out of layout (has_data_for is false).
+#[test]
+fn swarm_widget_without_managed_agents_stays_hidden_from_layout() {
+    let data = InfoWidgetData {
+        swarm_info: Some(SwarmInfo {
+            session_count: 4,
+            session_names: vec!["alpha".to_string()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(!data.has_data_for(WidgetKind::SwarmStatus));
+    assert_eq!(
+        calculate_widget_height(WidgetKind::SwarmStatus, &data, 34, 20),
+        0
+    );
+}
+
 #[test]
 fn swarm_widget_renders_member_roles_and_details() {
     let data = InfoWidgetData {
@@ -935,22 +1202,30 @@ fn swarm_widget_renders_member_roles_and_details() {
                     friendly_name: Some("coord".to_string()),
                     status: "running".to_string(),
                     detail: Some("orchestrating patch".to_string()),
+                    task_label: None,
                     role: Some("coordinator".to_string()),
                     is_headless: None,
                     live_attachments: None,
                     status_age_secs: None,
                     output_tail: None,
+                    report_back_to_session_id: None,
+                    todo_progress: None,
+                    todo_items: Vec::new(),
                 },
                 SwarmMemberStatus {
                     session_id: "tree-12345678".to_string(),
                     friendly_name: Some("trees".to_string()),
                     status: "ready".to_string(),
                     detail: Some("worktree synced".to_string()),
-                    role: Some("worktree_manager".to_string()),
+                    task_label: None,
+                    role: Some("agent".to_string()),
                     is_headless: None,
                     live_attachments: None,
                     status_age_secs: None,
                     output_tail: None,
+                    report_back_to_session_id: None,
+                    todo_progress: None,
+                    todo_items: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -963,7 +1238,6 @@ fn swarm_widget_renders_member_roles_and_details() {
     assert!(text.contains("3s"), "got: {text}");
     assert!(text.contains("1c"), "got: {text}");
     assert!(text.contains("★"), "got: {text}");
-    assert!(text.contains("◆"), "got: {text}");
     assert!(
         text.contains("coord running - orchestrating patch"),
         "got: {text}"
@@ -972,6 +1246,120 @@ fn swarm_widget_renders_member_roles_and_details() {
         text.contains("trees ready - worktree synced"),
         "got: {text}"
     );
+}
+
+#[test]
+fn swarm_widget_handles_empty_swarm_and_zero_area_without_panic() {
+    // No swarm info at all: renders nothing.
+    let data = InfoWidgetData::default();
+    assert!(super::render_swarm_widget(&data, Rect::new(0, 0, 40, 4)).is_empty());
+
+    // Empty swarm (no members, no names, no subagent status): only the stats line.
+    let data = InfoWidgetData {
+        swarm_info: Some(SwarmInfo::default()),
+        ..Default::default()
+    };
+    let lines = super::render_swarm_widget(&data, Rect::new(0, 0, 40, 4));
+    assert_eq!(lines.len(), 1, "expected only the stats line");
+    // session_count == 0 and client_count == None: stats line is just the bee icon.
+    let text = lines_text(&lines);
+    assert!(
+        !text.contains("0s"),
+        "zero sessions must not render: {text}"
+    );
+
+    // Zero-size rect must not panic or underflow.
+    let _ = super::render_swarm_widget(&data, Rect::new(0, 0, 0, 0));
+    let mut member_data = data.clone();
+    member_data.swarm_info.as_mut().unwrap().members = vec![SwarmMemberStatus {
+        session_id: "abc".to_string(),
+        friendly_name: None,
+        status: "running".to_string(),
+        detail: None,
+        task_label: None,
+        role: None,
+        is_headless: None,
+        live_attachments: None,
+        status_age_secs: None,
+        output_tail: None,
+        report_back_to_session_id: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+    }];
+    let _ = super::render_swarm_widget(&member_data, Rect::new(0, 0, 0, 0));
+    let _ = super::render_swarm_widget(&member_data, Rect::new(0, 0, 3, 1));
+}
+
+#[test]
+fn swarm_widget_caps_member_rows_for_large_swarms() {
+    let members: Vec<SwarmMemberStatus> = (0..500)
+        .map(|i| SwarmMemberStatus {
+            session_id: format!("session-{i:04}"),
+            friendly_name: Some(format!("worker-{i}")),
+            status: "running".to_string(),
+            detail: Some("very long detail text that should be truncated".repeat(4)),
+            task_label: None,
+            role: None,
+            is_headless: None,
+            live_attachments: None,
+            status_age_secs: None,
+            output_tail: None,
+            report_back_to_session_id: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+        })
+        .collect();
+    let data = InfoWidgetData {
+        swarm_info: Some(SwarmInfo {
+            session_count: 500,
+            client_count: Some(3),
+            members,
+            session_names: (0..500).map(|i| format!("worker-{i}")).collect(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let lines = super::render_swarm_widget(&data, Rect::new(0, 0, 30, 10));
+    // Stats line + at most 3 member rows regardless of swarm size.
+    assert_eq!(lines.len(), 4, "expected stats line + capped member rows");
+    let text = lines_text(&lines);
+    assert!(text.contains("500s"), "got: {text}");
+    assert!(text.contains("3c"), "got: {text}");
+}
+
+#[test]
+fn background_widget_handles_empty_and_large_task_lists() {
+    // No background info: renders nothing.
+    let data = InfoWidgetData::default();
+    assert!(super::render_background_widget(&data, Rect::new(0, 0, 40, 4)).is_empty());
+
+    // running_count == 0: summary is suppressed even if stale task names linger.
+    let info = BackgroundInfo {
+        running_count: 0,
+        running_tasks: vec!["stale".to_string()],
+        ..Default::default()
+    };
+    assert!(super::render_background_compact(&info).is_empty());
+
+    // Large task list: summary + 3 rows + overflow line, no panic at tiny width.
+    let info = BackgroundInfo {
+        running_count: 200,
+        running_tasks: (0..200).map(|i| format!("task-{i}")).collect(),
+        progress_detail: Some("42% · working".to_string()),
+        ..Default::default()
+    };
+    let data = InfoWidgetData {
+        background_info: Some(info.clone()),
+        ..Default::default()
+    };
+    let lines = super::render_background_widget(&data, Rect::new(0, 0, 40, 8));
+    assert_eq!(lines.len(), 5, "summary + 3 tasks + overflow");
+    let text = lines_text(&lines);
+    assert!(text.contains("200 running"), "got: {text}");
+    assert!(text.contains("+197 more"), "got: {text}");
+    // Zero-size rect must not panic (row width clamps to a minimum).
+    let _ = super::render_background_widget(&data, Rect::new(0, 0, 0, 0));
 }
 
 #[test]
@@ -1104,6 +1492,7 @@ fn placements_never_include_border_only_widgets() {
             assigned_to: None,
             confidence: None,
             completion_confidence: None,
+            confidence_history: Vec::new(),
         }],
         queue_mode: Some(true),
         memory_info: Some(MemoryInfo {
@@ -1145,4 +1534,90 @@ fn placements_never_include_border_only_widgets() {
         "found border-only widget placement: {:?}",
         placements
     );
+}
+
+/// The compact overview page must render exactly as many lines as
+/// `compute_page_layout` reserved for it. A mismatch either clips the last
+/// sections (background tasks were the historical victim, since they render
+/// last) or leaves blank reserved rows.
+#[test]
+fn compact_page_height_estimate_matches_rendered_lines() {
+    use super::InfoPageKind;
+
+    // No todos/memory so the only candidate page is CompactOnly, and the
+    // background section (rendered last) is included.
+    let data = InfoWidgetData {
+        model: Some("claude-test-1".to_string()),
+        provider_name: Some("anthropic".to_string()),
+        session_count: Some(2),
+        context_info: Some(crate::prompt::ContextInfo {
+            system_prompt_chars: 10_000,
+            total_chars: 30_000,
+            ..Default::default()
+        }),
+        background_info: Some(BackgroundInfo {
+            running_count: 2,
+            running_tasks: vec!["bash".to_string(), "task".to_string()],
+            ..Default::default()
+        }),
+        usage_info: Some(UsageInfo {
+            provider: UsageProvider::Anthropic,
+            five_hour: 0.3,
+            seven_day: 0.5,
+            available: true,
+            ..Default::default()
+        }),
+        cache_hit_info: Some(CacheHitInfo {
+            reported_input_tokens: 1_000,
+            read_tokens: 800,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let inner = Rect::new(0, 0, 38, 30);
+    let layout = super::compute_page_layout(&data, inner.width as usize, inner.height);
+    assert_eq!(layout.pages.len(), 1, "expected a single compact page");
+    assert_eq!(layout.pages[0].kind, InfoPageKind::CompactOnly);
+
+    let lines = super::render_page(InfoPageKind::CompactOnly, &data, inner);
+    assert_eq!(
+        lines.len() as u16,
+        layout.pages[0].height,
+        "compact page height estimate must match rendered line count \
+         (background section is rendered last and gets clipped on mismatch)"
+    );
+}
+
+/// Same consistency check for a cost-based (API key) provider, whose usage
+/// section renders a single line.
+#[test]
+fn compact_page_height_matches_for_cost_based_usage() {
+    use super::InfoPageKind;
+
+    let data = InfoWidgetData {
+        model: Some("gpt-test".to_string()),
+        background_info: Some(BackgroundInfo {
+            running_count: 1,
+            running_tasks: vec!["bash".to_string()],
+            ..Default::default()
+        }),
+        usage_info: Some(UsageInfo {
+            provider: UsageProvider::CostBased,
+            total_cost: 0.42,
+            input_tokens: 10_000,
+            output_tokens: 2_000,
+            available: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let inner = Rect::new(0, 0, 38, 30);
+    let layout = super::compute_page_layout(&data, inner.width as usize, inner.height);
+    assert_eq!(layout.pages.len(), 1);
+    assert_eq!(layout.pages[0].kind, InfoPageKind::CompactOnly);
+
+    let lines = super::render_page(InfoPageKind::CompactOnly, &data, inner);
+    assert_eq!(lines.len() as u16, layout.pages[0].height);
 }

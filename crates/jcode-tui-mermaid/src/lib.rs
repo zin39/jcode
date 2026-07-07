@@ -228,25 +228,31 @@ mod viewport_render;
 mod widget_render;
 
 pub use cache_render::{
-    RenderResult, deferred_render_epoch, get_cached_path, is_mermaid_lang, render_mermaid,
+    RenderResult, debug_bump_deferred_render_epoch_for_tests, deferred_render_epoch,
+    evict_render_cache_for_content, get_cached_path, is_mermaid_lang, render_mermaid,
     render_mermaid_deferred, render_mermaid_deferred_with_registration,
     render_mermaid_deferred_with_stream_scope, render_mermaid_sized, render_mermaid_untracked,
 };
 #[cfg(feature = "renderer")]
 pub use content_render::terminal_theme;
 pub use content_render::{
-    MermaidContent, diagram_placeholder_lines, error_to_lines, estimate_image_height,
-    image_widget_placeholder_markdown, inline_image_placeholder_lines, parse_image_placeholder,
-    parse_inline_image_placeholder, result_to_content, result_to_lines, write_video_export_marker,
+    INLINE_DIAGRAM_MAX_ROWS, INLINE_FIT_MIN_ROWS, MermaidContent, diagram_placeholder_lines,
+    error_to_lines, estimate_image_height, image_widget_placeholder_markdown, inline_fit_geometry,
+    inline_image_placeholder_lines, inline_transcript_aspect_goal,
+    inline_transcript_aspect_goal_with_font, parse_image_placeholder,
+    parse_inline_image_placeholder, result_to_content, result_to_lines,
+    transcript_preferred_aspect_ratio, transcript_preferred_aspect_ratio_with_font,
+    write_video_export_marker,
 };
 pub use inline_image::{
     inline_image_dims, inline_image_id, inline_image_is_materialized, materialize_inline_image,
-    materialize_inline_image_by_id,
+    materialize_inline_image_by_id, rediscover_inline_image,
 };
+pub use runtime::force_test_kitty_picker;
 pub use runtime::{
     error_lines_for, get_cached_png, get_font_size, image_protocol_available, init_picker,
     is_video_export_mode, protocol_type, register_external_image, register_inline_image,
-    set_video_export_mode,
+    set_video_export_mode, with_image_protocol_override,
 };
 pub use viewport_render::{
     InlineFitReadiness, inline_fit_readiness, invalidate_render_state, prewarm_inline_fit_state,
@@ -255,11 +261,13 @@ pub use viewport_render::{
 };
 pub use widget_render::{render_image_widget, render_image_widget_fit, render_image_widget_scale};
 
+use cache_render::LAYOUT_CACHE_MAX;
 #[cfg(test)]
 use cache_render::calculate_render_size;
 use cache_render::{
     CachedDiagram, MermaidCache, RENDER_CACHE_MAX, RENDER_WIDTH_BUCKET_CELLS,
-    bump_deferred_render_epoch, get_cached_diagram,
+    bump_deferred_render_epoch, clear_layout_cache, get_cached_diagram,
+    get_cached_diagram_in_memory, layout_cache_usage,
 };
 use viewport_render::clear_image_area;
 use widget_render::{BORDER_WIDTH, draw_left_border, render_stateful_image_safe};
@@ -346,8 +354,28 @@ fn render_svg_for_png(
     layout_config: &LayoutConfig,
     output_dimensions: Option<(f32, f32)>,
 ) -> (String, MeasuredSvgDimensions) {
-    let dimensions = mmdr_measure_svg_dimensions(layout, layout_config, output_dimensions);
-    let svg = mmdr_render_svg_with_dimensions(layout, theme, layout_config, output_dimensions);
+    // Measure the natural (content-hugging) canvas first, then fit it into the
+    // requested target box while preserving aspect ratio. Forcing the raw
+    // target dimensions letterboxes wide diagrams inside the ~4:3 request box:
+    // the PNG (and therefore the transcript placeholder) reserves huge
+    // transparent bands above/below the ink. This mirrors the legacy
+    // `retarget_svg_for_png` fit semantics.
+    let natural = mmdr_measure_svg_dimensions(layout, layout_config, None);
+    let fitted = output_dimensions.map(|(target_width, target_height)| {
+        let target_width = target_width.max(1.0);
+        let target_height = target_height.max(1.0);
+        let natural_width = natural.width.max(1.0);
+        let natural_height = natural.height.max(1.0);
+        let scale = (target_width / natural_width)
+            .min(target_height / natural_height)
+            .max(0.0001);
+        (
+            (natural_width * scale).max(1.0),
+            (natural_height * scale).max(1.0),
+        )
+    });
+    let dimensions = mmdr_measure_svg_dimensions(layout, layout_config, fitted);
+    let svg = mmdr_render_svg_with_dimensions(layout, theme, layout_config, fitted);
     (
         svg,
         MeasuredSvgDimensions {
@@ -396,6 +424,22 @@ static RENDER_CACHE: LazyLock<Mutex<MermaidCache>> =
 /// naturally refreshed on the next redraw.
 static DEFERRED_RENDER_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// Count of `path.exists()`/`read_dir` filesystem stat syscalls performed by
+/// the render-cache lookup paths. The inline-image scroll hot path used to pay
+/// one of these per visible (and prefetched) image *per frame*, so this counter
+/// makes that cost observable to the image-scroll benchmark and regression tests.
+static CACHE_STAT_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn record_cache_stat_syscall() {
+    CACHE_STAT_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total filesystem stat syscalls performed by the render-cache lookups so far.
+pub fn cache_stat_syscalls() -> u64 {
+    CACHE_STAT_SYSCALLS.load(Ordering::Relaxed)
+}
+
 type PendingRenderKey = (u64, u32, RenderProfile);
 type PendingRenderMap = HashMap<PendingRenderKey, PendingDeferredRender>;
 
@@ -436,6 +480,20 @@ static SVG_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
 /// inline screenshots reuses warm protocol state instead of re-encoding.
 const IMAGE_STATE_MAX: usize = 24;
 
+/// Maximum number of Kitty virtual-placement state entries to keep.
+///
+/// Unlike `IMAGE_STATE` (which holds full decoded+encoded `StatefulProtocol`
+/// data), a steady-state `KittyViewportState` entry is tiny: once its one-shot
+/// `pending_transmit` payload has been drawn it is just metadata (a path, a u32
+/// id, and a few dimensions, ~100 bytes). The terminal itself retains the
+/// transmitted pixels, so keeping the id->geometry mapping warm lets a scroll
+/// back over a long transcript of screenshots re-address the existing image with
+/// unicode placeholders instead of paying a synchronous decode + scale + base64
+/// re-transmit. We therefore size this far larger than `IMAGE_STATE_MAX` so the
+/// scroll working set for a screenshot-heavy session stays warm; the memory cost
+/// of the extra metadata entries is negligible.
+const KITTY_VIEWPORT_STATE_MAX: usize = 256;
+
 /// Image state cache - holds StatefulProtocol for each rendered image
 /// Keyed by content hash; source_path guards prevent stale reuse when
 /// a higher-resolution PNG for the same hash replaces the old one.
@@ -459,6 +517,22 @@ static LAST_RENDER: LazyLock<Mutex<HashMap<u64, LastRenderState>>> =
 /// Render errors for lazy mermaid diagrams (hash -> error message)
 static RENDER_ERRORS: LazyLock<Mutex<HashMap<u64, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Cap for the LAST_RENDER / RENDER_ERRORS bookkeeping maps. Entries are tiny,
+/// but both maps are keyed by content hash and previously grew without bound
+/// over a long session. On overflow the map is simply cleared: LAST_RENDER only
+/// powers a skipped-render stat, and a cleared RENDER_ERRORS entry just means
+/// one failed diagram re-renders (and re-fails) once more.
+pub(crate) const RENDER_BOOKKEEPING_MAX: usize = 1024;
+
+/// Insert into a bounded bookkeeping map, clearing it if it would exceed
+/// [`RENDER_BOOKKEEPING_MAX`] distinct keys.
+pub(crate) fn bounded_bookkeeping_insert<V>(map: &mut HashMap<u64, V>, hash: u64, value: V) {
+    if map.len() >= RENDER_BOOKKEEPING_MAX && !map.contains_key(&hash) {
+        map.clear();
+    }
+    map.insert(hash, value);
+}
 
 /// Prevent unbounded growth when a long session contains many unique diagrams.
 const ACTIVE_DIAGRAMS_MAX: usize = 128;
@@ -628,7 +702,7 @@ impl KittyViewportCache {
         } else {
             self.entries.insert(hash, state);
             self.order.push_back(hash);
-            while self.order.len() > IMAGE_STATE_MAX {
+            while self.order.len() > KITTY_VIEWPORT_STATE_MAX {
                 if let Some(old) = self.order.pop_front() {
                     self.entries.remove(&old);
                 }
@@ -720,6 +794,11 @@ pub struct MermaidDebugStats {
     pub total_requests: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// Layout-tier cache hits: the PNG cache missed but the computed layout
+    /// was reused, so only SVG+PNG rasterization ran (no parse/compute_layout).
+    pub layout_cache_hits: u64,
+    /// Layout-tier cache misses: full parse + compute_layout executed.
+    pub layout_cache_misses: u64,
     pub deferred_enqueued: u64,
     pub deferred_deduped: u64,
     pub deferred_superseded: u64,
@@ -761,6 +840,11 @@ pub struct MermaidDebugStats {
     pub last_target_height: Option<u32>,
     pub deferred_pending: usize,
     pub deferred_epoch: u64,
+    /// Layout-tier cache resident entries (see `layout_cache_hits`).
+    pub layout_cache_entries: usize,
+    pub layout_cache_limit: usize,
+    /// Approximate resident bytes held by cached layouts.
+    pub layout_cache_approx_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -840,6 +924,11 @@ pub struct MermaidMemoryProfile {
     pub cache_disk_max_age_secs: u64,
     /// Mermaid-specific working set estimate (cache metadata + protocol floor + decoded source).
     pub mermaid_working_set_estimate_bytes: u64,
+    /// Number of computed layouts cached in the layout tier.
+    pub layout_cache_entries: usize,
+    pub layout_cache_limit: usize,
+    /// Approximate resident bytes held by cached layouts (nodes+edges+labels walk).
+    pub layout_cache_approx_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -878,6 +967,35 @@ pub struct MermaidFlickerBenchmark {
     pub fit_protocol_rebuild_rate: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageScrollBenchmark {
+    /// Protocol the benchmark ran against (e.g. "Kitty").
+    pub protocol: Option<String>,
+    /// Number of distinct inline images in the simulated transcript.
+    pub images: usize,
+    /// Number of simulated scroll frames.
+    pub frames: usize,
+    /// Images visible per frame (drives the per-frame draw cost).
+    pub visible_per_frame: usize,
+    /// Per-frame UI-thread wall time across the scroll (ms).
+    pub frame_timing: MermaidTimingSummary,
+    /// Filesystem stat syscalls performed by render-cache lookups during the
+    /// scroll (the cost this benchmark was built to catch). Steady-state
+    /// scrolling should approach zero.
+    pub cache_stat_syscalls: u64,
+    /// Stat syscalls per rendered frame (cache_stat_syscalls / frames).
+    pub cache_stat_syscalls_per_frame: f64,
+    /// Frames where a visible image was not yet warm, so the UI thread skipped
+    /// the draw and scheduled an off-thread prewarm (the "blank then pop" hitch
+    /// the look-ahead prefetch is meant to eliminate).
+    pub visible_draw_skips: u64,
+    /// Kitty fit-state rebuilds during the scroll (decode + scale + transmit).
+    /// Steady-state re-scrolling within the cache working set should be zero.
+    pub fit_protocol_rebuilds: u64,
+    /// Cheap fit-state reuse hits during the scroll.
+    pub fit_state_reuse_hits: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MermaidDebugStatsDelta {
     pub image_state_hits: u64,
@@ -894,9 +1012,9 @@ mod debug;
 
 pub use debug::{
     ImageStateInfo, ScrollFrameInfo, ScrollTestResult, TestRenderResult, clear_cache, debug_cache,
-    debug_flicker_benchmark, debug_image_state, debug_memory_benchmark, debug_memory_profile,
-    debug_render, debug_stats, debug_stats_json, debug_test_render, debug_test_resize_stability,
-    debug_test_scroll, reset_debug_stats,
+    debug_flicker_benchmark, debug_image_scroll_benchmark, debug_image_state,
+    debug_memory_benchmark, debug_memory_profile, debug_render, debug_stats, debug_stats_json,
+    debug_test_render, debug_test_resize_stability, debug_test_scroll, reset_debug_stats,
 };
 
 fn hash_content(content: &str) -> u64 {
@@ -924,6 +1042,12 @@ const CACHE_MAX_AGE_SECS: u64 = 3 * 24 * 60 * 60;
 /// Maximum total cache size (50 MB)
 const CACHE_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 
+/// File extensions the render/materialize paths write into the cache dir.
+/// `evict_old_cache` must recognize every one of them: inline images keep
+/// their source container format (`{hash}_inline.jpg` etc.), so an extension
+/// missing here would never be evicted and leak on disk forever.
+const CACHE_FILE_EXTENSIONS: [&str; 7] = ["png", "jpg", "gif", "webp", "bmp", "ico", "img"];
+
 /// Evict old cache files on startup.
 pub fn evict_old_cache() {
     let cache_dir = match RENDER_CACHE.lock() {
@@ -941,7 +1065,10 @@ pub fn evict_old_cache() {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "png")
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| CACHE_FILE_EXTENSIONS.contains(&e))
             && let Ok(meta) = entry.metadata()
         {
             let size = meta.len();

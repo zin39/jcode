@@ -23,7 +23,15 @@ fn display_message_from_stored_message(
             Some(DisplayMessage::background_task(text))
         }
         None => match message.role {
-            Role::User => Some(DisplayMessage::user(text)),
+            Role::User => {
+                // Synthetic auto-poke continuations are persisted as user
+                // turns for the model but must not display as user prompts.
+                if crate::todo::is_auto_poke_message(&text) {
+                    Some(DisplayMessage::system(text))
+                } else {
+                    Some(DisplayMessage::user(text))
+                }
+            }
             Role::Assistant => Some(DisplayMessage::assistant(text)),
         },
     }
@@ -138,6 +146,43 @@ impl App {
         };
 
         self.replace_display_message_title_and_content(idx, title, content)
+    }
+
+    /// Push or update the swarm plan graph as an inline chat message.
+    ///
+    /// The transcript keeps exactly one plan-graph message. Plan updates
+    /// arrive in rapid bursts (one broadcast per assignment or status flip),
+    /// and during an active run they interleave with worker DMs and reports;
+    /// stacking one diagram per version would flood the transcript (deep
+    /// plans reach v100+). If the existing plan-graph message is still the
+    /// last message it is updated in place; otherwise it is moved to the
+    /// bottom so the live diagram stays with the current activity.
+    pub(super) fn upsert_trailing_swarm_plan_graph_message(
+        &mut self,
+        title: String,
+        content: String,
+    ) {
+        const PLAN_GRAPH_TITLE_PREFIX: &str = "Plan graph · ";
+        let plan_graph_idx = self.display_messages.iter().rposition(|message| {
+            message.role == "swarm"
+                && message
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.starts_with(PLAN_GRAPH_TITLE_PREFIX))
+        });
+
+        match plan_graph_idx {
+            Some(idx) if idx + 1 == self.display_messages.len() => {
+                self.replace_display_message_title_and_content(idx, Some(title), content);
+            }
+            Some(idx) => {
+                self.remove_display_message(idx);
+                self.push_display_message(DisplayMessage::swarm(title, content));
+            }
+            None => {
+                self.push_display_message(DisplayMessage::swarm(title, content));
+            }
+        }
     }
 
     pub(super) fn upsert_background_task_progress_message(&mut self, content: String) {

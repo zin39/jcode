@@ -63,7 +63,7 @@ fn render_compacts_huge_grep_match_lines() {
         "b".repeat(800)
     );
 
-    let compact = render::compact_rendered_match_line(&line, &args);
+    let compact = ::agentgrep::render::compact_rendered_match_line(&line, &args);
 
     assert!(compact.contains("set_status_notice"));
     assert!(compact.contains("[truncated:"), "{compact}");
@@ -72,6 +72,23 @@ fn render_compacts_huge_grep_match_lines() {
         "compact output should be bounded, got {} chars: {compact}",
         compact.chars().count()
     );
+}
+
+#[test]
+fn render_compacts_huge_trace_region_body_lines() {
+    let line = format!("function handleAuth(){{{}}}", "var x=1;".repeat(2000));
+
+    let compact = ::agentgrep::render::compact_region_body_line(&line);
+
+    assert!(compact.contains("[truncated:"), "{compact}");
+    assert!(
+        compact.chars().count() < 340,
+        "compact region body line should be bounded, got {} chars",
+        compact.chars().count()
+    );
+
+    let short = "fn small() {}";
+    assert_eq!(::agentgrep::render::compact_region_body_line(short), short);
 }
 
 #[test]
@@ -467,6 +484,51 @@ fn build_outline_args_accepts_file_field() {
     assert_eq!(args.path.as_deref(), Some("/workspace/repo"));
 }
 
+#[test]
+fn input_accepts_file_path_alias_for_file() {
+    let params: AgentGrepInput = serde_json::from_value(json!({
+        "mode": "outline",
+        "file_path": "src/app.rs"
+    }))
+    .expect("agentgrep input with file_path should deserialize");
+
+    assert_eq!(params.file.as_deref(), Some("src/app.rs"));
+}
+
+#[test]
+fn build_outline_args_treats_file_valued_path_as_outline_target() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(temp.path().join("app.rs"), "fn main() {}\n").expect("write file");
+    let ctx = test_ctx(temp.path());
+
+    let params = AgentGrepInput {
+        mode: "outline".to_string(),
+        query: Some("fn".to_string()),
+        file: None,
+        terms: None,
+        regex: None,
+        path: Some("app.rs".to_string()),
+        glob: None,
+        file_type: None,
+        hidden: None,
+        no_ignore: None,
+        max_files: None,
+        max_regions: None,
+        full_region: None,
+        debug_plan: None,
+        debug_score: None,
+        paths_only: None,
+    };
+
+    let args = build_outline_args(&params, &ctx, None).unwrap();
+    assert_eq!(
+        args.file,
+        temp.path().join("app.rs").display().to_string(),
+        "file-valued path should become the outline target instead of joining query onto it"
+    );
+    assert_eq!(args.path, None);
+}
+
 #[tokio::test]
 async fn execute_runs_linked_grep() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -750,4 +812,21 @@ fn tuning_detects_file_changed_since_seen() {
 
     assert!(tuned.current_version_confidence < 0.6);
     assert!(tuned.reasons.contains(&"file_changed_since_seen"));
+}
+
+#[test]
+fn input_accepts_legacy_grep_param_aliases() {
+    // Models sometimes call the removed native `grep` tool, which is now
+    // aliased to agentgrep. Its `pattern`/`include` params must map to
+    // agentgrep's `query`/`glob`.
+    let input: AgentGrepInput = serde_json::from_value(serde_json::json!({
+        "pattern": "fn main",
+        "include": "*.rs",
+        "path": "src"
+    }))
+    .expect("legacy grep params should deserialize");
+    assert_eq!(input.query.as_deref(), Some("fn main"));
+    assert_eq!(input.glob.as_deref(), Some("*.rs"));
+    assert_eq!(input.path.as_deref(), Some("src"));
+    assert_eq!(input.mode, "grep");
 }

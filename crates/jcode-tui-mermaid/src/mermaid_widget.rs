@@ -202,7 +202,7 @@ pub fn render_image_widget(
                     .ok()
                     .and_then(|mut map| {
                         let prev = map.get(&hash).cloned();
-                        map.insert(hash, state_key.clone());
+                        super::bounded_bookkeeping_insert(&mut map, hash, state_key.clone());
                         prev
                     })
                     .map(|prev| prev == state_key)
@@ -421,7 +421,7 @@ fn render_image_widget_fit_inner(
                     .ok()
                     .and_then(|mut map| {
                         let prev = map.get(&hash).cloned();
-                        map.insert(hash, state_key.clone());
+                        super::bounded_bookkeeping_insert(&mut map, hash, state_key.clone());
                         prev
                     })
                     .map(|prev| prev == state_key)

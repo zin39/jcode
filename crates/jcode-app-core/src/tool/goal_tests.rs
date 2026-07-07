@@ -36,25 +36,26 @@ async fn initiative_tool_create_and_resume_round_trip() {
         .await
         .expect("create goal");
     assert!(create.output.contains("Created initiative"));
+    assert!(!create.output.contains("side panel"));
 
-    let update = timeout(Duration::from_secs(1), bus_rx.recv())
-        .await
-        .expect("side panel update timeout")
-        .expect("side panel update event");
-    let snapshot = match update {
-        BusEvent::SidePanelUpdated(update) => update.snapshot,
-        other => panic!("expected side panel update event, got {:?}", other),
-    };
-    assert_eq!(
-        snapshot.focused_page_id.as_deref(),
-        Some("goal.ship-mobile-mvp")
-    );
+    // Creating an initiative must not spawn the side panel.
+    let update = timeout(Duration::from_millis(200), bus_rx.recv()).await;
+    if let Ok(Ok(event)) = update {
+        assert!(
+            !matches!(event, BusEvent::SidePanelUpdated(_)),
+            "create must not publish a side panel update, got {:?}",
+            event
+        );
+    }
 
     let persisted =
         crate::side_panel::snapshot_for_session("ses_goal_tool").expect("side panel snapshot");
-    assert_eq!(
-        persisted.focused_page_id.as_deref(),
-        Some("goal.ship-mobile-mvp")
+    assert!(
+        !persisted
+            .pages
+            .iter()
+            .any(|page| page.id == "goal.ship-mobile-mvp"),
+        "create must not write a goal page to the side panel"
     );
 
     let resume = tool
@@ -72,7 +73,7 @@ async fn initiative_tool_create_and_resume_round_trip() {
 }
 
 #[tokio::test]
-async fn initiative_tool_list_opens_goals_overview_by_default() {
+async fn initiative_tool_list_does_not_open_side_panel_by_default() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("repo");
@@ -109,7 +110,11 @@ async fn initiative_tool_list_opens_goals_overview_by_default() {
     assert!(list.output.contains("# Goals"));
     let snapshot =
         crate::side_panel::snapshot_for_session("ses_goal_list").expect("side panel snapshot");
-    assert_eq!(snapshot.focused_page_id.as_deref(), Some("goals"));
+    assert!(
+        !snapshot.pages.iter().any(|page| page.id == "goals"),
+        "list must not open the goals overview in the side panel"
+    );
+    assert_eq!(snapshot.focused_page_id, None);
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
@@ -149,8 +154,9 @@ async fn initiative_tool_update_refreshes_open_overview_without_stealing_focus()
         execution_mode: crate::tool::ToolExecutionMode::AgentTurn,
     };
 
-    tool.execute(json!({"action": "list"}), ctx.clone())
-        .await
+    // The user opens the overview explicitly (e.g. via /goals); the tool
+    // itself never spawns the side panel.
+    crate::goal::open_goals_overview_for_session("ses_goal_update", Some(&project), true)
         .expect("open goals overview");
 
     tool.execute(

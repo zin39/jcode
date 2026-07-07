@@ -171,7 +171,40 @@ pub(super) fn ensure_kitty_fit_state(
     if target_cols == 0 || target_rows == 0 {
         return None;
     }
+    // Fast path: the state already matches. Hold the lock only for this cheap
+    // probe, never across the expensive scale/transmit below.
+    let existing_unique_id = {
+        let mut cache = KITTY_VIEWPORT_STATE.lock().ok()?;
+        if let Some(state) = cache.get_mut(hash) {
+            if state.source_path == source_path
+                && state.font_size == font_size
+                && state.fit_target == Some((target_cols, target_rows))
+            {
+                return Some((state.unique_id, state.full_cols, state.full_rows));
+            }
+            Some(state.unique_id)
+        } else {
+            None
+        }
+    };
+
+    // Heavy work (resize + RGBA conversion + base64 transmit encoding) runs
+    // WITHOUT holding KITTY_VIEWPORT_STATE. The off-thread prewarm worker calls
+    // this, and the UI thread's per-frame `probe_kitty_fit_state` needs that
+    // same lock; holding it across the encode would serialize the prewarm
+    // worker against every scroll frame and reintroduce the very stall the
+    // off-thread prewarm exists to avoid.
+    let scaled = scale_to_fit_box(source, target_cols, target_rows, font_size);
+    let (full_cols, full_rows) = kitty_full_rect_for_image(&scaled, font_size);
+    if full_cols == 0 || full_rows == 0 {
+        return None;
+    }
+    let unique_id = existing_unique_id.unwrap_or_else(|| kitty_viewport_unique_id(hash));
+    let pending_transmit = kitty_transmit_virtual(&scaled, unique_id);
+
     let mut cache = KITTY_VIEWPORT_STATE.lock().ok()?;
+    // Re-check under the lock: another thread may have built matching state
+    // while we were encoding. If so, reuse it and drop our redundant transmit.
     if let Some(state) = cache.get_mut(hash)
         && state.source_path == source_path
         && state.font_size == font_size
@@ -179,24 +212,6 @@ pub(super) fn ensure_kitty_fit_state(
     {
         return Some((state.unique_id, state.full_cols, state.full_rows));
     }
-
-    // Scale once to fit the target cell box, preserving aspect ratio.
-    let max_w_px = (target_cols as u32).saturating_mul(font_size.0.max(1) as u32);
-    let max_h_px = (target_rows as u32).saturating_mul(font_size.1.max(1) as u32);
-    let scaled = if source.width() <= max_w_px && source.height() <= max_h_px {
-        source.clone()
-    } else {
-        source.resize(max_w_px, max_h_px, image::imageops::FilterType::Triangle)
-    };
-    let (full_cols, full_rows) = kitty_full_rect_for_image(&scaled, font_size);
-    if full_cols == 0 || full_rows == 0 {
-        return None;
-    }
-
-    let unique_id = cache
-        .get_mut(hash)
-        .map(|state| state.unique_id)
-        .unwrap_or_else(|| kitty_viewport_unique_id(hash));
 
     cache.insert(
         hash,
@@ -207,7 +222,7 @@ pub(super) fn ensure_kitty_fit_state(
             unique_id,
             full_cols,
             full_rows,
-            pending_transmit: Some(kitty_transmit_virtual(&scaled, unique_id)),
+            pending_transmit: Some(pending_transmit),
             fit_target: Some((target_cols, target_rows)),
         },
     );
@@ -219,6 +234,23 @@ pub(super) fn ensure_kitty_fit_state(
     cache
         .get_mut(hash)
         .map(|state| (state.unique_id, state.full_cols, state.full_rows))
+}
+
+/// Scale a source image once to fit a `(cols, rows)` cell box at `font_size`,
+/// preserving aspect ratio. Returns a clone when the source already fits.
+fn scale_to_fit_box(
+    source: &DynamicImage,
+    target_cols: u16,
+    target_rows: u16,
+    font_size: (u16, u16),
+) -> DynamicImage {
+    let max_w_px = (target_cols as u32).saturating_mul(font_size.0.max(1) as u32);
+    let max_h_px = (target_rows as u32).saturating_mul(font_size.1.max(1) as u32);
+    if source.width() <= max_w_px && source.height() <= max_h_px {
+        source.clone()
+    } else {
+        source.resize(max_w_px, max_h_px, image::imageops::FilterType::Triangle)
+    }
 }
 
 pub(super) fn render_kitty_virtual_viewport(
@@ -681,7 +713,10 @@ pub fn inline_fit_readiness(
     if picker.protocol_type() != ProtocolType::Kitty {
         return InlineFitReadiness::Unsupported;
     }
-    let Some(cached) = get_cached_diagram(hash, None) else {
+    // Hot path: runs on the UI thread for every visible and prefetched image,
+    // every frame. Use the in-memory-only cache lookup so steady-state scrolling
+    // never pays a `path.exists()` stat syscall per image per frame.
+    let Some(cached) = get_cached_diagram_in_memory(hash) else {
         return InlineFitReadiness::NeedsPrewarm;
     };
     let border_width = if draw_border { BORDER_WIDTH } else { 0 };
@@ -813,7 +848,11 @@ pub fn render_image_widget_fit_stable(
         return false;
     }
 
-    let cached = match get_cached_diagram(hash, None) {
+    // Hot path: runs on the UI thread for every visible image every frame.
+    // The in-memory-only lookup avoids a per-frame `path.exists()` stat; a
+    // genuinely missing file degrades gracefully below when the source decode
+    // fails and the caller falls back to the per-area fit renderer.
+    let cached = match get_cached_diagram_in_memory(hash) {
         Some(cached) => cached,
         None => return false,
     };

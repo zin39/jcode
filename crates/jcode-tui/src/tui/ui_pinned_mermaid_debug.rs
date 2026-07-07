@@ -166,6 +166,10 @@ pub fn debug_probe_side_panel_mermaid(
     centered: bool,
 ) -> anyhow::Result<SidePanelMermaidProbe> {
     let font_size_px = font_size_px.unwrap_or((8, 16));
+    // The width-aware render cache intentionally reuses wider cached PNGs
+    // (good for live resizes), but the probe must report the geometry a fresh
+    // render at *this* pane width produces, so evict any cached buckets first.
+    mermaid::evict_render_cache_for_content(mermaid_source);
     let render = mermaid::render_mermaid_untracked(mermaid_source, Some(pane_width_cells));
     let mermaid::RenderResult::Image { width, height, .. } = render else {
         let mermaid::RenderResult::Error(error) = render else {

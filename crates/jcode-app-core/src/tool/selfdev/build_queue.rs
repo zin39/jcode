@@ -771,7 +771,9 @@ impl SelfDevTool {
         let wait_result = background::global().wait(&task_id, wait, false).await;
 
         let finished = matches!(
-            wait_result.as_ref().map(|result| result.task.status.clone()),
+            wait_result
+                .as_ref()
+                .map(|result| result.task.status.clone()),
             Some(BackgroundTaskStatus::Completed)
                 | Some(BackgroundTaskStatus::Superseded)
                 | Some(BackgroundTaskStatus::Failed)
@@ -798,7 +800,9 @@ impl SelfDevTool {
         let build_request = request_id
             .as_deref()
             .and_then(|id| BuildRequest::load(id).ok().flatten());
-        let task_status = wait_result.as_ref().map(|result| result.task.status.clone());
+        let task_status = wait_result
+            .as_ref()
+            .map(|result| result.task.status.clone());
 
         let build_succeeded = match build_request.as_ref().map(|request| &request.state) {
             Some(BuildRequestState::Completed) => true,

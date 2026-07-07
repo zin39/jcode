@@ -71,6 +71,7 @@ impl App {
         let configured_base = crate::subscription_catalog::configured_api_base()
             .unwrap_or_else(|| crate::subscription_catalog::DEFAULT_JCODE_API_BASE.to_string());
         let runtime_mode = crate::subscription_catalog::is_runtime_mode_enabled();
+        let cached_tier = crate::subscription_catalog::cached_tier();
 
         let mut message = String::from("Jcode Subscription Status\n\n");
         message.push_str(&format!(
@@ -87,8 +88,14 @@ impl App {
             if crate::subscription_catalog::has_router_base() {
                 ""
             } else {
-                " (default placeholder)"
+                " (default)"
             }
+        ));
+        message.push_str(&format!(
+            "  - Tier: {}\n",
+            cached_tier
+                .map(|tier| tier.display_name().to_string())
+                .unwrap_or_else(|| "unknown (treated as Plus)".to_string())
         ));
         message.push_str(&format!(
             "  - Runtime mode: {}\n\n",
@@ -106,21 +113,23 @@ impl App {
             } else {
                 ""
             };
+            let tier_suffix = match model.min_tier {
+                crate::subscription_catalog::JcodeTier::Plus => "",
+                crate::subscription_catalog::JcodeTier::Flagship => " [Flagship]",
+            };
             message.push_str(&format!(
-                "  - {} - {}{}\n      - {}\n      - {}\n",
+                "  - {} - {}{}{}\n      - {}\n      - {}\n",
                 model.display_name,
                 model.id,
                 default_suffix,
+                tier_suffix,
                 crate::subscription_catalog::routing_policy_detail(model),
                 model.note
             ));
         }
 
-        message.push_str("\nPlanned tiers\n\n");
-        for tier in [
-            crate::subscription_catalog::JcodeTier::Starter20,
-            crate::subscription_catalog::JcodeTier::Pro100,
-        ] {
+        message.push_str("\nTiers\n\n");
+        for tier in crate::subscription_catalog::JcodeTier::ALL.iter().copied() {
             message.push_str(&format!(
                 "  - {} - ${}/mo retail, about ${:.2} usable inference budget\n",
                 tier.display_name(),
@@ -129,11 +138,59 @@ impl App {
             ));
         }
 
-        message.push_str(
-            "\nUsage/billing reporting is not live yet; this command is a scaffold for the curated jcode-managed subscription path.",
-        );
+        if configured_key {
+            message.push_str("\nFetching account status...");
+        } else {
+            message.push_str("\nLog in with /login jcode to see account usage and tier.");
+        }
 
         self.push_display_message(DisplayMessage::system(message));
+
+        // With credentials present, fetch live account status (/v1/me) in the
+        // background and surface it via a UiActivity card. Short timeout keeps
+        // this responsive; offline failures degrade to a quiet log line.
+        if configured_key {
+            let session_id = self.session.id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    match crate::subscription_api::fetch_subscription_me().await {
+                        Ok(me) => {
+                            let tier_label = me
+                                .parsed_tier()
+                                .map(|tier| tier.display_name().to_string())
+                                .unwrap_or_else(|| me.tier.clone());
+                            let resets = me
+                                .usage
+                                .resets_at
+                                .as_deref()
+                                .map(|at| format!(", resets {}", at))
+                                .unwrap_or_default();
+                            crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
+                                crate::bus::UiActivity::background(
+                                    Some(session_id),
+                                    format!(
+                                        "Jcode Subscription Account\n\n  - Email: {}\n  - Tier: {} ({})\n  - Usage: ${:.2} of ${:.2}{}",
+                                        me.email,
+                                        tier_label,
+                                        me.status,
+                                        me.usage.used_usd,
+                                        me.usage.budget_usd,
+                                        resets
+                                    ),
+                                    Some("Subscription: account status loaded"),
+                                ),
+                            ));
+                        }
+                        Err(error) => {
+                            crate::logging::info(&format!(
+                                "jcode subscription status fetch failed (offline?): {}",
+                                error
+                            ));
+                        }
+                    }
+                });
+            }
+        }
     }
 
     pub(super) fn show_auth_status(&mut self) {
@@ -211,12 +268,19 @@ impl App {
                     crate::subscription_catalog::JCODE_API_KEY_ENV,
                     crate::subscription_catalog::JCODE_ENV_FILE,
                 )?;
-                crate::provider_catalog::save_env_value_to_env_file(
+                for env_key in [
                     crate::subscription_catalog::JCODE_API_BASE_ENV,
-                    crate::subscription_catalog::JCODE_ENV_FILE,
-                    None,
-                )?;
-                Ok("Logged out of jcode subscription API key.".to_string())
+                    crate::subscription_catalog::JCODE_ACCOUNT_ID_ENV,
+                    crate::subscription_catalog::JCODE_ACCOUNT_EMAIL_ENV,
+                    crate::subscription_catalog::JCODE_TIER_ENV,
+                ] {
+                    crate::provider_catalog::save_env_value_to_env_file(
+                        env_key,
+                        crate::subscription_catalog::JCODE_ENV_FILE,
+                        None,
+                    )?;
+                }
+                Ok("Logged out of jcode subscription.".to_string())
             }
             LoginProviderTarget::Claude => {
                 let removed = crate::auth::claude::clear_accounts()?;
@@ -319,12 +383,19 @@ impl App {
             crate::subscription_catalog::JCODE_API_KEY_ENV,
             crate::subscription_catalog::JCODE_ENV_FILE,
         );
-        if let Err(err) = crate::provider_catalog::save_env_value_to_env_file(
+        for env_key in [
             crate::subscription_catalog::JCODE_API_BASE_ENV,
-            crate::subscription_catalog::JCODE_ENV_FILE,
-            None,
-        ) {
-            errors.push(format!("jcode subscription API base: {}", err));
+            crate::subscription_catalog::JCODE_ACCOUNT_ID_ENV,
+            crate::subscription_catalog::JCODE_ACCOUNT_EMAIL_ENV,
+            crate::subscription_catalog::JCODE_TIER_ENV,
+        ] {
+            if let Err(err) = crate::provider_catalog::save_env_value_to_env_file(
+                env_key,
+                crate::subscription_catalog::JCODE_ENV_FILE,
+                None,
+            ) {
+                errors.push(format!("jcode subscription {}: {}", env_key, err));
+            }
         }
 
         Self::clear_api_key_logout_summary(
@@ -2648,6 +2719,9 @@ impl App {
         }
         if login.success {
             self.recent_authenticated_provider = Some((login.provider.clone(), Instant::now()));
+            // A fresh login is exactly what the credential-failure breaker is
+            // waiting for: give automatic retries a fresh budget.
+            self.reset_credential_failure_breaker();
             self.invalidate_model_picker_cache();
             let suppress_first_run_login_noise =
                 self.onboarding_flow_active() && !matches!(login.provider.as_str(), "copilot_code");

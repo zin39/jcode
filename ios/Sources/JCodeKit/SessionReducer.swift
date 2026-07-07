@@ -41,6 +41,9 @@ public struct TranscriptEntry: Equatable, Sendable, Identifiable {
     public var toolCalls: [ToolCall]
     /// True while this entry is still receiving streamed content.
     public var isStreaming: Bool
+    /// True while this entry is a soft-interrupt waiting for the server to
+    /// inject it at a safe point. Cleared by `soft_interrupt_injected`.
+    public var isQueued: Bool
 
     public init(
         id: UUID = UUID(),
@@ -48,7 +51,8 @@ public struct TranscriptEntry: Equatable, Sendable, Identifiable {
         text: String,
         reasoning: String = "",
         toolCalls: [ToolCall] = [],
-        isStreaming: Bool = false
+        isStreaming: Bool = false,
+        isQueued: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -56,6 +60,29 @@ public struct TranscriptEntry: Equatable, Sendable, Identifiable {
         self.reasoning = reasoning
         self.toolCalls = toolCalls
         self.isStreaming = isStreaming
+        self.isQueued = isQueued
+    }
+}
+
+/// A transient, user-dismissible notice surfaced to the UI.
+///
+/// Covers out-of-band server signals that must never be silently dropped:
+/// push notifications, interrupts, and context compaction events.
+public struct Notice: Equatable, Sendable, Identifiable {
+    public enum Kind: Equatable, Sendable {
+        case info
+        case notification
+        case compaction
+    }
+
+    public var id: UUID
+    public var kind: Kind
+    public var message: String
+
+    public init(id: UUID = UUID(), kind: Kind = .info, message: String) {
+        self.id = id
+        self.kind = kind
+        self.message = message
     }
 }
 
@@ -66,17 +93,33 @@ public struct SessionState: Equatable, Sendable {
     public var sessionID: String?
     public var sessionTitle: String?
     public var allSessions: [String]
+    /// Human titles for sessions in `allSessions`, keyed by session ID.
+    /// Populated from `session_renamed` broadcasts and history payloads.
+    public var sessionTitles: [String: String]
     public var isProcessing: Bool
     public var isReasoning: Bool
     public var modelName: String?
     public var providerName: String?
     public var availableModels: [String]
+    public var reasoningEffort: String?
     public var serverVersion: String?
     public var tokenInput: UInt64
     public var tokenOutput: UInt64
     public var statusDetail: String?
+    /// Live turn-level provider phase (e.g. "authenticating", "waiting").
+    public var serverPhase: String?
     public var errorBanner: String?
-    public var notices: [String]
+    public var notices: [Notice]
+    /// Soft-interrupt messages queued mid-run, in send order, until the
+    /// server confirms injection.
+    public var pendingInterrupts: [String]
+
+    public var hasPendingInterrupts: Bool { !pendingInterrupts.isEmpty }
+
+    /// Human title for a session in the list, falling back to nil when unknown.
+    public func title(forSession sessionID: String) -> String? {
+        sessionTitles[sessionID]
+    }
 
     public init() {
         phase = .disconnected
@@ -84,17 +127,21 @@ public struct SessionState: Equatable, Sendable {
         sessionID = nil
         sessionTitle = nil
         allSessions = []
+        sessionTitles = [:]
         isProcessing = false
         isReasoning = false
         modelName = nil
         providerName = nil
         availableModels = []
+        reasoningEffort = nil
         serverVersion = nil
         tokenInput = 0
         tokenOutput = 0
         statusDetail = nil
+        serverPhase = nil
         errorBanner = nil
         notices = []
+        pendingInterrupts = []
     }
 }
 
@@ -104,8 +151,16 @@ public enum LocalIntent: Equatable, Sendable {
     case userSentMessage(String)
     /// User queued a soft-interrupt message mid-run.
     case userQueuedInterrupt(String)
+    /// User cancelled all queued soft-interrupts before they injected; the
+    /// optimistic bubbles are removed because they will never reach the agent.
+    case cancelledQueuedInterrupts
     /// Dismiss the current error banner.
     case dismissError
+    /// Dismiss a transient notice by id.
+    case dismissNotice(UUID)
+    /// User cleared the conversation; wipe the transcript optimistically while
+    /// keeping the connection and session metadata.
+    case clearedConversation
     /// Reset everything (switching servers/sessions).
     case reset
 }
@@ -132,8 +187,19 @@ public enum SessionReducer {
             state.isProcessing = true
             state.errorBanner = nil
         case .userQueuedInterrupt(let text):
-            state.transcript.append(TranscriptEntry(role: .user, text: text))
+            state.transcript.append(TranscriptEntry(role: .user, text: text, isQueued: true))
+            state.pendingInterrupts.append(text)
+        case .cancelledQueuedInterrupts:
+            state.transcript.removeAll { $0.isQueued }
+            state.pendingInterrupts = []
         case .dismissError:
+            state.errorBanner = nil
+        case .dismissNotice(let id):
+            state.notices.removeAll { $0.id == id }
+        case .clearedConversation:
+            state.transcript = []
+            state.isProcessing = false
+            state.isReasoning = false
             state.errorBanner = nil
         case .reset:
             state = SessionState()
@@ -158,6 +224,7 @@ public enum SessionReducer {
         case .disconnected, .reconnecting:
             state.isProcessing = false
             state.isReasoning = false
+            state.serverPhase = nil
             finishStreaming(&state)
         case .connecting:
             break
@@ -221,20 +288,40 @@ public enum SessionReducer {
         case .messageEnd:
             finishStreaming(&state)
 
+        case .connectionPhase(let phase):
+            state.serverPhase = phase.isEmpty ? nil : phase
+
+        case .softInterruptInjected(let content, let displayRole, _, _):
+            resolvePendingInterrupt(&state, content: content, displayRole: displayRole)
+
+        case .retryRollback(let attempt, let max):
+            // The provider is replaying the response from the top: discard all
+            // partial output from the current attempt so it does not duplicate.
+            if let last = state.transcript.indices.last, state.transcript[last].isStreaming {
+                state.transcript.removeLast()
+            }
+            state.isReasoning = false
+            state.statusDetail = "Retrying (\(attempt)/\(max))"
+
         case .done:
             state.isProcessing = false
             state.isReasoning = false
+            state.serverPhase = nil
             finishStreaming(&state)
+            drainPendingInterrupts(&state)
 
         case .interrupted:
             state.isProcessing = false
             state.isReasoning = false
+            state.serverPhase = nil
             finishStreaming(&state)
-            state.notices.append("Interrupted")
+            drainPendingInterrupts(&state)
+            state.notices.append(Notice(message: "Interrupted"))
 
         case .error(_, let message, let retryAfterSecs):
             state.isProcessing = false
             state.isReasoning = false
+            state.serverPhase = nil
             finishStreaming(&state)
             if let retry = retryAfterSecs {
                 state.errorBanner = "\(message) (retry in \(retry)s)"
@@ -257,6 +344,7 @@ public enum SessionReducer {
             state.sessionID = sessionID
 
         case .sessionRenamed(let sessionID, let displayTitle):
+            state.sessionTitles[sessionID] = displayTitle
             if state.sessionID == nil || state.sessionID == sessionID {
                 state.sessionTitle = displayTitle
             }
@@ -271,6 +359,20 @@ public enum SessionReducer {
                 state.modelName = model
             }
 
+        case .reasoningEffortChanged(_, let effort, let error):
+            if let error {
+                state.errorBanner = error
+            } else {
+                state.reasoningEffort = effort
+            }
+
+        case .compactResult(_, let message, let success):
+            if success {
+                state.notices.append(Notice(kind: .compaction, message: message))
+            } else {
+                state.errorBanner = message
+            }
+
         case .availableModelsUpdated(let models, let providerModel):
             state.availableModels = models
             if let providerModel {
@@ -279,12 +381,22 @@ public enum SessionReducer {
 
         case .compaction(let trigger, let tokensSaved):
             if let saved = tokensSaved, trigger != "background" {
-                state.notices.append("Context compacted (\(saved) tokens saved)")
+                state.notices.append(
+                    Notice(kind: .compaction, message: "Context compacted (\(saved) tokens saved)"))
             }
 
         case .notification(let fromName, let message):
             let prefix = fromName.map { "\($0): " } ?? ""
-            state.notices.append(prefix + message)
+            state.notices.append(Notice(kind: .notification, message: prefix + message))
+
+        case .reloading:
+            state.notices.append(Notice(message: "Server is updating, reconnecting shortly"))
+
+        case .sessionCloseRequested(let reason):
+            state.isProcessing = false
+            state.isReasoning = false
+            finishStreaming(&state)
+            state.errorBanner = reason.isEmpty ? "Server closed this session" : reason
 
         case .ack, .pong, .unknown:
             break
@@ -307,6 +419,13 @@ public enum SessionReducer {
         }
         state.serverVersion = payload.serverVersion ?? state.serverVersion
         state.sessionTitle = payload.displayTitle ?? state.sessionTitle
+        state.reasoningEffort = payload.reasoningEffort ?? state.reasoningEffort
+        if let title = payload.displayTitle {
+            state.sessionTitles[payload.sessionID] = title
+        }
+        // History replaces the transcript wholesale, so optimistic queued
+        // bubbles are rebuilt from the server's authoritative view.
+        state.pendingInterrupts = []
         if let totals = payload.totalTokens {
             state.tokenInput = totals.input
             state.tokenOutput = totals.output
@@ -348,6 +467,34 @@ public enum SessionReducer {
     }
 
     // MARK: - Helpers
+
+    /// Marks the matching queued soft-interrupt as delivered. If the injection
+    /// came from another client (no optimistic bubble), appends the content so
+    /// the transcript still reflects what the agent saw.
+    private static func resolvePendingInterrupt(
+        _ state: inout SessionState, content: String, displayRole: String?
+    ) {
+        if let index = state.pendingInterrupts.firstIndex(of: content) {
+            state.pendingInterrupts.remove(at: index)
+        }
+        if let index = state.transcript.firstIndex(where: { $0.isQueued && $0.text == content })
+            ?? state.transcript.firstIndex(where: { $0.isQueued })
+        {
+            state.transcript[index].isQueued = false
+        } else {
+            let role: TranscriptEntry.Role = displayRole == "system" ? .system : .user
+            state.transcript.append(TranscriptEntry(role: role, text: content))
+        }
+    }
+
+    /// The turn is over: anything still marked queued has either been consumed
+    /// server-side or is moot, so stop showing it as pending.
+    private static func drainPendingInterrupts(_ state: inout SessionState) {
+        state.pendingInterrupts = []
+        for index in state.transcript.indices where state.transcript[index].isQueued {
+            state.transcript[index].isQueued = false
+        }
+    }
 
     /// Mutates the trailing streaming assistant entry, creating it if needed.
     private static func withStreamingAssistant(
