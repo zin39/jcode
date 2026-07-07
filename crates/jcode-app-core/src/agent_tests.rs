@@ -824,6 +824,37 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
 }
 
 #[tokio::test]
+async fn task_state_is_injected_into_dynamic_prompt() {
+    /// Removes the task-state file on drop so a mid-test assertion failure
+    /// never leaves an artifact behind in the real jcode dir.
+    struct TaskStateCleanup(String);
+    impl Drop for TaskStateCleanup {
+        fn drop(&mut self) {
+            let _ = jcode_base::session::task_state::write_task_state(&self.0, "");
+        }
+    }
+
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = Agent::new(provider, registry);
+    let session_id = agent.session.id.clone();
+    let _cleanup = TaskStateCleanup(session_id.clone());
+
+    jcode_base::session::task_state::write_task_state(&session_id, "## Plan\n- finish migration")
+        .unwrap();
+
+    let split = agent.build_system_prompt_split(None);
+    assert!(split.dynamic_part.contains("# Task State"));
+    assert!(split.dynamic_part.contains("finish migration"));
+
+    jcode_base::session::task_state::write_task_state(&session_id, "").unwrap();
+
+    let split = agent.build_system_prompt_split(None);
+    assert!(!split.dynamic_part.contains("# Task State"));
+}
+
+#[tokio::test]
 async fn memory_injection_message_defaults_to_ephemeral_history() {
     let _guard = crate::storage::lock_test_env();
     let previous = std::env::var_os("JCODE_PERSIST_MEMORY_INJECTIONS");

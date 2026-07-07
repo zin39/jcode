@@ -47,6 +47,20 @@ impl Agent {
         pending
     }
 
+    fn append_task_state(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        let Some(state) = jcode_base::session::task_state::read_task_state(&self.session.id) else {
+            return;
+        };
+
+        if !split.dynamic_part.is_empty() {
+            split.dynamic_part.push_str("\n\n");
+        }
+        split.dynamic_part.push_str(
+            "# Task State\n\nYour saved working state (maintained via the `update_task_state` tool; survives compaction). Keep it current:\n\n",
+        );
+        split.dynamic_part.push_str(&state);
+    }
+
     fn append_current_turn_system_reminder(&self, split: &mut crate::prompt::SplitSystemPrompt) {
         let Some(reminder) = self
             .current_turn_system_reminder
@@ -115,6 +129,7 @@ impl Agent {
             include_prompt_overlay,
         );
 
+        self.append_task_state(&mut split);
         self.append_current_turn_system_reminder(&mut split);
         crate::prompt::append_swarm_effort_directive(
             &mut split,
