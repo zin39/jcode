@@ -146,6 +146,7 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
         covers_up_to_turn: 7,
         original_turn_count: 9,
         compacted_count: 7,
+        tool_cleared_up_to: None,
     });
 
     let _ = session.provider_messages();
@@ -737,6 +738,7 @@ fn test_save_persists_compaction_state() -> Result<()> {
         covers_up_to_turn: 8,
         original_turn_count: 8,
         compacted_count: 8,
+        tool_cleared_up_to: None,
     });
 
     session.save()?;
@@ -1622,6 +1624,7 @@ fn test_render_messages_shows_recent_compacted_history_by_default() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        tool_cleared_up_to: None,
     });
 
     let rendered = render_messages(&session);
@@ -1671,6 +1674,7 @@ fn test_render_messages_can_expand_compacted_history_window() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        tool_cleared_up_to: None,
     });
 
     // A small compacted prefix (few renderable messages, a single turn) must
@@ -1747,6 +1751,7 @@ fn test_compacted_history_truncates_only_when_long_and_many_turns() {
         covers_up_to_turn: prefix_turns,
         original_turn_count: prefix_turns,
         compacted_count,
+        tool_cleared_up_to: None,
     });
 
     let total_renderable = prefix_turns * 5; // 100
@@ -1816,6 +1821,7 @@ fn test_compacted_history_never_truncates_single_long_turn() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count,
+        tool_cleared_up_to: None,
     });
 
     // Even with a tiny requested window, a single long turn is never truncated.
@@ -1876,6 +1882,7 @@ fn test_compacted_history_window_counts_renderable_messages_not_hidden_reminders
         covers_up_to_turn: 4,
         original_turn_count: 4,
         compacted_count: 4,
+        tool_cleared_up_to: None,
     });
 
     let (rendered, _images, info) = render_messages_and_images_with_compacted_history(&session, 1);

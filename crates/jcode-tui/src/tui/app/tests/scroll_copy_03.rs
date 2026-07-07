@@ -902,6 +902,7 @@ fn compacted_history_app_with_remaining(turns: usize) -> App {
         covers_up_to_turn: turns,
         original_turn_count: turns,
         compacted_count,
+        tool_cleared_up_to: None,
     });
 
     let (rendered_messages, _images, _info) =

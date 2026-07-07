@@ -606,6 +606,10 @@ impl Agent {
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
+            // Native-provider compaction re-bases indexing entirely, so the
+            // stage-1 clearing watermark (which is meaningful only relative
+            // to the previous message indexing) does not carry forward.
+            tool_cleared_up_to: None,
         };
 
         self.session.compaction = Some(state.clone());
@@ -657,6 +661,14 @@ impl Agent {
                                     logging::warn(&format!(
                                         "Emergency hard compact: dropped {} messages (context was critical)",
                                         dropped
+                                    ));
+                                }
+                                crate::compaction::CompactionAction::ToolResultsCleared {
+                                    cleared,
+                                } => {
+                                    logging::info(&format!(
+                                        "Stage-1 tool-result clearing freed enough headroom to skip summarization ({} results cleared)",
+                                        cleared
                                     ));
                                 }
                                 crate::compaction::CompactionAction::None => {}

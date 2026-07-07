@@ -303,6 +303,10 @@ impl App {
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
+            // Native-provider compaction re-bases indexing entirely, so the
+            // stage-1 clearing watermark (which is meaningful only relative
+            // to the previous message indexing) does not carry forward.
+            tool_cleared_up_to: None,
         };
 
         self.session.compaction = Some(state.clone());
@@ -345,6 +349,10 @@ impl App {
                             self.set_status_notice("Compacting context");
                         }
                         crate::compaction::CompactionAction::HardCompacted(_) => {}
+                        // Lightweight, reversible, no provider round-trip —
+                        // does not warrant interrupting the user like a real
+                        // (summarizing) compaction does.
+                        crate::compaction::CompactionAction::ToolResultsCleared { .. } => {}
                         crate::compaction::CompactionAction::None => {}
                     }
                 }

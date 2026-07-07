@@ -848,6 +848,7 @@ fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_cont
             covers_up_to_turn: 1,
             original_turn_count: 1,
             compacted_count: 0,
+            tool_cleared_up_to: None,
         };
         crate::todo::save_todos(
             &app.session.id,

@@ -88,6 +88,33 @@ pub fn clear_tool_results_up_to(messages: &mut [Message], up_to_index: usize) ->
     cleared
 }
 
+/// Byte length of the cleared replacement for `original`, without requiring
+/// the caller to allocate the exact string. Defers to
+/// [`cleared_tool_result_content`] itself (rather than reimplementing its
+/// layout) so this estimate can never drift out of sync with what clearing
+/// actually produces.
+pub fn cleared_tool_result_estimate_chars(original: &str) -> usize {
+    cleared_tool_result_content(original).len()
+}
+
+/// Count clearable tool-result payloads in `messages[..up_to_index]` without
+/// mutating anything. Mirrors [`clear_tool_results_up_to`]'s predicate
+/// exactly so a reported count always matches what an actual clearing pass
+/// over the same range would affect.
+pub fn count_clearable_tool_results(messages: &[Message], up_to_index: usize) -> usize {
+    let end = up_to_index.min(messages.len());
+    messages[..end]
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { content, .. } if is_clearable_tool_result(content)
+            )
+        })
+        .count()
+}
+
 /// Absolute minimum turns to keep during emergency compaction
 pub const MIN_TURNS_TO_KEEP: usize = 2;
 
@@ -194,6 +221,11 @@ pub enum CompactionAction {
     BackgroundStarted { trigger: String },
     /// Emergency hard compact performed. Contains number of messages dropped.
     HardCompacted(usize),
+    /// Stage-1 reversible tool-result clearing freed enough headroom that
+    /// summarization was skipped this turn. Contains the number of clearable
+    /// tool results affected (stored history is untouched — this only
+    /// changed the API view).
+    ToolResultsCleared { cleared: usize },
 }
 
 /// Stats about compaction state

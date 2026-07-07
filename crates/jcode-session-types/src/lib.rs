@@ -265,6 +265,11 @@ pub struct StoredCompactionState {
     pub covers_up_to_turn: usize,
     pub original_turn_count: usize,
     pub compacted_count: usize,
+    /// Absolute index up to which stage-1 reversible tool-result clearing has
+    /// advanced. Absent/`None` for sessions saved before this field existed,
+    /// or when nothing has been cleared yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_cleared_up_to: Option<usize>,
 }
 
 impl StoredMessage {

@@ -147,6 +147,14 @@ pub struct CompactionManager {
     /// drift apart (see [`ActiveCharEstimate`]).
     active_chars: ActiveCharEstimate,
 
+    /// Absolute index (into the caller's full message list) up to which
+    /// clearable tool results have been marked for view-time clearing.
+    /// Message indexes are stable because history is append-only, so this
+    /// watermark only ever grows. Clearing itself is reversible: stored
+    /// history is never mutated, only the cloned API view produced by
+    /// [`Self::messages_for_api_with`].
+    tool_cleared_up_to: usize,
+
     /// Background compaction task handle
     pending_task: Option<JoinHandle<Result<CompactionResult>>>,
 
@@ -212,6 +220,7 @@ impl CompactionManager {
             compacted_count: 0,
             active_summary: None,
             active_chars: ActiveCharEstimate::default(),
+            tool_cleared_up_to: 0,
             pending_task: None,
             pending_trigger: None,
             pending_cutoff: 0,
@@ -248,6 +257,27 @@ impl CompactionManager {
     /// Get current token budget
     pub fn token_budget(&self) -> usize {
         self.token_budget
+    }
+
+    /// Absolute index (into the caller's full message list) up to which
+    /// clearable tool results have been marked for view-time clearing.
+    pub fn tool_cleared_up_to(&self) -> usize {
+        self.tool_cleared_up_to
+    }
+
+    /// Advance the tool-result-clearing watermark. Monotonic: never moves
+    /// backward, since history is append-only and clearing is reversible
+    /// only in the sense that stored history keeps the full text — the
+    /// watermark itself tracks "how far view-time clearing currently
+    /// reaches", which only grows as context pressure persists.
+    pub fn set_tool_cleared_up_to(&mut self, up_to: usize) {
+        self.tool_cleared_up_to = self.tool_cleared_up_to.max(up_to);
+    }
+
+    /// Kill switch for stage-1 tool-result clearing. Does not affect
+    /// already-set watermarks — it only prevents new stage-1 triggers.
+    fn tool_result_clearing_disabled() -> bool {
+        std::env::var("JCODE_DISABLE_TOOL_RESULT_CLEARING").is_ok_and(|v| v == "1")
     }
 
     /// Notify the manager that a message was added.
@@ -333,6 +363,7 @@ impl CompactionManager {
         self.semantic_embed_cache_counter = 0;
         self.total_turns = total_messages;
         self.compacted_count = state.compacted_count.min(total_messages);
+        self.tool_cleared_up_to = state.tool_cleared_up_to.unwrap_or(0).min(total_messages);
         self.active_chars
             .reset_pending(total_messages > self.compacted_count);
         self.active_summary = Some(Summary {
@@ -385,6 +416,7 @@ impl CompactionManager {
                 covers_up_to_turn: summary.covers_up_to_turn,
                 original_turn_count: summary.original_turn_count,
                 compacted_count: self.compacted_count,
+                tool_cleared_up_to: Some(self.tool_cleared_up_to).filter(|v| *v > 0),
             })
     }
 
@@ -773,7 +805,7 @@ impl CompactionManager {
         // length (the two can diverge across restore/clamp/compaction paths,
         // and trusting a mismatched cache is exactly what corrupts token
         // accounting).
-        if self.active_chars.is_dirty()
+        let raw = if self.active_chars.is_dirty()
             || self.active_messages_count() != self.active_messages(all_messages).len()
         {
             self.active_messages(all_messages)
@@ -782,7 +814,49 @@ impl CompactionManager {
                 .sum()
         } else {
             self.active_chars.value()
+        };
+        raw.saturating_sub(self.tool_clear_savings_with(all_messages))
+    }
+
+    /// Char-count reduction that stage-1 tool-result clearing contributes to
+    /// [`Self::active_message_chars_with`]'s raw sum.
+    ///
+    /// `active_chars` (cache or recompute) always reflects the *uncleared*
+    /// text — clearing only ever touches the cloned API view built by
+    /// [`Self::messages_for_api_with`], never stored history — so usage
+    /// estimation has to subtract the savings separately. The affected range
+    /// is `[compacted_count, tool_cleared_up_to)`: anything before
+    /// `compacted_count` has already left the active suffix (its chars are
+    /// not in `raw` at all), and anything at/after `tool_cleared_up_to`
+    /// hasn't been marked for clearing yet.
+    ///
+    /// Scans that (bounded, shrinking-as-compaction-catches-up) range fresh
+    /// each call rather than maintaining an incremental cache like
+    /// `active_chars` does: the region's membership shifts whenever
+    /// `compacted_count` advances, and recomputing it here mirrors the same
+    /// per-block cost `content_char_count` already pays across the active
+    /// suffix elsewhere in this module (e.g. `hard_compact_with`).
+    fn tool_clear_savings_with(&self, all_messages: &[Message]) -> usize {
+        let start = self.compacted_count.min(all_messages.len());
+        let end = self.tool_cleared_up_to.min(all_messages.len());
+        if start >= end {
+            return 0;
         }
+        all_messages[start..end]
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. }
+                    if jcode_compaction_core::is_clearable_tool_result(content) =>
+                {
+                    let original_len = content.len();
+                    let cleared_len =
+                        jcode_compaction_core::cleared_tool_result_estimate_chars(content);
+                    Some(original_len.saturating_sub(cleared_len))
+                }
+                _ => None,
+            })
+            .sum()
     }
 
     /// Get current token estimate using the caller's message list
@@ -1006,6 +1080,38 @@ impl CompactionManager {
                             reason
                         ));
                     }
+                }
+            }
+        }
+
+        // Stage 1: reversible tool-result clearing. Cheaper than
+        // summarization (no provider round-trip, no background task) and
+        // fully reversible (stored history is untouched — only the API view
+        // changes), so try it before spawning background summarization.
+        // Recompute usage fresh here rather than reusing `usage` from above:
+        // the critical-threshold branch may have waited on an in-flight
+        // compaction and changed it.
+        let usage = self.context_usage_with(all_messages);
+        if usage >= COMPACTION_THRESHOLD
+            && !Self::tool_result_clearing_disabled()
+            && all_messages.len() > RECENT_TURNS_TO_KEEP
+        {
+            let candidate = all_messages.len() - RECENT_TURNS_TO_KEEP;
+            if candidate > self.tool_cleared_up_to {
+                self.set_tool_cleared_up_to(candidate);
+                let cleared = jcode_compaction_core::count_clearable_tool_results(
+                    all_messages,
+                    candidate,
+                );
+                let post_usage = self.context_usage_with(all_messages);
+                crate::logging::info(&format!(
+                    "[compaction] Stage-1 tool-result clearing: {} results cleared, usage {:.1}% -> {:.1}%",
+                    cleared,
+                    usage * 100.0,
+                    post_usage * 100.0,
+                ));
+                if cleared > 0 && post_usage < COMPACTION_THRESHOLD {
+                    return CompactionAction::ToolResultsCleared { cleared };
                 }
             }
         }
@@ -1300,7 +1406,7 @@ impl CompactionManager {
 
         let active = self.active_messages(all_messages);
 
-        match &self.active_summary {
+        let mut result = match &self.active_summary {
             Some(summary) => {
                 let summary_block = summary
                     .openai_encrypted_content
@@ -1328,7 +1434,29 @@ impl CompactionManager {
                 result
             }
             None => active.to_vec(),
+        };
+
+        // Stage-1 reversible tool-result clearing: translate the absolute
+        // watermark (an index into `all_messages`) into view coordinates and
+        // clear in-place on this cloned view only. Stored history — and thus
+        // `all_messages` in every other caller — is never mutated, so this is
+        // fully reversible: if a future turn needs the original text, it's
+        // still on disk/in memory, just not sent to the provider anymore.
+        let compacted = self.compacted_count;
+        let offset = if self.active_summary.is_some() { 1 } else { 0 };
+        let view_watermark = self
+            .tool_cleared_up_to
+            .saturating_sub(compacted)
+            .saturating_add(offset)
+            .min(result.len());
+        if view_watermark > offset {
+            jcode_compaction_core::clear_tool_results_up_to(
+                &mut result[..view_watermark],
+                view_watermark,
+            );
         }
+
+        result
     }
 
     /// Check if compaction is in progress
@@ -1801,6 +1929,8 @@ pub async fn build_transfer_compaction_state(
         covers_up_to_turn: total_turns,
         original_turn_count: total_turns,
         compacted_count: 0,
+        // Fresh transfer target — no clearing watermark carries over.
+        tool_cleared_up_to: None,
     }))
 }
 
