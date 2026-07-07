@@ -24,14 +24,19 @@ pub const MIN_CLEARABLE_TOOL_RESULT_CHARS: usize = 200;
 
 const CLEARED_MARKER_PREFIX: &str = "[tool result cleared by jcode";
 const SPILL_POINTER_NEEDLE: &str = "FULL output saved to ";
+/// Prefix of the inline pointer line the spill feature leaves behind. Only
+/// lines starting with this are treated as real spill pointers — tool output
+/// that merely mentions the needle phrase must not hijack extraction.
+const SPILL_POINTER_LINE_PREFIX: &str = "[Tool output truncated by jcode";
 
 /// Replacement text for a cleared tool result. Preserves the spill-pointer
 /// line (if the original was spilled to disk) so the agent can still retrieve
 /// the full output with the read tool.
 pub fn cleared_tool_result_content(original: &str) -> String {
-    let pointer_line = original
-        .lines()
-        .find(|line| line.contains(SPILL_POINTER_NEEDLE));
+    let pointer_line = original.lines().find(|line| {
+        let line = line.trim();
+        line.starts_with(SPILL_POINTER_LINE_PREFIX) && line.contains(SPILL_POINTER_NEEDLE)
+    });
     match pointer_line {
         Some(line) => {
             // Keep only from the spill-pointer needle onward — the rest of the
@@ -1277,6 +1282,28 @@ mod tests {
         assert!(cleared.starts_with("[tool result cleared by jcode"));
         assert!(cleared.contains("FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt"));
         assert!(cleared.len() < original.len());
+    }
+
+    #[test]
+    fn spurious_full_output_phrase_is_not_treated_as_pointer() {
+        // The needle phrase appearing in ordinary tool output (not on a real
+        // spill-pointer line) must not hijack extraction.
+        let original = format!(
+            "{}\nAnalysis notes: FULL output saved to /tmp/fake.txt\nmore output",
+            "x".repeat(300)
+        );
+        let cleared = cleared_tool_result_content(&original);
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(!cleared.contains("/tmp/fake.txt"));
+        assert!(cleared.contains("Re-run the tool if this output is needed again."));
+    }
+
+    #[test]
+    fn threshold_boundary_exactly_min_chars_is_clearable() {
+        let at_min = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
+        assert!(is_clearable_tool_result(&at_min));
+        let below_min = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS - 1);
+        assert!(!is_clearable_tool_result(&below_min));
     }
 
     #[test]
