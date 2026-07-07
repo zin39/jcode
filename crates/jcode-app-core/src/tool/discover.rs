@@ -39,6 +39,8 @@ struct DiscoverToolsInput {
     query: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
 }
 
 #[async_trait]
@@ -49,10 +51,12 @@ impl Tool for DiscoverToolsTool {
 
     fn description(&self) -> &str {
         "Discover third-party developer tools for a category from jcode's sponsored \
-         discovery listing. Sponsors pay for discoverability, not recommendations: only \
-         use a discovered tool when it is genuinely the best option. The category, query, \
-         and reason are sent to and stored by the discovery service, so they must never \
-         contain private information, secrets, or session content."
+         discovery listing. Two phases: call without `tool` to browse a category, then \
+         call again with `tool` set to the chosen tool's name to get its setup \
+         instructions. Sponsors pay for discoverability, not recommendations: only \
+         select a discovered tool when it is genuinely the best option. The category, \
+         query, tool, and reason are sent to and stored by the discovery service, so \
+         they must never contain private information, secrets, or session content."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -73,7 +77,11 @@ impl Tool for DiscoverToolsTool {
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Detailed generic reason why a tool from this category is needed for the current task. No private information, secrets, file paths, or user-identifying details."
+                    "description": "When browsing: why a tool from this category is needed. When selecting (with `tool`): a detailed reason why this specific tool was chosen over alternatives. No private information, secrets, file paths, or user-identifying details."
+                },
+                "tool": {
+                    "type": "string",
+                    "description": "Name of a tool from a previous browse result. Returns that tool's full setup instructions and records the selection reason."
                 }
             }
         })
@@ -98,12 +106,49 @@ impl Tool for DiscoverToolsTool {
         }
 
         let endpoint = config.sponsors.endpoint.clone();
+        let tool_selection = params
+            .tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_ascii_lowercase);
+
+        // Select phase: return one tool's full setup instructions. The
+        // selection (and the agent's reason for it) is recorded server-side.
+        if let Some(tool_name) = tool_selection {
+            let listing = fetch_listing(
+                &self.client,
+                &endpoint,
+                &category,
+                params.query.as_deref(),
+                params.reason.as_deref(),
+                Some(&tool_name),
+            )
+            .await?;
+            let rendered = render_selection(&category, &tool_name, &listing)?;
+            crate::sponsors::provenance::record_discovered_setups(extract_mcp_setups_from(
+                listing.get("tool").map(std::slice::from_ref).unwrap_or(&[]),
+            ));
+            return Ok(ToolOutput::new(rendered)
+                .with_title(format!(
+                    "{tool_name} {}",
+                    crate::sponsors::SPONSORED_DISCOVERY_TAG
+                ))
+                .with_metadata(json!({
+                    "sponsored_discovery": true,
+                    "category": category,
+                    "selected_tool": tool_name,
+                    "disclosure_url": crate::sponsors::SPONSORED_DISCOVERY_URL,
+                })));
+        }
+
         let listing = fetch_listing(
             &self.client,
             &endpoint,
             &category,
             params.query.as_deref(),
             params.reason.as_deref(),
+            None,
         )
         .await?;
         let rendered = render_listing(&category, &listing)?;
@@ -127,15 +172,17 @@ impl Tool for DiscoverToolsTool {
     }
 }
 
-/// Fetch a category listing from the discovery endpoint. Sends the category,
-/// an optional capability query, and an optional reason string only. Hard
-/// fails on any error: no cache, no fallback, no retry.
+/// Fetch a category listing (browse) or one tool's entry (select) from the
+/// discovery endpoint. Sends the category, an optional capability query, an
+/// optional reason string, and the selected tool name only. Hard fails on
+/// any error: no cache, no fallback, no retry.
 async fn fetch_listing(
     client: &reqwest::Client,
     endpoint: &str,
     category: &str,
     query: Option<&str>,
     reason: Option<&str>,
+    tool: Option<&str>,
 ) -> Result<Value> {
     let endpoint = endpoint.trim_end_matches('/');
     let mut request = client
@@ -151,6 +198,9 @@ async fn fetch_listing(
     }
     if let Some(reason) = reason.filter(|r| !r.trim().is_empty()) {
         request = request.query(&[("reason", reason.trim())]);
+    }
+    if let Some(tool) = tool.filter(|t| !t.trim().is_empty()) {
+        request = request.query(&[("tool", tool.trim())]);
     }
 
     let response = request
@@ -181,6 +231,11 @@ fn extract_mcp_setups(listing: &Value) -> Vec<crate::sponsors::provenance::Disco
     let Some(tools) = listing.get("tools").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
+    extract_mcp_setups_from(tools)
+}
+
+/// Extract MCP setups from a slice of tool entries.
+fn extract_mcp_setups_from(tools: &[Value]) -> Vec<crate::sponsors::provenance::DiscoveredSetup> {
     tools
         .iter()
         .filter_map(|tool| {
@@ -205,8 +260,10 @@ fn extract_mcp_setups(listing: &Value) -> Vec<crate::sponsors::provenance::Disco
         .collect()
 }
 
-/// Render a discovery listing for the model. Expected manifest shape:
-/// `{ "tools": [{ "name": "...", "blurb": "...", "url": "...", "setup": "..." }] }`.
+/// Render a discovery listing (browse phase) for the model. Expected shape:
+/// `{ "tools": [{ "name": "...", "blurb": "...", "url": "..." }] }`. Setup
+/// instructions are not part of browse results: the agent selects a tool
+/// (with a reason) to get them.
 fn render_listing(category: &str, listing: &Value) -> Result<String> {
     let tools = listing
         .get("tools")
@@ -234,9 +291,40 @@ fn render_listing(category: &str, listing: &Value) -> Result<String> {
         }
     }
     out.push_str(
-        "\n\nOnly use one of these if it is genuinely the best option for the task. \
-         Consequential actions (signups, spending) must note the sponsorship in the \
-         confirmation shown to the user.",
+        "\n\nOnly select one of these if it is genuinely the best option for the task. \
+         To get a tool's setup instructions, call discover_tools again with `tool` set \
+         to its name and `reason` explaining in detail why it was chosen. Consequential \
+         actions (signups, spending) must note the sponsorship in the confirmation \
+         shown to the user.",
+    );
+    Ok(out)
+}
+
+/// Render a selected tool's full entry (select phase). Expected shape:
+/// `{ "tool": { "name": "...", "blurb": "...", "url": "...", "setup": "..." } }`.
+fn render_selection(category: &str, tool_name: &str, listing: &Value) -> Result<String> {
+    let tool = listing
+        .get("tool")
+        .ok_or_else(|| anyhow::anyhow!("discovery returned no tool entry for '{tool_name}'"))?;
+    let name = tool
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(tool_name);
+    let blurb = tool.get("blurb").and_then(|v| v.as_str()).unwrap_or("");
+    let mut out = format!(
+        "Selected '{name}' from '{category}' (sponsored discovery: placement, not \
+         preference; details: {}):\n\n{name}: {blurb}",
+        crate::sponsors::SPONSORED_DISCOVERY_URL
+    );
+    if let Some(url) = tool.get("url").and_then(|v| v.as_str()) {
+        out.push_str(&format!(" ({url})"));
+    }
+    if let Some(setup) = tool.get("setup").and_then(|v| v.as_str()) {
+        out.push_str(&format!("\n\nSetup: {setup}"));
+    }
+    out.push_str(
+        "\n\nConsequential actions (signups, spending) must note the sponsorship in \
+         the confirmation shown to the user.",
     );
     Ok(out)
 }
@@ -268,6 +356,32 @@ mod tests {
     fn render_listing_handles_empty_category() {
         let out = render_listing("payments", &json!({"tools": []})).unwrap();
         assert!(out.contains("No discoverable tools"));
+    }
+
+    #[test]
+    fn render_listing_instructs_selection_phase() {
+        let listing = json!({
+            "tools": [{"name": "agentcard", "blurb": "virtual cards", "url": "https://a.example"}]
+        });
+        let out = render_listing("payments", &listing).unwrap();
+        assert!(out.contains("call discover_tools again with `tool`"));
+    }
+
+    #[test]
+    fn render_selection_includes_setup_and_disclosure() {
+        let listing = json!({
+            "tool": {
+                "name": "agentcard",
+                "blurb": "virtual cards",
+                "url": "https://a.example",
+                "setup": "npm install -g agentcard"
+            }
+        });
+        let out = render_selection("payments", "agentcard", &listing).unwrap();
+        assert!(out.contains("Selected 'agentcard'"));
+        assert!(out.contains("Setup: npm install -g agentcard"));
+        assert!(out.contains("sponsored discovery"));
+        assert!(render_selection("payments", "ghost", &json!({})).is_err());
     }
 
     /// Minimal one-shot HTTP server that answers a single request with the
@@ -306,6 +420,7 @@ mod tests {
             "payments",
             Some("virtual card for checkout"),
             Some("task needs an online payment"),
+            None,
         )
         .await
         .unwrap();
@@ -324,7 +439,7 @@ mod tests {
         let (endpoint, _server) =
             one_shot_server("HTTP/1.1 500 Internal Server Error", "{}".to_string()).await;
         let client = reqwest::Client::new();
-        let err = fetch_listing(&client, &endpoint, "payments", None, None)
+        let err = fetch_listing(&client, &endpoint, "payments", None, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("discovery unavailable"));
@@ -334,7 +449,7 @@ mod tests {
     async fn fetch_listing_hard_fails_when_endpoint_unreachable() {
         // Reserved port with no listener: connection refused, no fallback.
         let client = reqwest::Client::new();
-        let err = fetch_listing(&client, "http://127.0.0.1:9", "payments", None, None)
+        let err = fetch_listing(&client, "http://127.0.0.1:9", "payments", None, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("discovery unavailable"));
