@@ -55,6 +55,182 @@ fn test_mcp_config_empty() {
 }
 
 #[test]
+fn test_mcp_config_accepts_claude_mcp_servers_key() {
+    // Claude Code uses `mcpServers`, not `servers`.
+    let json = r#"{
+            "mcpServers": {
+                "claude-server": {
+                    "command": "npx",
+                    "args": ["-y", "some-mcp"]
+                }
+            }
+        }"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(config.servers.len(), 1);
+    let server = config.servers.get("claude-server").unwrap();
+    assert_eq!(server.command, "npx");
+    assert!(server.is_stdio());
+}
+
+#[test]
+fn test_mcp_http_server_is_not_stdio() {
+    let json = r#"{
+            "mcpServers": {
+                "remote": {
+                    "type": "http",
+                    "url": "https://example.com/mcp"
+                }
+            }
+        }"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    let server = config.servers.get("remote").unwrap();
+    assert!(!server.is_stdio());
+    assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+}
+
+#[test]
+fn test_load_claude_json_global_and_project_servers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("myproject");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let claude_json = temp.path().join(".claude.json");
+
+    let body = serde_json::json!({
+        "mcpServers": {
+            "global-srv": { "command": "global-bin" }
+        },
+        "projects": {
+            cwd.to_string_lossy(): {
+                "mcpServers": {
+                    "project-srv": { "command": "project-bin", "args": ["--flag"] }
+                }
+            }
+        }
+    });
+    std::fs::write(&claude_json, serde_json::to_string_pretty(&body).unwrap()).unwrap();
+
+    let config = McpConfig::load_claude_json(&claude_json, Some(&cwd));
+    assert_eq!(config.servers.len(), 2);
+    assert_eq!(
+        config.servers.get("global-srv").unwrap().command,
+        "global-bin"
+    );
+    assert_eq!(
+        config.servers.get("project-srv").unwrap().command,
+        "project-bin"
+    );
+}
+
+#[test]
+fn test_load_project_locals_resolves_against_given_dir_not_cwd() {
+    // Issue #420: remote/client sessions must load project-local MCP config
+    // from the session working directory, not the server process cwd.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("client-project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers":{"example-server":{"command":"npx","args":["-y","some-mcp-server"]}}}"#,
+    )
+    .unwrap();
+
+    // The process cwd (this repo) is unrelated to `project`; resolution must
+    // come from the explicit path.
+    let config = McpConfig::load_project_locals(&project);
+    assert_eq!(config.servers.len(), 1);
+    let server = config.servers.get("example-server").unwrap();
+    assert_eq!(server.command, "npx");
+    assert!(server.is_stdio());
+
+    // A directory with no project-local config yields nothing.
+    let empty = temp.path().join("empty-project");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert!(McpConfig::load_project_locals(&empty).servers.is_empty());
+}
+
+#[test]
+fn test_load_project_locals_merge_order() {
+    // `.jcode/mcp.json` loads first, then `.mcp.json` overrides same-named
+    // servers, then `.claude/mcp.json`.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path();
+    std::fs::create_dir_all(project.join(".jcode")).unwrap();
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    std::fs::write(
+        project.join(".jcode/mcp.json"),
+        r#"{"servers":{"shared-name":{"command":"jcode-bin"},"jcode-only":{"command":"a"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers":{"shared-name":{"command":"claude-bin"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".claude/mcp.json"),
+        r#"{"mcpServers":{"legacy-only":{"command":"c"}}}"#,
+    )
+    .unwrap();
+
+    let config = McpConfig::load_project_locals(project);
+    assert_eq!(config.servers.len(), 3);
+    assert_eq!(
+        config.servers.get("shared-name").unwrap().command,
+        "claude-bin",
+        ".mcp.json must override .jcode/mcp.json for same-named servers"
+    );
+    assert!(config.servers.contains_key("jcode-only"));
+    assert!(config.servers.contains_key("legacy-only"));
+}
+
+#[test]
+fn test_server_enabled_defaults_true() {
+    // Existing configs without the flag keep current behavior (issue #436).
+    let json = r#"{"servers":{"srv":{"command":"bin"}}}"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    assert!(config.servers.get("srv").unwrap().is_enabled());
+}
+
+#[test]
+fn test_server_enabled_false_opencode_style() {
+    let json = r#"{"servers":{"srv":{"command":"bin","enabled":false}}}"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.servers.get("srv").unwrap().is_enabled());
+}
+
+#[test]
+fn test_server_disabled_true_claude_style() {
+    let json = r#"{"mcpServers":{"srv":{"command":"bin","disabled":true}}}"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.servers.get("srv").unwrap().is_enabled());
+}
+
+#[test]
+fn test_server_disabled_wins_over_enabled() {
+    // `disabled` (Claude Code style) wins when both spellings are present.
+    let json = r#"{"servers":{"srv":{"command":"bin","enabled":true,"disabled":true}}}"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.servers.get("srv").unwrap().is_enabled());
+
+    let json = r#"{"servers":{"srv":{"command":"bin","enabled":false,"disabled":false}}}"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    assert!(config.servers.get("srv").unwrap().is_enabled());
+}
+
+#[test]
+fn test_disabled_server_survives_save_roundtrip() {
+    // Disabled servers must stay in config (kept, not spawned), including
+    // through a save/load cycle.
+    let json = r#"{"servers":{"off":{"command":"bin","enabled":false}}}"#;
+    let config: McpConfig = serde_json::from_str(json).unwrap();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("mcp.json");
+    config.save_to_file(&path).unwrap();
+    let reloaded = McpConfig::load_from_file(&path).unwrap();
+    assert!(!reloaded.servers.get("off").unwrap().is_enabled());
+}
+
+#[test]
 fn test_tool_def_deserialization() {
     let json = r#"{
             "name": "read_file",

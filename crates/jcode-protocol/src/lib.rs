@@ -19,6 +19,7 @@ use jcode_batch_types::BatchProgress;
 use jcode_message_types::{InputShellResult, ToolCall};
 use jcode_plan::{PlanItem, VersionedPlan, next_runnable_item_ids, summarize_plan_graph};
 use jcode_side_panel_types::{SidePanelSnapshot, snapshot_is_empty};
+use std::collections::BTreeMap;
 
 #[path = "protocol_memory.rs"]
 mod memory_snapshots;
@@ -171,6 +172,7 @@ impl AuthChanged {
 pub type ReloadRecoverySnapshot = jcode_selfdev_types::ReloadRecoveryDirective;
 
 mod wire;
+pub use wire::TaskGraphNodeSpec;
 pub use wire::{Request, ServerEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,7 +213,10 @@ pub struct AgentInfo {
     /// Optional status detail (current task, error, etc.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Role: "agent", "coordinator", "worktree_manager"
+    /// Stable label of the task/role this member was spawned or assigned for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_label: Option<String>,
+    /// Role: "agent" or "coordinator"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Whether this member is a headless spawned session.
@@ -229,6 +234,12 @@ pub struct AgentInfo {
     /// Seconds since the last status change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_secs: Option<u64>,
+    /// Seconds since the last observed activity (token usage, turn start,
+    /// tool events, or swarm task heartbeats). Unlike `status_age_secs`,
+    /// which measures the last lifecycle transition, this reflects whether
+    /// the agent is actually doing work right now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_age_secs: Option<u64>,
     /// Live activity (whether processing + current tool name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<SessionActivitySnapshot>,
@@ -281,6 +292,10 @@ pub struct AgentStatusSnapshot {
     pub live_attachments: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_secs: Option<u64>,
+    /// Seconds since the last observed activity (tokens, turns, tool events,
+    /// or swarm task heartbeats), independent of lifecycle transitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_age_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined_age_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -308,6 +323,19 @@ pub struct PlanGraphStatus {
     pub active_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completed_ids: Vec<String>,
+    /// Terminal without completing: failed, stopped, or crashed items. A plan
+    /// whose run "finished" with entries here did not finish cleanly, so
+    /// schedulers and reports must surface these instead of reading the
+    /// terminal state as success.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_ids: Vec<String>,
+    /// Recorded failure reason per failed item id (from the durable task
+    /// progress checkpoint, e.g. "task failed: Anthropic API error (401
+    /// Unauthorized)"). Lets `plan_status` and schedulers explain *why* a node
+    /// failed (and classify waves of credential failures) instead of only
+    /// listing failed ids. Only failed items with a recorded reason appear.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed_reasons: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cycle_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -316,6 +344,30 @@ pub struct PlanGraphStatus {
     pub next_ready_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub newly_ready_ids: Vec<String>,
+    /// Completed (non-gate) items whose artifact self-reported LOW confidence.
+    /// Shaky coverage the coordinator should widen with follow-up nodes; deep
+    /// gates are also blocked from passing over these while unaddressed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub low_confidence_ids: Vec<String>,
+    /// Engine mode for this plan: "deep" (comprehensive, gated, wide fan-out) or
+    /// "light" (cheap fan-out). Lets schedulers like `run_plan` pick a
+    /// mode-appropriate concurrency policy. Defaults to "light" for legacy plans.
+    #[serde(default = "default_plan_mode")]
+    pub mode: String,
+    /// Growth accounting: nodes from the initial seed (legacy/unknown origins
+    /// count as seeded).
+    #[serde(default)]
+    pub seeded_count: usize,
+    /// Growth accounting: machinery-generated nodes (expand children, gate-
+    /// injected gaps, and the gates themselves). `seeded_count + grown_count ==
+    /// item_count`. A deep plan with `grown_count == 0` never decomposed or
+    /// gated anything, which almost always means under-exploration.
+    #[serde(default)]
+    pub grown_count: usize,
+}
+
+fn default_plan_mode() -> String {
+    "light".to_string()
 }
 
 impl PlanGraphStatus {
@@ -328,10 +380,16 @@ impl PlanGraphStatus {
             blocked_ids: Vec::new(),
             active_ids: Vec::new(),
             completed_ids: Vec::new(),
+            failed_ids: Vec::new(),
+            failed_reasons: BTreeMap::new(),
             cycle_ids: Vec::new(),
             unresolved_dependency_ids: Vec::new(),
             next_ready_ids: Vec::new(),
             newly_ready_ids: Vec::new(),
+            low_confidence_ids: Vec::new(),
+            mode: default_plan_mode(),
+            seeded_count: 0,
+            grown_count: 0,
         }
     }
 
@@ -342,6 +400,17 @@ impl PlanGraphStatus {
         newly_ready_ids: Vec<String>,
     ) -> Self {
         let graph = summarize_plan_graph(&plan.items);
+        let growth = jcode_plan::bridge::growth_stats(plan);
+        let failed_reasons: BTreeMap<String, String> = graph
+            .failed_ids
+            .iter()
+            .filter_map(|id| {
+                plan.task_progress
+                    .get(id)
+                    .and_then(|progress| progress.checkpoint_summary.clone())
+                    .map(|reason| (id.clone(), reason))
+            })
+            .collect();
         Self {
             swarm_id: Some(swarm_id.into()),
             version: plan.version,
@@ -350,10 +419,16 @@ impl PlanGraphStatus {
             blocked_ids: graph.blocked_ids,
             active_ids: graph.active_ids,
             completed_ids: graph.completed_ids,
+            failed_ids: graph.failed_ids,
+            failed_reasons,
             cycle_ids: graph.cycle_ids,
             unresolved_dependency_ids: graph.unresolved_dependency_ids,
             next_ready_ids: next_runnable_item_ids(&plan.items, next_ready_limit),
             newly_ready_ids,
+            low_confidence_ids: jcode_plan::bridge::low_confidence_completed_ids(plan),
+            mode: plan.mode.clone(),
+            seeded_count: growth.seeded,
+            grown_count: growth.grown(),
         }
     }
 }
@@ -369,7 +444,11 @@ pub struct SwarmMemberStatus {
     /// Optional detail (task, error, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Role: "agent", "coordinator", "worktree_manager"
+    /// Stable label of the task/role this member was spawned or assigned for.
+    /// Unlike `detail`, it is not overwritten by transient status updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_label: Option<String>,
+    /// Role: "agent" or "coordinator"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Whether this member is a headless spawned session.
@@ -386,6 +465,29 @@ pub struct SwarmMemberStatus {
     /// members when inline streaming taps are active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tail: Option<String>,
+    /// Session id this member reports back to (its spawner/parent in the swarm
+    /// tree). Walking this chain reconstructs the spawn tree, which lets a
+    /// client scope the inline gallery to the subtree it actually spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_back_to_session_id: Option<String>,
+    /// Todo/plan progress as (completed, total) for this member, when known.
+    /// Surfaced on the inline swarm strip as a compact "C/T" counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_progress: Option<(u32, u32)>,
+    /// Compact snapshot of this member's todo list (content + status), capped
+    /// by the producer. Rendered in the focused inline swarm panel so the
+    /// coordinator can see what each agent is working through.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todo_items: Vec<SwarmTodoItem>,
+}
+
+/// One compact todo entry crossing the swarm status boundary. Only the
+/// display essentials travel; full todo metadata stays in the owning session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmTodoItem {
+    pub content: String,
+    /// "pending", "in_progress", or "completed".
+    pub status: String,
 }
 
 /// Status of a member being awaited by comm_await_members
@@ -463,7 +565,12 @@ impl Request {
             Request::CommProposePlan { id, .. } => *id,
             Request::CommApprovePlan { id, .. } => *id,
             Request::CommRejectPlan { id, .. } => *id,
+            Request::CommSeedGraph { id, .. } => *id,
+            Request::CommExpandNode { id, .. } => *id,
+            Request::CommCompleteNode { id, .. } => *id,
+            Request::CommInjectGap { id, .. } => *id,
             Request::CommSpawn { id, .. } => *id,
+            Request::CommListModels { id, .. } => *id,
             Request::CommStop { id, .. } => *id,
             Request::CommAssignRole { id, .. } => *id,
             Request::CommSummary { id, .. } => *id,
@@ -494,7 +601,12 @@ impl Request {
                 | Request::CommProposePlan { .. }
                 | Request::CommApprovePlan { .. }
                 | Request::CommRejectPlan { .. }
+                | Request::CommSeedGraph { .. }
+                | Request::CommExpandNode { .. }
+                | Request::CommCompleteNode { .. }
+                | Request::CommInjectGap { .. }
                 | Request::CommSpawn { .. }
+                | Request::CommListModels { .. }
                 | Request::CommStop { .. }
                 | Request::CommAssignRole { .. }
                 | Request::CommSummary { .. }

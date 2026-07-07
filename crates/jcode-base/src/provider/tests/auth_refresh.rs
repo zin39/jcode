@@ -90,6 +90,7 @@ fn test_on_auth_changed_hot_initializes_openai_and_marks_routes_available() {
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider: Some(ActiveProvider::OpenAI),
+            routes_memo: std::sync::Mutex::new(None),
         };
 
         crate::auth::codex::upsert_account_from_tokens(
@@ -125,9 +126,11 @@ fn test_on_auth_changed_refreshes_existing_openai_provider_credentials() {
         )
         .expect("save stale test OpenAI auth");
 
-        let existing = Arc::new(openai::OpenAIProvider::new(
-            crate::auth::codex::load_credentials().expect("load stale openai credentials"),
-        ));
+        // The concrete OpenAI runtime lives downstream; token refresh itself is
+        // covered by jcode-provider-openai-runtime's tests. Here we assert the
+        // MultiProvider wiring: on_auth_changed must call reload_credentials()
+        // on an existing OpenAI runtime instead of replacing it.
+        let existing = test_openai_runtime();
 
         crate::auth::codex::upsert_account_from_tokens(
             "openai-1",
@@ -141,7 +144,7 @@ fn test_on_auth_changed_refreshes_existing_openai_provider_credentials() {
         let provider = MultiProvider {
             claude: RwLock::new(None),
             anthropic: RwLock::new(None),
-            openai: RwLock::new(Some(existing.clone())),
+            openai: RwLock::new(Some(Arc::clone(&existing) as Arc<dyn Provider>)),
             copilot_api: RwLock::new(None),
             antigravity: RwLock::new(None),
             gemini: RwLock::new(None),
@@ -154,6 +157,7 @@ fn test_on_auth_changed_refreshes_existing_openai_provider_credentials() {
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider: Some(ActiveProvider::OpenAI),
+            routes_memo: std::sync::Mutex::new(None),
         };
 
         provider.on_auth_changed();
@@ -161,8 +165,10 @@ fn test_on_auth_changed_refreshes_existing_openai_provider_credentials() {
         let openai = provider
             .openai_provider()
             .expect("existing openai provider");
-        let loaded = runtime.block_on(async { openai.test_access_token().await });
-        assert_eq!(loaded, "fresh-access-token");
+        assert!(
+            Arc::ptr_eq(&openai, &(existing as Arc<dyn Provider>)),
+            "on_auth_changed must reload credentials in place, not replace the runtime"
+        );
     });
 }
 
@@ -188,6 +194,7 @@ fn test_on_auth_changed_hot_initializes_anthropic_and_marks_routes_available() {
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider: Some(ActiveProvider::Claude),
+            routes_memo: std::sync::Mutex::new(None),
         };
 
         crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
@@ -232,6 +239,7 @@ fn test_on_auth_changed_hot_initializes_anthropic_from_api_key_and_marks_routes_
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider: Some(ActiveProvider::Claude),
+            routes_memo: std::sync::Mutex::new(None),
         };
 
         crate::provider_catalog::save_env_value_to_env_file(
@@ -295,6 +303,7 @@ fn test_anthropic_model_routes_keep_plain_4_6_available_without_extra_usage() {
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider: Some(ActiveProvider::Claude),
+            routes_memo: std::sync::Mutex::new(None),
         };
 
         crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
@@ -359,6 +368,7 @@ fn test_on_auth_changed_hot_initializes_openrouter_and_marks_routes_available() 
                     use_claude_cli: false,
                     startup_notices: RwLock::new(Vec::new()),
                     forced_provider: Some(ActiveProvider::OpenRouter),
+                    routes_memo: std::sync::Mutex::new(None),
                 };
 
                 provider.on_auth_changed();
@@ -383,6 +393,12 @@ fn test_on_auth_changed_hot_initializes_copilot_and_marks_routes_available() {
             let runtime = enter_test_runtime();
             let _enter = runtime.enter();
 
+            // The concrete Copilot runtime lives downstream; register the
+            // shared test stub through the composition-root registry.
+            external::register_external_provider(external::COPILOT_RUNTIME, || {
+                test_copilot_runtime()
+            });
+
             let provider = MultiProvider {
                 claude: RwLock::new(None),
                 anthropic: RwLock::new(None),
@@ -399,6 +415,7 @@ fn test_on_auth_changed_hot_initializes_copilot_and_marks_routes_available() {
                 use_claude_cli: false,
                 startup_notices: RwLock::new(Vec::new()),
                 forced_provider: Some(ActiveProvider::Copilot),
+                routes_memo: std::sync::Mutex::new(None),
             };
 
             provider.on_auth_changed();
@@ -416,6 +433,12 @@ fn test_startup_initializes_antigravity_when_cached_tokens_are_expired() {
     with_clean_provider_test_env(|| {
         let runtime = enter_test_runtime();
         let _enter = runtime.enter();
+
+        // The concrete Antigravity runtime lives downstream; register the
+        // shared test stub through the composition-root registry.
+        external::register_external_provider(external::ANTIGRAVITY_RUNTIME, || {
+            test_antigravity_runtime()
+        });
 
         crate::auth::antigravity::save_tokens(&crate::auth::antigravity::AntigravityTokens {
             access_token: "expired-access-token".to_string(),
@@ -442,6 +465,12 @@ fn test_on_auth_changed_hot_initializes_antigravity_when_tokens_exist_but_are_ex
         let runtime = enter_test_runtime();
         let _enter = runtime.enter();
 
+        // The concrete Antigravity runtime lives downstream; register the
+        // shared test stub through the composition-root registry.
+        external::register_external_provider(external::ANTIGRAVITY_RUNTIME, || {
+            test_antigravity_runtime()
+        });
+
         crate::auth::antigravity::save_tokens(&crate::auth::antigravity::AntigravityTokens {
             access_token: "expired-access-token".to_string(),
             refresh_token: "refresh-token".to_string(),
@@ -467,6 +496,7 @@ fn test_on_auth_changed_hot_initializes_antigravity_when_tokens_exist_but_are_ex
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider: Some(ActiveProvider::Antigravity),
+            routes_memo: std::sync::Mutex::new(None),
         };
 
         provider.on_auth_changed();
@@ -485,7 +515,7 @@ fn test_multi_provider_antigravity_routes_do_not_include_legacy_duplicate_entrie
         anthropic: RwLock::new(None),
         openai: RwLock::new(None),
         copilot_api: RwLock::new(None),
-        antigravity: RwLock::new(Some(Arc::new(antigravity::AntigravityProvider::new()))),
+        antigravity: RwLock::new(Some(test_antigravity_runtime())),
         gemini: RwLock::new(None),
         cursor: RwLock::new(None),
         bedrock: RwLock::new(None),
@@ -496,6 +526,7 @@ fn test_multi_provider_antigravity_routes_do_not_include_legacy_duplicate_entrie
         use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),
         forced_provider: Some(ActiveProvider::Antigravity),
+        routes_memo: std::sync::Mutex::new(None),
     };
 
     let routes = provider.model_routes();
@@ -572,6 +603,39 @@ fn test_on_auth_changed_hot_initializes_gemini_and_marks_routes_available() {
         let runtime = enter_test_runtime();
         let _enter = runtime.enter();
 
+        // The concrete Gemini runtime lives downstream in
+        // jcode-provider-gemini-runtime, so base tests register a stub through
+        // the same composition-root registry the binary uses. This also
+        // exercises the external-provider hot-init path end to end.
+        struct StubGeminiRuntime;
+        #[async_trait::async_trait]
+        impl Provider for StubGeminiRuntime {
+            async fn complete(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _system: &str,
+                _resume_session_id: Option<&str>,
+            ) -> anyhow::Result<EventStream> {
+                anyhow::bail!("stub gemini runtime does not stream")
+            }
+            fn name(&self) -> &'static str {
+                "gemini"
+            }
+            fn model(&self) -> String {
+                "gemini-2.5-pro".to_string()
+            }
+            fn available_models_display(&self) -> Vec<String> {
+                vec!["gemini-2.5-pro".to_string()]
+            }
+            fn fork(&self) -> std::sync::Arc<dyn Provider> {
+                std::sync::Arc::new(StubGeminiRuntime)
+            }
+        }
+        external::register_external_provider(external::GEMINI_RUNTIME, || {
+            std::sync::Arc::new(StubGeminiRuntime)
+        });
+
         crate::auth::gemini::save_tokens(&crate::auth::gemini::GeminiTokens {
             access_token: "test-access-token".to_string(),
             refresh_token: "test-refresh-token".to_string(),
@@ -596,6 +660,7 @@ fn test_on_auth_changed_hot_initializes_gemini_and_marks_routes_available() {
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider: Some(ActiveProvider::Gemini),
+            routes_memo: std::sync::Mutex::new(None),
         };
 
         provider.on_auth_changed();
@@ -615,6 +680,13 @@ fn test_on_auth_changed_hot_initializes_cursor_and_marks_routes_available() {
             let runtime = enter_test_runtime();
             let _enter = runtime.enter();
 
+            // The concrete Cursor runtime lives downstream in
+            // jcode-provider-cursor-runtime; register the shared test stub
+            // through the same composition-root registry the binary uses.
+            external::register_external_provider(external::CURSOR_RUNTIME, || {
+                test_cursor_runtime()
+            });
+
             let provider = MultiProvider {
                 claude: RwLock::new(None),
                 anthropic: RwLock::new(None),
@@ -631,6 +703,7 @@ fn test_on_auth_changed_hot_initializes_cursor_and_marks_routes_available() {
                 use_claude_cli: false,
                 startup_notices: RwLock::new(Vec::new()),
                 forced_provider: Some(ActiveProvider::Cursor),
+                routes_memo: std::sync::Mutex::new(None),
             };
 
             provider.on_auth_changed();

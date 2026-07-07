@@ -44,14 +44,17 @@ static LLM_OUTPUT_TOK: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 fn bench_root() -> PathBuf {
     std::env::var("MEMORY_BENCH_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs_home().join("jcode-memory-bench")
-        })
+        .unwrap_or_else(|_| dirs_home().join("jcode-memory-bench"))
 }
 
 fn dirs_home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
 }
+
+/// A queued extraction job: (session id, transcript, expected (id, content) pairs).
+type ExtractionJob = (String, String, Vec<(String, String)>);
+/// A raw recall result row: (query, ranked (id, score) candidates, hits, total).
+type RecallResultRow = (String, Vec<(String, f32)>, usize, usize);
 
 // ---------------- Corpus ----------------
 
@@ -59,8 +62,12 @@ fn dirs_home() -> PathBuf {
 struct CorpusMemory {
     id: String,
     content: String,
+    // Parsed from the corpus fixture for completeness; not used by the current
+    // recall scoring path.
+    #[allow(dead_code)]
     category: String,
     embedding: Option<Vec<f32>>,
+    #[allow(dead_code)]
     graph: String,
     source: Option<String>,
     active: bool,
@@ -159,10 +166,7 @@ fn dense_retrieve(
     limit: usize,
     apply_gap: bool,
 ) -> Vec<(String, f32)> {
-    let entries: Vec<&CorpusMemory> = corpus
-        .active()
-        .filter(|m| m.embedding.is_some())
-        .collect();
+    let entries: Vec<&CorpusMemory> = corpus.active().filter(|m| m.embedding.is_some()).collect();
     let emb_refs: Vec<&[f32]> = entries
         .iter()
         .filter_map(|m| m.embedding.as_deref())
@@ -368,8 +372,10 @@ fn rrf(lists: &[Vec<(String, f32)>], k: f32, limit: usize) -> Vec<(String, f32)>
 ///   - `drop_ratio`: stop as soon as an item is `< prev * drop_ratio` (a cliff in
 ///     the score curve marks the relevant/irrelevant boundary).
 ///   - `max_k`: hard upper bound (backstop).
+///
 /// Returns at least 1 item when the input is non-empty (the top candidate always
 /// clears its own floor), so recall of a present top-1 is never lost.
+#[allow(dead_code)] // Convenience wrapper; bench paths call dynamic_gate_abs directly.
 fn dynamic_gate(
     ranked: &[(String, f32)],
     rel_floor: f32,
@@ -432,16 +438,24 @@ struct QueryRecord {
 
 fn cmd_queries(args: &[String]) -> Result<()> {
     let opts = parse_kv(args);
-    let graph_file = opts
-        .get("corpus")
-        .cloned()
-        .unwrap_or_else(|| bench_root().join("corpus/projects/7fe469b5e6e471c1.json").display().to_string());
+    let graph_file = opts.get("corpus").cloned().unwrap_or_else(|| {
+        bench_root()
+            .join("corpus/projects/7fe469b5e6e471c1.json")
+            .display()
+            .to_string()
+    });
     let sessions_dir = opts
         .get("sessions")
         .cloned()
         .unwrap_or_else(|| format!("{}/.jcode/sessions", dirs_home().display()));
-    let max_sessions: usize = opts.get("max_sessions").and_then(|s| s.parse().ok()).unwrap_or(20);
-    let per_session: usize = opts.get("per_session").and_then(|s| s.parse().ok()).unwrap_or(6);
+    let max_sessions: usize = opts
+        .get("max_sessions")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let per_session: usize = opts
+        .get("per_session")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
     let working_dir_filter = opts.get("working_dir").cloned();
 
     let corpus = Corpus::load_graph_file(Path::new(&graph_file))?;
@@ -469,7 +483,7 @@ fn cmd_queries(args: &[String]) -> Result<()> {
             Some((p, mtime))
         })
         .collect();
-    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.1));
 
     let out_path = bench_root().join("labels/queries.jsonl");
     if let Some(parent) = out_path.parent() {
@@ -491,12 +505,16 @@ fn cmd_queries(args: &[String]) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue,
         };
-        if let Some(filter) = &working_dir_filter {
-            if session.working_dir.as_deref() != Some(filter.as_str()) {
-                continue;
-            }
+        if let Some(filter) = &working_dir_filter
+            && session.working_dir.as_deref() != Some(filter.as_str())
+        {
+            continue;
         }
-        let sid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let sid = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         let origin_ids = by_source.get(&sid).cloned().unwrap_or_default();
 
         let messages: Vec<_> = session.messages.iter().map(|m| m.to_message()).collect();
@@ -574,15 +592,23 @@ struct PoolCandidate {
 
 fn cmd_pool(args: &[String]) -> Result<()> {
     let opts = parse_kv(args);
-    let graph_file = opts
-        .get("corpus")
-        .cloned()
-        .unwrap_or_else(|| bench_root().join("corpus/projects/7fe469b5e6e471c1.json").display().to_string());
-    let pool_n: usize = opts.get("pool_n").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let graph_file = opts.get("corpus").cloned().unwrap_or_else(|| {
+        bench_root()
+            .join("corpus/projects/7fe469b5e6e471c1.json")
+            .display()
+            .to_string()
+    });
+    let pool_n: usize = opts
+        .get("pool_n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
 
     let corpus = Corpus::load_graph_file(Path::new(&graph_file))?;
-    let content_by_id: HashMap<String, String> =
-        corpus.memories.iter().map(|m| (m.id.clone(), m.content.clone())).collect();
+    let content_by_id: HashMap<String, String> = corpus
+        .memories
+        .iter()
+        .map(|m| (m.id.clone(), m.content.clone()))
+        .collect();
     let bm25 = Bm25::build(&corpus);
 
     let queries = read_queries()?;
@@ -601,13 +627,22 @@ fn cmd_pool(args: &[String]) -> Result<()> {
 
         let mut retrievers_by_id: HashMap<String, Vec<String>> = HashMap::new();
         for (id, _) in &dense {
-            retrievers_by_id.entry(id.clone()).or_default().push("dense".into());
+            retrievers_by_id
+                .entry(id.clone())
+                .or_default()
+                .push("dense".into());
         }
         for (id, _) in &lexical {
-            retrievers_by_id.entry(id.clone()).or_default().push("bm25".into());
+            retrievers_by_id
+                .entry(id.clone())
+                .or_default()
+                .push("bm25".into());
         }
         for (id, _) in &fused {
-            retrievers_by_id.entry(id.clone()).or_default().push("rrf".into());
+            retrievers_by_id
+                .entry(id.clone())
+                .or_default()
+                .push("rrf".into());
         }
         // Exclude origin-session memories to avoid extraction leakage.
         let origin: HashSet<&String> = q.origin_memory_ids.iter().collect();
@@ -629,7 +664,11 @@ fn cmd_pool(args: &[String]) -> Result<()> {
     }
 
     std::fs::write(&out_path, out)?;
-    println!("Wrote pool for {} queries -> {}", queries.len(), out_path.display());
+    println!(
+        "Wrote pool for {} queries -> {}",
+        queries.len(),
+        out_path.display()
+    );
     Ok(())
 }
 
@@ -724,8 +763,6 @@ For each candidate, output an integer 0-100: 100 = clearly essential to answer t
 0 = irrelevant, generic, stale, or only shares surface keywords. Use the full range and be calibrated: most candidates in a pool are NOT relevant and should score low. \
 Reply with ONLY a JSON object mapping candidate number to score, e.g. {\"1\":5,\"2\":95,\"3\":0}. Include EVERY candidate. No prose.";
 
-
-
 // ---- Synthesis ("fork writes what to inject") experiment -----------------
 //
 // Instead of selecting relevant memories (llm_rerank), the model reads the
@@ -742,7 +779,10 @@ Reply with ONLY a JSON object: {\"used\":[candidate numbers you drew from],\"not
 
 fn build_synth_prompt(query: &str, candidates: &[(String, String)]) -> String {
     let q = if query.chars().count() > 4000 {
-        query.chars().skip(query.chars().count() - 4000).collect::<String>()
+        query
+            .chars()
+            .skip(query.chars().count() - 4000)
+            .collect::<String>()
     } else {
         query.to_string()
     };
@@ -753,7 +793,9 @@ fn build_synth_prompt(query: &str, candidates: &[(String, String)]) -> String {
     for (i, (_id, content)) in candidates.iter().enumerate() {
         p.push_str(&format!("{}. {}\n", i + 1, content.replace('\n', " ")));
     }
-    p.push_str("\nReturn {\"used\":[...],\"note\":\"...\"} drawing ONLY from the candidates above.");
+    p.push_str(
+        "\nReturn {\"used\":[...],\"note\":\"...\"} drawing ONLY from the candidates above.",
+    );
     p
 }
 
@@ -766,7 +808,11 @@ fn parse_synth_response(resp: &str, n: usize) -> (Vec<usize>, String) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp[s..=e]) else {
         return (Vec::new(), String::new());
     };
-    let note = v.get("note").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let note = v
+        .get("note")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let mut seen = std::collections::HashSet::new();
     let used = v
         .get("used")
@@ -797,14 +843,20 @@ fn parse_scored_response(resp: &str, n: usize) -> Vec<(usize, f32)> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp[s..=e]) else {
         return Vec::new();
     };
-    let Some(obj) = v.as_object() else { return Vec::new() };
+    let Some(obj) = v.as_object() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for (k, val) in obj {
-        let Ok(idx1) = k.trim().parse::<usize>() else { continue };
+        let Ok(idx1) = k.trim().parse::<usize>() else {
+            continue;
+        };
         if idx1 < 1 || idx1 > n {
             continue;
         }
-        let score = val.as_f64().or_else(|| val.as_str().and_then(|s| s.parse().ok()));
+        let score = val
+            .as_f64()
+            .or_else(|| val.as_str().and_then(|s| s.parse().ok()));
         if let Some(sc) = score {
             out.push((idx1 - 1, sc as f32));
         }
@@ -818,20 +870,23 @@ fn cmd_judge(args: &[String]) -> Result<()> {
         .get("model")
         .cloned()
         .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string());
-    let concurrency: usize = opts.get("concurrency").and_then(|s| s.parse().ok()).unwrap_or(8);
+    let concurrency: usize = opts
+        .get("concurrency")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
     // Backend: explicit --backend, else infer from model name.
-    let backend = opts
-        .get("backend")
-        .cloned()
-        .unwrap_or_else(|| {
-            if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
-                "openai".to_string()
-            } else {
-                "claude".to_string()
-            }
-        });
+    let backend = opts.get("backend").cloned().unwrap_or_else(|| {
+        if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
+            "openai".to_string()
+        } else {
+            "claude".to_string()
+        }
+    });
     // Reasoning effort override (OpenAI only); default "none" for no-thinking.
-    let reasoning = opts.get("reasoning").cloned().unwrap_or_else(|| "none".to_string());
+    let reasoning = opts
+        .get("reasoning")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
 
     let input_path = bench_root().join("labels/judge_ready.jsonl");
     let text = std::fs::read_to_string(&input_path)
@@ -854,14 +909,18 @@ fn cmd_judge(args: &[String]) -> Result<()> {
 
     let results = rt.block_on(async {
         use futures::stream::{self, StreamExt};
-        stream::iter(inputs.into_iter())
+        stream::iter(inputs)
             .map(|input| {
                 let model = model.clone();
                 let backend = backend.clone();
                 let reasoning = reasoning.clone();
                 async move {
                     let sidecar = if backend == "openai" {
-                        let eff = if reasoning == "default" { None } else { Some(reasoning) };
+                        let eff = if reasoning == "default" {
+                            None
+                        } else {
+                            Some(reasoning)
+                        };
                         jcode::sidecar::Sidecar::with_openai_model(&model, eff)
                     } else {
                         jcode::sidecar::Sidecar::with_claude_model(&model)
@@ -954,11 +1013,16 @@ fn alt_dense_rank(
 
 fn cmd_metrics(args: &[String]) -> Result<()> {
     let opts = parse_kv(args);
-    let graph_file = opts
-        .get("corpus")
+    let graph_file = opts.get("corpus").cloned().unwrap_or_else(|| {
+        bench_root()
+            .join("corpus/projects/7fe469b5e6e471c1.json")
+            .display()
+            .to_string()
+    });
+    let config = opts
+        .get("config")
         .cloned()
-        .unwrap_or_else(|| bench_root().join("corpus/projects/7fe469b5e6e471c1.json").display().to_string());
-    let config = opts.get("config").cloned().unwrap_or_else(|| "baseline".into());
+        .unwrap_or_else(|| "baseline".into());
 
     let corpus = Corpus::load_graph_file(Path::new(&graph_file))?;
     let bm25 = Bm25::build(&corpus);
@@ -984,12 +1048,10 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
     // Optional alternative embedder for A/B (e.g. bge-small). When set, we
     // re-embed the corpus with this model and embed queries with the query
     // prefix. Used by the *_alt configs.
-    let alt_embedder = opts
-        .get("embedder")
-        .map(|dir| {
-            eprintln!("Loading alt embedder from {dir}");
-            jcode::embedding::Embedder::load_from_dir(Path::new(dir)).expect("load alt embedder")
-        });
+    let alt_embedder = opts.get("embedder").map(|dir| {
+        eprintln!("Loading alt embedder from {dir}");
+        jcode::embedding::Embedder::load_from_dir(Path::new(dir)).expect("load alt embedder")
+    });
     let query_prefix = opts.get("query_prefix").cloned().unwrap_or_default();
     let passage_prefix = opts.get("passage_prefix").cloned().unwrap_or_default();
     // Precompute alt corpus embeddings (active memories only) once.
@@ -1019,7 +1081,7 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
     // would use. Requires OPENAI_API_KEY (or --openai_key=...). Model/base via
     // --openai_model / --openai_base.
     let openai_backend = if config == "openai_dense" || config == "openai_hybrid" {
-        use jcode::embedding_backend::{OpenAiEmbeddingBackend, DEFAULT_OPENAI_EMBEDDING_MODEL};
+        use jcode::embedding_backend::{DEFAULT_OPENAI_EMBEDDING_MODEL, OpenAiEmbeddingBackend};
         let model = opts
             .get("openai_model")
             .cloned()
@@ -1071,22 +1133,36 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
         None => Vec::new(),
     };
 
-
     // Optional cross-encoder reranker for ce_rerank config.
     let ce_reranker = opts.get("reranker").map(|dir| {
         eprintln!("Loading cross-encoder reranker from {dir}");
         jcode::embedding::CrossEncoder::load_from_dir(Path::new(dir)).expect("load reranker")
     });
-    let rerank_pool: usize = opts.get("rerank_pool").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let rerank_pool: usize = opts
+        .get("rerank_pool")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     // Dynamic variable-k gate tunables (used by *_dyn configs). These control how
     // many memories are injected PER QUERY instead of a fixed top-k.
-    let gate_floor: f32 = opts.get("gate_floor").and_then(|s| s.parse().ok()).unwrap_or(0.55);
-    let gate_drop: f32 = opts.get("gate_drop").and_then(|s| s.parse().ok()).unwrap_or(0.80);
-    let gate_max: usize = opts.get("gate_max").and_then(|s| s.parse().ok()).unwrap_or(5);
+    let gate_floor: f32 = opts
+        .get("gate_floor")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.55);
+    let gate_drop: f32 = opts
+        .get("gate_drop")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.80);
+    let gate_max: usize = opts
+        .get("gate_max")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     // Absolute floor on the TOP hybrid score: if even the best candidate scores
     // below this, the no-LLM gate injects NOTHING. This is the zero-cost lever
     // for cutting bloat on no-memory turns (empty-gold). 0.0 = disabled (legacy).
-    let gate_abs: f32 = opts.get("gate_abs").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let gate_abs: f32 = opts
+        .get("gate_abs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let content_by_id: HashMap<String, String> = corpus
         .active()
         .map(|m| (m.id.clone(), m.content.clone()))
@@ -1125,17 +1201,27 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 "claude".to_string()
             }
         });
-        let reasoning = opts.get("reasoning").cloned().unwrap_or_else(|| "none".to_string());
-        let concurrency: usize =
-            opts.get("concurrency").and_then(|s| s.parse().ok()).unwrap_or(8);
+        let reasoning = opts
+            .get("reasoning")
+            .cloned()
+            .unwrap_or_else(|| "none".to_string());
+        let concurrency: usize = opts
+            .get("concurrency")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
         // Query view: "focused" (default, what we ship) or "full" (raw transcript
         // window, models the fork-the-judge-off-warm-transcript / prefix-cache idea).
-        let query_view = opts.get("query_view").cloned().unwrap_or_else(|| "focused".to_string());
+        let query_view = opts
+            .get("query_view")
+            .cloned()
+            .unwrap_or_else(|| "focused".to_string());
 
         // Build (qid, focused_query, pool_candidates) for judged queries only.
-        let mut jobs: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
+        let mut jobs: Vec<ExtractionJob> = Vec::new();
         for q in &queries {
-            let Some(rel) = gold.get(&q.qid) else { continue };
+            let Some(rel) = gold.get(&q.qid) else {
+                continue;
+            };
             if rel.is_empty() {
                 continue;
             }
@@ -1145,7 +1231,12 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
             let pool = rrf(&[dense, lex], 60.0, rerank_pool);
             let cands: Vec<(String, String)> = pool
                 .into_iter()
-                .map(|(id, _)| (id.clone(), content_by_id.get(&id).cloned().unwrap_or_default()))
+                .map(|(id, _)| {
+                    (
+                        id.clone(),
+                        content_by_id.get(&id).cloned().unwrap_or_default(),
+                    )
+                })
                 .collect();
             // Query view fed to the reranker:
             //   focused (default) = noise-stripped latest-user intent (what we ship);
@@ -1182,14 +1273,18 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
             .build()?;
         let raw: Vec<(String, Vec<String>, String, usize, usize)> = rt.block_on(async {
             use futures::stream::{self, StreamExt};
-            stream::iter(jobs.into_iter())
+            stream::iter(jobs)
                 .map(|(qid, query, cands)| {
                     let model = model.clone();
                     let backend = backend.clone();
                     let reasoning = reasoning.clone();
                     async move {
                         let sidecar = if backend == "openai" {
-                            let eff = if reasoning == "default" { None } else { Some(reasoning) };
+                            let eff = if reasoning == "default" {
+                                None
+                            } else {
+                                Some(reasoning)
+                            };
                             jcode::sidecar::Sidecar::with_openai_model(&model, eff)
                         } else {
                             jcode::sidecar::Sidecar::with_claude_model(&model)
@@ -1199,7 +1294,10 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                         let (system, prompt) = if synth {
                             (LLM_SYNTH_SYSTEM, build_synth_prompt(&query, &cands))
                         } else if strict {
-                            (LLM_RERANK_STRICT_SYSTEM, build_rerank_prompt(&query, &cands))
+                            (
+                                LLM_RERANK_STRICT_SYSTEM,
+                                build_rerank_prompt(&query, &cands),
+                            )
                         } else if judge_sel {
                             // Use the EXACT gold-judge prompt as the selector: the
                             // gold labels were produced by this judge, so this is
@@ -1306,13 +1404,19 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
             LLM_OUTPUT_TOK.store(total_out / nq / 4, std::sync::atomic::Ordering::Relaxed);
         }
 
-        raw.into_iter().map(|(qid, ids, _, _, _)| (qid, ids)).collect()
+        raw.into_iter()
+            .map(|(qid, ids, _, _, _)| (qid, ids))
+            .collect()
     } else if config == "llm_cached" {
         // Replay a previously-saved llm_rerank map (results/llm_rerank_map.json)
         // so cap/gate sweeps are free (no LLM calls). Written by any llm_* run.
         let path = bench_root().join("results/llm_rerank_map.json");
-        let txt = std::fs::read_to_string(&path)
-            .with_context(|| format!("no cached map at {} (run an llm_* config first)", path.display()))?;
+        let txt = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "no cached map at {} (run an llm_* config first)",
+                path.display()
+            )
+        })?;
         serde_json::from_str(&txt)?
     } else {
         HashMap::new()
@@ -1331,9 +1435,15 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
     // caches the full score map. `llm_scored_cached` replays that cache so a
     // --score_threshold sweep is free. Selection at scoring time: keep candidates
     // with score >= score_threshold (dynamic count incl. 0), capped at gate_max.
-    let score_threshold: f32 = opts.get("score_threshold").and_then(|s| s.parse().ok()).unwrap_or(80.0);
+    let score_threshold: f32 = opts
+        .get("score_threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80.0);
     let llm_score_map: HashMap<String, Vec<(String, f32)>> = if config == "llm_scored" {
-        let model = opts.get("model").cloned().unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        let model = opts
+            .get("model")
+            .cloned()
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
         let backend = opts.get("backend").cloned().unwrap_or_else(|| {
             if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
                 "openai".into()
@@ -1341,10 +1451,15 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 "claude".into()
             }
         });
-        let concurrency: usize = opts.get("concurrency").and_then(|s| s.parse().ok()).unwrap_or(8);
-        let mut jobs: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
+        let concurrency: usize = opts
+            .get("concurrency")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let mut jobs: Vec<ExtractionJob> = Vec::new();
         for q in &queries {
-            let Some(rel) = gold.get(&q.qid) else { continue };
+            let Some(rel) = gold.get(&q.qid) else {
+                continue;
+            };
             if rel.is_empty() {
                 continue;
             }
@@ -1354,15 +1469,28 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
             let pool = rrf(&[dense, lex], 60.0, rerank_pool);
             let cands: Vec<(String, String)> = pool
                 .into_iter()
-                .map(|(id, _)| (id.clone(), content_by_id.get(&id).cloned().unwrap_or_default()))
+                .map(|(id, _)| {
+                    (
+                        id.clone(),
+                        content_by_id.get(&id).cloned().unwrap_or_default(),
+                    )
+                })
                 .collect();
             jobs.push((q.qid.clone(), focus_query(&q.query), cands));
         }
-        eprintln!("llm_scored: scoring {} queries (pool={}) with {} (concurrency {})", jobs.len(), rerank_pool, model, concurrency);
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let raw: Vec<(String, Vec<(String, f32)>, usize, usize)> = rt.block_on(async {
+        eprintln!(
+            "llm_scored: scoring {} queries (pool={}) with {} (concurrency {})",
+            jobs.len(),
+            rerank_pool,
+            model,
+            concurrency
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let raw: Vec<RecallResultRow> = rt.block_on(async {
             use futures::stream::{self, StreamExt};
-            stream::iter(jobs.into_iter())
+            stream::iter(jobs)
                 .map(|(qid, query, cands)| {
                     let model = model.clone();
                     let backend = backend.clone();
@@ -1391,7 +1519,8 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                                     if attempt == 1 {
                                         eprintln!("llm_scored failed for {qid}: {e}");
                                     } else {
-                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
                                     }
                                 }
                             }
@@ -1406,18 +1535,28 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
         let nq = raw.len().max(1);
         let tp: usize = raw.iter().map(|(_, _, p, _)| *p).sum();
         let to: usize = raw.iter().map(|(_, _, _, o)| *o).sum();
-        eprintln!("llm_scored: {} LLM calls | avg prompt ~{} tok, avg output ~{} tok (1 call/turn)", raw.len(), tp / nq / 4, to / nq / 4);
+        eprintln!(
+            "llm_scored: {} LLM calls | avg prompt ~{} tok, avg output ~{} tok (1 call/turn)",
+            raw.len(),
+            tp / nq / 4,
+            to / nq / 4
+        );
         LLM_CALLS.store(raw.len(), std::sync::atomic::Ordering::Relaxed);
         LLM_PROMPT_TOK.store(tp / nq / 4, std::sync::atomic::Ordering::Relaxed);
         LLM_OUTPUT_TOK.store(to / nq / 4, std::sync::atomic::Ordering::Relaxed);
-        let map: HashMap<String, Vec<(String, f32)>> = raw.into_iter().map(|(q, s, _, _)| (q, s)).collect();
+        let map: HashMap<String, Vec<(String, f32)>> =
+            raw.into_iter().map(|(q, s, _, _)| (q, s)).collect();
         let path = bench_root().join("results/llm_score_map.json");
         let _ = std::fs::write(&path, serde_json::to_string(&map)?);
         map
     } else if config == "llm_scored_cached" {
         let path = bench_root().join("results/llm_score_map.json");
-        let txt = std::fs::read_to_string(&path)
-            .with_context(|| format!("no cached score map at {} (run llm_scored first)", path.display()))?;
+        let txt = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "no cached score map at {} (run llm_scored first)",
+                path.display()
+            )
+        })?;
         // Cached llm_scored runs ran the LLM, so report 1 call/turn for cost.
         LLM_CALLS.store(1, std::sync::atomic::Ordering::Relaxed);
         serde_json::from_str(&txt)?
@@ -1427,12 +1566,27 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
         // (0..N) as its score. Keeping only high-vote candidates removes single-
         // judge noise -> higher precision. Cached to llm_score_map.json, so
         // `llm_scored_cached --score_threshold=K` sweeps the vote bar K for free.
-        let n_ens: usize = opts.get("ensemble").and_then(|s| s.parse().ok()).unwrap_or(3);
-        let model = opts.get("model").cloned().unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-        let concurrency: usize = opts.get("concurrency").and_then(|s| s.parse().ok()).unwrap_or(8);
-        let qv = opts.get("query_view").cloned().unwrap_or_else(|| "focused".into());
-        let all_queries = opts.get("all_queries").map(|s| s == "1" || s == "true").unwrap_or(false);
-        let mut jobs: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
+        let n_ens: usize = opts
+            .get("ensemble")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let model = opts
+            .get("model")
+            .cloned()
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        let concurrency: usize = opts
+            .get("concurrency")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let qv = opts
+            .get("query_view")
+            .cloned()
+            .unwrap_or_else(|| "focused".into());
+        let all_queries = opts
+            .get("all_queries")
+            .map(|s| s == "1" || s == "true")
+            .unwrap_or(false);
+        let mut jobs: Vec<ExtractionJob> = Vec::new();
         for q in &queries {
             match gold.get(&q.qid) {
                 Some(rel) if !rel.is_empty() => {}
@@ -1447,16 +1601,34 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
             let pool = rrf(&[dense, lex], 60.0, rerank_pool);
             let cands: Vec<(String, String)> = pool
                 .into_iter()
-                .map(|(id, _)| (id.clone(), content_by_id.get(&id).cloned().unwrap_or_default()))
+                .map(|(id, _)| {
+                    (
+                        id.clone(),
+                        content_by_id.get(&id).cloned().unwrap_or_default(),
+                    )
+                })
                 .collect();
-            let rq = if qv == "full" { q.query.clone() } else { focus_query(&q.query) };
+            let rq = if qv == "full" {
+                q.query.clone()
+            } else {
+                focus_query(&q.query)
+            };
             jobs.push((q.qid.clone(), rq, cands));
         }
-        eprintln!("llm_ensemble: {} queries x {} votes (pool={}) with {} (concurrency {})", jobs.len(), n_ens, rerank_pool, model, concurrency);
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let raw: Vec<(String, Vec<(String, f32)>, usize, usize)> = rt.block_on(async {
+        eprintln!(
+            "llm_ensemble: {} queries x {} votes (pool={}) with {} (concurrency {})",
+            jobs.len(),
+            n_ens,
+            rerank_pool,
+            model,
+            concurrency
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let raw: Vec<RecallResultRow> = rt.block_on(async {
             use futures::stream::{self, StreamExt};
-            stream::iter(jobs.into_iter())
+            stream::iter(jobs)
                 .map(|(qid, query, cands)| {
                     let model = model.clone();
                     async move {
@@ -1480,7 +1652,10 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                                         if attempt == 1 {
                                             eprintln!("llm_ensemble failed for {qid}: {e}");
                                         } else {
-                                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                500,
+                                            ))
+                                            .await;
                                         }
                                     }
                                 }
@@ -1500,11 +1675,18 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
         let nq = raw.len().max(1);
         let tp: usize = raw.iter().map(|(_, _, p, _)| *p).sum();
         let to: usize = raw.iter().map(|(_, _, _, o)| *o).sum();
-        eprintln!("llm_ensemble: {} queries | {} calls/turn | avg prompt ~{} tok, avg output ~{} tok", raw.len(), n_ens, tp / nq / 4, to / nq / 4);
+        eprintln!(
+            "llm_ensemble: {} queries | {} calls/turn | avg prompt ~{} tok, avg output ~{} tok",
+            raw.len(),
+            n_ens,
+            tp / nq / 4,
+            to / nq / 4
+        );
         LLM_CALLS.store(n_ens, std::sync::atomic::Ordering::Relaxed);
         LLM_PROMPT_TOK.store(tp / nq / 4, std::sync::atomic::Ordering::Relaxed);
         LLM_OUTPUT_TOK.store(to / nq / 4, std::sync::atomic::Ordering::Relaxed);
-        let map: HashMap<String, Vec<(String, f32)>> = raw.into_iter().map(|(q, s, _, _)| (q, s)).collect();
+        let map: HashMap<String, Vec<(String, f32)>> =
+            raw.into_iter().map(|(q, s, _, _)| (q, s)).collect();
         let path = bench_root().join("results/llm_score_map.json");
         let _ = std::fs::write(&path, serde_json::to_string(&map)?);
         map
@@ -1528,8 +1710,14 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
     // and the LLM selectors. Fixed top-k always injects k here by construction.
     let empty_aware = matches!(
         config.as_str(),
-        "hybrid_dyn" | "oracle_dyn" | "llm_rerank" | "llm_strict" | "llm_judge"
-            | "llm_scored" | "llm_scored_cached" | "llm_ensemble"
+        "hybrid_dyn"
+            | "oracle_dyn"
+            | "llm_rerank"
+            | "llm_strict"
+            | "llm_judge"
+            | "llm_scored"
+            | "llm_scored_cached"
+            | "llm_ensemble"
     );
     let mut empty_q = 0usize;
     let mut empty_clean = 0usize; // empty-gold queries where we injected 0 (good)
@@ -1554,7 +1742,12 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 "llm_scored" | "llm_scored_cached" | "llm_ensemble" => {
                     let mut scored = llm_score_map.get(&q.qid).cloned().unwrap_or_default();
                     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-                    scored.into_iter().filter(|(_, s)| *s >= score_threshold).take(gate_max).map(|(id, _)| id).collect()
+                    scored
+                        .into_iter()
+                        .filter(|(_, s)| *s >= score_threshold)
+                        .take(gate_max)
+                        .map(|(id, _)| id)
+                        .collect()
                 }
                 // LLM keep/drop selectors: not precomputed for empty-gold queries
                 // (the rerank map only covers judged queries), so skip scoring them
@@ -1564,7 +1757,10 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                     continue;
                 }
             };
-            let injected: Vec<String> = injected.into_iter().filter(|id| !origin.contains(id)).collect();
+            let injected: Vec<String> = injected
+                .into_iter()
+                .filter(|id| !origin.contains(id))
+                .collect();
             if injected.is_empty() {
                 empty_clean += 1;
             }
@@ -1573,7 +1769,9 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
     }
 
     for q in &queries {
-        let Some(rel) = gold.get(&q.qid) else { continue };
+        let Some(rel) = gold.get(&q.qid) else {
+            continue;
+        };
         if rel.is_empty() {
             continue;
         }
@@ -1581,24 +1779,38 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
         let q_emb = embedding::embed(&q.query)?;
         let focused = focus_query(&q.query);
         let q_emb_focused = embedding::embed(&focused)?;
-        let q_emb_alt = alt_embedder
-            .as_ref()
-            .map(|emb| emb.embed(&format!("{query_prefix}{}", q.query)).unwrap_or_default());
+        let q_emb_alt = alt_embedder.as_ref().map(|emb| {
+            emb.embed(&format!("{query_prefix}{}", q.query))
+                .unwrap_or_default()
+        });
         let q_emb_openai = openai_backend.as_ref().map(|b| {
             use jcode::embedding_backend::EmbeddingBackend;
-            b.embed_query(&q.query).expect("OpenAI query embedding failed")
+            b.embed_query(&q.query)
+                .expect("OpenAI query embedding failed")
         });
         let origin: HashSet<&String> = q.origin_memory_ids.iter().collect();
 
         let ranked: Vec<String> = match config.as_str() {
-            "baseline" => dense_retrieve(&q_emb, &corpus, EMBEDDING_SIMILARITY_THRESHOLD, EMBEDDING_MAX_HITS, true)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect(),
-            "dense_nogap" => dense_retrieve(&q_emb, &corpus, EMBEDDING_SIMILARITY_THRESHOLD, EMBEDDING_MAX_HITS, false)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect(),
+            "baseline" => dense_retrieve(
+                &q_emb,
+                &corpus,
+                EMBEDDING_SIMILARITY_THRESHOLD,
+                EMBEDDING_MAX_HITS,
+                true,
+            )
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect(),
+            "dense_nogap" => dense_retrieve(
+                &q_emb,
+                &corpus,
+                EMBEDDING_SIMILARITY_THRESHOLD,
+                EMBEDDING_MAX_HITS,
+                false,
+            )
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect(),
             "dense_t0" => dense_retrieve(&q_emb, &corpus, 0.0, EMBEDDING_MAX_HITS, false)
                 .into_iter()
                 .map(|(id, _)| id)
@@ -1607,11 +1819,18 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect(),
-            "bm25" => bm25.search(&q.query, EMBEDDING_MAX_HITS).into_iter().map(|(id, _)| id).collect(),
+            "bm25" => bm25
+                .search(&q.query, EMBEDDING_MAX_HITS)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
             "hybrid" => {
                 let dense = dense_retrieve(&q_emb, &corpus, 0.0, 50, false);
                 let lex = bm25.search(&q.query, 50);
-                rrf(&[dense, lex], 60.0, EMBEDDING_MAX_HITS).into_iter().map(|(id, _)| id).collect()
+                rrf(&[dense, lex], 60.0, EMBEDDING_MAX_HITS)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
             }
             "ce_rerank" => {
                 // recall-5: hybrid top-N candidate pool, reranked by a local
@@ -1648,7 +1867,12 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 let pool = rrf(&[dense, lex], 60.0, rerank_pool);
                 let cands: Vec<(String, String)> = pool
                     .into_iter()
-                    .map(|(id, _)| (id.clone(), content_by_id.get(&id).cloned().unwrap_or_default()))
+                    .map(|(id, _)| {
+                        (
+                            id.clone(),
+                            content_by_id.get(&id).cloned().unwrap_or_default(),
+                        )
+                    })
                     .collect();
                 // Use just the most recent user line as the rerank query.
                 let rq = focus_query(&q.query);
@@ -1700,7 +1924,8 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 let pool = rrf(&[dense, lex], 60.0, 50);
                 dynamic_gate_abs(&pool, gate_floor, gate_drop, gate_max, gate_abs)
             }
-            "llm_rerank" | "llm_rerank_padded" | "llm_strict" | "llm_judge" | "llm_synth" | "llm_cached" => {
+            "llm_rerank" | "llm_rerank_padded" | "llm_strict" | "llm_judge" | "llm_synth"
+            | "llm_cached" => {
                 // recall-5 Mode-2: listwise LLM rerank of the hybrid top-N pool,
                 // precomputed into llm_rerank_map above. `llm_rerank` is precision
                 // mode (relevant-only); `llm_rerank_padded` emulates the old buggy
@@ -1733,10 +1958,8 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 // Multiply fused RRF score by a gentle prior derived from
                 // confidence / strength / recency. Priors only re-order within
                 // the already-retrieved set; they never add/remove candidates.
-                let prior: HashMap<&String, f32> = corpus
-                    .active()
-                    .map(|m| (&m.id, memory_prior(m)))
-                    .collect();
+                let prior: HashMap<&String, f32> =
+                    corpus.active().map(|m| (&m.id, memory_prior(m))).collect();
                 let mut adj: Vec<(String, f32)> = fused
                     .into_iter()
                     .map(|(id, s)| {
@@ -1745,12 +1968,18 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                     })
                     .collect();
                 adj.sort_by(|a, b| b.1.total_cmp(&a.1));
-                adj.into_iter().take(EMBEDDING_MAX_HITS).map(|(id, _)| id).collect()
+                adj.into_iter()
+                    .take(EMBEDDING_MAX_HITS)
+                    .map(|(id, _)| id)
+                    .collect()
             }
             "hybrid_focused" => {
                 let dense = dense_retrieve(&q_emb_focused, &corpus, 0.0, 50, false);
                 let lex = bm25.search(&focused, 50);
-                rrf(&[dense, lex], 60.0, EMBEDDING_MAX_HITS).into_iter().map(|(id, _)| id).collect()
+                rrf(&[dense, lex], 60.0, EMBEDDING_MAX_HITS)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
             }
             "hybrid_expand" => {
                 // Hybrid base ranking, then 1-hop graph expansion: each base hit
@@ -1773,17 +2002,24 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
                 }
                 let mut v: Vec<(String, f32)> = scored.into_iter().collect();
                 v.sort_by(|a, b| b.1.total_cmp(&a.1));
-                v.into_iter().take(EMBEDDING_MAX_HITS).map(|(id, _)| id).collect()
+                v.into_iter()
+                    .take(EMBEDDING_MAX_HITS)
+                    .map(|(id, _)| id)
+                    .collect()
             }
             "bge_dense" => {
-                let qe = q_emb_alt.as_ref().expect("--embedder required for bge_dense");
+                let qe = q_emb_alt
+                    .as_ref()
+                    .expect("--embedder required for bge_dense");
                 alt_dense_rank(qe, &alt_corpus_emb, EMBEDDING_MAX_HITS)
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect()
             }
             "bge_hybrid" => {
-                let qe = q_emb_alt.as_ref().expect("--embedder required for bge_hybrid");
+                let qe = q_emb_alt
+                    .as_ref()
+                    .expect("--embedder required for bge_hybrid");
                 let dense = alt_dense_rank(qe, &alt_corpus_emb, 50);
                 let lex = bm25.search(&q.query, 50);
                 rrf(&[dense, lex], 60.0, EMBEDDING_MAX_HITS)
@@ -1826,7 +2062,10 @@ fn cmd_metrics(args: &[String]) -> Result<()> {
             }
             other => anyhow::bail!("unknown config: {other}"),
         };
-        let ranked: Vec<String> = ranked.into_iter().filter(|id| !origin.contains(id)).collect();
+        let ranked: Vec<String> = ranked
+            .into_iter()
+            .filter(|id| !origin.contains(id))
+            .collect();
         let rel_set: HashSet<&String> = rel.iter().collect();
         total_injected += ranked.len();
 
@@ -1925,8 +2164,18 @@ fn cmd_probe(args: &[String]) -> Result<()> {
     let c = e.embed(&format!("{pp}coffee brewing temperature guide"))?;
     let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
     let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
-    println!("dim={} normA={:.4} normB={:.4} normC={:.4}", a.len(), norm(&a), norm(&b), norm(&c));
-    println!("cos(query,relevant)={:.4} cos(query,unrelated)={:.4}", dot(&a, &b), dot(&a, &c));
+    println!(
+        "dim={} normA={:.4} normB={:.4} normC={:.4}",
+        a.len(),
+        norm(&a),
+        norm(&b),
+        norm(&c)
+    );
+    println!(
+        "cos(query,relevant)={:.4} cos(query,unrelated)={:.4}",
+        dot(&a, &b),
+        dot(&a, &c)
+    );
     println!("a[0..8]={:?}", &a[0..8.min(a.len())]);
     Ok(())
 }
@@ -1943,8 +2192,10 @@ fn cmd_gate(args: &[String]) -> Result<()> {
         .get("sessions")
         .cloned()
         .unwrap_or_else(|| format!("{}/.jcode/sessions", dirs_home().display()));
-    let max_sessions: usize =
-        opts.get("max_sessions").and_then(|s| s.parse().ok()).unwrap_or(60);
+    let max_sessions: usize = opts
+        .get("max_sessions")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
     let working_dir_filter = opts.get("working_dir").cloned();
     // Thresholds to sweep. A turn FIRES the rerank when cosine(current, last_fired)
     // < threshold (topic moved enough) OR it is the first turn of the session.
@@ -1958,8 +2209,14 @@ fn cmd_gate(args: &[String]) -> Result<()> {
     // versus the last fired turn. This is the stronger signal: if retrieval
     // surfaces the same memories, the rerank answer cannot change. Requires
     // --corpus to load the same graph production retrieves from.
-    let pool_k: usize = opts.get("pool_k").and_then(|s| s.parse().ok()).unwrap_or(10);
-    let pool_thr: f32 = opts.get("pool_thr").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let pool_k: usize = opts
+        .get("pool_k")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let pool_thr: f32 = opts
+        .get("pool_thr")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
     let corpus_pool = match opts.get("corpus") {
         Some(p) => {
             let c = Corpus::load_graph_file(Path::new(p))?;
@@ -1975,15 +2232,20 @@ fn cmd_gate(args: &[String]) -> Result<()> {
     // least one memory NOT already surfaced this session (the natural trigger,
     // since already-injected memories are filtered out before reranking). Also
     // apply an optional min-cadence (>= cadence turns since last fire).
-    let cadence: usize = opts.get("cadence").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cadence: usize = opts
+        .get("cadence")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let mut nov_fires = 0usize;
     let mut nov_total = 0usize;
     // Production-faithful gate: mirrors memory_agent::should_run_rerank exactly.
     // Fires when first-turn OR topic_changed (cosine < TOPIC_CHANGE_THRESHOLD vs
     // last embedding) OR turns_since_last_rerank >= prod_cadence. This captures
     // the real fire-rate (above 1/N because topic jumps + first turn fire extra).
-    let prod_cadence: usize =
-        opts.get("prod_cadence").and_then(|s| s.parse().ok()).unwrap_or(3);
+    let prod_cadence: usize = opts
+        .get("prod_cadence")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     const TOPIC_CHANGE_THRESHOLD: f32 = 0.3;
     let mut prod_fires = 0usize;
     let mut prod_total = 0usize;
@@ -2005,7 +2267,7 @@ fn cmd_gate(args: &[String]) -> Result<()> {
             Some((p, mtime))
         })
         .collect();
-    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.1));
 
     // Per-threshold tallies.
     let mut fires = vec![0usize; thresholds.len()];
@@ -2026,10 +2288,10 @@ fn cmd_gate(args: &[String]) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue,
         };
-        if let Some(filter) = &working_dir_filter {
-            if session.working_dir.as_deref() != Some(filter.as_str()) {
-                continue;
-            }
+        if let Some(filter) = &working_dir_filter
+            && session.working_dir.as_deref() != Some(filter.as_str())
+        {
+            continue;
         }
         let messages: Vec<_> = session.messages.iter().map(|m| m.to_message()).collect();
         // Every user turn is a relevance-check opportunity (production runs the
@@ -2052,7 +2314,11 @@ fn cmd_gate(args: &[String]) -> Result<()> {
             .unwrap_or(20);
         let user_turns: Vec<usize> = if user_turns.len() > max_turns {
             let step = user_turns.len() / max_turns;
-            user_turns.into_iter().step_by(step.max(1)).take(max_turns).collect()
+            user_turns
+                .into_iter()
+                .step_by(step.max(1))
+                .take(max_turns)
+                .collect()
         } else {
             user_turns
         };
@@ -2143,8 +2409,7 @@ fn cmd_gate(args: &[String]) -> Result<()> {
             let mut last_pool: Option<std::collections::HashSet<String>> = None;
             // Novelty state: ids already surfaced this session, and turns since
             // the last novelty-fire (for the cadence floor).
-            let mut surfaced: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut surfaced: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut since_fire = usize::MAX;
             for (idx, &turn) in user_turns.iter().enumerate() {
                 let emb = &embs[idx];
@@ -2191,7 +2456,7 @@ fn cmd_gate(args: &[String]) -> Result<()> {
         }
 
         used_sessions += 1;
-        if used_sessions % 5 == 0 {
+        if used_sessions.is_multiple_of(5) {
             eprintln!("  ...{used_sessions} sessions, {total_turns} turns embedded");
         }
     }
@@ -2210,7 +2475,9 @@ fn cmd_gate(args: &[String]) -> Result<()> {
         consec_sims.iter().sum::<f32>() / consec_sims.len() as f32
     };
 
-    println!("Gate simulation over {used_sessions} sessions, {total_turns} relevance-check opportunities");
+    println!(
+        "Gate simulation over {used_sessions} sessions, {total_turns} relevance-check opportunities"
+    );
     println!(
         "Consecutive-turn cosine: mean={:.3} p10={:.3} p25={:.3} p50={:.3} p75={:.3} p90={:.3}",
         mean,
@@ -2269,7 +2536,10 @@ fn read_queries() -> Result<Vec<QueryRecord>> {
     let path = bench_root().join("labels/queries.jsonl");
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} (run `queries` first)", path.display()))?;
-    Ok(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+    Ok(text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
 }
 
 fn read_gold() -> Result<HashMap<String, Vec<String>>> {
@@ -2288,10 +2558,10 @@ fn read_gold() -> Result<HashMap<String, Vec<String>>> {
 fn parse_kv(args: &[String]) -> HashMap<String, String> {
     let mut m = HashMap::new();
     for a in args {
-        if let Some(rest) = a.strip_prefix("--") {
-            if let Some((k, v)) = rest.split_once('=') {
-                m.insert(k.to_string(), v.to_string());
-            }
+        if let Some(rest) = a.strip_prefix("--")
+            && let Some((k, v)) = rest.split_once('=')
+        {
+            m.insert(k.to_string(), v.to_string());
         }
     }
     m
@@ -2316,7 +2586,9 @@ fn cmd_cosdiag(args: &[String]) -> Result<()> {
     let mut empty_top: Vec<f32> = Vec::new();
     let mut rel_top: Vec<f32> = Vec::new();
     for q in &queries {
-        let Some(rel) = gold.get(&q.qid) else { continue };
+        let Some(rel) = gold.get(&q.qid) else {
+            continue;
+        };
         let q_emb = embedding::embed(&q.query)?;
         let dense = dense_retrieve(&q_emb, &corpus, 0.0, 5, false);
         let top1 = dense.first().map(|(_, s)| *s).unwrap_or(0.0);
@@ -2358,7 +2630,8 @@ fn cmd_cosdiag(args: &[String]) -> Result<()> {
     // relevant turns we would wrongly suppress (lose recall entirely).
     println!("\nfloor  empty_clean%  rel_kept%");
     for f in [0.30_f32, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70] {
-        let ec = empty_top.iter().filter(|&&s| s < f).count() as f32 / empty_top.len().max(1) as f32;
+        let ec =
+            empty_top.iter().filter(|&&s| s < f).count() as f32 / empty_top.len().max(1) as f32;
         let rk = rel_top.iter().filter(|&&s| s >= f).count() as f32 / rel_top.len().max(1) as f32;
         println!("{:.2}   {:.3}         {:.3}", f, ec, rk);
     }

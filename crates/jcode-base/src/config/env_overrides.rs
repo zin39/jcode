@@ -243,6 +243,16 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_COPY_BADGE_ALT_LABEL") {
             self.display.copy_badge_alt_label = v;
         }
+        if let Ok(v) = std::env::var("JCODE_COMPACT_NOTIFICATIONS") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.compact_notifications = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_SHOW_AGENTGREP_OUTPUT") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.show_agentgrep_output = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_CHAT_NATIVE_SCROLLBAR") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.native_scrollbars.chat = parsed;
@@ -298,6 +308,16 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_SWARM_SPAWN_MODE") {
             if let Some(parsed) = SwarmSpawnMode::parse(&v) {
                 self.agents.swarm_spawn_mode = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_SWARM_STRIP_LAYOUT") {
+            if let Some(parsed) = SwarmStripLayout::parse(&v) {
+                self.agents.swarm_strip_layout = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_SWARM_MAX_CONCURRENT_AGENTS") {
+            if let Ok(parsed) = v.trim().parse::<usize>() {
+                self.agents.swarm_max_concurrent_agents = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_MEMORY_MODEL") {
@@ -372,6 +392,7 @@ impl Config {
                 };
             }
         }
+        hook_env_override(&mut self.hooks.turn_start, "JCODE_HOOK_TURN_START");
         hook_env_override(&mut self.hooks.turn_end, "JCODE_HOOK_TURN_END");
         hook_env_override(&mut self.hooks.session_start, "JCODE_HOOK_SESSION_START");
         hook_env_override(&mut self.hooks.session_end, "JCODE_HOOK_SESSION_END");
@@ -417,6 +438,42 @@ impl Config {
             && !v.trim().is_empty()
         {
             self.websearch.searxng_url = Some(v);
+        }
+        if let Ok(v) = std::env::var("JCODE_TAVILY_API_KEY")
+            && !v.trim().is_empty()
+        {
+            self.websearch.tavily_api_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("JCODE_TAVILY_API_KEY_ENV")
+            && !v.trim().is_empty()
+        {
+            self.websearch.tavily_api_key_env = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_TAVILY_SEARCH_DEPTH")
+            && !v.trim().is_empty()
+        {
+            self.websearch.tavily_search_depth = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_ENABLED") {
+            self.websearch.last30days_enabled = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_SCRIPT")
+            && !v.trim().is_empty()
+        {
+            self.websearch.last30days_script = Some(v);
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_TIMEOUT_SECS")
+            && let Ok(parsed) = v.trim().parse::<u64>()
+        {
+            self.websearch.last30days_timeout_secs = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_LAST30DAYS_SOURCES")
+            && !v.trim().is_empty()
+        {
+            self.websearch.last30days_sources = v;
         }
 
         if let Ok(v) = std::env::var("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES") {

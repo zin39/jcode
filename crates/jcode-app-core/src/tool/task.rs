@@ -254,44 +254,71 @@ impl Tool for SubagentTool {
         };
 
         let start = std::time::Instant::now();
-        // Inactivity watchdog: drive the subagent to completion, but if it makes no
-        // progress (no heartbeat) for the resolved stall budget, abort so the
-        // coordinator's tool call returns an error instead of blocking forever (the
-        // hung-subagent freeze). Dropping the run future cancels the in-flight work;
-        // we also fire graceful_shutdown for any cooperative cleanup.
-        let run_outcome = match resolve_subagent_stall_timeout(params.stall_timeout_secs) {
-            Some(stall) => {
-                let poll = std::time::Duration::from_secs(5).min(stall);
-                match run_until_complete_or_stalled(
-                    agent.run_once_capture(&augmented_prompt),
-                    last_activity.clone(),
-                    stall,
-                    poll,
-                )
-                .await
-                {
-                    StallResult::Completed(res) => res,
-                    StallResult::Stalled { idle } => {
-                        agent.request_graceful_shutdown();
-                        logging::warn(&format!(
-                            "[tool:subagent] stall watchdog fired: no progress for {}s (limit {}s) session_id={} description={}",
-                            idle.as_secs(),
-                            stall.as_secs(),
-                            agent.session_id(),
-                            params.description,
-                        ));
-                        Err(anyhow::anyhow!(
-                            "subagent '{}' stalled: no progress for {}s (inactivity limit {}s); aborted so the coordinator is not blocked. Retry, raise stall_timeout_secs, or split the task.",
-                            params.description,
-                            idle.as_secs(),
-                            stall.as_secs(),
-                        ))
+        // Two complementary bounds: the total wall-clock timeout
+        // (agents.subagent_timeout_secs, 0 disables; issue #365) catches runs that
+        // never finish even while active, and the inactivity stall watchdog catches
+        // hung runs with no progress. Dropping the run future cancels in-flight work.
+        let timeout_secs = crate::config::config().agents.subagent_timeout_secs;
+        let stall_budget = resolve_subagent_stall_timeout(params.stall_timeout_secs);
+        let run_fut = async {
+            match stall_budget {
+                Some(stall) => {
+                    let poll = std::time::Duration::from_secs(5).min(stall);
+                    match run_until_complete_or_stalled(
+                        agent.run_once_capture(&augmented_prompt),
+                        last_activity.clone(),
+                        stall,
+                        poll,
+                    )
+                    .await
+                    {
+                        StallResult::Completed(res) => res,
+                        StallResult::Stalled { idle } => {
+                            agent.request_graceful_shutdown();
+                            logging::warn(&format!(
+                                "[tool:subagent] stall watchdog fired: no progress for {}s (limit {}s) session_id={} description={}",
+                                idle.as_secs(),
+                                stall.as_secs(),
+                                agent.session_id(),
+                                params.description,
+                            ));
+                            Err(anyhow::anyhow!(
+                                "subagent '{}' stalled: no progress for {}s (inactivity limit {}s); aborted so the coordinator is not blocked. Retry, raise stall_timeout_secs, or split the task.",
+                                params.description,
+                                idle.as_secs(),
+                                stall.as_secs(),
+                            ))
+                        }
                     }
                 }
+                None => agent.run_once_capture(&augmented_prompt).await,
             }
-            None => agent.run_once_capture(&augmented_prompt).await,
         };
-        let final_text = run_outcome.map_err(|err| {
+        let run_result = if timeout_secs == 0 {
+            run_fut.await
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_fut).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    logging::warn(&format!(
+                        "[tool:subagent] subagent timed out after {}s description={} type={} session_id={} model={}",
+                        timeout_secs,
+                        params.description,
+                        params.subagent_type,
+                        agent.session_id(),
+                        resolved_model
+                    ));
+                    listener.abort();
+                    return Err(anyhow::anyhow!(
+                        "subagent '{}' timed out after {}s without producing a final answer",
+                        params.description,
+                        timeout_secs
+                    ));
+                }
+            }
+        };
+        let final_text = run_result.map_err(|err| {
             logging::warn(&format!(
                 "[tool:subagent] subagent failed description={} type={} session_id={} model={} error={}",
                 params.description,

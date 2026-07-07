@@ -69,6 +69,10 @@ pub fn debug_stats() -> MermaidDebugStats {
     if let Ok(pending) = PENDING_RENDER_REQUESTS.lock() {
         out.deferred_pending = pending.len();
     }
+    let (layout_entries, layout_bytes) = layout_cache_usage();
+    out.layout_cache_entries = layout_entries;
+    out.layout_cache_limit = LAYOUT_CACHE_MAX;
+    out.layout_cache_approx_bytes = layout_bytes;
     out.deferred_epoch = deferred_render_epoch();
     out.protocol = protocol_type().map(|p| format!("{:?}", p));
     out.render_size_backend = render_size_backend();
@@ -165,10 +169,16 @@ pub fn debug_memory_profile() -> MermaidMemoryProfile {
 
     out.active_diagrams = active_diagram_count();
 
+    let (layout_entries, layout_bytes) = layout_cache_usage();
+    out.layout_cache_entries = layout_entries;
+    out.layout_cache_limit = LAYOUT_CACHE_MAX;
+    out.layout_cache_approx_bytes = layout_bytes;
+
     out.mermaid_working_set_estimate_bytes = out
         .render_cache_metadata_estimate_bytes
         .saturating_add(out.image_state_protocol_min_estimate_bytes)
-        .saturating_add(out.source_cache_decoded_estimate_bytes);
+        .saturating_add(out.source_cache_decoded_estimate_bytes)
+        .saturating_add(layout_bytes);
 
     out
 }
@@ -322,6 +332,163 @@ pub fn debug_flicker_benchmark(steps: usize) -> MermaidFlickerBenchmark {
             deltas.fit_protocol_rebuilds as f64 / fit_samples.len() as f64
         },
         deltas,
+    }
+}
+
+/// Synthesize a base64 PNG payload of `(w, h)` pixels with a per-image gradient
+/// so each benchmark image is a distinct content hash.
+fn synth_png_b64(seed: u32, w: u32, h: u32) -> String {
+    let mut img = image::RgbaImage::new(w, h);
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        let r = ((x.wrapping_add(seed)) % 256) as u8;
+        let g = ((y.wrapping_add(seed.wrapping_mul(7))) % 256) as u8;
+        let b = ((x ^ y).wrapping_add(seed.wrapping_mul(13)) % 256) as u8;
+        *px = image::Rgba([r, g, b, 255]);
+    }
+    let dynimg = image::DynamicImage::ImageRgba8(img);
+    let mut bytes: Vec<u8> = Vec::new();
+    {
+        use image::ImageEncoder as _;
+        let encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+        let _ = encoder.write_image(dynimg.as_bytes(), w, h, image::ExtendedColorType::Rgba8);
+    }
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
+}
+
+/// Headless image-scroll benchmark. Reproduces the transcript-scroll cost for a
+/// session full of inline screenshots without a real terminal: it materializes
+/// `images` synthetic PNGs and then drives the exact per-frame UI hot path the
+/// viewport uses (`inline_fit_readiness` + `render_image_widget_fit_stable` for
+/// every visible image, plus a readiness probe for every image in the
+/// +/-2-viewport look-ahead prefetch band).
+///
+/// It is intentionally single-threaded and synchronous so the measured numbers
+/// are attributable purely to the UI thread (the real app off-threads the cold
+/// decode via a prewarm worker, but the *steady-state* per-frame cost measured
+/// here is identical and is what "smooth scrolling" depends on).
+///
+/// Headline metric: `cache_stat_syscalls_per_frame`. Every render-cache lookup
+/// that hits the filesystem (`path.exists()` / `read_dir`) is counted, so the
+/// regression this benchmark guards - a per-frame stat syscall for every visible
+/// and prefetched image - is caught objectively. It must stay ~0 in steady
+/// state. `fit_protocol_rebuilds` catches cache thrash (re-decode / re-encode
+/// storms) when the scroll working set exceeds the bounded caches.
+pub fn debug_image_scroll_benchmark(
+    images: usize,
+    frames: usize,
+    visible_per_frame: usize,
+) -> ImageScrollBenchmark {
+    // Force a Kitty picker so the stable-fit fast path (the one used for real
+    // inline screenshots) is exercised even in a headless benchmark process.
+    force_test_kitty_picker();
+
+    let images = images.clamp(1, 4096);
+    let frames = frames.clamp(1, 100_000);
+    let visible_per_frame = visible_per_frame.clamp(1, images);
+
+    // Placeholder geometry the viewport would compute for a fit image.
+    let content_width: u16 = 100;
+    let image_rows: u16 = 16;
+    let image_area = Rect::new(0, 0, content_width, image_rows);
+    let mut buf = Buffer::empty(image_area);
+
+    // Materialize the synthetic transcript: each image is decoded + cached once,
+    // exactly like the first time a screenshot scrolls into view.
+    let mut ids: Vec<u64> = Vec::with_capacity(images);
+    for seed in 0..images as u32 {
+        let b64 = synth_png_b64(seed, 1280, 800);
+        if let Some((id, _, _)) = materialize_inline_image("image/png", &b64) {
+            ids.push(id);
+        }
+    }
+
+    // A single synchronous "draw a visible image" step: the readiness probe the
+    // viewport runs via ensure_drawable, then the stable-fit draw. On a cold
+    // image this also performs the decode+scale+transmit inline (the work the
+    // real app pushes to its prewarm worker); on a warm image it is the cheap
+    // placeholder re-address that every steady-state scroll frame pays.
+    let draw_visible = |buf: &mut Buffer, id: u64| {
+        let _ = inline_fit_readiness(id, content_width, image_rows, true);
+        let _ = render_image_widget_fit_stable(
+            id,
+            image_area,
+            buf,
+            content_width,
+            image_rows,
+            0,
+            false,
+            true,
+        );
+    };
+
+    // Rows occupied per image in the simulated transcript (image + label + gaps).
+    let row_stride: usize = image_rows as usize + 3;
+    let viewport_rows: usize = visible_per_frame * row_stride;
+    let prefetch_margin_images: usize = visible_per_frame * 2;
+    let total_rows = images.saturating_mul(row_stride);
+
+    // Warm the entire transcript once so the steady-state measurement below is
+    // not polluted by unavoidable first-touch decodes. This mirrors scrolling
+    // through the whole history once before settling.
+    for &id in &ids {
+        draw_visible(&mut buf, id);
+    }
+
+    let stat_before = super::cache_stat_syscalls();
+    let stats_before = debug_stats();
+    let mut frame_samples = Vec::with_capacity(frames);
+
+    // Steady-state slow scroll: advance one transcript row per frame. Most
+    // images stay visible across many frames (a real reading-speed scroll), so
+    // this measures the warm per-frame hot path - the cost a regression in the
+    // stat-syscall or fit-state-reuse path would inflate.
+    for frame in 0..frames {
+        let top_row = if total_rows > viewport_rows {
+            frame % (total_rows - viewport_rows + 1)
+        } else {
+            0
+        };
+        let first_visible = top_row / row_stride;
+        let last_visible = (first_visible + visible_per_frame).min(images);
+        let band_start = first_visible.saturating_sub(prefetch_margin_images);
+        let band_end = (last_visible + prefetch_margin_images).min(images);
+
+        let start = Instant::now();
+
+        // Visible images: probe + draw.
+        for &id in &ids[first_visible..last_visible] {
+            draw_visible(&mut buf, id);
+        }
+        // Prefetch band: readiness probe only (mirrors ui_viewport.rs prefetch).
+        for &id in ids[band_start..first_visible]
+            .iter()
+            .chain(ids[last_visible..band_end].iter())
+        {
+            let _ = inline_fit_readiness(id, content_width, image_rows, true);
+        }
+
+        frame_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let stat_after = super::cache_stat_syscalls();
+    let stats_after = debug_stats();
+    let stat_syscalls = stat_after.saturating_sub(stat_before);
+
+    ImageScrollBenchmark {
+        protocol: protocol_type().map(|p| format!("{:?}", p)),
+        images,
+        frames,
+        visible_per_frame,
+        frame_timing: percentile_summary(&frame_samples),
+        cache_stat_syscalls: stat_syscalls,
+        cache_stat_syscalls_per_frame: stat_syscalls as f64 / frames as f64,
+        visible_draw_skips: 0,
+        fit_protocol_rebuilds: stats_after
+            .fit_protocol_rebuilds
+            .saturating_sub(stats_before.fit_protocol_rebuilds),
+        fit_state_reuse_hits: stats_after
+            .fit_state_reuse_hits
+            .saturating_sub(stats_before.fit_state_reuse_hits),
     }
 }
 

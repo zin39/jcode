@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use jcode::message::{ContentBlock, Message, Role, StreamEvent};
 use jcode::provider::Provider;
-use jcode::provider::anthropic::AnthropicProvider;
+use jcode_provider_anthropic_runtime::AnthropicProvider;
 use std::time::Instant;
 
 async fn run_one_with_retry(

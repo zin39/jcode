@@ -68,20 +68,24 @@ using terms from application "System Events"
         if lvl > maxlvl then return out
         set r to "?"
         try
-            set r to (role of el as text)
+            set rawR to role of el
+            if rawR is not missing value then set r to (rawR as text)
         end try
         set t to ""
         try
-            set t to (title of el as text)
+            set rawT to title of el
+            if rawT is not missing value then set t to (rawT as text)
         end try
         if t is "" then
             try
-                set t to (value of el as text)
+                set rawV to value of el
+                if rawV is not missing value then set t to (rawV as text)
             end try
         end if
         set d to ""
         try
-            set d to (description of el as text)
+            set rawD to description of el
+            if rawD is not missing value then set d to (rawD as text)
         end try
         set pos to ""
         try
@@ -113,12 +117,20 @@ tell application "System Events"
     set frontApp to {target}
     set appName to name of frontApp
     set out to "App: " & appName & " (element paths shown as #a.b.c == child indices from front window)" & linefeed
+    set winCount to 0
     try
-        set win to front window of frontApp
-        set out to out & (my dumpEl(win, 0, {depth}, ""))
-    on error errMsg
-        set out to out & "(no window / " & errMsg & ")"
+        set winCount to (count of windows of frontApp)
     end try
+    if winCount is 0 then
+        set out to out & "(app \"" & appName & "\" has no open windows right now -- it may be a background/menu-bar app, or all its windows are closed or on another Space)"
+    else
+        try
+            set win to front window of frontApp
+            set out to out & (my dumpEl(win, 0, {depth}, ""))
+        on error errMsg
+            set out to out & "(could not read front window: " & errMsg & ")"
+        end try
+    end if
     return out
 end tell
 "##,
@@ -153,15 +165,18 @@ using terms from application "System Events"
         if lvl > maxlvl then return out
         set r to ""
         try
-            set r to (role of el as text)
+            set rawR to role of el
+            if rawR is not missing value then set r to (rawR as text)
         end try
         set t to ""
         try
-            set t to (title of el as text)
+            set rawT to title of el
+            if rawT is not missing value then set t to (rawT as text)
         end try
         set v to ""
         try
-            set v to (value of el as text)
+            set rawV to value of el
+            if rawV is not missing value then set v to (rawV as text)
         end try
         set ok to true
         if roleM is not "" and r is not roleM then set ok to false
@@ -189,13 +204,21 @@ end using terms from
 
 tell application "System Events"
     set frontApp to first application process whose name is {app}
+    set winCount to 0
     try
-        set win to front window of frontApp
-        set out to (my findEl(win, 0, {depth}, "", {role_m}, {title_m}, {value_m}))
-    on error errMsg
-        set out to "(error: " & errMsg & ")"
+        set winCount to (count of windows of frontApp)
     end try
-    if out is "" then set out to "(no matching elements)"
+    if winCount is 0 then
+        set out to "(app has no open windows right now -- it may be a background/menu-bar app, or all its windows are closed or on another Space)"
+    else
+        try
+            set win to front window of frontApp
+            set out to (my findEl(win, 0, {depth}, "", {role_m}, {title_m}, {value_m}))
+        on error errMsg
+            set out to "(error: " & errMsg & ")"
+        end try
+        if out is "" then set out to "(no matching elements)"
+    end if
     return out
 end tell
 "#,
@@ -322,11 +345,13 @@ using terms from application "System Events"
         if my inFrame(el, px, py) then
             set r to ""
             try
-                set r to (role of el as text)
+                set rawR to role of el
+                if rawR is not missing value then set r to (rawR as text)
             end try
             set t to ""
             try
-                set t to (title of el as text)
+                set rawT to title of el
+                if rawT is not missing value then set t to (rawT as text)
             end try
             set p to position of el
             set sz to size of el
@@ -348,12 +373,20 @@ end using terms from
 
 tell application "System Events"
     set frontApp to first application process whose name is {app}
+    set winCount to 0
     try
-        set win to front window of frontApp
-        set out to my hit(win, {x}, {y}, "", 40, 0, "(none)")
-    on error errMsg
-        set out to "(error: " & errMsg & ")"
+        set winCount to (count of windows of frontApp)
     end try
+    if winCount is 0 then
+        set out to "(app has no open windows right now -- it may be a background/menu-bar app, or all its windows are closed or on another Space)"
+    else
+        try
+            set win to front window of frontApp
+            set out to my hit(win, {x}, {y}, "", 40, 0, "(none)")
+        on error errMsg
+            set out to "(error: " & errMsg & ")"
+        end try
+    end if
     return out
 end tell
 "#,

@@ -209,6 +209,83 @@ impl App {
                 "version": jcode_build_meta::VERSION,
             })
             .to_string()
+        } else if cmd.starts_with("mouse:") {
+            // Inject a raw mouse event: mouse:<kind>:<col>,<row>
+            // kind: down|up|drag|click (click = down then up at same cell)
+            let raw = cmd.strip_prefix("mouse:").unwrap_or("");
+            let (kind, coords) = match raw.split_once(':') {
+                Some(pair) => pair,
+                None => return "mouse error: expected mouse:<kind>:<col>,<row>".to_string(),
+            };
+            let (col, row) = match coords.split_once(',').and_then(|(c, r)| {
+                Some((c.trim().parse::<u16>().ok()?, r.trim().parse::<u16>().ok()?))
+            }) {
+                Some(pair) => pair,
+                None => return "mouse error: bad coords (expected <col>,<row>)".to_string(),
+            };
+            use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+            let mut inject = |kind: MouseEventKind| {
+                self.handle_mouse_event(MouseEvent {
+                    kind,
+                    column: col,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::empty(),
+                })
+            };
+            match kind {
+                "down" => {
+                    inject(MouseEventKind::Down(MouseButton::Left));
+                }
+                "up" => {
+                    inject(MouseEventKind::Up(MouseButton::Left));
+                }
+                "drag" => {
+                    inject(MouseEventKind::Drag(MouseButton::Left));
+                }
+                "click" => {
+                    inject(MouseEventKind::Down(MouseButton::Left));
+                    inject(MouseEventKind::Up(MouseButton::Left));
+                }
+                // A real kitty click with sub-cell hand jitter: kitty reports
+                // motion at pixel granularity, so Down, Drag (same cell), Up.
+                "jitter-click" => {
+                    inject(MouseEventKind::Down(MouseButton::Left));
+                    inject(MouseEventKind::Drag(MouseButton::Left));
+                    inject(MouseEventKind::Up(MouseButton::Left));
+                }
+                other => return format!("mouse error: unknown kind '{other}'"),
+            }
+            self.debug_trace
+                .record("mouse", format!("{kind} at {col},{row}"));
+            format!(
+                "OK: mouse {kind} at {col},{row} (status: {:?})",
+                self.status_notice.as_ref().map(|(text, _)| text.as_str())
+            )
+        } else if cmd.starts_with("image-click-target:") {
+            // Probe the inline-image expand badge hit-test at screen coords.
+            let raw = cmd.strip_prefix("image-click-target:").unwrap_or("");
+            let (col, row) = match raw.split_once(',').and_then(|(c, r)| {
+                Some((c.trim().parse::<u16>().ok()?, r.trim().parse::<u16>().ok()?))
+            }) {
+                Some(pair) => pair,
+                None => return "image-click-target error: expected <col>,<row>".to_string(),
+            };
+            let image_id = crate::tui::ui::inline_image_expand_target_from_screen(col, row);
+            let body_id =
+                crate::tui::ui::inline_image_body_target_from_screen(col, row, self.centered);
+            let link = crate::tui::ui::link_target_from_screen(col, row);
+            serde_json::json!({
+                "col": col,
+                "row": row,
+                "image_expand_target": image_id,
+                "image_body_target": body_id,
+                "link_target": link,
+            })
+            .to_string()
+        } else if cmd == "image-regions" {
+            // Dump the current chat snapshot's inline-image regions and label
+            // lines so a driver can compute real badge click coordinates.
+            crate::tui::ui::debug_chat_image_regions_json()
         } else if cmd == "expand-badge-fixture" {
             let old_string = (0..24)
                 .map(|idx| format!("old fixture line {idx}\n"))
@@ -304,6 +381,7 @@ impl App {
                         friendly_name: Some(names[i % names.len()].to_string()),
                         status: statuses[i % statuses.len()].to_string(),
                         detail: Some(format!("task {}", i + 1)),
+                        task_label: None,
                         role: if i == 0 {
                             Some("coordinator".to_string())
                         } else {
@@ -313,6 +391,20 @@ impl App {
                         live_attachments: Some(1),
                         status_age_secs: Some((i as u64) * 7),
                         output_tail: Some(samples[i % samples.len()].to_string()),
+                        report_back_to_session_id: None,
+                        todo_progress: Some(((i as u32 * 3) % 9, 9)),
+                        todo_items: (0..5)
+                            .map(|t| crate::protocol::SwarmTodoItem {
+                                content: format!("step {} of synthetic plan", t + 1),
+                                status: if (t as u32) < (i as u32 * 3) % 9 {
+                                    "completed".to_string()
+                                } else if t as u32 == (i as u32 * 3) % 9 {
+                                    "in_progress".to_string()
+                                } else {
+                                    "pending".to_string()
+                                },
+                            })
+                            .collect(),
                     })
                     .collect();
                 self.debug_force_inline_gallery = true;
@@ -342,11 +434,15 @@ impl App {
                             ProcessingStatus::RunningTool(_) => "running".to_string(),
                         },
                         detail: self.subagent_status.clone(),
+                        task_label: None,
                         role: None,
                         is_headless: Some(false),
                         live_attachments: Some(1),
                         status_age_secs: Some(0),
                         output_tail: None,
+                        report_back_to_session_id: None,
+                        todo_progress: None,
+                        todo_items: Vec::new(),
                     }],
                 })
                 .to_string()
@@ -444,15 +540,31 @@ impl App {
         } else if cmd == "render-stats" {
             use crate::tui::visual_debug;
             visual_debug::enable();
+            let draw_calls = crate::tui::ui::debug_draw_call_history(16);
             match visual_debug::latest_frame() {
                 Some(frame) => serde_json::to_string_pretty(&serde_json::json!({
                     "frame_id": frame.frame_id,
                     "render_timing": frame.render_timing,
                     "render_order": frame.render_order,
+                    "draw_calls": draw_calls,
                 }))
                 .unwrap_or_else(|_| "{}".to_string()),
-                None => "render-stats: no frames captured".to_string(),
+                None => serde_json::to_string_pretty(&serde_json::json!({
+                    "frame_id": serde_json::Value::Null,
+                    "render_timing": serde_json::Value::Null,
+                    "render_order": serde_json::Value::Null,
+                    "draw_calls": draw_calls,
+                }))
+                .unwrap_or_else(|_| "render-stats: no frames captured".to_string()),
             }
+        } else if cmd == "draw-stats" {
+            let payload = crate::tui::ui::debug_draw_call_history(32);
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        } else if cmd.starts_with("draw-stats ") {
+            let raw_limit = cmd.strip_prefix("draw-stats ").unwrap_or("32").trim();
+            let limit = raw_limit.parse::<usize>().unwrap_or(32);
+            let payload = crate::tui::ui::debug_draw_call_history(limit);
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
         } else if cmd == "render-order" {
             use crate::tui::visual_debug;
             visual_debug::enable();
@@ -510,6 +622,20 @@ impl App {
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
         } else if cmd == "mermaid:flicker-bench" {
             let result = crate::tui::mermaid::debug_flicker_benchmark(24);
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        } else if cmd == "image-scroll-bench" || cmd.starts_with("image-scroll-bench ") {
+            // Headless inline-image scroll benchmark. Usage:
+            //   image-scroll-bench [images] [frames] [visible_per_frame]
+            // Defaults model a screenshot-heavy transcript scrolled slowly.
+            let raw = cmd.strip_prefix("image-scroll-bench").unwrap_or("").trim();
+            let mut parts = raw.split_whitespace();
+            let images = parts.next().and_then(|v| v.parse().ok()).unwrap_or(60usize);
+            let frames = parts
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600usize);
+            let visible = parts.next().and_then(|v| v.parse().ok()).unwrap_or(3usize);
+            let result = crate::tui::mermaid::debug_image_scroll_benchmark(images, frames, visible);
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
         } else if cmd.starts_with("mermaid:flicker-bench ") {
             let raw_steps = cmd
@@ -764,7 +890,8 @@ impl App {
                  - layout - dump latest layout JSON\n\
                  - margins - dump layout margins JSON\n\
                  - widgets - dump info widget summary/placements\n\
-                 - render-stats - dump render timing + order JSON\n\
+                 - render-stats - dump render timing + order + draw-call attribution JSON\n\
+                 - draw-stats [n] - dump per-draw attribution history (render_ms, changed cells)\n\
                  - render-order - dump render order list\n\
                  - anomalies - dump visual debug anomalies\n\
                  - theme - dump current palette snapshot\n\
@@ -790,6 +917,9 @@ impl App {
                  - widget-stability[:<json>] - quantify info-widget movement while scrolling current transcript\n\
                  - side-panel-latency[:<json>] - benchmark headless side-panel input->frame latency\n\
                  - keys:<keyspec> - inject key events (e.g. keys:ctrl+r)\n\
+                 - mouse:<kind>:<col>,<row> - inject mouse events (down|up|drag|click|jitter-click)\n\
+                 - image-click-target:<col>,<row> - probe inline-image badge / link hit-test\n\
+                 - image-regions - dump chat snapshot image regions + badge screen coords\n\
                  - input - get current input buffer\n\
                  - set_input:<text> - set input buffer\n\
                  - submit - submit current input\n\

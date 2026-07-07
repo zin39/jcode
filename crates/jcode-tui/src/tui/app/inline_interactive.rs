@@ -1088,8 +1088,15 @@ impl App {
 
             if is_openai_model && is_openai && !available_efforts.is_empty() {
                 for effort in &available_efforts {
+                    // Swarm modes (swarm / swarm-deep) are orchestration rungs on
+                    // the effort ladder, not per-model reasoning variants. They
+                    // must not generate `model (swarm)` picker rows.
+                    if crate::prompt::is_swarm_mode_effort(effort) {
+                        continue;
+                    }
                     let effort_label = match *effort {
-                        "xhigh" => "max",
+                        "xhigh" => "xhigh",
+                        "max" => "max",
                         "high" => "high",
                         "medium" => "med",
                         "low" => "low",
@@ -1555,13 +1562,15 @@ impl App {
         if !active {
             return Ok(false);
         }
+        // Use Ctrl+O (set default) and Ctrl+N (toggle favorite) so the picker
+        // preview no longer steals Ctrl+B / Ctrl+F / Alt+F, which are the tmux
+        // prefix and readline word-navigation keys users rely on while editing
+        // the `/model` command line. Cycling favorites stays on Shift+Tab.
         let is_default =
-            modifiers.contains(KeyModifiers::CONTROL) && key_char_eq_ignore_ascii_case(code, 'b');
+            modifiers.contains(KeyModifiers::CONTROL) && key_char_eq_ignore_ascii_case(code, 'o');
         let is_favorite =
-            modifiers.contains(KeyModifiers::CONTROL) && key_char_eq_ignore_ascii_case(code, 'f');
-        let is_cycle_favorite =
-            modifiers.contains(KeyModifiers::ALT) && key_char_eq_ignore_ascii_case(code, 'f');
-        if is_default || is_favorite || is_cycle_favorite {
+            modifiers.contains(KeyModifiers::CONTROL) && key_char_eq_ignore_ascii_case(code, 'n');
+        if is_default || is_favorite {
             self.handle_inline_interactive_key(code, modifiers)?;
             return Ok(true);
         }
@@ -1624,6 +1633,20 @@ impl App {
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.filtered.is_empty() {
                         self.inline_interactive_state = None;
+                        self.input.clear();
+                        self.cursor_pos = 0;
+                        return Ok(true);
+                    }
+                    // `/login` + immediate Enter should not silently launch the
+                    // first provider's login flow. Without a filter or an
+                    // explicit selection there is no clear user choice yet, so
+                    // activate the picker and let them pick deliberately.
+                    if picker.kind == PickerKind::Login
+                        && picker.filter.is_empty()
+                        && picker.selected == 0
+                    {
+                        picker.preview = false;
+                        picker.column = 0;
                         self.input.clear();
                         self.cursor_pos = 0;
                         return Ok(true);
@@ -1950,10 +1973,13 @@ impl App {
                         .unwrap_or_else(|| session_id.to_string())
                 }
                 ResumeTarget::ClaudeCodeSession { session_id, .. } => {
-                    format!("Claude Code {}", &session_id[..session_id.len().min(8)])
+                    format!(
+                        "Claude Code {}",
+                        jcode_core::util::truncate_str(session_id, 8)
+                    )
                 }
                 ResumeTarget::CodexSession { session_id, .. } => {
-                    format!("Codex {}", &session_id[..session_id.len().min(8)])
+                    format!("Codex {}", jcode_core::util::truncate_str(session_id, 8))
                 }
                 ResumeTarget::PiSession { session_path } => std::path::Path::new(session_path)
                     .file_stem()
@@ -1961,7 +1987,10 @@ impl App {
                     .unwrap_or("Pi session")
                     .to_string(),
                 ResumeTarget::OpenCodeSession { session_id, .. } => {
-                    format!("OpenCode {}", &session_id[..session_id.len().min(8)])
+                    format!("OpenCode {}", jcode_core::util::truncate_str(session_id, 8))
+                }
+                ResumeTarget::CursorSession { session_id, .. } => {
+                    format!("Cursor {}", jcode_core::util::truncate_str(session_id, 8))
                 }
             };
             let resolved_target = match crate::import::resolve_resume_target_to_jcode(target) {
@@ -2049,10 +2078,13 @@ impl App {
                     .unwrap_or_else(|| session_id.to_string())
             }
             ResumeTarget::ClaudeCodeSession { session_id, .. } => {
-                format!("Claude Code {}", &session_id[..session_id.len().min(8)])
+                format!(
+                    "Claude Code {}",
+                    jcode_core::util::truncate_str(session_id, 8)
+                )
             }
             ResumeTarget::CodexSession { session_id, .. } => {
-                format!("Codex {}", &session_id[..session_id.len().min(8)])
+                format!("Codex {}", jcode_core::util::truncate_str(session_id, 8))
             }
             ResumeTarget::PiSession { session_path } => std::path::Path::new(session_path)
                 .file_stem()
@@ -2060,7 +2092,10 @@ impl App {
                 .unwrap_or("Pi session")
                 .to_string(),
             ResumeTarget::OpenCodeSession { session_id, .. } => {
-                format!("OpenCode {}", &session_id[..session_id.len().min(8)])
+                format!("OpenCode {}", jcode_core::util::truncate_str(session_id, 8))
+            }
+            ResumeTarget::CursorSession { session_id, .. } => {
+                format!("Cursor {}", jcode_core::util::truncate_str(session_id, 8))
             }
         };
 
@@ -2339,7 +2374,7 @@ impl App {
         if let Some(entry_name) = selected_name {
             self.set_status_notice(format!("Favorite → {}", entry_name));
         } else {
-            self.set_status_notice("No favorited models yet. Use Ctrl+F to favorite one.");
+            self.set_status_notice("No favorited models yet. Use Ctrl+N to favorite one.");
         }
     }
 
@@ -2494,7 +2529,7 @@ impl App {
                 }
             }
             code if modifiers.contains(KeyModifiers::CONTROL)
-                && key_char_eq_ignore_ascii_case(code, 'b') =>
+                && key_char_eq_ignore_ascii_case(code, 'o') =>
             {
                 if let Some(ref picker) = self.inline_interactive_state {
                     if !picker_is_runtime_model_picker(picker) {
@@ -2556,14 +2591,9 @@ impl App {
                 }
             }
             code if modifiers.contains(KeyModifiers::CONTROL)
-                && key_char_eq_ignore_ascii_case(code, 'f') =>
+                && key_char_eq_ignore_ascii_case(code, 'n') =>
             {
                 self.toggle_selected_model_favorite();
-            }
-            code if modifiers.contains(KeyModifiers::ALT)
-                && key_char_eq_ignore_ascii_case(code, 'f') =>
-            {
-                self.cycle_selected_model_favorite();
             }
             KeyCode::Enter => {
                 let Some(ref mut picker) = self.inline_interactive_state else {
@@ -2736,8 +2766,22 @@ impl App {
                             self.inline_interactive_state = None;
                             self.upstream_provider = None;
                             self.status_detail = None;
+                            // Track the chosen method client-side so post-error
+                            // fallback picks know which credential path the
+                            // active route uses (remote sessions have no other
+                            // route bookkeeping).
+                            self.session.route_api_method =
+                                Some(route_selection.api_method.clone());
                             self.pending_route_selection = Some(route_selection);
                             self.pending_model_switch = Some(spec);
+                            // In remote mode `self.provider` is a local
+                            // stand-in, so applying the picked effort variant
+                            // to it does not reach the server. Stage it so the
+                            // remote dispatcher forwards it right after the
+                            // model switch; otherwise the server keeps its
+                            // configured default (low) and silently runs e.g.
+                            // "gpt-5.5 (high)" at low effort (issue #427).
+                            self.pending_reasoning_effort = effort.clone();
                         } else {
                             match self.provider.set_route_selection(&route_selection) {
                                 Ok(()) => {
@@ -3235,24 +3279,32 @@ mod tests {
             &unavailable_openai_oauth_route,
         ));
 
+        // Current policy (see jcode-provider-core): claude-opus-4-8 is the
+        // recommended Anthropic flagship; older Opus and OpenRouter/Copilot
+        // routes are not recommended.
         assert!(model_picker_route_is_recommended(
-            "claude-opus-4-7",
+            "claude-opus-4-8",
             &claude_oauth_route,
         ));
         assert!(!model_picker_route_is_recommended(
             "claude-opus-4-7",
+            &claude_oauth_route,
+        ));
+        assert!(!model_picker_route_is_recommended(
+            "claude-opus-4-8",
             &claude_openrouter_route,
         ));
         assert!(!model_picker_route_is_recommended(
-            "claude-opus-4-7",
+            "claude-opus-4-8",
             &copilot_route,
         ));
 
-        assert!(model_picker_route_is_recommended(
+        // DeepSeek routes are no longer in the recommended set at all.
+        assert!(!model_picker_route_is_recommended(
             "deepseek/deepseek-v4-pro",
             &openrouter_auto_route,
         ));
-        assert!(model_picker_route_is_recommended(
+        assert!(!model_picker_route_is_recommended(
             "deepseek/deepseek-v4-pro",
             &deepseek_direct_route,
         ));

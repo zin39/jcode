@@ -101,3 +101,8 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$install_dir"; then
   echo ""
   echo "Tip: add $install_dir to PATH if needed."
 fi
+
+# Ensure the launcher dir is on PATH for bash, zsh and fish in future shells.
+# shellcheck source=scripts/lib/configure_path.sh
+. "$(dirname "$0")/lib/configure_path.sh"
+jcode_configure_path "$install_dir"

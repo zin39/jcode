@@ -45,6 +45,12 @@ pub async fn run() -> Result<()> {
         crate::auth::external::load_api_key_for_env,
     );
 
+    // Register externally-implemented provider runtimes with the base
+    // provider registry. These crates sit downstream of jcode-base (so
+    // provider edits do not rebuild the app spine), which means base cannot
+    // name their concrete types; this composition root wires them up instead.
+    register_external_provider_runtimes();
+
     // Invert the legacy safety -> notifications dependency: safety raises a
     // permission request and the notifications layer (which depends on safety
     // types) delivers it via the dispatcher registered here.
@@ -108,6 +114,94 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Register provider runtimes that live downstream of `jcode-base` with the
+/// base crate's external provider registry. Keep every downstream runtime
+/// registration in this one function so the composition-root wiring stays
+/// discoverable as more providers move out of the base crate.
+pub fn register_external_provider_runtimes() {
+    crate::provider::external::register_external_provider(
+        crate::provider::external::GEMINI_RUNTIME,
+        || std::sync::Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new()),
+    );
+    crate::provider::external::register_external_provider(
+        crate::provider::external::CURSOR_RUNTIME,
+        || std::sync::Arc::new(jcode_provider_cursor_runtime::CursorCliProvider::new()),
+    );
+    crate::provider::external::register_external_provider(
+        crate::provider::external::ANTIGRAVITY_RUNTIME,
+        || std::sync::Arc::new(jcode_provider_antigravity_runtime::AntigravityProvider::new()),
+    );
+    crate::provider::external::register_external_provider(
+        crate::provider::external::CLAUDE_CLI_RUNTIME,
+        || std::sync::Arc::new(jcode_provider_claude_cli_runtime::ClaudeProvider::new()),
+    );
+    crate::provider::external::register_external_provider(
+        crate::provider::external::ANTHROPIC_RUNTIME,
+        || std::sync::Arc::new(jcode_provider_anthropic_runtime::AnthropicProvider::new()),
+    );
+    // OpenRouter serves several identities (aggregator, pinned API-key
+    // runtime, direct OpenAI-compatible profiles, named config profiles)
+    // through one concrete type, so it registers a parameterized factory.
+    crate::provider::external::register_openrouter_factory(|spec| {
+        use crate::provider::external::OpenRouterRuntimeSpec;
+        use jcode_provider_openrouter_runtime::OpenRouterProvider;
+        let provider: std::sync::Arc<dyn crate::provider::Provider> = match spec {
+            OpenRouterRuntimeSpec::Default => std::sync::Arc::new(OpenRouterProvider::new()?),
+            OpenRouterRuntimeSpec::OpenRouterApiKey => {
+                std::sync::Arc::new(OpenRouterProvider::new_openrouter_api_key_runtime()?)
+            }
+            OpenRouterRuntimeSpec::CompatibleProfile(profile) => std::sync::Arc::new(
+                OpenRouterProvider::new_openai_compatible_profile_runtime(profile)?,
+            ),
+            OpenRouterRuntimeSpec::NamedProfile { name, config } => std::sync::Arc::new(
+                OpenRouterProvider::new_named_openai_compatible(&name, &config)?,
+            ),
+        };
+        Ok(provider)
+    });
+    crate::provider::external::register_profile_catalog_refresh(
+        jcode_provider_openrouter_runtime::maybe_schedule_openai_compatible_profile_catalog_refresh,
+    );
+    crate::provider::external::register_standard_openrouter_catalog_refresh(
+        jcode_provider_openrouter_runtime::maybe_schedule_standard_openrouter_catalog_refresh,
+    );
+    // OpenAI's constructor needs Codex credentials on hand; absence means the
+    // provider is simply unavailable.
+    crate::provider::external::register_external_provider_fallible(
+        crate::provider::external::OPENAI_RUNTIME,
+        || {
+            let credentials = crate::auth::codex::load_credentials().ok()?;
+            Some(
+                std::sync::Arc::new(jcode_provider_openai_runtime::OpenAIProvider::new(
+                    credentials,
+                )) as std::sync::Arc<dyn crate::provider::Provider>,
+            )
+        },
+    );
+    // Copilot's constructor is fallible (needs a GitHub token) and the runtime
+    // wants tier detection scheduled right after construction, eagerly for
+    // interactive sessions and deferred for non-interactive ones. That policy
+    // lives here in the composition root so base stays provider-agnostic.
+    crate::provider::external::register_external_provider_fallible(
+        crate::provider::external::COPILOT_RUNTIME,
+        || {
+            let provider = std::sync::Arc::new(
+                jcode_provider_copilot_runtime::CopilotApiProvider::new().ok()?,
+            );
+            let eager_tier_detection = std::env::var("JCODE_NON_INTERACTIVE").is_err();
+            if eager_tier_detection && tokio::runtime::Handle::try_current().is_ok() {
+                let p_clone = std::sync::Arc::clone(&provider);
+                tokio::spawn(async move {
+                    p_clone.detect_tier_and_set_default().await;
+                });
+            } else {
+                provider.complete_init_without_tier_detection();
+            }
+            Some(provider as std::sync::Arc<dyn crate::provider::Provider>)
+        },
+    );
 }
 
 fn parse_and_prepare_args() -> Result<Args> {
@@ -270,5 +364,33 @@ mod tests {
         assert!(matches!(args.command, Some(Command::Update)));
         assert!(!should_spawn_background_update_check(&args));
         assert!(should_auto_install_update(&args));
+    }
+    #[test]
+    fn external_provider_runtimes_register_and_instantiate() {
+        register_external_provider_runtimes();
+        for (key, expected_name) in [
+            (crate::provider::external::GEMINI_RUNTIME, "gemini"),
+            (crate::provider::external::CURSOR_RUNTIME, "cursor"),
+            (
+                crate::provider::external::ANTIGRAVITY_RUNTIME,
+                "antigravity",
+            ),
+        ] {
+            assert!(
+                crate::provider::external::external_provider_registered(key),
+                "{key} runtime should be registered"
+            );
+            let provider = crate::provider::external::instantiate_external_provider(key)
+                .unwrap_or_else(|| panic!("{key} runtime factory should instantiate"));
+            assert_eq!(provider.name(), expected_name);
+            assert!(!provider.model().is_empty());
+        }
+
+        // Copilot's factory is fallible (requires a GitHub token), so only
+        // assert registration; instantiation legitimately returns None when no
+        // Copilot credentials exist on the machine running the tests.
+        assert!(crate::provider::external::external_provider_registered(
+            crate::provider::external::COPILOT_RUNTIME
+        ));
     }
 }

@@ -188,7 +188,13 @@ pub fn persisted_background_tasks_note(session_id: &str) -> String {
         ));
     }
 
-    let pending_awaits = crate::server::pending_await_members_for_session(session_id);
+    // Background awaits auto-resume on the new server and report via
+    // notify/wake, so they need no agent action. Only blocking awaits, whose
+    // socket waiter dies with the old process, must be rerun by the agent.
+    let pending_awaits: Vec<_> = crate::server::pending_await_members_for_session(session_id)
+        .into_iter()
+        .filter(|state| !state.background)
+        .collect();
     if !pending_awaits.is_empty() {
         let await_list = pending_awaits
             .iter()
@@ -210,7 +216,7 @@ pub fn persisted_background_tasks_note(session_id: &str) -> String {
             .join("; ");
 
         notes.push_str(&format!(
-            "\nPersisted `communicate await_members` wait(s) are still pending: {}. If you still need those coordination points after reload, rerun the same `communicate` call with action `await_members` to resume them with the remaining timeout instead of starting over.",
+            "\nPersisted blocking `swarm await_members` wait(s) are still pending: {}. If you still need those coordination points after reload, rerun the same `swarm` call with action `await_members` to resume them with the remaining timeout instead of starting over. (Background awaits resume automatically and will notify you.)",
             await_list
         ));
     }

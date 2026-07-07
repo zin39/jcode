@@ -5,6 +5,7 @@ pub mod cheap_route;
 pub mod debate_status;
 mod cost_guard;
 mod environment;
+mod inline_tail;
 mod interrupts;
 mod loop_detect;
 mod messages;
@@ -92,7 +93,12 @@ fn stable_json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
 }
 
 fn message_hashes(messages: &[Message]) -> Vec<u64> {
-    messages.iter().map(stable_hash_json).collect()
+    // Hash the cache-relevant projection, not the raw Message. Raw hashing
+    // keys off non-transmitted metadata (timestamp, tool_duration_ms,
+    // ReasoningTrace blocks, cache_control markers), which triggers spurious
+    // harness:_prefix_changed KV-cache miss reports when the same message is
+    // re-serialized with backfilled metadata on the next turn.
+    crate::message::cache_relevant_message_hashes(messages)
 }
 
 fn kv_cache_request_event(
@@ -109,7 +115,7 @@ fn kv_cache_request_event(
     ServerEvent::KvCacheRequest {
         system_static_hash: stable_hash_str(system_static),
         tools_hash: stable_hash_json(tools),
-        messages_hash: stable_hash_json(messages),
+        messages_hash: stable_hash_json(&crate::message::cache_relevant_messages(messages)),
         message_hashes: message_hashes(messages),
         message_count: messages.len(),
         tool_count: tools.len(),
@@ -259,6 +265,10 @@ pub struct Agent {
     turn_made_edits: bool,
     /// Verification fix-cycles consumed this turn.
     verify_attempts: u32,
+    /// Rolling activity tail (text + tool markers) for the inline output tap.
+    /// Persists across turns so the coordinator's viewport never blanks at
+    /// turn boundaries or freezes during long tool calls.
+    inline_tail: inline_tail::InlineTailBuffer,
 }
 
 impl Agent {
@@ -318,6 +328,7 @@ impl Agent {
             allow_auto_reroute: false,
             turn_made_edits: false,
             verify_attempts: 0,
+            inline_tail: inline_tail::InlineTailBuffer::default(),
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
@@ -638,6 +649,10 @@ impl Agent {
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
+            // Native-provider compaction re-bases indexing entirely, so the
+            // stage-1 clearing watermark (which is meaningful only relative
+            // to the previous message indexing) does not carry forward.
+            tool_cleared_up_to: None,
         };
 
         self.session.compaction = Some(state.clone());
@@ -689,6 +704,14 @@ impl Agent {
                                     logging::warn(&format!(
                                         "Emergency hard compact: dropped {} messages (context was critical)",
                                         dropped
+                                    ));
+                                }
+                                crate::compaction::CompactionAction::ToolResultsCleared {
+                                    cleared,
+                                } => {
+                                    logging::info(&format!(
+                                        "Stage-1 tool-result clearing freed enough headroom to skip summarization ({} results cleared)",
+                                        cleared
                                     ));
                                 }
                                 crate::compaction::CompactionAction::None => {}

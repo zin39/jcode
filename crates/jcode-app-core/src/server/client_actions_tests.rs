@@ -131,6 +131,7 @@ fn clone_split_session_uses_persisted_session_state() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        tool_cleared_up_to: None,
     });
     parent.save().expect("save parent");
 
@@ -190,6 +191,7 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
             swarm_enabled: false,
             status: "ready".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("duck".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -198,6 +200,8 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
             last_status_change: now,
             is_headless: false,
             output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
         },
     )])));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::<String, HashSet<String>>::new()));
@@ -293,6 +297,7 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
             swarm_enabled: false,
             status: "ready".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("stale".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -301,6 +306,8 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
             last_status_change: now,
             is_headless: false,
             output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
         },
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
@@ -375,6 +382,7 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
             last_seen: Instant::now(),
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         },
     )])));
@@ -390,6 +398,7 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
             swarm_enabled: false,
             status: "ready".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("otter".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -398,6 +407,8 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
             last_status_change: Instant::now(),
             is_headless: false,
             output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
         },
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
@@ -487,6 +498,7 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             last_seen: Instant::now(),
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         },
     )])));
@@ -502,6 +514,7 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             swarm_enabled: false,
             status: "running".to_string(),
             detail: None,
+            task_label: None,
             friendly_name: Some("otter".to_string()),
             report_back_to_session_id: None,
             latest_completion_report: None,
@@ -510,6 +523,8 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
             last_status_change: Instant::now(),
             is_headless: false,
             output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
         },
     )])));
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
@@ -584,6 +599,7 @@ fn live_member(session_id: &str) -> (SwarmMember, mpsc::UnboundedReceiver<Server
         swarm_enabled: false,
         status: "ready".to_string(),
         detail: None,
+        task_label: None,
         friendly_name: Some("otter".to_string()),
         report_back_to_session_id: None,
         latest_completion_report: None,
@@ -592,6 +608,8 @@ fn live_member(session_id: &str) -> (SwarmMember, mpsc::UnboundedReceiver<Server
         last_status_change: Instant::now(),
         is_headless: false,
         output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
     };
     (member, attach_rx)
 }

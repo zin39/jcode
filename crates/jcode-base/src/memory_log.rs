@@ -277,7 +277,7 @@ pub fn log_pending_prepared(session_id: &str, prompt: &str, count: usize, memory
             "target_session": session_id,
             "count": count,
             "prompt_chars": prompt.chars().count(),
-            "prompt_preview": &prompt[..prompt.len().min(500)],
+            "prompt_preview": jcode_core::util::truncate_str(prompt, 500),
             "memory_ids": memory_ids,
         })),
     );
@@ -293,6 +293,22 @@ pub fn log_marked_injected(session_id: &str, ids: &[String]) {
         Some(serde_json::json!({
             "target_session": session_id,
             "memory_ids": ids,
+        })),
+    );
+}
+
+/// Log when memories are marked as already known to a session without an
+/// injection (e.g. extracted from that session's own transcript).
+pub fn log_marked_known(session_id: &str, ids: &[String], reason: &str) {
+    if ids.is_empty() {
+        return;
+    }
+    write_log(
+        "marked_known",
+        Some(serde_json::json!({
+            "target_session": session_id,
+            "memory_ids": ids,
+            "reason": reason,
         })),
     );
 }
@@ -357,7 +373,7 @@ pub fn log_candidate_filter(
             "target_session": session_id,
             "total_candidates": total_candidates,
             "after_dedup": after_dedup,
-            "context_preview": &context_preview[..context_preview.len().min(200)],
+            "context_preview": jcode_core::util::truncate_str(context_preview, 200),
         })),
     );
 }

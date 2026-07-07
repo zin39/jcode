@@ -89,6 +89,20 @@ impl Agent {
         pending
     }
 
+    fn append_task_state(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        let Some(state) = jcode_base::session::task_state::read_task_state(&self.session.id) else {
+            return;
+        };
+
+        if !split.dynamic_part.is_empty() {
+            split.dynamic_part.push_str("\n\n");
+        }
+        split.dynamic_part.push_str(
+            "# Task State\n\nYour saved working state (maintained via the `update_task_state` tool; survives compaction). Keep it current:\n\n",
+        );
+        split.dynamic_part.push_str(&state);
+    }
+
     fn append_current_turn_system_reminder(&self, split: &mut crate::prompt::SplitSystemPrompt) {
         let Some(reminder) = self
             .current_turn_system_reminder
@@ -141,17 +155,34 @@ impl Agent {
             .as_ref()
             .map(std::path::PathBuf::from);
 
-        let (mut split, _context_info) = crate::prompt::build_system_prompt_split(
+        // Anthropic's `claude-fable-5` refuses (stop_reason=refusal, no output)
+        // on otherwise-benign freeform overlays that mention sensitive-sounding
+        // work (e.g. a credential-leak-scanning pipeline). Omit the user overlay
+        // for models with that stricter guardrail so fable-5 stays usable.
+        let include_prompt_overlay =
+            crate::prompt::model_should_receive_prompt_overlay(&self.provider.model());
+
+        let (mut split, _context_info) = crate::prompt::build_system_prompt_split_with_overlay(
             skill_prompt.as_deref(),
             &available_skills,
             self.session.is_canary,
             memory_prompt,
             working_dir.as_deref(),
+            include_prompt_overlay,
         );
 
+        self.append_task_state(&mut split);
         self.append_current_turn_system_reminder(&mut split);
         self.append_auto_delegation_directive(&mut split);
         self.append_gold_mode_directive(&mut split);
+        crate::prompt::append_swarm_effort_directive(
+            &mut split,
+            self.provider.reasoning_effort().as_deref(),
+        );
+        crate::prompt::append_web_grounding_directive(
+            &mut split,
+            crate::config::config().features.web_grounding,
+        );
 
         split
     }

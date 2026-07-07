@@ -34,6 +34,7 @@ fn test_swarm_member(session_id: &str, status: &str) -> SwarmMember {
         swarm_enabled: true,
         status: status.to_string(),
         detail: None,
+        task_label: None,
         friendly_name: Some(session_id.to_string()),
         report_back_to_session_id: Some("coord".to_string()),
         latest_completion_report: None,
@@ -42,6 +43,8 @@ fn test_swarm_member(session_id: &str, status: &str) -> SwarmMember {
         last_status_change: Instant::now(),
         is_headless: false,
         output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
     }
 }
 

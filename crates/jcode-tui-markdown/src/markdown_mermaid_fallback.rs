@@ -20,6 +20,12 @@ pub fn image_protocol_available() -> bool {
     false
 }
 
+/// Monotonic deferred-render epoch. The fallback renderer never defers, so
+/// the epoch never advances.
+pub fn deferred_render_epoch() -> u64 {
+    0
+}
+
 pub fn render_mermaid_deferred_with_stream_scope(
     _content: &str,
     _terminal_width: Option<u16>,
@@ -61,4 +67,12 @@ pub fn result_to_lines(result: RenderResult, _max_width: Option<usize>) -> Vec<L
         RenderResult::Image { .. } => Vec::new(),
         RenderResult::Error(message) => vec![Line::from(message)],
     }
+}
+
+pub fn parse_image_placeholder(_line: &Line<'_>) -> Option<u64> {
+    None
+}
+
+pub fn parse_inline_image_placeholder(_line: &Line<'_>) -> Option<(u64, u16, u16)> {
+    None
 }

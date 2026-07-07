@@ -1,13 +1,33 @@
 use super::*;
 
 /// Maximum in-memory RENDER_CACHE entries (metadata only, not images).
-pub(super) const RENDER_CACHE_MAX: usize = 64;
+///
+/// Each entry is just `(hash, profile) -> (path, width, height)` (well under a
+/// few hundred bytes), so this can be generous. It must comfortably exceed the
+/// number of inline screenshots a single transcript can accumulate: the
+/// inline-image scroll path looks images up here by id on the hot path
+/// (`get_cached_diagram_in_memory`), and an eviction forces a re-materialize
+/// (decode + cache-file write) round trip the next time that image scrolls into
+/// view, which shows up as a scroll hitch on screenshot-heavy sessions.
+pub(super) const RENDER_CACHE_MAX: usize = 512;
 /// Reuse a cached PNG only if it's at least this fraction of requested width.
 /// This avoids visibly blurry upscaling after terminal/pane resizes.
 pub(super) const CACHE_WIDTH_MATCH_PERCENT: u32 = 85;
 /// Quantize requested Mermaid render widths so tiny pane-width changes, like a
 /// 1-cell scrollbar reservation, reuse the same cold render/cache entry.
 pub(super) const RENDER_WIDTH_BUCKET_CELLS: u32 = 4;
+/// Maximum in-memory LAYOUT_CACHE entries.
+///
+/// Unlike `RENDER_CACHE` (metadata-only), each entry owns a full mermaid
+/// `Layout`: node/edge geometry plus label text blocks. Measured via
+/// [`approx_layout_bytes`]: a small 5-node flowchart is ~4 KB and a
+/// complexity-capped diagram (100 nodes / 99 edges) is ~75 KB, so 32 entries
+/// are bounded by ~2.4 MB worst case and typically a few hundred KB. Layout
+/// is the dominant render stage (~580 ms in a debug build for a medium
+/// diagram vs ~125 ms PNG rasterization and ~0.2 ms SVG) and is
+/// terminal-width independent, so caching it means a resize that crosses a PNG
+/// width bucket only re-rasterizes instead of re-running parse+layout.
+pub(super) const LAYOUT_CACHE_MAX: usize = 32;
 
 /// Mermaid rendering cache
 pub(super) struct MermaidCache {
@@ -69,9 +89,11 @@ impl MermaidCache {
             }
         }) {
             if existing.path.exists() {
+                super::record_cache_stat_syscall();
                 self.touch(key);
                 return Some(existing);
             }
+            super::record_cache_stat_syscall();
             self.entries.remove(&key);
             if let Some(pos) = self.order.iter().position(|entry| *entry == key) {
                 self.order.remove(pos);
@@ -94,6 +116,7 @@ impl MermaidCache {
     ) -> Option<CachedDiagram> {
         let key = (hash, profile);
         if let Some(existing) = self.entries.get(&key).cloned() {
+            super::record_cache_stat_syscall();
             if existing.path.exists() && cached_width_satisfies(existing.width, min_width) {
                 self.touch(key);
                 return Some(existing);
@@ -110,6 +133,34 @@ impl MermaidCache {
         }
 
         None
+    }
+
+    /// In-memory-only lookup for `(hash, profile)`: returns a clone of the
+    /// cached entry if present, without any `path.exists()` stat or on-disk
+    /// discovery. Marks the entry as recently used so the hot scroll path keeps
+    /// the working set warm in the LRU.
+    fn get_in_memory(&mut self, hash: u64, profile: RenderProfile) -> Option<CachedDiagram> {
+        let key = (hash, profile);
+        let existing = self.entries.get(&key).cloned()?;
+        self.touch(key);
+        Some(existing)
+    }
+
+    /// In-memory-only lookup for `hash` under ANY render profile (most
+    /// recently used wins). Still no filesystem access. Needed by the inline
+    /// draw path: a transcript mermaid render lands under an aspect-tagged
+    /// profile, while the draw thread runs outside that aspect scope, so an
+    /// exact-profile lookup would never find it.
+    fn get_in_memory_any_profile(&mut self, hash: u64) -> Option<CachedDiagram> {
+        let key = self
+            .order
+            .iter()
+            .rev()
+            .find(|(entry_hash, _)| *entry_hash == hash)
+            .copied()?;
+        let existing = self.entries.get(&key).cloned()?;
+        self.touch(key);
+        Some(existing)
     }
 
     pub(super) fn insert(&mut self, hash: u64, profile: RenderProfile, diagram: CachedDiagram) {
@@ -148,6 +199,7 @@ impl MermaidCache {
         profile: Option<RenderProfile>,
     ) -> Option<CachedDiagram> {
         let mut candidates: Vec<(PathBuf, u32, RenderProfile)> = Vec::new();
+        super::record_cache_stat_syscall();
         let entries = fs::read_dir(&self.cache_dir).ok()?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -222,6 +274,347 @@ pub(super) fn parse_cache_filename(path: &Path) -> Option<(u64, u32, RenderProfi
     Some((hash, width, profile))
 }
 
+/// Cache key for the layout tier. A layout depends on the diagram source, the
+/// theme (text metrics via font family/size), the requested aspect goal, and
+/// the effective spacing/density `LayoutConfig`, but *not* on the terminal
+/// width, which only affects rasterization.
+#[cfg(feature = "renderer")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct LayoutCacheKey {
+    pub(super) source_hash: u64,
+    pub(super) theme_fingerprint: u64,
+    /// Aspect bucket (per-mille) carried by the ambient render profile.
+    pub(super) profile: RenderProfile,
+    /// Fingerprint of the effective spacing/density `LayoutConfig`.
+    pub(super) layout_config_fingerprint: u64,
+}
+
+/// LRU cache of computed layouts (see [`LAYOUT_CACHE_MAX`] for sizing notes).
+///
+/// `render_svg_for_png` takes `&Layout`, so a cached layout is reusable across
+/// any number of SVG/PNG renders at different output dimensions.
+#[cfg(feature = "renderer")]
+pub(super) struct LayoutCache {
+    pub(super) entries: HashMap<LayoutCacheKey, Arc<Layout>>,
+    pub(super) order: VecDeque<LayoutCacheKey>,
+    /// Theme fingerprint of resident entries. A theme change clears the cache
+    /// eagerly (stale-theme layouts would only ever waste LRU slots because
+    /// the fingerprint is also part of the key).
+    pub(super) theme_fingerprint: Option<u64>,
+}
+
+#[cfg(feature = "renderer")]
+impl LayoutCache {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            theme_fingerprint: None,
+        }
+    }
+
+    /// Clear resident entries when the theme fingerprint changes.
+    fn enforce_theme(&mut self, theme_fingerprint: u64) {
+        if self.theme_fingerprint != Some(theme_fingerprint) {
+            self.entries.clear();
+            self.order.clear();
+            self.theme_fingerprint = Some(theme_fingerprint);
+        }
+    }
+
+    fn touch(&mut self, key: LayoutCacheKey) {
+        if let Some(pos) = self.order.iter().position(|entry| *entry == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+    }
+
+    pub(super) fn get(&mut self, key: &LayoutCacheKey) -> Option<Arc<Layout>> {
+        self.enforce_theme(key.theme_fingerprint);
+        let layout = self.entries.get(key).cloned()?;
+        self.touch(*key);
+        Some(layout)
+    }
+
+    pub(super) fn insert(&mut self, key: LayoutCacheKey, layout: Arc<Layout>) {
+        self.enforce_theme(key.theme_fingerprint);
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.entries.entry(key) {
+            entry.insert(layout);
+            self.touch(key);
+        } else {
+            self.entries.insert(key, layout);
+            self.order.push_back(key);
+            while self.order.len() > LAYOUT_CACHE_MAX {
+                if let Some(old) = self.order.pop_front() {
+                    self.entries.remove(&old);
+                }
+            }
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.theme_fingerprint = None;
+    }
+}
+
+/// Layout-tier cache: (source, theme, aspect, density config) -> computed layout.
+#[cfg(feature = "renderer")]
+pub(super) static LAYOUT_CACHE: LazyLock<Mutex<LayoutCache>> =
+    LazyLock::new(|| Mutex::new(LayoutCache::new()));
+
+/// Fingerprint a serializable config/theme value. Stability across processes
+/// is irrelevant (in-memory cache), only in-process consistency matters.
+#[cfg(feature = "renderer")]
+fn serialize_fingerprint<T: serde::Serialize>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match serde_json::to_string(value) {
+        Ok(text) => text.hash(&mut hasher),
+        Err(_) => std::any::type_name::<T>().hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// Build the effective `LayoutConfig` for a diagram of the given complexity.
+/// Single source of truth for the render path and the layout cache key.
+#[cfg(feature = "renderer")]
+pub(super) fn build_layout_config(
+    complexity: usize,
+    render_profile: RenderProfile,
+) -> LayoutConfig {
+    // Adaptive spacing based on complexity
+    let spacing_factor = if complexity > 30 { 1.2 } else { 1.0 };
+    LayoutConfig {
+        node_spacing: 80.0 * spacing_factor,
+        rank_spacing: 80.0 * spacing_factor,
+        node_padding_x: 40.0,
+        node_padding_y: 20.0,
+        preferred_aspect_ratio: render_profile.preferred_aspect_ratio(),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "renderer")]
+pub(super) fn layout_cache_key(
+    source_hash: u64,
+    theme: &Theme,
+    layout_config: &LayoutConfig,
+    profile: RenderProfile,
+) -> LayoutCacheKey {
+    LayoutCacheKey {
+        source_hash,
+        theme_fingerprint: serialize_fingerprint(theme),
+        profile,
+        layout_config_fingerprint: serialize_fingerprint(layout_config),
+    }
+}
+
+#[cfg(feature = "renderer")]
+fn layout_cache_get(key: &LayoutCacheKey) -> Option<Arc<Layout>> {
+    let cached = LAYOUT_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key);
+    if let Ok(mut state) = MERMAID_DEBUG.lock() {
+        if cached.is_some() {
+            state.stats.layout_cache_hits += 1;
+        } else {
+            state.stats.layout_cache_misses += 1;
+        }
+    }
+    cached
+}
+
+#[cfg(feature = "renderer")]
+fn layout_cache_insert(key: LayoutCacheKey, layout: Arc<Layout>) {
+    LAYOUT_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, layout);
+}
+
+/// Clear the layout tier (used by `mermaid:evict` / theme resets).
+pub(super) fn clear_layout_cache() {
+    #[cfg(feature = "renderer")]
+    LAYOUT_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// (entry count, approximate resident bytes) for the layout cache.
+pub(super) fn layout_cache_usage() -> (usize, u64) {
+    #[cfg(feature = "renderer")]
+    {
+        let cache = LAYOUT_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes = cache
+            .entries
+            .values()
+            .map(|layout| approx_layout_bytes(layout))
+            .sum();
+        (cache.entries.len(), bytes)
+    }
+    #[cfg(not(feature = "renderer"))]
+    {
+        (0, 0)
+    }
+}
+
+#[cfg(feature = "renderer")]
+fn text_block_bytes(block: &mermaid_rs_renderer::layout::TextBlock) -> u64 {
+    std::mem::size_of::<mermaid_rs_renderer::layout::TextBlock>() as u64
+        + block
+            .lines
+            .iter()
+            .map(|line| line.len() as u64 + std::mem::size_of::<String>() as u64)
+            .sum::<u64>()
+}
+
+/// Approximate resident size of a computed `Layout`.
+///
+/// Walks nodes (struct + id strings + label text blocks), edges (struct +
+/// endpoint ids + routed points + labels), and subgraphs. Diagram-specific
+/// payloads (`DiagramData::Sequence`, pie slices, ...) are counted only at
+/// enum size, so this is a flowchart-accurate estimate and a lower bound for
+/// other diagram kinds; those payloads scale with the same MAX_NODES/MAX_EDGES
+/// caps, so the LAYOUT_CACHE_MAX budget analysis still holds.
+#[cfg(feature = "renderer")]
+pub(super) fn approx_layout_bytes(layout: &Layout) -> u64 {
+    use mermaid_rs_renderer::layout::{EdgeLayout, NodeLayout, SubgraphLayout};
+    let mut bytes = std::mem::size_of::<Layout>() as u64;
+    for (id, node) in &layout.nodes {
+        bytes += std::mem::size_of::<NodeLayout>() as u64
+            + id.len() as u64
+            + node.id.len() as u64
+            + text_block_bytes(&node.label);
+    }
+    for edge in &layout.edges {
+        bytes += std::mem::size_of::<EdgeLayout>() as u64
+            + edge.from.len() as u64
+            + edge.to.len() as u64
+            + (edge.points.len() as u64) * (std::mem::size_of::<(f32, f32)>() as u64);
+        for label in [&edge.label, &edge.start_label, &edge.end_label]
+            .into_iter()
+            .flatten()
+        {
+            bytes += text_block_bytes(label);
+        }
+    }
+    for subgraph in &layout.subgraphs {
+        bytes += std::mem::size_of::<SubgraphLayout>() as u64
+            + subgraph.label.len() as u64
+            + text_block_bytes(&subgraph.label_block)
+            + subgraph
+                .nodes
+                .iter()
+                .map(|node| node.len() as u64 + std::mem::size_of::<String>() as u64)
+                .sum::<u64>();
+    }
+    bytes
+}
+
+/// Test-only per-content layout computation counter. Unlike the global
+/// hit/miss stats this is keyed by content hash, so parallel tests with
+/// unique fixtures can assert exact layout counts without cross-test races.
+#[cfg(test)]
+pub(super) static LAYOUT_COMPUTATIONS: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(all(test, feature = "renderer"))]
+fn record_layout_computation_for_test(hash: u64) {
+    if let Ok(mut counts) = LAYOUT_COMPUTATIONS.lock() {
+        *counts.entry(hash).or_insert(0) += 1;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn layout_computations_for_test(hash: u64) -> u64 {
+    LAYOUT_COMPUTATIONS
+        .lock()
+        .map(|counts| counts.get(&hash).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Drop all PNG render-cache entries (memory and on-disk files, every width
+/// bucket and profile) for `content`, forcing the next render to rasterize
+/// fresh. The width-aware cache lookup deliberately accepts wider cached PNGs
+/// (`cached_width_satisfies`), which is right for resize reuse but wrong for
+/// probes/tests that need deterministic geometry for a specific pane width.
+pub fn evict_render_cache_for_content(content: &str) {
+    evict_render_cache_by_hash(hash_content(content));
+}
+
+/// Test-only alias kept for the layout-tier cache tests: drop all PNG
+/// render-cache entries for `hash` while the layout tier stays warm.
+/// Simulates the bucket-crossing-resize / disk-eviction path.
+#[cfg(test)]
+pub(super) fn evict_render_cache_for_test(hash: u64) {
+    evict_render_cache_by_hash(hash);
+}
+
+/// Test-only: insert a render-cache entry under the CURRENT render profile
+/// (so a test can simulate a transcript render inside an aspect scope).
+#[cfg(test)]
+pub(super) fn insert_render_cache_entry_for_test(
+    hash: u64,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+) {
+    if let Ok(mut cache) = RENDER_CACHE.lock() {
+        cache.insert(
+            hash,
+            current_render_profile(),
+            CachedDiagram {
+                path,
+                width,
+                height,
+            },
+        );
+    }
+}
+
+/// Test-only view of the hot-path in-memory lookup.
+#[cfg(test)]
+pub(super) fn get_cached_diagram_in_memory_for_test(hash: u64) -> Option<CachedDiagram> {
+    get_cached_diagram_in_memory(hash)
+}
+
+fn evict_render_cache_by_hash(hash: u64) {
+    let mut cache = RENDER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keys: Vec<(u64, RenderProfile)> = cache
+        .entries
+        .keys()
+        .filter(|(entry_hash, _)| *entry_hash == hash)
+        .copied()
+        .collect();
+    for key in keys {
+        if let Some(entry) = cache.entries.remove(&key) {
+            let _ = fs::remove_file(&entry.path);
+        }
+        if let Some(pos) = cache.order.iter().position(|entry| *entry == key) {
+            cache.order.remove(pos);
+        }
+    }
+    // Also delete on-disk files not resident in memory: `discover_on_disk`
+    // would otherwise resurrect them on the next lookup.
+    if let Ok(entries) = fs::read_dir(&cache.cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some((file_hash, _, _)) = parse_cache_filename(&path)
+                && file_hash == hash
+            {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 pub(super) fn get_cached_diagram(hash: u64, min_width: Option<u32>) -> Option<CachedDiagram> {
     let profile = current_render_profile();
     let mut cache = RENDER_CACHE.lock().ok()?;
@@ -229,6 +622,29 @@ pub(super) fn get_cached_diagram(hash: u64, min_width: Option<u32>) -> Option<Ca
         return Some(diagram);
     }
     cache.get(hash, min_width, None)
+}
+
+/// In-memory-only render-cache lookup: returns the cached entry for `hash`
+/// without touching the filesystem (no `path.exists()` stat, no `read_dir`
+/// discovery). This is the hot-path lookup used by the inline-image scroll
+/// renderer, which calls it for every visible and prefetched image *per frame*;
+/// a per-frame stat syscall there shows up as tail-latency jank while scrolling
+/// a transcript full of screenshots.
+///
+/// Correctness: a genuinely missing file degrades gracefully at the actual
+/// decode point (`load_source_image`/`image::open` returns `None`, and the
+/// stable-fit renderer falls back), so re-validating existence on every frame
+/// buys nothing for the common case where the file is present.
+pub(super) fn get_cached_diagram_in_memory(hash: u64) -> Option<CachedDiagram> {
+    let profile = current_render_profile();
+    let mut cache = RENDER_CACHE.lock().ok()?;
+    cache
+        .get_in_memory(hash, profile)
+        .or_else(|| cache.get_in_memory(hash, RenderProfile::default()))
+        // Transcript mermaid diagrams are rendered under an aspect-tagged
+        // profile, but the draw path calls this outside that aspect scope.
+        // Any cached PNG for the hash beats a permanently blank placeholder.
+        .or_else(|| cache.get_in_memory_any_profile(hash))
 }
 
 fn get_cached_diagram_for_profile(
@@ -273,7 +689,16 @@ pub enum RenderResult {
 /// Check if a code block language is mermaid
 pub fn is_mermaid_lang(lang: &str) -> bool {
     let lang_lower = lang.to_lowercase();
-    lang_lower == "mermaid" || lang_lower.starts_with("mermaid")
+    let is_mermaid = lang_lower == "mermaid" || lang_lower.starts_with("mermaid");
+    if is_mermaid {
+        // First sighting of mermaid content anywhere (streaming markdown,
+        // transcript render, pinned pane) kicks off the system font-DB load in
+        // the background so the eventual PNG render finds it warm. Doing this
+        // here instead of at startup keeps diagram-free sessions from paying
+        // the font scan at all. OnceLock-guarded: only the first call spawns.
+        super::runtime::prewarm_svg_font_db_async();
+    }
+    is_mermaid
 }
 
 /// Maximum allowed nodes in a diagram (prevents OOM on complex diagrams)
@@ -347,6 +772,13 @@ pub(super) fn bump_deferred_render_epoch() {
 
 pub fn deferred_render_epoch() -> u64 {
     DEFERRED_RENDER_EPOCH.load(Ordering::Relaxed)
+}
+
+/// Test-only: advance the deferred-render epoch as if a background render
+/// just completed, so cache layers that stamp pending placeholders can be
+/// exercised deterministically without racing the real worker thread.
+pub fn debug_bump_deferred_render_epoch_for_tests() {
+    bump_deferred_render_epoch();
 }
 
 fn deferred_render_sender() -> &'static mpsc::Sender<DeferredRenderTask> {
@@ -659,7 +1091,7 @@ fn render_mermaid_sized_internal(
     {
         let msg = "Mermaid rendering is disabled in this build".to_string();
         if let Ok(mut errors) = RENDER_ERRORS.lock() {
-            errors.insert(hash, msg.clone());
+            super::bounded_bookkeeping_insert(&mut errors, hash, msg.clone());
         }
         if let Ok(mut state) = MERMAID_DEBUG.lock() {
             state.stats.render_errors += 1;
@@ -716,30 +1148,33 @@ fn render_mermaid_sized_internal(
 
         let render_start = Instant::now();
         let render_result = panic::catch_unwind(move || -> Result<RenderStageBreakdown, String> {
-            let parse_start = Instant::now();
-            // Parse mermaid
-            let parsed =
-                parse_mermaid(&content_owned).map_err(|e| format!("Parse error: {}", e))?;
-            let parse_ms = parse_start.elapsed().as_secs_f32() * 1000.0;
-
             // Configure theme for terminal (dark background friendly)
             let theme = terminal_theme();
+            let layout_config = build_layout_config(complexity, render_profile);
 
-            // Adaptive spacing based on complexity
-            let spacing_factor = if complexity > 30 { 1.2 } else { 1.0 };
-            let layout_config = LayoutConfig {
-                node_spacing: 80.0 * spacing_factor,
-                rank_spacing: 80.0 * spacing_factor,
-                node_padding_x: 40.0,
-                node_padding_y: 20.0,
-                preferred_aspect_ratio: render_profile.preferred_aspect_ratio(),
-                ..Default::default()
+            // Layout tier: parse+layout dominate render cost (~580 ms layout vs
+            // ~125 ms PNG in a debug build) and are terminal-width independent,
+            // so a PNG-cache miss caused by a width-bucket-crossing resize can
+            // reuse the computed layout and only re-rasterize.
+            let cache_key = layout_cache_key(hash, &theme, &layout_config, render_profile);
+            let (layout, parse_ms, layout_ms) = if let Some(layout) = layout_cache_get(&cache_key) {
+                (layout, 0.0, 0.0)
+            } else {
+                let parse_start = Instant::now();
+                // Parse mermaid
+                let parsed =
+                    parse_mermaid(&content_owned).map_err(|e| format!("Parse error: {}", e))?;
+                let parse_ms = parse_start.elapsed().as_secs_f32() * 1000.0;
+
+                let layout_start = Instant::now();
+                // Compute layout
+                let layout = Arc::new(compute_layout(&parsed.graph, &theme, &layout_config));
+                let layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
+                #[cfg(test)]
+                record_layout_computation_for_test(hash);
+                layout_cache_insert(cache_key, Arc::clone(&layout));
+                (layout, parse_ms, layout_ms)
             };
-
-            let layout_start = Instant::now();
-            // Compute layout
-            let layout = compute_layout(&parsed.graph, &theme, &layout_config);
-            let layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
 
             let svg_start = Instant::now();
             let output_dimensions = Some((target_width as f32, target_height as f32));
@@ -806,7 +1241,7 @@ fn render_mermaid_sized_internal(
             }
             Ok(Err(e)) => {
                 if let Ok(mut errors) = RENDER_ERRORS.lock() {
-                    errors.insert(hash, e.clone());
+                    super::bounded_bookkeeping_insert(&mut errors, hash, e.clone());
                 }
                 if let Ok(mut state) = MERMAID_DEBUG.lock() {
                     state.stats.render_errors += 1;
@@ -824,7 +1259,11 @@ fn render_mermaid_sized_internal(
                     "unknown panic in mermaid renderer".to_string()
                 };
                 if let Ok(mut errors) = RENDER_ERRORS.lock() {
-                    errors.insert(hash, format!("Renderer panic: {}", msg));
+                    super::bounded_bookkeeping_insert(
+                        &mut errors,
+                        hash,
+                        format!("Renderer panic: {}", msg),
+                    );
                 }
                 if let Ok(mut state) = MERMAID_DEBUG.lock() {
                     state.stats.render_errors += 1;
@@ -875,5 +1314,24 @@ fn render_mermaid_sized_internal(
             width,
             height,
         }
+    }
+}
+
+#[cfg(test)]
+mod font_prewarm_tests {
+    /// The lazy prewarm must fire exactly on first mermaid detection, so a
+    /// diagram-free session never loads the font DB and a diagram session
+    /// warms it before the render path needs it.
+    #[test]
+    fn mermaid_detection_triggers_font_db_prewarm() {
+        assert!(!super::is_mermaid_lang("rust"), "sanity: non-mermaid");
+        // No spawn yet for non-mermaid langs (flag may already be set if
+        // another test rendered a diagram first, so only assert the positive
+        // path below).
+        assert!(super::is_mermaid_lang("mermaid"));
+        assert!(
+            crate::SVG_FONT_DB_PREWARM_STARTED.get().is_some(),
+            "first mermaid sighting must kick off the font-DB prewarm"
+        );
     }
 }

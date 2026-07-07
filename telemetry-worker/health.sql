@@ -101,6 +101,20 @@ ci_noise AS (
     WHERE event IN ('install', 'session_start', 'turn_end', 'session_end', 'session_crash')
       AND created_at > datetime('now', '-30 days')
       AND is_ci = 1
+),
+-- Auth failure health: count affected sessions/users, NOT SUM(error_auth_failed).
+-- Raw sums are dominated by runaway retry loops (one session logged 18k+ auth
+-- failures pre-breaker), which makes a single broken install look like a
+-- fleet-wide auth outage. Affected-session/user counts are outlier-resistant.
+auth_failures AS (
+    SELECT
+        COUNT(*) AS auth_failed_sessions_30d,
+        COUNT(DISTINCT telemetry_id) AS auth_failed_users_30d,
+        MAX(error_auth_failed) AS max_auth_fails_one_session_30d
+    FROM events
+    WHERE event IN ('session_end', 'session_crash')
+      AND error_auth_failed > 0
+      AND created_at > datetime('now', '-30 days')
 )
 SELECT
     install_events,
@@ -119,5 +133,8 @@ SELECT
     max_session_events_one_id,
     top5_session_events,
     total_session_events,
+    auth_failed_sessions_30d,
+    auth_failed_users_30d,
+    max_auth_fails_one_session_30d,
     ROUND(CAST(session_ends + session_crashes AS REAL) / NULLIF(session_starts, 0), 3) AS lifecycle_completion_ratio
-FROM event_counts, identity_counts, meaningful, outliers, ci_noise;
+FROM event_counts, identity_counts, meaningful, outliers, ci_noise, auth_failures;

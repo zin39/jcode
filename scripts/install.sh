@@ -49,7 +49,10 @@ else
   INSTALL_DIR="${JCODE_INSTALL_DIR:-$HOME/.local/bin}"
 fi
 
-VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
+# Extract the tag_name value, working for both pretty-printed (multi-line) and
+# compact (single-line) GitHub API JSON. `grep -o` isolates just the tag_name
+# field so `cut` no longer matches an unrelated string like the release url.
+VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep -o '"tag_name" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
 [ -n "$VERSION" ] || err "Failed to determine latest version"
 
 URL_TGZ="https://github.com/$REPO/releases/download/$VERSION/$ARTIFACT.tar.gz"
@@ -217,39 +220,73 @@ if [ "$IS_WINDOWS" = true ]; then
   fi
 else
   PATH_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
-  SHELL_NAME="$(basename "${SHELL:-}")"
+  added_to=""
 
-  if [ "$(uname -s)" = "Darwin" ]; then
-    DEFAULT_RC="$HOME/.zshrc"
-  else
-    DEFAULT_RC="$HOME/.bashrc"
+  _have() { command -v "$1" >/dev/null 2>&1; }
+
+  # Append the POSIX (bash/zsh/sh) PATH line to an rc file, idempotently.
+  #   ensure_posix_rc <rc-file> <create:yes|no>
+  # With create=yes the file (and parent dir) is created if missing; with
+  # create=no we only touch files that already exist, so we never change how a
+  # login shell resolves its startup files (e.g. creating ~/.bash_profile would
+  # stop bash from reading ~/.profile).
+  ensure_posix_rc() {
+    rc="$1"; create="$2"
+    if [ ! -f "$rc" ]; then
+      [ "$create" = "yes" ] || return 0
+      mkdir -p "$(dirname "$rc")"
+    fi
+    if ! grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
+      printf '\n# Added by jcode installer\n%s\n' "$PATH_LINE" >> "$rc"
+      added_to="$added_to $rc"
+    fi
+  }
+
+  # fish uses its own syntax and does not read POSIX rc files.
+  ensure_fish_rc() {
+    create="$1"
+    rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+    if [ ! -f "$rc" ]; then
+      [ "$create" = "yes" ] || return 0
+      mkdir -p "$(dirname "$rc")"
+    fi
+    if ! grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
+      {
+        printf '\n# Added by jcode installer\n'
+        printf 'if not contains "%s" $PATH\n' "$INSTALL_DIR"
+        printf '    set -gx PATH "%s" $PATH\n' "$INSTALL_DIR"
+        printf 'end\n'
+      } >> "$rc"
+      added_to="$added_to $rc"
+    fi
+  }
+
+  # zsh: ~/.zshenv is read for every zsh invocation (login, interactive and
+  # scripts), so it is the most reliable single place to export PATH.
+  if _have zsh || [ "$(uname -s)" = "Darwin" ] || [ -f "$HOME/.zshenv" ] || [ -f "$HOME/.zshrc" ]; then
+    ensure_posix_rc "$HOME/.zshenv" yes
   fi
 
-  if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
-    added_to=""
-    path_files=()
+  # bash: ~/.bashrc for interactive shells, ~/.profile for login shells (macOS
+  # Terminal, ssh, etc.). We only create ~/.profile, never ~/.bash_profile, so
+  # we don't override an existing login-file lookup order.
+  if _have bash || [ -f "$HOME/.bashrc" ] || [ -f "$HOME/.bash_profile" ]; then
+    ensure_posix_rc "$HOME/.bashrc" yes
+  fi
+  ensure_posix_rc "$HOME/.profile" yes
 
-    if [ "$(uname -s)" = "Darwin" ] || [ "$SHELL_NAME" = "zsh" ]; then
-      # Keep PATH available for non-interactive zsh invocations too, such as
-      # `ssh host 'jcode --version'`, without depending on .zshrc/.zprofile.
-      path_files+=("$HOME/.zshenv")
-    fi
+  # fish: only set it up when fish is installed or already configured.
+  if _have fish || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ]; then
+    ensure_fish_rc yes
+  fi
 
-    path_files+=("$DEFAULT_RC")
+  # Also patch other common startup files when they already exist, so we cover
+  # users with custom login-shell setups without creating new files.
+  for rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile"; do
+    ensure_posix_rc "$rc" no
+  done
 
-    for rc in "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.profile"; do
-      if [ -f "$rc" ]; then
-        path_files+=("$rc")
-      fi
-    done
-
-    for rc in "${path_files[@]}"; do
-      if [ ! -f "$rc" ] || ! grep -qF "$INSTALL_DIR" "$rc" 2>/dev/null; then
-        printf '\n# Added by jcode installer\n%s\n' "$PATH_LINE" >> "$rc"
-        added_to="$added_to $rc"
-      fi
-    done
-
+  if [ -n "$added_to" ]; then
     info "Added $INSTALL_DIR to PATH in:$added_to"
   fi
 

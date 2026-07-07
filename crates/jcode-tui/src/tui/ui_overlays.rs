@@ -1,7 +1,7 @@
 use super::{
     accent_color, ai_color, ai_text, asap_color, clear_area, dim_color, get_grouped_changelog,
-    header_icon_color, header_name_color, header_session_color, pending_color, queued_color, rgb,
-    tool_color, user_bg, user_color, user_text,
+    header_icon_color, header_name_color, header_session_color, pending_color, queued_color,
+    record_chat_overlay_copy_snapshot, rgb, tool_color, user_bg, user_color, user_text,
 };
 use crate::tui::TuiState;
 use crate::tui::info_widget::WidgetPlacement;
@@ -10,7 +10,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-pub(super) fn draw_changelog_overlay(frame: &mut Frame, area: Rect, scroll: usize) {
+use super::selection_highlight::highlight_line_selection;
+
+pub(super) fn draw_changelog_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    app: &dyn TuiState,
+) {
     clear_area(frame, area);
 
     let groups = get_grouped_changelog();
@@ -69,17 +76,63 @@ pub(super) fn draw_changelog_overlay(frame: &mut Frame, area: Rect, scroll: usiz
                 .add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
-            " Esc to close · mouse wheel/j/k scroll · Space/PageUp page ",
+            " Esc to close · drag to select, release to copy · wheel/j/k scroll ",
             Style::default().fg(dim_color()),
         )))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(dim_color()));
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .scroll((scroll as u16, 0));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(paragraph, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let visible_end = scroll
+        .saturating_add(inner.height as usize)
+        .min(total_lines);
+
+    // Register the rendered lines so the shared copy-selection machinery can map
+    // mouse drags to text and highlight + copy the selection, exactly like the
+    // chat viewport. Without this, mouse capture would block native terminal
+    // selection and there would be no way to copy from the overlay.
+    record_chat_overlay_copy_snapshot(&lines, scroll, visible_end, inner);
+
+    let mut visible_lines: Vec<Line<'static>> =
+        lines.get(scroll..visible_end).unwrap_or(&[]).to_vec();
+
+    if let Some(range) = app.copy_selection_range().filter(|range| {
+        range.start.pane == crate::tui::CopySelectionPane::Chat
+            && range.end.pane == crate::tui::CopySelectionPane::Chat
+    }) {
+        let (start, end) = if (range.start.abs_line, range.start.column)
+            <= (range.end.abs_line, range.end.column)
+        {
+            (range.start, range.end)
+        } else {
+            (range.end, range.start)
+        };
+        for abs_idx in start.abs_line.max(scroll)..=end.abs_line.min(visible_end.saturating_sub(1))
+        {
+            let rel_idx = abs_idx.saturating_sub(scroll);
+            if let Some(line) = visible_lines.get_mut(rel_idx) {
+                let start_col = if abs_idx == start.abs_line {
+                    start.column
+                } else {
+                    0
+                };
+                let end_col = if abs_idx == end.abs_line {
+                    end.column
+                } else {
+                    line.width()
+                };
+                *line = highlight_line_selection(line, start_col, end_col);
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(visible_lines), inner);
 }
 
 pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, app: &dyn TuiState) {
@@ -137,7 +190,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(help_entry("/agents", "Configure models for agent roles"));
     lines.push(help_entry(
         "/effort <level>",
-        "Set reasoning effort (none|low|medium|high|xhigh)",
+        "Set effort (none|low|medium|high|xhigh|max|swarm|swarm-deep)",
     ));
     lines.push(help_entry(
         "/fast [on|off|status|default ...]",
@@ -150,6 +203,14 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(help_entry(
         "/alignment [status|centered|left]",
         "Show or persist text alignment preference",
+    ));
+    lines.push(help_entry(
+        "/compact-notifications [status|on|off]",
+        "Collapse swarm/file-activity notifications to one line",
+    ));
+    lines.push(help_entry(
+        "/show-agentgrep-output [status|on|off]",
+        "Render full agentgrep search output inline in chat",
     ));
     lines.push(help_entry("/config", "Show active configuration"));
     lines.push(help_entry("/config init", "Create default config file"));
@@ -173,6 +234,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Show keybinding conflicts with your terminal/OS",
     ));
     lines.push(help_entry("/usage", "Show connected provider usage limits"));
+    lines.push(help_entry(
+        "/support",
+        "Email support with diagnostics prefilled",
+    ));
     lines.push(help_entry("/version", "Show version and build details"));
     lines.push(help_entry(
         "/changelog",
@@ -204,7 +269,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     ));
     lines.push(help_entry(
         "/plan [goal]",
-        "Draft a plan-only proposal in the side panel (no edits)",
+        "Draft a plan-only proposal as a plan card (no edits)",
     ));
     lines.push(help_entry(
         "/improve",
@@ -226,7 +291,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/splitview [on|off|status]",
         "Mirror the current chat in the side panel",
     ));
-    lines.push(help_entry("/split", "Clone session into a new window"));
+    lines.push(help_entry(
+        "/fork [prompt]",
+        "Fork session into a new window (alias: /split)",
+    ));
     lines.push(help_entry(
         "/transfer",
         "Open a fresh session with only compacted context + copied todos",
@@ -398,6 +466,11 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Cycle diff mode (Off/Inline/Pinned/File)",
     ));
     lines.push(key_entry("Shift+Tab", "Cycle favorited models"));
+    lines.push(key_entry("Ctrl+O", "Set default model (in /model picker)"));
+    lines.push(key_entry(
+        "Ctrl+N",
+        "Toggle favorite model (in /model picker)",
+    ));
 
     lines.push(Line::from(""));
     lines.push(separator());
@@ -464,7 +537,7 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(key_entry("Ctrl+P", "Toggle auto-poke for incomplete todos"));
     lines.push(key_entry(
         &crate::tui::keybind::effort_switch_keys_label(),
-        "Cycle reasoning effort",
+        "Cycle effort (reasoning + swarm)",
     ));
     if cfg!(target_os = "macos") {
         lines.push(key_entry(

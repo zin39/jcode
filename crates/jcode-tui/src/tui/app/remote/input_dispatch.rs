@@ -37,6 +37,10 @@ pub(in crate::tui::app) async fn begin_remote_send(
     app.last_stream_activity = Some(Instant::now());
     app.remote_resume_activity = None;
     app.reset_streaming_tps();
+    // New turn -> new API call: the next usage report must replace, not merge
+    // into, the previous call's cache counters (issue #441). Newer servers
+    // also emit KvCacheRequest per call, which re-arms this flag per call.
+    app.mark_stream_usage_call_boundary();
     app.thought_line_inserted = false;
     app.thinking_prefix_emitted = false;
     app.thinking_buffer.clear();
@@ -110,6 +114,9 @@ pub(in crate::tui::app) async fn submit_prepared_remote_input(
     }
 
     app.commit_pending_streaming_assistant_message();
+    // A manually submitted prompt supersedes any armed post-error fallback
+    // offer (and its staged resend): the user chose to continue differently.
+    app.clear_pending_fallback_offer();
     // Remember the typed prompt so we can restore it to the input box if this turn
     // fails (e.g. "token refresh needed"), instead of dropping it.
     app.last_submitted_input = Some(prepared.raw_input.clone());

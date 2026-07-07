@@ -1,10 +1,11 @@
-# Swarm Architecture (Proposed)
+# Swarm Architecture
 
-Status: Proposed
+Status: Largely implemented (see `SWARM_TASK_GRAPH.md` for the DAG-first model
+that supersedes the agent-first framing here; its staged comm migration is in
+progress)
 
-This document captures the intended swarm coordination design based on the current
-project direction. It describes how agents coordinate, plan, communicate, and
-integrate work with optional git worktrees.
+This document captures the swarm coordination design. It describes how agents
+coordinate, plan, communicate, and integrate work with optional git worktrees.
 
 ## Goals
 
@@ -18,19 +19,25 @@ integrate work with optional git worktrees.
 
 ## Roles
 
-### Recursive spawning (depth-limited tree)
+### Recursive spawning (unbounded-depth tree)
 
 Spawning is recursive. Any swarm member can spawn child agents, and those
-children can spawn their own children, forming a spawn tree. The tree is capped
-at `MAX_SWARM_SPAWN_DEPTH` (currently 5): an agent at depth `d` may spawn
-children (which land at depth `d + 1`) only while `d < 5`. The root session that
-first spawns in a repo is depth 0.
+children can spawn their own children, forming a spawn tree. There is no depth
+cap: growth is bounded only by the total swarm member cap. The root session
+that first spawns in a repo is depth 0.
 
 The spawn/parent edge is encoded by `report_back_to_session_id`: a child spawned
 by `P` reports back to `P`. Walking that chain reconstructs ancestry and depth,
 so each agent "owns" the subtree it spawned. An agent may stop any agent in its
 own subtree (itself or a transitive descendant); `force=true` is still required
 to stop sessions outside the requester's subtree (e.g. user-created peers).
+
+When a mid-tree member leaves (stop, crash, disconnect, feature-off), its direct
+children are reparented rather than orphaned: they attach to their live
+grandparent, falling back to the current coordinator, else they become roots.
+Session renames (resume) rewrite children's report-back edges to the new id.
+This keeps ownership, stop permissions, subtree broadcast scope, and completion
+report-back coherent across member churn.
 
 The single per-swarm "coordinator" slot still exists, but only for shared,
 swarm-level plan operations (propose/approve/assign/task-control on the one
@@ -69,7 +76,8 @@ concurrently would make the shared plan incoherent.
 - Propose plan updates when they discover issues or new requirements.
 - Coordinate directly with other agents via DM or channels.
 - Emit lifecycle events when they start, finish, or stop unexpectedly.
-- May spawn their own child agents (subject to the depth-5 cap) and stop any
+- May spawn their own child agents (no depth cap; bounded only by the total
+  swarm member cap) and stop any
   agent in the subtree they spawned. Stopping agents outside their own subtree
   still requires `force=true`.
 
@@ -183,13 +191,15 @@ flowchart LR
 Explicit agent-to-agent communication is required for coordination and conflict
 resolution. The system supports:
 
-- Direct messages (DMs)
-- Swarm broadcast
-- Topic channels (group chats)
-- Shared context keys (set/read/append)
+- Direct messages (DMs) - the preferred exception channel
+- Subtree broadcast (reaches only the sender's spawned subtree; the swarm
+  coordinator keeps whole-swarm reach as an escape hatch)
+- Topic channels (group chats) - discouraged; prefer DMs and task-graph artifacts
+- Shared context keys (set/read/append) - discouraged; prefer the repo and
+  typed node artifacts. Share notifications are subtree-scoped like broadcasts.
 - Channel discovery and member inspection
 
-All agents can broadcast and send DMs or channel messages.
+All agents can send DMs and subtree broadcasts.
 
 All inter-agent communication is delivered as notifications (DMs, channel messages,
 broadcasts, plan updates, intent notices, and lifecycle events). Notifications are

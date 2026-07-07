@@ -93,6 +93,38 @@ fn test_child_process_tree_detection() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn test_grandchild_process_tree_detection() {
+    // Wrapper chain: an outer bash spawns an inner `bash -c cat`, so the actual
+    // stdin reader (`cat`) is a GRANDCHILD of the tracked pid. The intermediate
+    // bash is not itself reading stdin, so detection requires recursing past
+    // direct children (issue #373). A trailing `; true` keeps each bash from
+    // exec-optimizing itself away so the nesting (outer bash -> inner bash ->
+    // cat) is preserved.
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg("bash -c 'cat; true'; true")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("failed to spawn bash");
+
+    let pid = child.id();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let state = linux::check_process_tree(pid);
+
+    child.kill().ok();
+    child.wait().ok();
+
+    assert_eq!(
+        state,
+        StdinState::Reading,
+        "grandchild cat should be detected via recursive process-tree walk"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn test_direct_children_lists_immediate_children() {
     // Spawn a parent shell that itself spawns a long-lived child (`sleep`).
     // `direct_children` should report the immediate child PID(s) without
@@ -116,8 +148,7 @@ fn test_direct_children_lists_immediate_children() {
     // reparents to init (ppid 1) and the check races.
     let mut all_parented_by_pid = !kids.is_empty();
     for kid in &kids {
-        let status =
-            std::fs::read_to_string(format!("/proc/{}/status", kid)).unwrap_or_default();
+        let status = std::fs::read_to_string(format!("/proc/{}/status", kid)).unwrap_or_default();
         let ppid = status
             .lines()
             .find_map(|l| l.strip_prefix("PPid:\t"))
@@ -253,4 +284,38 @@ fn test_multiple_sequential_reads() {
 
     let status = child.wait().expect("failed to wait");
     assert!(status.success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_children_of_childless_process_does_not_scan_proc() {
+    // Regression test for issue #392 A1 (second occurrence): a childless
+    // process must return an empty list via /proc/<pid>/task/<tid>/children
+    // without falling back to the whole-/proc scan. We can't observe syscalls
+    // here, but we can assert the interface itself reports readable-and-empty
+    // for a leaf process we control, which is the branch condition the fix
+    // keys on.
+    let mut child = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+
+    // `sleep` spawns no children. The children interface must be readable so
+    // direct_children() returns empty WITHOUT the proc-scan fallback.
+    let path = format!("/proc/{}/task/{}/children", pid, pid);
+    let readable = std::fs::read_to_string(&path).is_ok();
+    let children = super::linux::direct_children(pid);
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        readable,
+        "kernel lacks CONFIG_PROC_CHILDREN; fallback scan is expected on this system"
+    );
+    assert!(
+        children.is_empty(),
+        "sleep should have no children, got {children:?}"
+    );
 }

@@ -15,6 +15,7 @@ mod client_state;
 mod client_writer;
 mod comm_await;
 mod comm_control;
+mod comm_graph;
 mod comm_plan;
 mod comm_session;
 mod comm_sync;
@@ -50,7 +51,8 @@ mod util;
 pub(super) use self::await_members_state::AwaitMembersRuntime;
 use self::background_tasks::{
     dispatch_background_task_completion, dispatch_background_task_progress,
-    dispatch_swarm_output_tail, dispatch_ui_activity,
+    dispatch_swarm_await_completion, dispatch_swarm_output_tail, dispatch_swarm_todo_progress,
+    dispatch_ui_activity,
 };
 use self::debug::{ClientConnectionInfo, ClientDebugState};
 use self::debug_jobs::DebugJob;
@@ -58,11 +60,12 @@ use self::headless::create_headless_session;
 use self::reload::await_reload_signal;
 use self::runtime::ServerRuntime;
 use self::swarm::{
-    MAX_SWARM_SPAWN_DEPTH, broadcast_swarm_plan, broadcast_swarm_plan_with_previous,
+    MAX_SWARM_MEMBERS, broadcast_swarm_plan, broadcast_swarm_plan_with_previous,
     broadcast_swarm_status, record_swarm_event, record_swarm_event_for_session,
     refresh_swarm_task_staleness, remove_plan_participant, remove_session_from_swarm,
-    rename_plan_participant, run_swarm_message, swarm_is_self_or_ancestor, swarm_spawn_depth,
-    update_member_status, update_member_status_with_report,
+    rename_plan_participant, run_swarm_message, send_swarm_plan_to_session,
+    set_member_task_label, swarm_is_self_or_ancestor, update_member_status,
+    update_member_status_with_report, update_member_status_with_report_tldr,
 };
 use self::swarm_channels::{
     remove_session_channel_subscriptions, subscribe_session_to_channel,
@@ -387,6 +390,9 @@ const IDLE_TIMEOUT_SECS: u64 = 300;
 /// How often to check whether the embedding model can be unloaded.
 const EMBEDDING_IDLE_CHECK_SECS: u64 = 30;
 
+/// How often the retained-heap watchdog samples allocator retention.
+const HEAP_RETENTION_CHECK_SECS: u64 = 120;
+
 /// Exit code when server shuts down due to idle timeout
 pub const EXIT_IDLE_TIMEOUT: i32 = 44;
 
@@ -653,10 +659,11 @@ impl Server {
                 registry.register_selfdev_tools().await;
             }
             registry
-                .register_mcp_tools(
+                .register_mcp_tools_for_dir(
                     None,
                     Some(Arc::clone(&mcp_pool)),
                     Some("headless".to_string()),
+                    session.working_dir.as_ref().map(std::path::PathBuf::from),
                 )
                 .await;
 
@@ -682,10 +689,7 @@ impl Server {
                 .await;
                 let mut shutdown_signals = self.shutdown_signals.write().await;
                 shutdown_signals.insert(session_id.clone(), agent_guard.graceful_shutdown_signal());
-                register_background_tool_signal(
-                    &session_id,
-                    agent_guard.background_tool_signal(),
-                );
+                register_background_tool_signal(&session_id, agent_guard.background_tool_signal());
             }
 
             let stored_recovery_record = reload_recovery::peek_for_session(&session_id)
@@ -988,6 +992,22 @@ impl Server {
         // indexing cost while leaving exhaustive searches available on demand.
         crate::tool::spawn_recent_index_warmup();
 
+        // Reconcile background-task status files orphaned by a previous
+        // process image (crash or exec-based reload). Non-detached tasks die
+        // with their owning process but their status files still say Running,
+        // which leaves phantom entries in `bg list` and blocks `bg wait`
+        // until timeout. Detached tasks are untouched (they survive reloads
+        // and reconcile via their real pid).
+        tokio::spawn(async move {
+            let reconciled = crate::background::global().reconcile_orphaned_tasks().await;
+            if reconciled > 0 {
+                crate::logging::info(&format!(
+                    "Marked {} orphaned background task(s) from a previous server process as failed",
+                    reconciled
+                ));
+            }
+        });
+
         // Spawn reload monitor (event-driven via in-process channel).
         // In the unified server design, self-dev sessions share the main server,
         // so the shared server must always listen for reload signals.
@@ -1048,6 +1068,25 @@ impl Server {
             )
             .await;
         });
+
+        // Resume any background `swarm await_members` watchers that were active
+        // before this (re)start. Their results are delivered via notify/wake, so
+        // they can pick up transparently without the agent rerunning the wait.
+        {
+            let resume_swarm_members = Arc::clone(&self.swarm_state.members);
+            let resume_swarms_by_id = Arc::clone(&self.swarm_state.swarms_by_id);
+            let resume_swarm_event_tx = self.swarm_event_tx.clone();
+            let resume_await_runtime = self.await_members_runtime.clone();
+            tokio::spawn(async move {
+                comm_await::resume_background_awaits(
+                    &resume_swarm_members,
+                    &resume_swarms_by_id,
+                    &resume_swarm_event_tx,
+                    &resume_await_runtime,
+                )
+                .await;
+            });
+        }
 
         let stale_swarm_members = Arc::clone(&self.swarm_state.members);
         let stale_swarms_by_id = Arc::clone(&self.swarm_state.swarms_by_id);
@@ -1144,6 +1183,28 @@ impl Server {
                 }
             }
         });
+
+        // Spawn the retained-heap watchdog: glibc/jemalloc keep freed pages
+        // inside arenas, and the event-driven trim hooks (turn completion,
+        // history load) rarely fire on a server hosting mostly-idle sessions.
+        // Periodically check the allocator's freed-but-retained byte count and
+        // trim when it crosses the threshold, returning the pages to the OS.
+        let retention_threshold = crate::process_memory::retention_trim_threshold_bytes();
+        if retention_threshold != u64::MAX {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    HEAP_RETENTION_CHECK_SECS,
+                ));
+                loop {
+                    interval.tick().await;
+                    crate::process_memory::release_retained_heap_if_excessive(
+                        "server_retention_watchdog",
+                        retention_threshold,
+                        std::time::Duration::from_secs(60),
+                    );
+                }
+            });
+        }
 
         if crate::runtime_memory_log::server_logging_enabled() {
             let log_identity = self.identity.clone();
@@ -1838,13 +1899,29 @@ impl Server {
                 Ok(BusEvent::BackgroundTaskProgress(task)) => {
                     dispatch_background_task_progress(&task, &swarm_members).await;
                 }
+                Ok(BusEvent::SwarmAwaitCompleted(event)) => {
+                    dispatch_swarm_await_completion(
+                        &event,
+                        &sessions,
+                        &soft_interrupt_queues,
+                        &swarm_members,
+                        &swarms_by_id,
+                        &event_history,
+                        &event_counter,
+                        &swarm_event_tx,
+                    )
+                    .await;
+                }
                 Ok(BusEvent::UiActivity(activity)) => {
                     dispatch_ui_activity(&activity, &swarm_members).await;
                 }
-                // Session todos are private. Swarm plans are updated via explicit
-                // communication actions (comm_propose_plan / comm_approve_plan), not
-                // todowrite broadcasts.
-                Ok(BusEvent::TodoUpdated(_)) => {}
+                // Session todos are private to the session's transcript, but the
+                // completed/total counters are surfaced on the inline swarm strip
+                // so a coordinator can see each managed agent's progress at a
+                // glance. We forward only the aggregate counts, never the items.
+                Ok(BusEvent::TodoUpdated(event)) => {
+                    dispatch_swarm_todo_progress(&event, &swarm_members, &swarms_by_id).await;
+                }
                 Ok(BusEvent::SwarmOutputTail(tail)) => {
                     dispatch_swarm_output_tail(&tail, &swarm_members, &swarms_by_id).await;
                 }

@@ -191,14 +191,17 @@ pub(super) fn wrapped_body_line_count(line: &SingleSessionStyledLine, max_column
 
 pub(super) fn wrapped_ascii_body_line_count(text: &str, max_columns: usize) -> usize {
     let max_columns = max_columns.max(1);
+    let hang = hanging_indent_columns(text, max_columns);
     let trimmed_end = text.trim_end().len();
     let mut remaining = &text[..trimmed_end];
     let mut count = 1usize;
+    let mut columns = max_columns;
 
-    while remaining.len() > max_columns {
-        let split = ascii_word_wrap_split_index(remaining, max_columns);
+    while remaining.len() > columns {
+        let split = ascii_word_wrap_split_index(remaining, columns);
         remaining = remaining[split..].trim_start();
         count += 1;
+        columns = max_columns - hang;
     }
 
     count
@@ -227,26 +230,86 @@ pub(super) fn push_wrapped_ascii_body_line_parts(
     max_columns: usize,
 ) {
     let max_columns = max_columns.max(1);
+    let hang = hanging_indent_columns(text, max_columns);
     let trimmed_end = text.trim_end().len();
     let mut remaining = &text[..trimmed_end];
+    let mut first = true;
+    let mut columns = max_columns;
 
-    while remaining.len() > max_columns {
-        let split = ascii_word_wrap_split_index(remaining, max_columns);
+    while remaining.len() > columns {
+        let split = ascii_word_wrap_split_index(remaining, columns);
         let line = remaining[..split].trim_end();
-        let mut wrapped_line = SingleSessionStyledLine::new(line.to_string(), style);
+        let mut wrapped_line =
+            SingleSessionStyledLine::new(hang_wrapped_line_text(line, first, hang), style);
         wrapped_line.tool = tool.cloned();
         wrapped.push(wrapped_line);
 
         remaining = remaining[split..].trim_start();
+        first = false;
+        columns = max_columns - hang;
     }
 
-    let mut wrapped_line = SingleSessionStyledLine::new(remaining.to_string(), style);
+    let mut wrapped_line =
+        SingleSessionStyledLine::new(hang_wrapped_line_text(remaining, first, hang), style);
     wrapped_line.tool = tool.cloned();
     wrapped.push(wrapped_line);
 }
 
+/// Columns of hanging indent applied to wrapped continuation rows.
+///
+/// Continuation rows inherit the first row's leading whitespace (plus the
+/// width of a leading bullet/status glyph) so wrapped tool headers, tool
+/// details, and list items stay aligned inside their card inset instead of
+/// snapping back to column zero and colliding with card chrome.
+pub(super) fn hanging_indent_columns(text: &str, max_columns: usize) -> usize {
+    let mut columns = 0usize;
+    let mut chars = text.chars().peekable();
+    while chars.peek() == Some(&' ') {
+        chars.next();
+        columns += 1;
+    }
+    if let Some(glyph) = chars.peek().copied()
+        && matches!(
+            glyph,
+            '\u{25cf}'
+                | '\u{25cb}'
+                | '\u{2713}'
+                | '\u{2715}'
+                | '\u{2022}'
+                | '\u{25e6}'
+                | '\u{25aa}'
+                | '\u{25b8}'
+                | '\u{25be}'
+        )
+    {
+        chars.next();
+        if chars.peek() == Some(&' ') {
+            columns += 2;
+        }
+    }
+    // Keep a readable measure: skip the hang when it would crowd the row.
+    if columns + 12 > max_columns {
+        0
+    } else {
+        columns
+    }
+}
+
+fn hang_wrapped_line_text(line: &str, first: bool, hang: usize) -> String {
+    if first || hang == 0 {
+        line.to_string()
+    } else {
+        let mut text = String::with_capacity(hang + line.len());
+        text.extend(std::iter::repeat_n(' ', hang));
+        text.push_str(line);
+        text
+    }
+}
+
 pub(super) fn single_session_body_max_columns(size: PhysicalSize<u32>, text_scale: f32) -> usize {
-    let content_width = single_session_content_width(size);
+    // Reserve a small right gutter so wrapped text never kisses the card's
+    // right edge (mirrors the left inset breathing room).
+    let content_width = (single_session_content_width(size) - 10.0).max(1.0);
     (content_width / single_session_body_char_width_for_scale(text_scale))
         .floor()
         .max(20.0) as usize
@@ -258,35 +321,62 @@ pub(super) fn wrap_body_line_text_with_spans(
     max_columns: usize,
 ) -> Vec<(String, Vec<SingleSessionInlineSpan>)> {
     let max_columns = max_columns.max(1);
+    let hang = hanging_indent_columns(text, max_columns);
     let trimmed_end =
         single_session_trimmed_line_end_preserving_inline_code_whitespace(text, inline_spans);
     let mut remaining = &text[..trimmed_end];
     let mut lines = Vec::new();
     let mut base_byte = 0usize;
+    let mut first = true;
+    let mut columns = max_columns;
 
-    while text_exceeds_columns(remaining, max_columns) {
-        let split = word_wrap_split_index(remaining, max_columns);
+    while text_exceeds_columns(remaining, columns) {
+        let split = word_wrap_split_index(remaining, columns);
         let (line, rest) = remaining.split_at(split);
         let line = line.trim_end();
         let start = base_byte;
         let end = start + line.len();
-        lines.push((
-            line.to_string(),
+        lines.push(hang_wrapped_spanned_line(
+            line,
             inline_spans_for_wrapped_range(inline_spans, start, end),
+            first,
+            hang,
         ));
 
         let trimmed_rest = rest.trim_start();
         base_byte += split + rest.len().saturating_sub(trimmed_rest.len());
         remaining = trimmed_rest;
+        first = false;
+        columns = max_columns - hang;
     }
 
     let start = base_byte;
     let end = start + remaining.len();
-    lines.push((
-        remaining.to_string(),
+    lines.push(hang_wrapped_spanned_line(
+        remaining,
         inline_spans_for_wrapped_range(inline_spans, start, end),
+        first,
+        hang,
     ));
     lines
+}
+
+fn hang_wrapped_spanned_line(
+    line: &str,
+    mut spans: Vec<SingleSessionInlineSpan>,
+    first: bool,
+    hang: usize,
+) -> (String, Vec<SingleSessionInlineSpan>) {
+    if first || hang == 0 {
+        return (line.to_string(), spans);
+    }
+    // The hang prefix is `hang` ASCII spaces, so span byte offsets shift by
+    // exactly `hang` bytes.
+    for span in &mut spans {
+        span.start += hang;
+        span.end += hang;
+    }
+    (hang_wrapped_line_text(line, false, hang), spans)
 }
 
 pub(super) fn wrapped_body_line_text_count(
@@ -295,16 +385,19 @@ pub(super) fn wrapped_body_line_text_count(
     max_columns: usize,
 ) -> usize {
     let max_columns = max_columns.max(1);
+    let hang = hanging_indent_columns(text, max_columns);
     let trimmed_end =
         single_session_trimmed_line_end_preserving_inline_code_whitespace(text, inline_spans);
     let mut remaining = &text[..trimmed_end];
     let mut count = 1usize;
+    let mut columns = max_columns;
 
-    while text_exceeds_columns(remaining, max_columns) {
-        let split = word_wrap_split_index(remaining, max_columns);
+    while text_exceeds_columns(remaining, columns) {
+        let split = word_wrap_split_index(remaining, columns);
         let (_, rest) = remaining.split_at(split);
         remaining = rest.trim_start();
         count += 1;
+        columns = max_columns - hang;
     }
 
     count
@@ -351,7 +444,9 @@ pub(super) fn word_wrap_split_index(text: &str, max_columns: usize) -> usize {
     text[..hard_split]
         .char_indices()
         .rev()
-        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        // U+00A0 exists to forbid breaking, so it never becomes a split point
+        // (used by keyboard-hint lines to keep "Ctrl+V paste" pairs together).
+        .find_map(|(index, ch)| (ch.is_whitespace() && ch != '\u{a0}').then_some(index))
         .filter(|index| *index > 0)
         .unwrap_or(hard_split)
 }

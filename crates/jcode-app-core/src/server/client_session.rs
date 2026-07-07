@@ -8,7 +8,8 @@ use super::{
     register_session_interrupt_queue, remove_background_tool_signal, remove_plan_participant,
     remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, rename_background_tool_signal, rename_plan_participant,
-    rename_session_interrupt_queue, rename_stop_current_turn_signal, swarm_id_for_dir,
+    rename_session_interrupt_queue, rename_stop_current_turn_signal, send_swarm_plan_to_session,
+    swarm_id_for_dir,
     unregister_session_event_sender, update_member_status,
 };
 use crate::agent::Agent;
@@ -346,6 +347,7 @@ async fn ensure_client_swarm_member(
                     swarm_enabled,
                     status: "ready".to_string(),
                     detail: None,
+                    task_label: None,
                     friendly_name: member_name.clone(),
                     report_back_to_session_id: None,
                     latest_completion_report: None,
@@ -354,6 +356,8 @@ async fn ensure_client_swarm_member(
                     last_status_change: now,
                     is_headless: false,
                     output_tail: None,
+                    todo_progress: None,
+                    todo_items: Vec::new(),
                 },
             );
             inserted = true;
@@ -561,6 +565,7 @@ pub(super) async fn handle_subscribe(
                             notification_type: NotificationType::Message {
                                 scope: Some("swarm".to_string()),
                                 channel: None,
+                                tldr: None,
                             },
                             message: "You are now the coordinator for this swarm.".to_string(),
                         });
@@ -603,11 +608,22 @@ pub(super) async fn handle_subscribe(
 
     let mcp_register_ms = if register_mcp_tools {
         let mcp_register_start = Instant::now();
+        // Resolve project-local MCP config against the session working dir,
+        // not the server process cwd (issue #420). Prefer the subscribe
+        // request's dir; fall back to the agent's stored session dir.
+        let mcp_working_dir = match subscribe_working_dir.as_ref() {
+            Some(dir) => Some(PathBuf::from(dir)),
+            None => {
+                let agent_guard = agent.lock().await;
+                agent_guard.working_dir().map(PathBuf::from)
+            }
+        };
         registry
-            .register_mcp_tools(
+            .register_mcp_tools_for_dir(
                 Some(client_event_tx.clone()),
                 Some(Arc::clone(mcp_pool)),
                 Some(client_session_id.to_string()),
+                mcp_working_dir,
             )
             .await;
         mcp_register_start.elapsed().as_millis()
@@ -651,6 +667,10 @@ pub(super) async fn handle_subscribe(
         )
         .await;
     }
+
+    // Re-send the current swarm plan so a reconnecting client renders the
+    // plan graph immediately instead of waiting for the next plan mutation.
+    send_swarm_plan_to_session(client_session_id, swarm_members, swarm_plans).await;
 
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
@@ -1064,11 +1084,25 @@ pub(super) async fn handle_resume_session(
         )
         .await?;
         let _ = client_event_tx.send(ServerEvent::Done { id });
+        // Resolve project-local MCP config against the resumed session's
+        // working dir, not the server process cwd (issue #420).
+        // Do not block on the agent lock here: the target agent may be busy
+        // mid-turn (lock held), and awaiting it would deadlock the resume.
+        let mcp_working_dir = live_target_agent
+            .try_lock()
+            .ok()
+            .and_then(|agent_guard| agent_guard.working_dir().map(PathBuf::from))
+            .or_else(|| {
+                crate::session::Session::load_startup_stub(&session_id)
+                    .ok()
+                    .and_then(|session| session.working_dir.map(PathBuf::from))
+            });
         registry
-            .register_mcp_tools(
+            .register_mcp_tools_for_dir(
                 Some(client_event_tx.clone()),
                 Some(Arc::clone(mcp_pool)),
                 Some(session_id.clone()),
+                mcp_working_dir,
             )
             .await;
         spawn_model_prefetch_update(Arc::clone(provider), Arc::clone(live_target_agent));
@@ -1285,6 +1319,15 @@ pub(super) async fn handle_resume_session(
                     member.detail = None;
                     members.insert(session_id.clone(), member);
                 }
+                // Keep the spawn tree intact across the rename: children that
+                // reported back to the old session id must follow it, otherwise
+                // ownership (stop permissions, subtree broadcast, report-back)
+                // silently dangles on a dead id.
+                for member in members.values_mut() {
+                    if member.report_back_to_session_id.as_deref() == Some(&old_session_id) {
+                        member.report_back_to_session_id = Some(session_id.clone());
+                    }
+                }
             }
             remove_session_channel_subscriptions(
                 &old_session_id,
@@ -1352,11 +1395,22 @@ pub(super) async fn handle_resume_session(
             )
             .await?;
             let _ = client_event_tx.send(ServerEvent::Done { id });
+            // Re-send the swarm plan AFTER the History payload: the client
+            // clears its plan snapshot on session change, so without this the
+            // plan graph would stay blank until the next plan mutation.
+            send_swarm_plan_to_session(&session_id, swarm_members, swarm_plans).await;
+            // Resolve project-local MCP config against the restored session's
+            // working dir, not the server process cwd (issue #420).
+            let mcp_working_dir = {
+                let agent_guard = agent.lock().await;
+                agent_guard.working_dir().map(PathBuf::from)
+            };
             registry
-                .register_mcp_tools(
+                .register_mcp_tools_for_dir(
                     Some(client_event_tx.clone()),
                     Some(Arc::clone(mcp_pool)),
                     Some(session_id.clone()),
+                    mcp_working_dir,
                 )
                 .await;
             spawn_model_prefetch_update(Arc::clone(provider), Arc::clone(agent));

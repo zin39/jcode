@@ -66,6 +66,9 @@ fn member(
             last_status_change: Instant::now(),
             is_headless: false,
             output_tail: None,
+            todo_progress: None,
+            todo_items: Vec::new(),
+            task_label: None,
         },
         event_rx,
     )
@@ -248,6 +251,7 @@ fn prepare_visible_spawn_session_persists_startup_before_launch() {
         None,
         None,
         None,
+        None,
         false,
         Some(startup),
         |session_id, _cwd: &std::path::Path, _selfdev, provider_key| {
@@ -294,6 +298,7 @@ fn prepare_visible_spawn_session_cleans_startup_when_launch_not_started() {
         None,
         None,
         None,
+        None,
         false,
         Some("Do the thing."),
         |_session_id, _cwd: &std::path::Path, _selfdev, _provider_key| Ok(false),
@@ -326,6 +331,7 @@ fn prepare_visible_spawn_session_cleans_session_when_launch_errors() {
 
     let error = prepare_visible_spawn_session(
         Some(worktree.path().to_str().expect("utf8 worktree path")),
+        None,
         None,
         None,
         None,
@@ -364,6 +370,7 @@ fn prepare_visible_spawn_session_persists_and_launches_provider_key_for_openrout
         Some("openai/gpt-5.4@OpenAI"),
         None,
         None,
+        None,
         false,
         None,
         |_session_id, _cwd: &std::path::Path, _selfdev, provider_key| {
@@ -382,6 +389,37 @@ fn prepare_visible_spawn_session_persists_and_launches_provider_key_for_openrout
 }
 
 #[test]
+fn prepare_visible_spawn_session_persists_requested_effort() {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    let worktree = tempfile::TempDir::new().expect("temp worktree");
+    let (session_id, launched) = prepare_visible_spawn_session(
+        Some(worktree.path().to_str().expect("utf8 worktree path")),
+        Some("gpt-5.5"),
+        None,
+        None,
+        Some("low"),
+        false,
+        None,
+        |_session_id, _cwd: &std::path::Path, _selfdev, _provider_key| Ok(true),
+    )
+    .expect("visible spawn preparation should succeed");
+
+    assert!(launched);
+    let session = crate::session::Session::load(&session_id).expect("prepared session should save");
+    assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
+        session.reasoning_effort.as_deref(),
+        Some("low"),
+        "requested effort should persist so the headed client restores it"
+    );
+
+    crate::env::remove_var("JCODE_HOME");
+}
+
+#[test]
 fn prepare_visible_spawn_session_prefers_parent_provider_key_over_model_guess() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
@@ -392,6 +430,7 @@ fn prepare_visible_spawn_session_prefers_parent_provider_key_over_model_guess() 
         Some(worktree.path().to_str().expect("utf8 worktree path")),
         Some("gpt-5.4"),
         Some("ollama"),
+        None,
         None,
         false,
         None,
@@ -426,6 +465,7 @@ fn coordinator_identity(
 #[test]
 fn resolve_swarm_spawn_model_prefers_configured_model_over_coordinator_model() {
     let selection = resolve_swarm_spawn_selection(
+        None,
         Some("openai/gpt-5.4@OpenAI".to_string()),
         &coordinator_identity(
             Some("nvidia/llama-3.3-nemotron-super-49b-v1"),
@@ -443,6 +483,7 @@ fn resolve_swarm_spawn_model_prefers_configured_model_over_coordinator_model() {
 #[test]
 fn resolve_swarm_spawn_model_inherits_coordinator_when_unconfigured() {
     let selection = resolve_swarm_spawn_selection(
+        None,
         None,
         &coordinator_identity(
             Some("nvidia/llama-3.3-nemotron-super-49b-v1"),
@@ -468,6 +509,7 @@ fn resolve_swarm_spawn_model_inherits_coordinator_auth_route_for_oauth_vs_api() 
     // the same API route, not Claude OAuth (the config default).
     let selection = resolve_swarm_spawn_selection(
         None,
+        None,
         &coordinator_identity(
             Some("claude-opus-4-6"),
             Some("claude-api"),
@@ -483,6 +525,7 @@ fn resolve_swarm_spawn_model_inherits_coordinator_auth_route_for_oauth_vs_api() 
 #[test]
 fn resolve_swarm_spawn_model_keeps_provider_key_when_config_matches_coordinator() {
     let selection = resolve_swarm_spawn_selection(
+        None,
         Some("custom-model".to_string()),
         &coordinator_identity(
             Some("custom-model"),
@@ -501,6 +544,7 @@ fn resolve_swarm_spawn_model_openai_api_prefix_pins_api_route_over_coordinator()
     // `agents.swarm_model = "openai-api:gpt-5.5"` must spawn agents on GPT-5.5
     // via the OpenAI API key route, regardless of the coordinator's model/auth.
     let selection = resolve_swarm_spawn_selection(
+        None,
         Some("openai-api:gpt-5.5".to_string()),
         &coordinator_identity(
             Some("claude-opus-4-8"),
@@ -534,6 +578,7 @@ fn resolve_swarm_spawn_model_auth_route_prefixes_pin_expected_routes() {
         ),
     ] {
         let selection = resolve_swarm_spawn_selection(
+            None,
             Some(configured.to_string()),
             &coordinator_identity(
                 Some("some-other-model"),
@@ -563,6 +608,7 @@ fn resolve_swarm_spawn_model_auth_route_prefixes_pin_expected_routes() {
 fn resolve_swarm_spawn_model_inherit_sentinel_uses_coordinator_model() {
     for sentinel in ["inherit", "INHERIT", "coordinator", " inherit ", ""] {
         let selection = resolve_swarm_spawn_selection(
+            None,
             Some(sentinel.to_string()),
             &coordinator_identity(
                 Some("nvidia/llama-3.3-nemotron-super-49b-v1"),
@@ -587,6 +633,81 @@ fn resolve_swarm_spawn_model_inherit_sentinel_uses_coordinator_model() {
             "sentinel {sentinel:?} should inherit coordinator auth route",
         );
     }
+}
+
+#[test]
+fn resolve_swarm_spawn_model_requested_model_overrides_configured_pin() {
+    // A per-spawn requested model must beat the agents.swarm_model config pin.
+    let selection = resolve_swarm_spawn_selection(
+        Some("openai-api:gpt-5.5".to_string()),
+        Some("claude-oauth:claude-opus-4-8".to_string()),
+        &coordinator_identity(
+            Some("claude-fable-5"),
+            Some("claude-oauth"),
+            Some("claude-oauth"),
+        ),
+    );
+
+    assert_eq!(selection.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(selection.provider_key.as_deref(), Some("openai-api-key"));
+    assert_eq!(
+        selection.route_api_method.as_deref(),
+        Some("openai-api-key")
+    );
+}
+
+#[test]
+fn resolve_swarm_spawn_model_requested_inherit_overrides_configured_pin() {
+    // An explicit `inherit` request must force coordinator inheritance even
+    // when the config pins a different model.
+    let selection = resolve_swarm_spawn_selection(
+        Some("inherit".to_string()),
+        Some("openai-api:gpt-5.5".to_string()),
+        &coordinator_identity(
+            Some("claude-fable-5"),
+            Some("claude-api"),
+            Some("claude-api"),
+        ),
+    );
+
+    assert_eq!(selection.model.as_deref(), Some("claude-fable-5"));
+    assert_eq!(selection.provider_key.as_deref(), Some("claude-api"));
+    assert_eq!(selection.route_api_method.as_deref(), Some("claude-api"));
+}
+
+#[test]
+fn resolve_swarm_spawn_model_requested_matching_coordinator_model_keeps_route() {
+    // Requesting the coordinator's own model keeps its provider key and route.
+    let selection = resolve_swarm_spawn_selection(
+        Some("custom-model".to_string()),
+        None,
+        &coordinator_identity(
+            Some("custom-model"),
+            Some("custom-provider"),
+            Some("custom-route"),
+        ),
+    );
+
+    assert_eq!(selection.model.as_deref(), Some("custom-model"));
+    assert_eq!(selection.provider_key.as_deref(), Some("custom-provider"));
+    assert_eq!(selection.route_api_method.as_deref(), Some("custom-route"));
+}
+
+#[test]
+fn resolve_swarm_spawn_model_blank_requested_model_falls_back_to_config() {
+    // A whitespace-only requested model is treated as "not provided".
+    let selection = resolve_swarm_spawn_selection(
+        Some("   ".to_string()),
+        Some("openai-api:gpt-5.5".to_string()),
+        &coordinator_identity(
+            Some("claude-fable-5"),
+            Some("claude-oauth"),
+            Some("claude-oauth"),
+        ),
+    );
+
+    assert_eq!(selection.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(selection.provider_key.as_deref(), Some("openai-api-key"));
 }
 
 #[tokio::test]
@@ -656,7 +777,6 @@ async fn spawn_bootstraps_coordinator_when_swarm_has_none() {
     let swarm_id = ensure_spawn_coordinator_swarm(
         1,
         "req",
-        "Only the coordinator can spawn new agents.",
         &client_event_tx,
         &swarm_members,
         &swarms_by_id,
@@ -719,7 +839,6 @@ async fn nested_agent_can_spawn_while_live_coordinator_exists() {
     let swarm_id = ensure_spawn_coordinator_swarm(
         2,
         "child",
-        "Only the coordinator can spawn new agents.",
         &client_event_tx,
         &swarm_members,
         &swarms_by_id,
@@ -752,8 +871,9 @@ async fn nested_agent_can_spawn_while_live_coordinator_exists() {
 }
 
 #[tokio::test]
-async fn spawn_rejected_when_depth_limit_reached() {
-    // Build a chain root -> a -> b -> c -> d -> e (e is at depth 5 == cap).
+async fn spawn_allowed_at_arbitrary_depth_without_depth_cap() {
+    // Build a deep chain root -> a -> b -> c -> d -> e -> f. There is no depth
+    // cap anymore, so even a deeply nested agent may still spawn.
     let swarm_members = Arc::new(RwLock::new(HashMap::new()));
     let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
     let swarm_coordinators = Arc::new(RwLock::new(HashMap::from([(
@@ -771,6 +891,7 @@ async fn spawn_rejected_when_depth_limit_reached() {
             ("c", "b"),
             ("d", "c"),
             ("e", "d"),
+            ("f", "e"),
         ];
         for (id, parent) in chain {
             let (mut m, _rx) = member(id, Some("swarm-1"), "agent");
@@ -778,13 +899,52 @@ async fn spawn_rejected_when_depth_limit_reached() {
             members.insert(id.to_string(), m);
         }
     }
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
+
+    // `f` is deeply nested but the swarm is far below the member cap, so spawning
+    // is allowed.
+    let allowed = ensure_spawn_coordinator_swarm(
+        7,
+        "f",
+        &client_event_tx,
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_coordinators,
+        &swarm_plans,
+    )
+    .await;
+    assert_eq!(allowed.as_deref(), Some("swarm-1"));
+}
+
+#[tokio::test]
+async fn spawn_rejected_when_member_limit_reached() {
+    use crate::server::swarm::MAX_SWARM_MEMBERS;
+
+    // Fill the swarm to the member cap; the next spawn must be refused.
+    let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+    let swarm_coordinators = Arc::new(RwLock::new(HashMap::from([(
+        "swarm-1".to_string(),
+        "root".to_string(),
+    )])));
+    let swarm_plans = Arc::new(RwLock::new(HashMap::<String, VersionedPlan>::new()));
+    {
+        let mut members = swarm_members.write().await;
+        let (root, _rx) = member("root", Some("swarm-1"), "coordinator");
+        members.insert("root".to_string(), root);
+        // Add filler members so the swarm holds exactly MAX_SWARM_MEMBERS total.
+        for idx in 1..MAX_SWARM_MEMBERS {
+            let id = format!("agent-{idx}");
+            let (mut m, _rx) = member(&id, Some("swarm-1"), "agent");
+            m.report_back_to_session_id = Some("root".to_string());
+            members.insert(id, m);
+        }
+    }
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
 
-    // `e` is at depth 5 (== MAX_SWARM_SPAWN_DEPTH) and must be refused.
     let refused = ensure_spawn_coordinator_swarm(
         7,
-        "e",
-        "Only the coordinator can spawn new agents.",
+        "root",
         &client_event_tx,
         &swarm_members,
         &swarms_by_id,
@@ -796,20 +956,6 @@ async fn spawn_rejected_when_depth_limit_reached() {
     assert!(matches!(
         client_event_rx.recv().await,
         Some(ServerEvent::Error { message, .. })
-            if message.contains("Swarm spawn depth limit reached")
+            if message.contains("Swarm member limit reached")
     ));
-
-    // `d` is at depth 4 (< cap) and may still spawn.
-    let allowed = ensure_spawn_coordinator_swarm(
-        8,
-        "d",
-        "Only the coordinator can spawn new agents.",
-        &client_event_tx,
-        &swarm_members,
-        &swarms_by_id,
-        &swarm_coordinators,
-        &swarm_plans,
-    )
-    .await;
-    assert_eq!(allowed.as_deref(), Some("swarm-1"));
 }

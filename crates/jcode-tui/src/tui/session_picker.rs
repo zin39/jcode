@@ -740,6 +740,9 @@ impl SessionPicker {
             ResumeTarget::OpenCodeSession { .. } => external_path.as_deref().and_then(|path| {
                 loading::load_opencode_preview_from_path(std::path::Path::new(path))
             }),
+            ResumeTarget::CursorSession { .. } => external_path.as_deref().and_then(|path| {
+                loading::load_cursor_preview_from_path(std::path::Path::new(path))
+            }),
         }
     }
 
@@ -1180,6 +1183,18 @@ impl SessionPicker {
 
         let max_scroll = total_lines.saturating_sub(visible_height) as u16;
         self.preview_max_scroll = max_scroll;
+        // The transcript for the selected session may still be loading on a
+        // background thread, in which case this frame only shows a "Loading…"
+        // placeholder (max_scroll == 0). Keep the auto-scroll armed until the
+        // real content lands; otherwise the flag is consumed on the placeholder
+        // frame and the populated transcript stays pinned at the top, hiding the
+        // sticky "previous prompt" header that should appear once we snap to the
+        // bottom.
+        let preview_still_loading = session.messages_preview.is_empty()
+            && self
+                .pending_preview_load
+                .as_ref()
+                .is_some_and(|pending| pending.session_id == session.id);
         if self.auto_scroll_preview {
             // When a search is active and the selected session has a match in the
             // preview body, scroll the first hit into view (a few lines of lead-in
@@ -1190,7 +1205,9 @@ impl SessionPicker {
                 }
                 _ => max_scroll,
             };
-            self.auto_scroll_preview = false;
+            if !preview_still_loading {
+                self.auto_scroll_preview = false;
+            }
         } else {
             self.scroll_offset = self.scroll_offset.min(max_scroll);
         }
@@ -1512,7 +1529,9 @@ impl SessionPicker {
                     let mut skip_mermaid_blank = false;
 
                     for line in md_lines {
-                        if super::mermaid::parse_image_placeholder(&line).is_some() {
+                        if super::mermaid::parse_image_placeholder(&line).is_some()
+                            || super::mermaid::parse_inline_image_placeholder(&line).is_some()
+                        {
                             lines.push(
                                 Line::from(vec![Span::styled(
                                     "[mermaid diagram]",
@@ -1714,10 +1733,7 @@ impl SessionPicker {
     /// Apply search-match highlighting to already-built preview lines in place.
     /// Returns the index of the first line that contains a highlighted match, if
     /// any. Each token highlights independently (matching the AND-token filter).
-    fn highlight_lines_in_place(
-        lines: &mut [Line<'static>],
-        tokens: &[String],
-    ) -> Option<usize> {
+    fn highlight_lines_in_place(lines: &mut [Line<'static>], tokens: &[String]) -> Option<usize> {
         if tokens.is_empty() {
             return None;
         }
@@ -1881,34 +1897,36 @@ impl SessionPicker {
         }
 
         let selected = self.onboarding_start_new_highlighted;
-        let (marker, marker_style, label_style) = if selected {
+        // Render "Start a new session" as a real button (a filled capsule when
+        // selected) instead of a bare text row, so first-run users immediately
+        // read it as the primary action rather than a list caption. The hint
+        // next to it spells out both moves: Enter commits, Down browses.
+        let (cap_style, body_style) = if selected {
             (
-                "▸ ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(rgb(20, 24, 32))
+                    .bg(accent)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
             (
-                "  ",
-                Style::default().fg(rgb(120, 120, 130)),
-                Style::default().fg(rgb(180, 180, 190)),
+                Style::default().fg(rgb(58, 62, 70)),
+                Style::default().fg(rgb(170, 174, 182)).bg(rgb(58, 62, 70)),
             )
         };
-        let start_new = Line::from(vec![
-            Span::styled(marker, marker_style),
-            Span::styled("Start a new session", label_style),
-            Span::styled(
-                "  (or pick a session below to resume)",
-                Style::default().fg(rgb(90, 90, 100)),
-            ),
-        ]);
-        let row = Paragraph::new(start_new).style(if selected {
-            Style::default().bg(rgb(40, 32, 60))
+        let hint = if selected {
+            "  Enter starts fresh · ↓ resume a session below"
         } else {
-            Style::default()
-        });
+            "  ↑ back to this button · Enter resumes the highlighted session"
+        };
+        let start_new = Line::from(vec![
+            Span::styled("\u{25D6}", cap_style),
+            Span::styled(" Start a new session ", body_style),
+            Span::styled("\u{25D7}", cap_style),
+            Span::styled(hint, Style::default().fg(rgb(120, 120, 130))),
+        ]);
+        let row = Paragraph::new(start_new);
         frame.render_widget(row, chunks[1]);
     }
 

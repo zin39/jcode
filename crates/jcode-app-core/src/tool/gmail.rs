@@ -47,6 +47,8 @@ struct GmailInput {
     remove_labels: Option<Vec<String>>,
     #[serde(default)]
     confirmed: Option<bool>,
+    #[serde(default)]
+    attachments: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -85,6 +87,11 @@ impl Tool for GmailTool {
                 "confirmed": {
                     "type": "boolean",
                     "description": "Confirm."
+                },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Absolute file paths to attach (for draft/send actions)."
                 }
             }
         })
@@ -238,7 +245,21 @@ impl Tool for GmailTool {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("thread_id is required for thread action"))?;
 
-                let thread = self.client.get_thread(id).await?;
+                // Accept a message ID too: if the thread lookup fails, try
+                // resolving the ID as a message and use its containing thread.
+                let thread = match self.client.get_thread(id).await {
+                    Ok(t) => t,
+                    Err(thread_err) => {
+                        match self.client.get_message(id, MessageFormat::Metadata).await {
+                            Ok(msg) => {
+                                let tid = msg.thread_id.ok_or(thread_err)?;
+                                self.client.get_thread(&tid).await?
+                            }
+                            Err(_) => return Err(thread_err),
+                        }
+                    }
+                };
+                let thread_id = thread.id.clone();
                 let messages = thread.messages.unwrap_or_default();
 
                 if messages.is_empty() {
@@ -247,19 +268,29 @@ impl Tool for GmailTool {
 
                 let mut results = Vec::new();
                 for (i, msg) in messages.iter().enumerate() {
-                    results.push(format!(
-                        "--- Message {} ---\nFrom: {}\nDate: {}\nSubject: {}\nSnippet: {}",
+                    let mut entry = format!(
+                        "--- Message {} ---\nID: {}\nFrom: {}\nDate: {}\nSubject: {}\nSnippet: {}",
                         i + 1,
+                        msg.id,
                         msg.from().unwrap_or("(unknown)"),
                         msg.date().unwrap_or(""),
                         msg.subject().unwrap_or("(no subject)"),
                         msg.snippet.as_deref().unwrap_or(""),
-                    ));
+                    );
+                    let attachments = msg.attachments();
+                    if !attachments.is_empty() {
+                        entry.push_str(&format!(
+                            "\nAttachments ({}):\n{}",
+                            attachments.len(),
+                            gmail::format_attachment_lines(&attachments)
+                        ));
+                    }
+                    results.push(entry);
                 }
 
                 Ok(ToolOutput::new(format!(
                     "Thread {} ({} messages):\n\n{}",
-                    id,
+                    thread_id,
                     messages.len(),
                     results.join("\n\n")
                 )))
@@ -293,20 +324,50 @@ impl Tool for GmailTool {
                 let subject = params.subject.as_deref().unwrap_or("");
                 let body = params.body.as_deref().unwrap_or("");
 
+                let attachments: Vec<std::path::PathBuf> = params
+                    .attachments
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                for path in &attachments {
+                    if !path.is_file() {
+                        return Ok(ToolOutput::new(format!(
+                            "Attachment not found or not a file: {}",
+                            path.display()
+                        )));
+                    }
+                }
+
                 let draft = self
                     .client
-                    .create_draft(
+                    .create_draft_with_attachments(
                         to,
                         subject,
                         body,
                         params.in_reply_to.as_deref(),
                         params.thread_id.as_deref(),
+                        &attachments,
                     )
                     .await?;
 
+                let attach_line = if attachments.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "Attachments ({}):\n{}\n",
+                        attachments.len(),
+                        attachments
+                            .iter()
+                            .map(|p| format!("  - {}", p.display()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
                 Ok(ToolOutput::new(format!(
-                    "Draft created successfully.\nDraft ID: {}\nTo: {}\nSubject: {}\n\nTo send this draft, use action 'send_draft' with draft_id '{}' and confirmed: true.",
-                    draft.id, to, subject, draft.id
+                    "Draft created successfully.\nDraft ID: {}\nTo: {}\nSubject: {}\n{}\nTo send this draft, use action 'send_draft' with draft_id '{}' and confirmed: true.",
+                    draft.id, to, subject, attach_line, draft.id
                 )))
             }
 
@@ -326,31 +387,64 @@ impl Tool for GmailTool {
                 let subject = params.subject.as_deref().unwrap_or("");
                 let body = params.body.as_deref().unwrap_or("");
 
+                let attachments: Vec<std::path::PathBuf> = params
+                    .attachments
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                for path in &attachments {
+                    if !path.is_file() {
+                        return Ok(ToolOutput::new(format!(
+                            "Attachment not found or not a file: {}",
+                            path.display()
+                        )));
+                    }
+                }
+
                 if params.confirmed != Some(true) {
+                    let attach_line = if attachments.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "Attachments:\n{}\n",
+                            attachments
+                                .iter()
+                                .map(|p| format!("  - {}", p.display()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    };
                     return Ok(ToolOutput::new(format!(
                         "CONFIRMATION REQUIRED: Send this email?\n\n\
                          To: {}\n\
                          Subject: {}\n\
+                         {}\
                          Body:\n{}\n\n\
                          To confirm, call gmail again with the same parameters and confirmed: true.",
-                        to, subject, body
+                        to, subject, attach_line, body
                     )));
                 }
 
                 let msg = self
                     .client
-                    .send_message(
+                    .send_message_with_attachments(
                         to,
                         subject,
                         body,
                         params.in_reply_to.as_deref(),
                         params.thread_id.as_deref(),
+                        &attachments,
                     )
                     .await?;
 
                 Ok(ToolOutput::new(format!(
-                    "Email sent successfully.\nMessage ID: {}\nTo: {}\nSubject: {}",
-                    msg.id, to, subject
+                    "Email sent successfully.\nMessage ID: {}\nTo: {}\nSubject: {}\nAttachments: {}",
+                    msg.id,
+                    to,
+                    subject,
+                    attachments.len()
                 )))
             }
 

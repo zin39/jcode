@@ -7,9 +7,10 @@ pub use jcode_config_types::{
     AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
     CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
     DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HooksConfig, KeybindingsConfig,
-    MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig, NamedProviderModelConfig,
-    NamedProviderType, NativeScrollbarConfig, NotificationsConfig, PowerConfig, ProviderConfig,
-    ReasoningDisplayMode, SafetyConfig, SessionPickerResumeAction, SwarmSpawnMode, TerminalConfig,
+    LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, NamedProviderAuth,
+    NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
+    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
+    SessionPickerResumeAction, SponsorsConfig, SwarmSpawnMode, SwarmStripLayout, TerminalConfig,
     UpdateChannel, WebSearchConfig, WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_BING_MARKET",
     "JCODE_CENTERED_TOGGLE_KEY",
     "JCODE_CHAT_NATIVE_SCROLLBAR",
+    "JCODE_COMPACT_NOTIFICATIONS",
     "JCODE_COPY_BADGE_ALT_LABEL",
     "JCODE_COPY_SELECTION_TOGGLE_KEY",
     "JCODE_COPILOT_PREMIUM",
@@ -83,6 +85,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_HOOK_SESSION_END",
     "JCODE_HOOK_SESSION_START",
     "JCODE_HOOK_TURN_END",
+    "JCODE_HOOK_TURN_START",
     "JCODE_IDLE_ANIMATION",
     "JCODE_IMAP_HOST",
     "JCODE_INFO_WIDGET_TOGGLE_KEY",
@@ -95,7 +98,16 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_JADE_RELAY_TOKEN",
     "JCODE_JADE_RELAY_TOKEN_ID",
     "JCODE_JADE_RELAY_USER_ID",
+    "JCODE_KV_CACHE_MISS_NOTICES",
+    "JCODE_LAST30DAYS_ENABLED",
+    "JCODE_LAST30DAYS_SCRIPT",
+    "JCODE_LAST30DAYS_SOURCES",
+    "JCODE_LAST30DAYS_TIMEOUT_SECS",
     "JCODE_MARKDOWN_SPACING",
+    "JCODE_MEMORY_EMBEDDING_BACKEND",
+    "JCODE_MEMORY_EMBEDDING_BASE_URL",
+    "JCODE_MEMORY_EMBEDDING_DIM",
+    "JCODE_MEMORY_EMBEDDING_MODEL",
     "JCODE_MEMORY_ENABLED",
     "JCODE_MEMORY_MODEL",
     "JCODE_MEMORY_SIDECAR_ENABLED",
@@ -134,6 +146,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_SCROLL_UP_FALLBACK_KEY",
     "JCODE_SCROLL_UP_KEY",
     "JCODE_SEARXNG_URL",
+    "JCODE_SHOW_AGENTGREP_OUTPUT",
     "JCODE_SHOW_DIFFS",
     "JCODE_SHOW_THINKING",
     "JCODE_SIDE_PANEL_TOGGLE_KEY",
@@ -143,7 +156,12 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_STREAM_IDLE_TIMEOUT_SECS",
     "JCODE_SWARM_ENABLED",
     "JCODE_SWARM_MODEL",
+    "JCODE_SWARM_MAX_CONCURRENT_AGENTS",
     "JCODE_SWARM_SPAWN_MODE",
+    "JCODE_SWARM_STRIP_LAYOUT",
+    "JCODE_TAVILY_API_KEY",
+    "JCODE_TAVILY_API_KEY_ENV",
+    "JCODE_TAVILY_SEARCH_DEPTH",
     "JCODE_TELEGRAM_BOT_TOKEN",
     "JCODE_TELEGRAM_CHAT_ID",
     "JCODE_TELEGRAM_REPLY_ENABLED",
@@ -192,8 +210,11 @@ struct ConfigCache {
 }
 
 static CONFIG_CACHE: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
-    let fingerprint = ConfigCacheFingerprint::current();
     let config = leak_config(Config::load());
+    // Fingerprint after the load: applying env overrides may set env vars
+    // (e.g. copilot_premium -> JCODE_COPILOT_PREMIUM), and fingerprinting
+    // first would guarantee a spurious full reload on the next check.
+    let fingerprint = ConfigCacheFingerprint::current();
     // Seed the global context-limit cache from named provider configs on first
     // load so every codepath (TUI info widget, compaction budget, model
     // switching) sees user-configured `context_window` values from the start.
@@ -218,21 +239,7 @@ fn leak_config(config: Config) -> &'static Config {
 /// deadlock) and shares its logic with
 /// `crate::provider::populate_context_limits_from_config`.
 fn populate_context_limits_from_config_ref(cfg: &Config) {
-    let mut limits = std::collections::HashMap::new();
-    for provider_cfg in cfg.providers.values() {
-        for model in &provider_cfg.models {
-            let id = model.id.trim();
-            if id.is_empty() {
-                continue;
-            }
-            if let Some(limit) = model.context_window {
-                limits.insert(id.to_ascii_lowercase(), limit);
-            }
-        }
-    }
-    if !limits.is_empty() {
-        crate::provider::populate_context_limits(limits);
-    }
+    crate::provider::populate_context_limits_from_config_value(cfg);
 }
 
 /// Get the global config instance.
@@ -273,7 +280,11 @@ pub fn config() -> &'static Config {
                 &fingerprint,
             ));
             cache.config = leak_config(Config::load());
-            cache.fingerprint = fingerprint;
+            // Loading applies env overrides that can themselves set env vars
+            // (e.g. copilot_premium propagates config -> JCODE_COPILOT_PREMIUM).
+            // Re-fingerprint after the load so those self-inflicted env changes
+            // don't trigger a guaranteed second reload on the next check.
+            cache.fingerprint = ConfigCacheFingerprint::current();
             cache.force_reload = false;
         }
         cache.config
@@ -281,6 +292,12 @@ pub fn config() -> &'static Config {
 
     if let Some(reason) = reload_reason {
         crate::logging::info(&format!("CONFIG_RELOAD {}", reason));
+        // A config reload can change config-derived system prompt sections
+        // (feature toggles, sponsors, ...), which legitimately invalidates the
+        // KV cache prefix of warm sessions. Document it so a subsequent
+        // harness-attributed cache miss is surfaced with this cause instead of
+        // as an unexplained prompt mutation.
+        crate::cache_invalidation::record("config reload", &reason);
         notify_config_reloaded();
         // Re-seed the global context-limit cache so user edits to named
         // provider `context_window` values take effect without a restart.
@@ -496,6 +513,11 @@ pub struct Config {
 
     /// Verification-before-done loop configuration
     pub verify: VerifyConfig,
+    /// Sponsored discovery configuration
+    pub sponsors: SponsorsConfig,
+
+    /// Global "launch a new jcode" hotkeys (macOS). Baked once by auto-import.
+    pub launch_hotkeys: LaunchHotkeysConfig,
 }
 
 /// Agent Client Protocol adapter configuration.
@@ -567,7 +589,7 @@ pub struct ToolSelection {
 }
 
 impl ToolConfig {
-    const DEFAULT_DISABLED_TOOLS: &'static [&'static str] = &["gmail", "lsp"];
+    const DEFAULT_DISABLED_TOOLS: &'static [&'static str] = &["gmail"];
 
     pub fn selection(&self) -> ToolSelection {
         let mut allowed_tools = self.base_allowed_tools();
@@ -634,8 +656,6 @@ impl ToolConfig {
                     "apply_patch",
                     "patch",
                     "agentgrep",
-                    "glob",
-                    "grep",
                     "ls",
                     "batch",
                 ]
@@ -654,8 +674,6 @@ impl ToolConfig {
                     "apply_patch",
                     "patch",
                     "agentgrep",
-                    "glob",
-                    "grep",
                     "ls",
                 ]
                 .into_iter()

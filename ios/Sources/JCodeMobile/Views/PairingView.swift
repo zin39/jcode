@@ -4,6 +4,7 @@ import SwiftUI
 /// First-run pairing: scan QR or type host/port/code.
 struct PairingView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var host = ""
     @State private var port = String(Gateway.defaultPort)
@@ -25,7 +26,7 @@ struct PairingView: View {
                 }
 
                 Card {
-                    VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 16) {
                         field("Host", text: $host, placeholder: "devbox.tailnet.ts.net")
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
@@ -39,19 +40,21 @@ struct PairingView: View {
 
                 Button(action: pair) {
                     HStack {
-                        if isPairing {
+                        if isPairing && !reduceMotion {
                             ProgressView().tint(.black)
                         }
                         Text(isPairing ? "Pairing..." : "Pair")
                             .font(.headline)
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
+                    .padding(.vertical, 16)
                     .background(canPair ? Theme.mint : Theme.surfaceElevated)
                     .foregroundStyle(canPair ? .black : Theme.textTertiary)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                 }
                 .disabled(!canPair || isPairing)
+                .accessibilityLabel("Pair")
+                .accessibilityHint("Connects using the host, port, and code above")
 
                 Button {
                     showScanner = true
@@ -68,6 +71,8 @@ struct PairingView: View {
                                 .stroke(Theme.border, lineWidth: 1)
                         )
                 }
+                .accessibilityLabel("Scan QR code")
+                .accessibilityHint("Opens the camera to scan a pairing code")
 
                 Text("Run `jcode pair` on your machine, then scan the QR code or enter the code manually. Traffic stays on your tailnet.")
                     .font(.footnote)
@@ -76,6 +81,7 @@ struct PairingView: View {
             .padding(16)
         }
         .scrollDismissesKeyboard(.interactively)
+        .dynamicTypeSize(.large ... .accessibility3)
         .sheet(isPresented: $showScanner) {
             QRScannerView { scanned in
                 showScanner = false
@@ -92,7 +98,7 @@ struct PairingView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("jcode")
                 .font(Theme.mono(34, weight: .bold))
                 .foregroundStyle(Theme.textPrimary)
@@ -109,16 +115,17 @@ struct PairingView: View {
     }
 
     private func field(_ label: String, text: Binding<String>, placeholder: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text(label)
                 .font(.caption)
                 .foregroundStyle(Theme.textTertiary)
             TextField(placeholder, text: text)
                 .font(Theme.mono(16))
                 .foregroundStyle(Theme.textPrimary)
-                .padding(10)
+                .padding(12)
                 .background(Theme.surfaceElevated)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
+                .accessibilityLabel(label)
         }
     }
 

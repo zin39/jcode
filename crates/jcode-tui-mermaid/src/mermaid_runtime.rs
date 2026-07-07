@@ -241,7 +241,17 @@ fn probe_picker() -> Picker {
     picker
 }
 
-fn prewarm_svg_font_db_async() {
+/// Start loading the system font database on a background thread.
+///
+/// Called lazily from [`crate::is_mermaid_lang`] the first time mermaid
+/// content is actually detected, NOT at startup: loading the font DB costs
+/// tens of milliseconds of CPU and most sessions never render a diagram, so
+/// prewarming on every spawn made the font load one of the larger fixed costs
+/// of launching a client. Detection happens while markdown is still
+/// streaming/rendering, so the DB is warm (or loading concurrently) by the
+/// time the first real diagram render needs it; if the render wins the race it
+/// just blocks on the same `LazyLock`.
+pub(crate) fn prewarm_svg_font_db_async() {
     SVG_FONT_DB_PREWARM_STARTED.get_or_init(|| {
         let _ = std::thread::Builder::new()
             .name("jcode-mermaid-fontdb-prewarm".to_string())
@@ -285,10 +295,24 @@ pub fn init_picker() {
             PickerInitMode::Probe => Some(probe_picker()),
         }
     });
-    prewarm_svg_font_db_async();
+    // Note: the SVG font-DB prewarm is intentionally NOT triggered here.
+    // init_picker() runs on every TUI startup, and the font load is only
+    // needed if a mermaid diagram is actually rendered; see
+    // prewarm_svg_font_db_async() for the lazy trigger.
     // Evict old cache files once per process
     CACHE_EVICTED.get_or_init(|| {
         evict_old_cache();
+    });
+}
+
+/// Force the global picker into Kitty protocol for deterministic benchmarks and
+/// tests. No-op if the picker is already initialized. Uses a font-size-correct
+/// fast picker base so cell<->pixel math matches a real Kitty terminal.
+pub fn force_test_kitty_picker() {
+    PICKER.get_or_init(|| {
+        let mut picker = fast_picker();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        Some(picker)
     });
 }
 
@@ -307,7 +331,35 @@ pub fn protocol_type() -> Option<ProtocolType> {
     }
 }
 
+thread_local! {
+    /// Scoped test override for image-protocol availability. The real signal
+    /// (PICKER) is a process-global OnceLock that any test can initialize as
+    /// a side effect, so "no protocol" tests need a thread-local pin instead
+    /// of relying on process-wide ordering.
+    static IMAGE_PROTOCOL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with image-protocol availability forced on/off on the current
+/// thread (or `None` to restore the real detection).
+pub fn with_image_protocol_override<T>(enabled: Option<bool>, f: impl FnOnce() -> T) -> T {
+    IMAGE_PROTOCOL_OVERRIDE.with(|cell| {
+        let prev = cell.replace(enabled);
+        struct Reset<'a>(&'a std::cell::Cell<Option<bool>>, Option<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _reset = Reset(cell, prev);
+        f()
+    })
+}
+
 pub fn image_protocol_available() -> bool {
+    if let Some(enabled) = IMAGE_PROTOCOL_OVERRIDE.with(|cell| cell.get()) {
+        return enabled;
+    }
     PICKER.get().and_then(|p| p.as_ref()).is_some() || VIDEO_EXPORT_MODE.load(Ordering::Relaxed)
 }
 
@@ -477,11 +529,23 @@ mod tests {
             Multiplexer::Zellij
         );
         assert_eq!(
-            detect_multiplexer(Some("tmux-256color"), Some("/tmp/tmux-1000/default,1,0"), None, None, None),
+            detect_multiplexer(
+                Some("tmux-256color"),
+                Some("/tmp/tmux-1000/default,1,0"),
+                None,
+                None,
+                None
+            ),
             Multiplexer::Tmux
         );
         assert_eq!(
-            detect_multiplexer(Some("screen.xterm-256color"), None, Some("1234.pts-0.host"), None, None),
+            detect_multiplexer(
+                Some("screen.xterm-256color"),
+                None,
+                Some("1234.pts-0.host"),
+                None,
+                None
+            ),
             Multiplexer::Screen
         );
         // TERM prefix alone is enough for screen/tmux even without TMUX/STY.
@@ -503,7 +567,13 @@ mod tests {
     fn detect_multiplexer_herdr_wins_over_others() {
         // Herdr is the most specific signal even if a stale TMUX leaks through.
         assert_eq!(
-            detect_multiplexer(Some("xterm-256color"), Some("/tmp/tmux"), None, None, Some("1")),
+            detect_multiplexer(
+                Some("xterm-256color"),
+                Some("/tmp/tmux"),
+                None,
+                None,
+                Some("1")
+            ),
             Multiplexer::Herdr
         );
     }
@@ -544,10 +614,7 @@ mod tests {
     #[test]
     fn probe_env_helper_back_compat() {
         // Unset / disabled keeps the historical fast default.
-        assert_eq!(
-            picker_init_mode_from_probe_env(None),
-            PickerInitMode::Fast
-        );
+        assert_eq!(picker_init_mode_from_probe_env(None), PickerInitMode::Fast);
         assert_eq!(
             picker_init_mode_from_probe_env(Some("0")),
             PickerInitMode::Fast

@@ -3,6 +3,7 @@ use crate::tool::selfdev::ReloadContext;
 use crate::tui::TuiState;
 use crate::tui::app as app_mod;
 use crate::tui::app::remote::swarm_plan_core::RemoteSwarmPlanSnapshot;
+use crate::tui::app::remote::swarm_status_core::swarm_status_transition_notice;
 
 fn allow_runtime_identity_mismatch() -> bool {
     std::env::var_os("JCODE_ALLOW_SERVER_VERSION_MISMATCH").is_some()
@@ -231,6 +232,310 @@ mod runtime_identity_tests {
     }
 }
 
+/// Fingerprint of the last fully-applied History payload for one client
+/// instance, so byte-identical bootstrap redeliveries can be dropped without
+/// rebuilding the display transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppliedHistoryFingerprint {
+    session_id: String,
+    fingerprint: u64,
+}
+
+/// Last fully-applied History payload fingerprint, keyed by
+/// `App::remote_client_instance_id`.
+///
+/// This is deliberately NOT stored on `RemoteConnection`: a reconnect builds a
+/// fresh connection (resetting `has_loaded_history`), and that reconnect
+/// re-bootstrap is exactly the duplicate full-payload delivery this state must
+/// survive to dedup. Keeping it module-local also keeps the dedup concern
+/// entirely inside the History handler. Entries are tiny (session id + u64);
+/// the map is bounded because many short-lived `App`s only exist in tests.
+static LAST_APPLIED_HISTORY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, AppliedHistoryFingerprint>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn last_applied_history_fingerprint(instance_id: &str) -> Option<AppliedHistoryFingerprint> {
+    LAST_APPLIED_HISTORY
+        .lock()
+        .ok()
+        .and_then(|map| map.get(instance_id).cloned())
+}
+
+fn record_applied_history_fingerprint(instance_id: &str, session_id: &str, fingerprint: u64) {
+    if let Ok(mut map) = LAST_APPLIED_HISTORY.lock() {
+        // Bound growth from short-lived test/replay Apps; one entry per live
+        // client is the steady state, so clearing is harmless (worst case one
+        // extra full re-apply per client).
+        if !map.contains_key(instance_id) && map.len() >= 64 {
+            map.clear();
+        }
+        map.insert(
+            instance_id.to_string(),
+            AppliedHistoryFingerprint {
+                session_id: session_id.to_string(),
+                fingerprint,
+            },
+        );
+    }
+}
+
+/// Hash a JSON value structurally without serializing it to a string, so large
+/// tool inputs contribute to the fingerprint in one allocation-free pass.
+fn hash_json_value(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match value {
+        serde_json::Value::Null => 0u8.hash(hasher),
+        serde_json::Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        serde_json::Value::Number(n) => {
+            2u8.hash(hasher);
+            n.to_string().hash(hasher);
+        }
+        serde_json::Value::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        serde_json::Value::Array(items) => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                hash_json_value(item, hasher);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            5u8.hash(hasher);
+            map.len().hash(hasher);
+            for (key, item) in map {
+                key.hash(hasher);
+                hash_json_value(item, hasher);
+            }
+        }
+    }
+}
+
+/// Cheap structural fingerprint of a full History payload.
+///
+/// Reconnects, session-switch storms, and the history-recovery watchdog can
+/// redeliver the same multi-megabyte bootstrap payload within seconds.
+/// Re-applying it rebuilds the whole display transcript (~3-4x the wire size
+/// in transient arenas) for zero visible change. One pass over message bytes,
+/// no allocations proportional to payload size.
+fn history_payload_fingerprint(messages: &[crate::protocol::HistoryMessage]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    messages.len().hash(&mut hasher);
+    for message in messages {
+        message.role.hash(&mut hasher);
+        message.content.hash(&mut hasher);
+        match &message.tool_calls {
+            Some(calls) => {
+                calls.len().hash(&mut hasher);
+                for call in calls {
+                    call.hash(&mut hasher);
+                }
+            }
+            None => usize::MAX.hash(&mut hasher),
+        }
+        match &message.tool_data {
+            Some(tool) => {
+                1u8.hash(&mut hasher);
+                tool.id.hash(&mut hasher);
+                tool.name.hash(&mut hasher);
+                tool.intent.hash(&mut hasher);
+                tool.thought_signature.hash(&mut hasher);
+                hash_json_value(&tool.input, &mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
+/// Pure skip decision for a full History payload: skip only when the session
+/// did not change, the display still has content to preserve, and the payload
+/// fingerprints identical to the one most recently applied for this session.
+/// Session switches and rewinds always re-apply (a rewind's truncated payload
+/// fingerprints differently, and a session switch flips `session_changed`).
+fn should_skip_identical_history_payload(
+    session_changed: bool,
+    display_is_empty: bool,
+    last_applied: Option<&AppliedHistoryFingerprint>,
+    session_id: &str,
+    fingerprint: u64,
+) -> bool {
+    !session_changed
+        && !display_is_empty
+        && last_applied
+            .is_some_and(|entry| entry.session_id == session_id && entry.fingerprint == fingerprint)
+}
+
+/// True when the incoming rendered-image set is (cheaply) identical to the
+/// already-retained set: same count and, per image, same data length plus
+/// equal cheap metadata. Image data is compared by length only so duplicate
+/// multi-megabyte base64 payloads are never traversed byte-by-byte.
+fn history_images_match_retained(
+    incoming: &[crate::session::RenderedImage],
+    retained: &[crate::session::RenderedImage],
+) -> bool {
+    incoming.len() == retained.len()
+        && incoming.iter().zip(retained.iter()).all(|(a, b)| {
+            a.data.len() == b.data.len()
+                && a.media_type == b.media_type
+                && a.label == b.label
+                && a.source == b.source
+                && a.anchor == b.anchor
+        })
+}
+
+#[cfg(test)]
+mod history_dedup_tests {
+    use super::{
+        AppliedHistoryFingerprint, history_images_match_retained, history_payload_fingerprint,
+        should_skip_identical_history_payload,
+    };
+    use crate::protocol::HistoryMessage;
+    use crate::session::{RenderedImage, RenderedImageSource};
+
+    fn message(role: &str, content: &str) -> HistoryMessage {
+        HistoryMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_data: None,
+        }
+    }
+
+    fn image(data: &str) -> RenderedImage {
+        RenderedImage {
+            media_type: "image/png".to_string(),
+            data: data.to_string(),
+            label: None,
+            source: RenderedImageSource::UserInput,
+            anchor: None,
+        }
+    }
+
+    #[test]
+    fn identical_payloads_fingerprint_equal() {
+        let a = vec![message("user", "hi"), message("assistant", "hello")];
+        let b = vec![message("user", "hi"), message("assistant", "hello")];
+        assert_eq!(
+            history_payload_fingerprint(&a),
+            history_payload_fingerprint(&b)
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_on_content_role_count_and_tool_data() {
+        let base = vec![message("user", "hi"), message("assistant", "hello")];
+        let fp = history_payload_fingerprint(&base);
+
+        let content = vec![message("user", "hi"), message("assistant", "hello!")];
+        assert_ne!(fp, history_payload_fingerprint(&content));
+
+        let role = vec![message("user", "hi"), message("system", "hello")];
+        assert_ne!(fp, history_payload_fingerprint(&role));
+
+        let count = vec![message("user", "hi")];
+        assert_ne!(fp, history_payload_fingerprint(&count));
+
+        let mut tool = base.clone();
+        tool[1].tool_data = Some(super::ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            intent: None,
+            thought_signature: None,
+        });
+        assert_ne!(fp, history_payload_fingerprint(&tool));
+
+        // Same tool call with different input must differ too.
+        let mut tool_other = tool.clone();
+        tool_other[1].tool_data.as_mut().unwrap().input = serde_json::json!({"command": "pwd"});
+        assert_ne!(
+            history_payload_fingerprint(&tool),
+            history_payload_fingerprint(&tool_other)
+        );
+    }
+
+    #[test]
+    fn skip_decision_requires_same_session_same_fingerprint_and_intact_display() {
+        let entry = AppliedHistoryFingerprint {
+            session_id: "ses_a".to_string(),
+            fingerprint: 42,
+        };
+
+        // Exact match with intact display and unchanged session -> skip.
+        assert!(should_skip_identical_history_payload(
+            false,
+            false,
+            Some(&entry),
+            "ses_a",
+            42
+        ));
+        // Session switch must always re-apply.
+        assert!(!should_skip_identical_history_payload(
+            true,
+            false,
+            Some(&entry),
+            "ses_a",
+            42
+        ));
+        // A cleared display must be repopulated even for an identical payload.
+        assert!(!should_skip_identical_history_payload(
+            false,
+            true,
+            Some(&entry),
+            "ses_a",
+            42
+        ));
+        // Different session id -> re-apply.
+        assert!(!should_skip_identical_history_payload(
+            false,
+            false,
+            Some(&entry),
+            "ses_b",
+            42
+        ));
+        // Different payload (e.g. rewind truncation) -> re-apply.
+        assert!(!should_skip_identical_history_payload(
+            false,
+            false,
+            Some(&entry),
+            "ses_a",
+            43
+        ));
+        // Nothing applied yet -> re-apply.
+        assert!(!should_skip_identical_history_payload(
+            false, false, None, "ses_a", 42
+        ));
+    }
+
+    #[test]
+    fn images_match_retained_compares_count_and_lengths() {
+        let retained = vec![image("aaaa"), image("bbbbbb")];
+        let same = vec![image("aaaa"), image("bbbbbb")];
+        assert!(history_images_match_retained(&same, &retained));
+        // Length-only comparison: equal lengths count as identical.
+        let same_len = vec![image("cccc"), image("dddddd")];
+        assert!(history_images_match_retained(&same_len, &retained));
+
+        assert!(!history_images_match_retained(&[], &retained));
+        let fewer = vec![image("aaaa")];
+        assert!(!history_images_match_retained(&fewer, &retained));
+        let diff_len = vec![image("aaaa"), image("bbbbb")];
+        assert!(!history_images_match_retained(&diff_len, &retained));
+        let mut diff_meta = vec![image("aaaa"), image("bbbbbb")];
+        diff_meta[0].media_type = "image/jpeg".to_string();
+        assert!(!history_images_match_retained(&diff_meta, &retained));
+        assert!(history_images_match_retained(&[], &[]));
+    }
+}
+
 pub(in crate::tui::app) fn handle_server_event(
     app: &mut App,
     event: ServerEvent,
@@ -411,6 +716,10 @@ pub(in crate::tui::app) fn handle_server_event(
             if let Some(key) = App::experimental_feature_key_for_tool(&tool_call) {
                 app.note_experimental_feature_use(key);
             }
+            if tool_call.name == "swarm" {
+                app.maybe_surface_swarm_config_hint();
+            }
+            app.maybe_surface_sponsor_disclosure(&tool_call.name);
             if let Some(tc) = app.streaming_tool_calls.iter_mut().find(|tc| tc.id == id) {
                 tc.input = parsed_input;
                 tc.refresh_intent_from_input();
@@ -457,14 +766,15 @@ pub(in crate::tui::app) fn handle_server_event(
             let previous_cache_creation = app.streaming.streaming_cache_creation_tokens;
             let was_recorded = app.kv_cache.current_api_usage_recorded;
             app.accumulate_streaming_output_tokens(output, call_output_tokens_seen);
-            app.streaming.streaming_input_tokens = input;
+            // Per-call replace semantics for input/cache counters: a stale
+            // cache-read figure from a previous call must not leak into this
+            // call's context accounting (issue #441).
+            app.apply_stream_usage_input_report(
+                Some(input),
+                cache_read_input,
+                cache_creation_input,
+            );
             app.streaming.streaming_output_tokens = output;
-            if cache_read_input.is_some() {
-                app.streaming.streaming_cache_read_tokens = cache_read_input;
-            }
-            if cache_creation_input.is_some() {
-                app.streaming.streaming_cache_creation_tokens = cache_creation_input;
-            }
             if app.record_completed_stream_cache_usage() {
                 app.token_accounting.total_input_tokens = app
                     .token_accounting
@@ -486,7 +796,15 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.last_api_completed = Some(Instant::now());
                 app.last_api_completed_provider = Some(<App as TuiState>::provider_name(app));
                 app.last_api_completed_model = Some(<App as TuiState>::provider_model(app));
-                app.last_turn_input_tokens = (input > 0).then_some(input);
+                // Effective prompt (input + read + creation), matching the
+                // local push_turn_footer path: this feeds the cache
+                // countdown/cold indicators as "what gets resent".
+                let effective = crate::tui::info_widget::effective_prompt_tokens(
+                    input,
+                    app.streaming.streaming_cache_read_tokens.unwrap_or(0),
+                    app.streaming.streaming_cache_creation_tokens.unwrap_or(0),
+                );
+                app.last_turn_input_tokens = (effective > 0).then_some(effective);
             } else if was_recorded && app.kv_cache.current_api_usage_recorded {
                 app.token_accounting.total_input_tokens = app
                     .token_accounting
@@ -549,20 +867,26 @@ pub(in crate::tui::app) fn handle_server_event(
                         Some(app.streaming.streaming_cache_creation_tokens.unwrap_or(0));
                 }
 
+                let effective_prompt_tokens = crate::tui::info_widget::effective_prompt_tokens(
+                    input,
+                    app.streaming.streaming_cache_read_tokens.unwrap_or(0),
+                    app.streaming.streaming_cache_creation_tokens.unwrap_or(0),
+                );
                 if let Some(baseline) = app.kv_cache.kv_cache_baseline.as_mut() {
-                    baseline.input_tokens = input;
+                    // Store the effective prompt (input + read + creation): for
+                    // split-accounting providers bare `input` is only the
+                    // uncached remainder, while the whole effective prompt is
+                    // what gets resent when the cache goes cold.
+                    baseline.input_tokens = effective_prompt_tokens;
                     baseline.completed_at = Instant::now();
                 }
                 app.token_accounting.cache_next_optimal_input_tokens =
-                    Some(crate::tui::info_widget::effective_prompt_tokens(
-                        input,
-                        app.streaming.streaming_cache_read_tokens.unwrap_or(0),
-                        app.streaming.streaming_cache_creation_tokens.unwrap_or(0),
-                    ));
+                    Some(effective_prompt_tokens);
                 app.last_api_completed = Some(Instant::now());
                 app.last_api_completed_provider = Some(<App as TuiState>::provider_name(app));
                 app.last_api_completed_model = Some(<App as TuiState>::provider_model(app));
-                app.last_turn_input_tokens = (input > 0).then_some(input);
+                app.last_turn_input_tokens =
+                    (effective_prompt_tokens > 0).then_some(effective_prompt_tokens);
             }
             eager_stream_redraw && matches!(app.status, ProcessingStatus::Streaming)
         }
@@ -621,8 +945,15 @@ pub(in crate::tui::app) fn handle_server_event(
             };
             app.status = if matches!(cp, crate::message::ConnectionPhase::Streaming) {
                 app.resume_streaming_tps();
+                app.connection_phase_started = None;
                 ProcessingStatus::Streaming
             } else {
+                // Start the "suspiciously long" timer when we first enter the
+                // connecting group so later round-trips in a turn don't inherit
+                // the whole-turn elapsed and immediately render yellow.
+                if !matches!(app.status, ProcessingStatus::Connecting(_)) {
+                    app.connection_phase_started = Some(Instant::now());
+                }
                 ProcessingStatus::Connecting(cp)
             };
             eager_stream_redraw
@@ -657,6 +988,7 @@ pub(in crate::tui::app) fn handle_server_event(
             ));
             app.rollback_streaming_attempt();
             remote.clear_pending();
+            app.connection_phase_started = Some(Instant::now());
             app.status = ProcessingStatus::Connecting(crate::message::ConnectionPhase::Retrying {
                 attempt,
                 max,
@@ -736,6 +1068,30 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             auto_poked
         }
+        ServerEvent::ProviderGuardrail {
+            stop_reason,
+            message,
+        } => {
+            crate::logging::warn(&format!(
+                "PROVIDER_GUARDRAIL_EVENT session={:?} stop_reason={:?}",
+                app.remote_session_id, stop_reason
+            ));
+            let label = stop_reason
+                .as_deref()
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or("guardrail");
+            // Plain text prefix: U+1F6E1 shield renders poorly in some
+            // terminals (kitty shows a narrow monochrome glyph).
+            app.push_display_message(DisplayMessage::system(format!("[guardrail] {}", message)));
+            app.set_status_notice(format!("Provider guardrail: {}", label));
+            // Guardrail refusals are model-side policy stops: retrying the
+            // same model usually refuses again, but a stronger model often
+            // handles the same legitimate request. Offer a one-keypress
+            // reroute to the strongest Anthropic route and resend. The offer
+            // sets its own (more actionable) status notice when armed.
+            app.offer_guardrail_reroute();
+            true
+        }
         ServerEvent::Done { id } => {
             let mut auto_poked = false;
             let mut completed_current_message = false;
@@ -764,6 +1120,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 }
                 completed_current_message = true;
                 app.clear_pending_remote_retry();
+                app.reset_credential_failure_breaker();
                 let ops = app.stream_buffer.flush();
                 app.apply_stream_ops(ops);
                 // The turn can finish with a reasoning region still open (the
@@ -815,6 +1172,10 @@ pub(in crate::tui::app) fn handle_server_event(
                 remote.clear_pending();
                 remote.reset_call_output_tokens_seen();
                 app.note_runtime_memory_event_force("turn_completed", "remote_turn_finished");
+                crate::process_memory::release_retained_heap_debounced(
+                    "client_turn_completed",
+                    std::time::Duration::from_secs(30),
+                );
                 auto_poked = app.schedule_auto_poke_followup_if_needed()
                     || app.schedule_overnight_poke_followup_if_needed();
                 if !auto_poked {
@@ -844,6 +1205,34 @@ pub(in crate::tui::app) fn handle_server_event(
             retry_after_secs,
             ..
         } => {
+            // The server rejects a Message request with this error while its
+            // previous turn is still running. This typically happens when a
+            // reload/reconnect raced the turn-end dispatch: the history
+            // activity snapshot said "idle", the client dequeued and sent a
+            // queued follow-up, but the server-side turn had not actually
+            // finished. Dropping the pending send here would silently lose the
+            // user's queued message (issue #391). Instead, put it back on the
+            // queue and re-adopt the running-turn state so the queue
+            // dispatches once the real turn completes.
+            if message == "Already processing a message"
+                && recover_undelivered_queued_continuation(app, "server busy rejection")
+            {
+                app.is_processing = true;
+                app.status = ProcessingStatus::Thinking(Instant::now());
+                app.current_message_id = None;
+                app.processing_started.get_or_insert_with(Instant::now);
+                app.last_stream_activity = Some(Instant::now());
+                app.remote_resume_activity = Some(RemoteResumeActivity {
+                    session_id: app.remote_session_id.clone().unwrap_or_default(),
+                    observed_at: Instant::now(),
+                    current_tool_name: None,
+                });
+                app.set_status_notice("Server still busy; follow-up stays queued");
+                crate::logging::info(
+                    "Server rejected queued continuation because a turn is still running; re-queued it and re-adopted the running turn",
+                );
+                return true;
+            }
             let reset_duration = retry_after_secs
                 .map(Duration::from_secs)
                 .or_else(|| parse_rate_limit_error(&message));
@@ -876,6 +1265,20 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             let is_failover_prompt =
                 crate::provider::parse_failover_prompt_message(&message).is_some();
+            // Snapshot the failed turn's payload before the cleanup below (and
+            // the retry-budget bookkeeping) clears it, so a fallback offer
+            // armed at a terminal no-retry point can resend it after the user
+            // accepts a switch to a working route.
+            let failed_fallback_payload = app.rate_limit_pending_message.as_ref().map(|pending| {
+                app_mod::FallbackResendPayload {
+                    content: pending.content.clone(),
+                    images: pending.images.clone(),
+                    is_system: pending.is_system,
+                    auto_retry: pending.auto_retry,
+                    system_reminder: pending.system_reminder.clone(),
+                    raw_input: app.last_submitted_input.clone(),
+                }
+            });
             app.push_display_message(DisplayMessage {
                 role: "error".to_string(),
                 content: message.clone(),
@@ -914,6 +1317,44 @@ pub(in crate::tui::app) fn handle_server_event(
             {
                 return false;
             }
+            // Credential-failure circuit breaker: repeated auth failures mean
+            // the login/API key is dead. Resending the identical request can
+            // never succeed and (before this breaker) produced runaway retry
+            // loops logging thousands of 401s per session. Stop every
+            // automatic resend path and tell the user to /login or /model.
+            if !is_connectivity_error && app.note_error_for_credential_breaker(&message) {
+                app.trip_credential_failure_breaker(&message);
+                app.offer_fallback_after_error_with_payload(
+                    &message,
+                    failed_fallback_payload.clone(),
+                );
+                return false;
+            }
+            // Deterministic model/endpoint-capability failures (e.g. Volcengine
+            // Ark's coding-plan endpoint returning 404 UnsupportedModel, or a
+            // model-not-found) can never succeed by resending the identical
+            // request. Fail fast with an actionable hint instead of burning the
+            // auto-retry budget on guaranteed 4xx responses (#387).
+            if crate::tui::app::commands::is_fatal_model_endpoint_error(&message) {
+                app.clear_pending_remote_retry();
+                if app.auto_poke_incomplete_todos {
+                    crate::tui::app::commands::stop_auto_poke_for_non_retryable_error(
+                        app, &message,
+                    );
+                }
+                app.push_display_message(DisplayMessage::system(
+                    "🛑 Not retrying: the model is not valid for the configured endpoint (e.g. an Ark coding-plan endpoint rejecting a model without the coding plan feature, or a model-not-found). Check the model name and base URL (the coding endpoint `/api/coding/v3` only accepts coding-plan models; use `/api/v3` otherwise), then send again.".to_string(),
+                ));
+                app.set_status_notice("Stopped: model/endpoint mismatch");
+                app.restore_failed_input_to_box();
+                // Switching models is exactly the right fix for a
+                // model/endpoint mismatch: offer the next best route.
+                app.offer_fallback_after_error_with_payload(
+                    &message,
+                    failed_fallback_payload.clone(),
+                );
+                return false;
+            }
             if app.auto_poke_incomplete_todos
                 && crate::tui::app::commands::is_non_retryable_auto_poke_error(&message)
             {
@@ -924,9 +1365,20 @@ pub(in crate::tui::app) fn handle_server_event(
                     return false;
                 }
                 crate::tui::app::commands::stop_auto_poke_for_non_retryable_error(app, &message);
+                // Terminal: no retry will fire. Offer a one-keypress switch to
+                // the next best model/auth-method (e.g. an expired OAuth login
+                // -> a working provider) with the failed payload staged.
+                app.offer_fallback_after_error_with_payload(
+                    &message,
+                    failed_fallback_payload.clone(),
+                );
                 return false;
             }
             if app.stop_overnight_auto_poke_for_non_retryable_error(&message) {
+                app.offer_fallback_after_error_with_payload(
+                    &message,
+                    failed_fallback_payload.clone(),
+                );
                 return false;
             }
             if !is_failover_prompt && !app.schedule_pending_remote_retry("⚠ Remote request failed.")
@@ -935,6 +1387,11 @@ pub(in crate::tui::app) fn handle_server_event(
                 // No automatic retry will resend this turn, so restore the prompt the
                 // user typed back into the input box instead of dropping it.
                 app.restore_failed_input_to_box();
+                // Offer a one-keypress switch to the next best model/auth-method
+                // and resend (e.g. expired OpenAI OAuth session -> a provider
+                // that is known to work), instead of leaving the user to run
+                // /login or /model manually.
+                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
                 return app.schedule_auto_poke_followup_if_needed()
                     || app.schedule_overnight_poke_followup_if_needed();
             }
@@ -996,7 +1453,12 @@ pub(in crate::tui::app) fn handle_server_event(
         }
         ServerEvent::Reloading { .. } => {
             app.append_reload_message("🔄 Server reload initiated...");
-            false
+            // In-process server reloads (self-dev build-reload) keep the same
+            // server PID and never disconnect this client, so the reconnect-time
+            // client re-exec never fires. If a newer client binary is on disk and
+            // we are idle, re-exec now so client-side (TUI) changes also take
+            // effect. No-op for non-selfdev sessions or when already current.
+            app.maybe_self_reload_after_server_reload()
         }
         ServerEvent::ReloadProgress {
             step,
@@ -1233,7 +1695,20 @@ pub(in crate::tui::app) fn handle_server_event(
             app.remote_service_tier = service_tier;
             app.remote_compaction_mode = Some(compaction_mode);
             app.set_side_panel_snapshot(side_panel);
-            app.remote_side_pane_images = images;
+            if history_images_match_retained(&images, &app.remote_side_pane_images) {
+                // The already-retained image set is identical (count + per-image
+                // byte length + metadata). Drop the incoming copy immediately so
+                // two full base64 payloads are never alive side by side.
+                if !images.is_empty() {
+                    crate::logging::info(&format!(
+                        "History images identical to retained set ({} images); dropping incoming copy",
+                        images.len()
+                    ));
+                }
+                drop(images);
+            } else {
+                app.remote_side_pane_images = images;
+            }
             app.persist_remote_model_catalog_cache();
             app.remote_skills = skills;
             app.invalidate_command_candidates_cache();
@@ -1346,18 +1821,92 @@ pub(in crate::tui::app) fn handle_server_event(
                         "Preserving locally restored display history for metadata-only History bootstrap",
                     );
                 } else {
-                    let restored_messages = messages
-                        .into_iter()
-                        .map(|msg| DisplayMessage {
-                            role: msg.role,
-                            content: msg.content,
-                            tool_calls: msg.tool_calls.unwrap_or_default(),
-                            duration_secs: None,
-                            title: None,
-                            tool_data: msg.tool_data,
-                        })
-                        .collect();
-                    app.replace_display_messages(restored_messages);
+                    let fingerprint = history_payload_fingerprint(&messages);
+                    let last_applied =
+                        last_applied_history_fingerprint(&app.remote_client_instance_id);
+                    if should_skip_identical_history_payload(
+                        session_changed,
+                        app.display_messages().is_empty(),
+                        last_applied.as_ref(),
+                        &session_id,
+                        fingerprint,
+                    ) {
+                        // Watchdog re-requests and reconnect re-bootstraps can
+                        // redeliver a byte-identical full payload seconds apart.
+                        // Rebuilding the transcript would stack multi-megabyte
+                        // transient arenas for zero visible change, so drop the
+                        // payload here instead of re-applying it.
+                        crate::logging::info(&format!(
+                            "Skipping re-apply of identical History payload (session={}, messages={}, fingerprint={:x})",
+                            session_id, history_message_count, fingerprint
+                        ));
+                        drop(messages);
+                    } else {
+                        let restored_messages = messages
+                            .into_iter()
+                            .map(|msg| DisplayMessage {
+                                role: msg.role,
+                                content: msg.content,
+                                tool_calls: msg.tool_calls.unwrap_or_default(),
+                                duration_secs: None,
+                                title: None,
+                                tool_data: msg.tool_data,
+                            })
+                            .collect();
+                        app.replace_display_messages(restored_messages);
+                        // A same-session forced re-apply (rewind / rewind-undo
+                        // truncation, or a deferred bootstrap) rebuilds the
+                        // transcript without running the session_changed
+                        // clears above. Drop any streaming preview diagram so
+                        // it cannot keep rendering a mermaid block from a
+                        // message that was just truncated away. This is safe
+                        // for a genuinely live stream: every streaming render
+                        // frame re-registers the preview
+                        // (markdown_render_full.rs set_streaming_preview_diagram).
+                        if !session_changed {
+                            crate::tui::mermaid::clear_streaming_preview_diagram();
+                            // A rewind (or rewind-undo) re-apply can race a
+                            // stale `Done` from the just-finished turn: the
+                            // History payload is written directly to the
+                            // socket by handle_get_history while the Done is
+                            // still queued in the per-client event forwarder
+                            // (server/client_lifecycle.rs), so the client can
+                            // apply the truncated transcript FIRST and process
+                            // the Done SECOND. The Done handler flushes
+                            // stream_buffer and commits any non-empty
+                            // streaming_text as an assistant message plus a
+                            // turn footer, resurrecting content that was just
+                            // rewound away. Drop all stale streaming state
+                            // here so the late Done settles the turn without
+                            // appending anything. This is gated on the pending
+                            // rewind notice (armed by the client /rewind path
+                            // before the redelivery) because other same-session
+                            // re-applies, like a reconnect bootstrap during a
+                            // live turn, may hold legitimately buffered stream
+                            // chunks. The server rejects rewinds while a turn
+                            // is processing, so streaming state present at this
+                            // point is stale by construction.
+                            if app.pending_remote_rewind_notice.is_some() {
+                                app.stream_buffer.clear();
+                                app.clear_streaming_render_state();
+                                app.streaming_tool_calls.clear();
+                                app.batch_progress = None;
+                                app.thought_line_inserted = false;
+                                app.thinking_prefix_emitted = false;
+                                app.thinking_buffer.clear();
+                                app.streaming.streaming_input_tokens = 0;
+                                app.streaming.streaming_output_tokens = 0;
+                                app.streaming.streaming_cache_read_tokens = None;
+                                app.streaming.streaming_cache_creation_tokens = None;
+                                app.reset_streaming_tps();
+                            }
+                        }
+                        record_applied_history_fingerprint(
+                            &app.remote_client_instance_id,
+                            &session_id,
+                            fingerprint,
+                        );
+                    }
                 }
 
                 if history_matches_pending_startup_prompt(app) {
@@ -1371,6 +1920,7 @@ pub(in crate::tui::app) fn handle_server_event(
                     app.set_status_notice("Reload complete - prompt preserved");
                 }
                 app.note_runtime_memory_event_force("history_loaded", "remote_history_applied");
+                crate::process_memory::release_retained_heap("client_history_loaded");
                 if let Some(notice) = app.pending_remote_rewind_notice.take() {
                     let content = if notice.undo {
                         "✓ Undid rewind. Restored the messages removed by the last rewind."
@@ -1396,6 +1946,12 @@ pub(in crate::tui::app) fn handle_server_event(
             }
 
             app.maybe_show_catchup_after_history(&session_id);
+
+            // The bootstrap above may have cleared/replaced the transcript for a
+            // brand-new session, wiping the startup notice card (launch-hotkeys /
+            // welcome tip). Re-apply it so it stays visible on the idle screen
+            // instead of flashing for a moment and disappearing.
+            app.reapply_pending_startup_notice_if_cleared();
 
             let should_consume_pending_reload_status = match app
                 .pending_reload_reconnect_status
@@ -1550,6 +2106,26 @@ pub(in crate::tui::app) fn handle_server_event(
         }
         ServerEvent::SwarmStatus { members } => {
             if app.swarm_enabled {
+                // Surface member lifecycle transitions (done/failed/blocked/
+                // stopped) as a status notice, the same way plan syncs are
+                // surfaced. Diff within the subtree this session manages (the
+                // same scoping the inline strip uses), so agents belonging to
+                // other sessions in a shared swarm stay silent.
+                let self_id = if app.is_remote {
+                    app.remote_session_id.clone()
+                } else {
+                    Some(app.session.id.clone())
+                };
+                if let Some(self_id) = self_id.as_deref() {
+                    let prev = app_mod::tui_state::filter_inline_swarm_subtree(
+                        &app.remote_swarm_members,
+                        self_id,
+                    );
+                    let next = app_mod::tui_state::filter_inline_swarm_subtree(&members, self_id);
+                    if let Some(notice) = swarm_status_transition_notice(&prev, &next) {
+                        app.set_status_notice(notice);
+                    }
+                }
                 app.remote_swarm_members = members;
                 persist_swarm_status_snapshot(app);
             } else {
@@ -1566,27 +2142,58 @@ pub(in crate::tui::app) fn handle_server_event(
             summary,
             ..
         } => {
-            let snapshot = RemoteSwarmPlanSnapshot {
-                swarm_id: swarm_id.clone(),
-                version,
-                items: items.clone(),
-                participants: participants.clone(),
-                reason: reason.clone(),
-                summary,
-            };
-            let notice = snapshot.status_notice();
-            app.swarm_plan_swarm_id = Some(snapshot.swarm_id.clone());
-            app.swarm_plan_version = Some(snapshot.version);
-            app.swarm_plan_items = snapshot.items.clone();
-            persist_swarm_plan_snapshot(
-                app,
-                snapshot.swarm_id,
-                snapshot.version,
-                snapshot.items,
-                snapshot.participants,
-                snapshot.reason,
-            );
-            app.set_status_notice(notice);
+            // Drop stale out-of-order broadcasts. Server-side plan mutations
+            // snapshot under the lock but send after releasing it, so two
+            // racing mutations can deliver an older version after a newer
+            // one; applying it would regress both the snapshot state and the
+            // inline diagram. Same-swarm version regressions are ignored,
+            // except near v1 (a deleted-and-recreated plan restarts its
+            // version counter and must still render).
+            let stale_regression = app.swarm_plan_swarm_id.as_deref() == Some(swarm_id.as_str())
+                && app
+                    .swarm_plan_version
+                    .is_some_and(|current| version < current)
+                && version > 2;
+            if !stale_regression {
+                let snapshot = RemoteSwarmPlanSnapshot {
+                    swarm_id: swarm_id.clone(),
+                    version,
+                    items: items.clone(),
+                    participants: participants.clone(),
+                    reason: reason.clone(),
+                    summary,
+                };
+                let notice = snapshot.status_notice();
+                app.swarm_plan_swarm_id = Some(snapshot.swarm_id.clone());
+                app.swarm_plan_version = Some(snapshot.version);
+                app.swarm_plan_items = snapshot.items.clone();
+                // Render the plan's task DAG as an inline chat diagram: the graph
+                // is pushed as a normal swarm message containing a mermaid fence,
+                // so it renders through the standard markdown/mermaid pipeline and
+                // scrolls by like any other transcript image. Plan updates
+                // coalesce onto a single transcript message (see
+                // upsert_trailing_swarm_plan_graph_message) instead of stacking
+                // one diagram per assignment churn. Skipped only when mermaid
+                // rendering is opted out (JCODE_ENABLE_MERMAID=0), since a raw
+                // mermaid source block would just be noise.
+                if crate::tui::markdown::mermaid_rendering_enabled()
+                    && let Some(graph) =
+                        crate::tui::swarm_plan_graph::swarm_plan_mermaid(&app.swarm_plan_items)
+                {
+                    let title = format!("Plan graph · v{}", snapshot.version);
+                    let content = format!("```mermaid\n{}\n```", graph.trim_end());
+                    app.upsert_trailing_swarm_plan_graph_message(title, content);
+                }
+                persist_swarm_plan_snapshot(
+                    app,
+                    snapshot.swarm_id,
+                    snapshot.version,
+                    snapshot.items,
+                    snapshot.participants,
+                    snapshot.reason,
+                );
+                app.set_status_notice(notice);
+            }
             false
         }
         ServerEvent::SwarmPlanProposal {
@@ -1632,6 +2239,16 @@ pub(in crate::tui::app) fn handle_server_event(
             if let Some(err) = error {
                 if let Some(prepared) = app.pending_prompt_after_model_switch.take() {
                     super::input_dispatch::restore_prepared_remote_input(app, prepared);
+                }
+                // A fallback-offer resend cannot go out on the failed switch;
+                // drop it and put the prompt back in the input box instead.
+                if let Some(payload) = app.pending_fallback_resend.take()
+                    && let Some(raw_input) = payload.raw_input
+                    && !raw_input.trim().is_empty()
+                    && app.input.is_empty()
+                {
+                    app.input = raw_input;
+                    app.cursor_pos = app.input.len();
                 }
                 app.push_display_message(DisplayMessage::error(
                     crate::tui::app::model_context::model_switch_failure_message(&err, true),
@@ -1891,8 +2508,12 @@ pub(in crate::tui::app) fn handle_server_event(
             };
 
             if background_task_scope {
-                let presentation =
-                    present_swarm_notification(&sender, &notification_type, &message);
+                let presentation = present_swarm_notification(
+                    &sender,
+                    &notification_type,
+                    &message,
+                    crate::config::config().display.compact_notifications,
+                );
                 if crate::message::parse_background_task_progress_notification_markdown(&message)
                     .is_some()
                 {
@@ -1934,7 +2555,27 @@ pub(in crate::tui::app) fn handle_server_event(
                 return false;
             }
 
-            let presentation = present_swarm_notification(&sender, &notification_type, &message);
+            let presentation = present_swarm_notification(
+                &sender,
+                &notification_type,
+                &message,
+                crate::config::config().display.compact_notifications,
+            );
+            // Plan bookkeeping churn (assignments, version bumps, approvals)
+            // arrives constantly while a plan runs. It only needs to pass by
+            // on the status line; the inline plan graph message already shows
+            // the resulting DAG state in the transcript.
+            let plan_scope = matches!(
+                &notification_type,
+                crate::protocol::NotificationType::Message {
+                    scope: Some(scope),
+                    ..
+                } if scope == "plan"
+            );
+            if plan_scope {
+                app.set_status_notice(format!("{} · {}", presentation.title, presentation.message));
+                return false;
+            }
             app.push_display_message(DisplayMessage::swarm(
                 presentation.title.clone(),
                 presentation.message.clone(),

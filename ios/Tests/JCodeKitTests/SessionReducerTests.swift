@@ -156,7 +156,66 @@ private func event(_ line: String) -> ConnectionOutput {
     #expect(state.isProcessing == false)
     #expect(state.transcript.last?.text == "partial")
     #expect(state.transcript.last?.isStreaming == false)
-    #expect(state.notices.contains("Interrupted"))
+    #expect(state.notices.contains { $0.message == "Interrupted" })
+}
+
+// MARK: - Notices (notifications / compaction / dismissal)
+
+@Test func notificationBecomesDismissibleNotice() {
+    let state = run([
+        event(#"{"type":"notification","from_name":"swarm","message":"build done"}"#)
+    ])
+    #expect(state.notices.count == 1)
+    #expect(state.notices[0].kind == .notification)
+    #expect(state.notices[0].message == "swarm: build done")
+}
+
+@Test func notificationWithoutSenderHasNoPrefix() {
+    let state = run([
+        event(#"{"type":"notification","message":"heads up"}"#)
+    ])
+    #expect(state.notices[0].message == "heads up")
+}
+
+@Test func foregroundCompactionSurfacesNotice() {
+    let state = run([
+        event(#"{"type":"compaction","trigger":"manual","tokens_saved":1234}"#)
+    ])
+    #expect(state.notices.count == 1)
+    #expect(state.notices[0].kind == .compaction)
+    #expect(state.notices[0].message.contains("1234"))
+}
+
+@Test func backgroundCompactionIsSilent() {
+    let state = run([
+        event(#"{"type":"compaction","trigger":"background","tokens_saved":50}"#)
+    ])
+    #expect(state.notices.isEmpty)
+}
+
+@Test func dismissNoticeRemovesOnlyThatNotice() {
+    var state = run([
+        event(#"{"type":"notification","message":"first"}"#),
+        event(#"{"type":"notification","message":"second"}"#),
+    ])
+    #expect(state.notices.count == 2)
+    let firstID = state.notices[0].id
+    state = SessionReducer.reduce(state, intent: .dismissNotice(firstID))
+    #expect(state.notices.count == 1)
+    #expect(state.notices[0].message == "second")
+}
+
+@Test func clearedConversationWipesTranscriptButKeepsSession() {
+    var state = run([
+        event(#"{"type":"session","session_id":"sess_keep"}"#),
+        event(#"{"type":"text_delta","text":"stale"}"#),
+        event(#"{"type":"done","id":1}"#),
+    ])
+    #expect(!state.transcript.isEmpty)
+    state = SessionReducer.reduce(state, intent: .clearedConversation)
+    #expect(state.transcript.isEmpty)
+    #expect(state.isProcessing == false)
+    #expect(state.sessionID == "sess_keep")
 }
 
 @Test func emptyStreamingStubIsDropped() {
@@ -280,4 +339,209 @@ private func event(_ line: String) -> ConnectionOutput {
     ])
     state = SessionReducer.reduce(state, intent: .reset)
     #expect(state == SessionState())
+}
+
+// MARK: - Queued soft-interrupts
+
+@Test func queuedInterruptTracksPendingState() {
+    var state = SessionReducer.reduce(SessionState(), intent: .userSentMessage("go"))
+    state = SessionReducer.reduce(state, intent: .userQueuedInterrupt("also do y"))
+    #expect(state.hasPendingInterrupts)
+    #expect(state.pendingInterrupts == ["also do y"])
+    #expect(state.transcript.last?.isQueued == true)
+    #expect(state.transcript.last?.text == "also do y")
+}
+
+@Test func injectionClearsMatchingQueuedInterrupt() {
+    var state = SessionReducer.reduce(SessionState(), intent: .userSentMessage("go"))
+    state = SessionReducer.reduce(state, intent: .userQueuedInterrupt("also do y"))
+    state = run(
+        [
+            event(
+                #"{"type":"soft_interrupt_injected","content":"also do y","point":"C"}"#)
+        ], from: state)
+    #expect(state.pendingInterrupts.isEmpty)
+    #expect(state.transcript.last?.isQueued == false)
+    #expect(state.transcript.last?.text == "also do y")
+}
+
+@Test func injectionFromAnotherClientAppendsEntry() {
+    let state = run([
+        event(
+            #"{"type":"soft_interrupt_injected","content":"external note","display_role":"system","point":"A"}"#
+        )
+    ])
+    #expect(state.transcript.count == 1)
+    #expect(state.transcript[0].role == .system)
+    #expect(state.transcript[0].text == "external note")
+    #expect(state.transcript[0].isQueued == false)
+}
+
+@Test func cancelledQueuedInterruptsRemovesOptimisticBubbles() {
+    var state = SessionReducer.reduce(SessionState(), intent: .userSentMessage("go"))
+    state = SessionReducer.reduce(state, intent: .userQueuedInterrupt("nevermind"))
+    state = SessionReducer.reduce(state, intent: .cancelledQueuedInterrupts)
+    #expect(state.pendingInterrupts.isEmpty)
+    #expect(!state.transcript.contains { $0.isQueued })
+    #expect(state.transcript.map(\.text) == ["go"])
+}
+
+@Test func turnCompletionDrainsPendingInterrupts() {
+    var state = SessionReducer.reduce(SessionState(), intent: .userSentMessage("go"))
+    state = SessionReducer.reduce(state, intent: .userQueuedInterrupt("late note"))
+    state = run(
+        [
+            event(#"{"type":"text_delta","text":"answer"}"#),
+            event(#"{"type":"done","id":1}"#),
+        ], from: state)
+    #expect(state.pendingInterrupts.isEmpty)
+    #expect(!state.transcript.contains { $0.isQueued })
+}
+
+@Test func historyResyncClearsPendingInterrupts() {
+    var state = SessionReducer.reduce(SessionState(), intent: .userQueuedInterrupt("queued"))
+    #expect(state.hasPendingInterrupts)
+    state = run(
+        [
+            event(
+                #"{"type":"history","id":1,"session_id":"s","messages":[{"role":"user","content":"q"}]}"#
+            )
+        ], from: state)
+    #expect(state.pendingInterrupts.isEmpty)
+}
+
+// MARK: - Turn-level connection phase
+
+@Test func connectionPhaseTracksAndClears() {
+    var state = run([event(#"{"type":"connection_phase","phase":"authenticating"}"#)])
+    #expect(state.serverPhase == "authenticating")
+
+    state = run([event(#"{"type":"done","id":1}"#)], from: state)
+    #expect(state.serverPhase == nil)
+
+    state = run([event(#"{"type":"connection_phase","phase":"waiting"}"#)], from: state)
+    state = run([.phase(.reconnecting(attempt: 1))], from: state)
+    #expect(state.serverPhase == nil)
+}
+
+// MARK: - Retry rollback
+
+@Test func retryRollbackDiscardsPartialOutput() {
+    var state = SessionReducer.reduce(SessionState(), intent: .userSentMessage("go"))
+    state = run(
+        [
+            event(#"{"type":"reasoning_delta","text":"thinking"}"#),
+            event(#"{"type":"text_delta","text":"partial answer"}"#),
+            event(#"{"type":"retry_rollback","attempt":1,"max":5}"#),
+        ], from: state)
+    // Only the user message survives; the partial assistant entry is discarded.
+    #expect(state.transcript.map(\.role) == [.user])
+    #expect(state.isReasoning == false)
+    #expect(state.statusDetail == "Retrying (1/5)")
+
+    // The replayed response streams into a fresh entry without duplication.
+    state = run(
+        [
+            event(#"{"type":"text_delta","text":"clean answer"}"#),
+            event(#"{"type":"done","id":1}"#),
+        ], from: state)
+    #expect(state.transcript.map(\.text) == ["go", "clean answer"])
+}
+
+@Test func retryRollbackKeepsCommittedTurns() {
+    let state = run([
+        event(#"{"type":"text_delta","text":"first"}"#),
+        event(#"{"type":"message_end"}"#),
+        event(#"{"type":"text_delta","text":"second partial"}"#),
+        event(#"{"type":"retry_rollback","attempt":1,"max":3}"#),
+    ])
+    #expect(state.transcript.map(\.text) == ["first"])
+}
+
+// MARK: - Session titles
+
+@Test func renameOfOtherSessionStillRecordsTitle() {
+    var state = run([event(#"{"type":"session","session_id":"sess_1"}"#)])
+    state = run(
+        [
+            event(
+                #"{"type":"session_renamed","session_id":"other","display_title":"Other work"}"#)
+        ], from: state)
+    #expect(state.sessionTitle == nil)
+    #expect(state.title(forSession: "other") == "Other work")
+}
+
+@Test func historyRecordsTitleForSessionList() {
+    let state = run([
+        event(
+            #"{"type":"history","id":1,"session_id":"sess_1","messages":[],"all_sessions":["sess_1","sess_2"],"display_title":"Main"}"#
+        )
+    ])
+    #expect(state.title(forSession: "sess_1") == "Main")
+    #expect(state.title(forSession: "sess_2") == nil)
+    #expect(state.sessionTitle == "Main")
+}
+
+// MARK: - Reasoning effort
+
+@Test func reasoningEffortChangeUpdatesOrErrors() {
+    var state = run([
+        event(#"{"type":"reasoning_effort_changed","id":1,"effort":"high"}"#)
+    ])
+    #expect(state.reasoningEffort == "high")
+
+    state = run(
+        [
+            event(#"{"type":"reasoning_effort_changed","id":2,"error":"unsupported"}"#)
+        ], from: state)
+    #expect(state.errorBanner == "unsupported")
+    #expect(state.reasoningEffort == "high")
+}
+
+@Test func historyCarriesReasoningEffortIntoState() {
+    let state = run([
+        event(
+            #"{"type":"history","id":1,"session_id":"s","messages":[],"reasoning_effort":"medium"}"#
+        )
+    ])
+    #expect(state.reasoningEffort == "medium")
+}
+
+// MARK: - Compaction result
+
+@Test func compactResultSuccessBecomesNotice() {
+    let state = run([
+        event(#"{"type":"compact_result","id":1,"message":"Compaction started","success":true}"#)
+    ])
+    #expect(state.notices.count == 1)
+    #expect(state.notices[0].kind == .compaction)
+    #expect(state.errorBanner == nil)
+}
+
+@Test func compactResultFailureBecomesError() {
+    let state = run([
+        event(#"{"type":"compact_result","id":1,"message":"Nothing to compact","success":false}"#)
+    ])
+    #expect(state.notices.isEmpty)
+    #expect(state.errorBanner == "Nothing to compact")
+}
+
+// MARK: - Server lifecycle events
+
+@Test func reloadingSurfacesNotice() {
+    let state = run([event(#"{"type":"reloading"}"#)])
+    #expect(state.notices.count == 1)
+    #expect(state.notices[0].message.contains("updating"))
+}
+
+@Test func sessionCloseRequestedStopsProcessingWithReason() {
+    var state = SessionReducer.reduce(SessionState(), intent: .userSentMessage("go"))
+    state = run(
+        [
+            event(#"{"type":"text_delta","text":"partial"}"#),
+            event(#"{"type":"session_close_requested","reason":"taken over by TUI"}"#),
+        ], from: state)
+    #expect(state.isProcessing == false)
+    #expect(state.errorBanner == "taken over by TUI")
+    #expect(state.transcript.last?.isStreaming == false)
 }

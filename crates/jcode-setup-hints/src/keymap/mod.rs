@@ -120,7 +120,10 @@ pub fn snapshot_path() -> anyhow::Result<std::path::PathBuf> {
 pub fn refresh_and_save() -> KeymapSnapshot {
     let snapshot = collect_snapshot();
     if let Ok(path) = snapshot_path()
-        && let Err(err) = jcode_storage::write_json(&path, &snapshot)
+        // Regeneratable cache (refreshed at least daily): a power-loss losing the
+        // newest copy just means one more refresh on the next launch, so skip the
+        // ~8ms macOS `F_FULLFSYNC` and use the atomic-rename fast write.
+        && let Err(err) = jcode_storage::write_json_fast(&path, &snapshot)
     {
         jcode_logging::warn(&format!("keymap snapshot write failed: {err}"));
     }

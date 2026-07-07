@@ -92,30 +92,6 @@ impl App {
             self.last_client_focus_recorded_at = Some(Instant::now());
             self.last_client_focus_session_id = Some(session_id);
         }
-
-        // Keep the system-wide launch hotkeys (`Cmd+'` last project, `Cmd+Shift+'`
-        // self-dev) pointed at the jcode window the user last focused, rather than
-        // whichever window happened to be launched most recently. The dirs are
-        // otherwise only recorded once at process launch (see `record_launch_dirs`
-        // in the CLI dispatch path), so focusing back into an older window never
-        // updated them. Best-effort and a no-op off macOS.
-        self.record_focus_launch_dirs();
-    }
-
-    /// Record this (focused) window's working directory and enclosing jcode repo
-    /// so the global launch hotkeys reopen jcode where the user last was.
-    ///
-    /// Uses the client process's current directory, which is the directory this
-    /// window was launched in (the client never `chdir`s), matching what the
-    /// launch-time recorder captures. The repo is derived from that same cwd so
-    /// the self-dev hotkey follows the focused window's repository instead of the
-    /// repo the binary was built from.
-    fn record_focus_launch_dirs(&self) {
-        let Ok(cwd) = std::env::current_dir() else {
-            return;
-        };
-        let repo = crate::build::find_repo_in_ancestors(&cwd);
-        crate::setup_hints::record_launch_dirs(&cwd, repo.as_deref());
     }
 
     pub(super) fn note_client_interaction(&mut self) {
@@ -209,6 +185,17 @@ impl App {
                 && !pending.is_system
                 && (!pending.content.trim().is_empty() || !pending.images.is_empty())
         });
+        // A queued follow-up that was dequeued and is currently in flight lives
+        // only in `rate_limit_pending_message` (is_system). Without a scheduled
+        // retry reset, that shape has no dispatch path after a restore (the
+        // tick resend requires `rate_limit_reset`), so persist it back into
+        // the queued/hidden lists instead; the restored queue re-sends it once
+        // the turn is proven idle (issue #391).
+        let inflight_continuation = self.rate_limit_pending_message.as_ref().filter(|pending| {
+            pending.is_system
+                && self.rate_limit_reset.is_none()
+                && (!pending.content.trim().is_empty() || pending.system_reminder.is_some())
+        });
         if self.input.is_empty()
             && self.pending_images.is_empty()
             && self.queued_messages.is_empty()
@@ -222,36 +209,65 @@ impl App {
             && !self.split_view_enabled
             && !self.todos_view_enabled
         {
+            // Nothing to save, but a stale file from an earlier run could
+            // still hold old queued messages/input. Leaving it behind would
+            // resurrect that stale state on the next restore. Only remove
+            // clearly stale files: another client attached to the same session
+            // may have just saved ITS queued messages during the same reload
+            // handoff, and deleting a fresh file here would drop them.
+            if let Ok(jcode_dir) = crate::storage::jcode_dir() {
+                let path = jcode_dir.join(format!("client-input-{}", session_id));
+                let is_stale = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(300));
+                if is_stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
             return;
         }
         if let Ok(jcode_dir) = crate::storage::jcode_dir() {
             let path = jcode_dir.join(format!("client-input-{}", session_id));
-            let rate_limit_reset_in_ms = if resume_prompt.is_some() {
-                None
-            } else {
-                self.rate_limit_reset.map(|reset| {
-                    let now = Instant::now();
-                    if reset <= now {
-                        0
-                    } else {
-                        (reset - now).as_millis().min(u64::MAX as u128) as u64
-                    }
-                })
-            };
-            let rate_limit_pending_message = if resume_prompt.is_some() {
-                None
-            } else {
-                self.rate_limit_pending_message.as_ref().map(|pending| {
-                    serde_json::json!({
-                        "content": pending.content,
-                        "images": pending.images,
-                        "is_system": pending.is_system,
-                        "system_reminder": pending.system_reminder,
-                        "auto_retry": pending.auto_retry,
-                        "retry_attempts": pending.retry_attempts,
+            let rate_limit_reset_in_ms =
+                if resume_prompt.is_some() || inflight_continuation.is_some() {
+                    None
+                } else {
+                    self.rate_limit_reset.map(|reset| {
+                        let now = Instant::now();
+                        if reset <= now {
+                            0
+                        } else {
+                            (reset - now).as_millis().min(u64::MAX as u128) as u64
+                        }
                     })
-                })
-            };
+                };
+            let rate_limit_pending_message =
+                if resume_prompt.is_some() || inflight_continuation.is_some() {
+                    None
+                } else {
+                    self.rate_limit_pending_message.as_ref().map(|pending| {
+                        serde_json::json!({
+                            "content": pending.content,
+                            "images": pending.images,
+                            "is_system": pending.is_system,
+                            "system_reminder": pending.system_reminder,
+                            "auto_retry": pending.auto_retry,
+                            "retry_attempts": pending.retry_attempts,
+                        })
+                    })
+                };
+            let mut queued_messages = self.queued_messages.clone();
+            let mut hidden_queued_system_messages = self.hidden_queued_system_messages.clone();
+            if let Some(pending) = inflight_continuation {
+                if !pending.content.trim().is_empty() {
+                    queued_messages.insert(0, pending.content.clone());
+                }
+                if let Some(reminder) = pending.system_reminder.clone() {
+                    hidden_queued_system_messages.insert(0, reminder);
+                }
+            }
             let resume_input = resume_prompt.map(|pending| pending.content.as_str());
             let resume_images = resume_prompt.map(|pending| pending.images.as_slice());
             let rate_limit_reset_in_ms =
@@ -269,8 +285,8 @@ impl App {
                     "data": data,
                 })).collect::<Vec<_>>(),
                 "submit_on_restore": resume_prompt.is_some(),
-                "queued_messages": self.queued_messages,
-                "hidden_queued_system_messages": self.hidden_queued_system_messages,
+                "queued_messages": queued_messages,
+                "hidden_queued_system_messages": hidden_queued_system_messages,
                 "interleave_message": self.interleave_message,
                 "pending_soft_interrupts": self.pending_soft_interrupts,
                 "pending_soft_interrupt_resend": pending_soft_interrupt_resend,
@@ -724,6 +740,8 @@ impl App {
         self.remote_session_id = session_id.map(str::to_string);
     }
 
+    /// Set the displayed remote connection type (e.g. "https/sse") for header
+    /// tests. `None` clears it (unknown connection).
     #[cfg(test)]
     pub(crate) fn set_connection_type_for_tests(&mut self, connection_type: Option<&str>) {
         self.connection_type = connection_type.map(str::to_string);
@@ -1702,6 +1720,10 @@ fn build_skills_report(app: &App) -> String {
 
 pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed == "/skills" {
+        // Sync from disk first so skills added by agent-side `skill_manage
+        // reload_all` (which only updates the server process registry) show up
+        // without a restart (issue #431).
+        app.refresh_skills_snapshot();
         app.push_display_message(
             DisplayMessage::system(build_skills_report(app)).with_title("Skills"),
         );
@@ -1864,7 +1886,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
         if let Some(ref provider_id) = app.provider_session_id {
             info.push_str(&format!(
                 "Provider Session: {}...\n",
-                &provider_id[..provider_id.len().min(16)]
+                jcode_core::util::truncate_str(provider_id, 16)
             ));
         }
 

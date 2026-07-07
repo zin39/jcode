@@ -18,6 +18,15 @@ thread_local! {
     /// Whether Mermaid cache misses should be rendered in the background and
     /// replaced on a later redraw instead of blocking the current frame.
     static DEFER_MERMAID_RENDER_CONTEXT: Cell<bool> = const { Cell::new(false) };
+    /// Optional test/debug override for whether mermaid rendering is enabled.
+    /// Thread-local (not process-global) so tests that disable mermaid cannot
+    /// race other test threads that rely on the process-env default.
+    static MERMAID_RENDERING_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Scoped, thread-local diagram display mode. Takes precedence over the
+    /// process-global override so render paths (e.g. the side panel, which
+    /// renders with diagrams inline) can pin a mode for one render without
+    /// mutating global state that concurrent threads observe.
+    static DIAGRAM_MODE_SCOPE: Cell<Option<DiagramDisplayMode>> = const { Cell::new(None) };
 }
 
 struct ScopedReset<'a, T: Copy> {
@@ -48,6 +57,9 @@ pub fn get_diagram_mode_override() -> Option<DiagramDisplayMode> {
 }
 
 pub(super) fn effective_diagram_mode() -> DiagramDisplayMode {
+    if let Some(scoped) = DIAGRAM_MODE_SCOPE.with(|ctx| ctx.get()) {
+        return scoped;
+    }
     if let Ok(mode) = DIAGRAM_MODE_OVERRIDE.lock()
         && let Some(override_mode) = *mode
     {
@@ -56,11 +68,40 @@ pub(super) fn effective_diagram_mode() -> DiagramDisplayMode {
     crate::config_snapshot().diagram_mode
 }
 
+/// Run `f` with the diagram display mode pinned on the current thread.
+/// Takes precedence over both the process-global override and the config
+/// snapshot, so a render path (e.g. the side panel, which always renders
+/// diagrams inline) can pin a mode without mutating process-global state
+/// that concurrent threads observe.
+pub fn with_diagram_mode_scope<T>(mode: DiagramDisplayMode, f: impl FnOnce() -> T) -> T {
+    DIAGRAM_MODE_SCOPE.with(|ctx| with_scoped_cell_value(ctx, Some(mode), f))
+}
+
 pub(super) fn effective_markdown_spacing_mode() -> MarkdownSpacingMode {
     MARKDOWN_SPACING_MODE_OVERRIDE.with(|mode| {
         mode.get()
             .unwrap_or(crate::config_snapshot().markdown_spacing)
     })
+}
+
+/// Whether mermaid diagram rendering is enabled.
+///
+/// Mermaid rendering is enabled by default (renderer v0.3.0+ passes the hard
+/// geometry gate). Set `JCODE_ENABLE_MERMAID=0` to opt out. Tests must not
+/// mutate that process-global env var (doing so races parallel test threads);
+/// use [`with_mermaid_rendering_override`] instead.
+pub fn mermaid_rendering_enabled() -> bool {
+    if let Some(enabled) = MERMAID_RENDERING_OVERRIDE.with(|ctx| ctx.get()) {
+        return enabled;
+    }
+    !std::env::var("JCODE_ENABLE_MERMAID").is_ok_and(|value| value == "0")
+}
+
+/// Run `f` with mermaid rendering forced on/off (or `None` to restore the
+/// env-based default) on the current thread. Thread-local and scoped, so
+/// parallel tests cannot observe each other's override.
+pub fn with_mermaid_rendering_override<T>(enabled: Option<bool>, f: impl FnOnce() -> T) -> T {
+    MERMAID_RENDERING_OVERRIDE.with(|ctx| with_scoped_cell_value(ctx, enabled, f))
 }
 
 #[cfg(test)]

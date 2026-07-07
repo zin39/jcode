@@ -60,6 +60,7 @@ use swarm_background::{render_background_compact, render_background_widget, rend
 use text::{truncate_smart, truncate_with_ellipsis};
 pub(crate) use tips::occasional_status_tip;
 use tips::{render_tips_widget, tips_widget_height};
+pub(crate) use todos_render::swarm_plan_todos;
 use todos_render::{render_todos_compact, render_todos_expanded, render_todos_widget};
 #[cfg(test)]
 use usage_render::render_usage_pill;
@@ -260,6 +261,18 @@ pub struct SwarmInfo {
     pub session_names: Vec<String>,
     /// Swarm member lifecycle status updates
     pub members: Vec<SwarmMemberStatus>,
+    /// Agents this session manages (spawn-subtree filtered), shown in the
+    /// swarm dock widget. Empty = no dock.
+    pub managed_members: Vec<SwarmMemberStatus>,
+    /// Selected agent index in the dock (display order), mirrors the inline
+    /// swarm panel selection so both surfaces agree.
+    pub selected: usize,
+    /// Whether the swarm panel/dock has keyboard focus.
+    pub focused: bool,
+    /// Swarm plan progress (completed, running, total), when a plan is active.
+    pub plan_progress: Option<(u32, u32, u32)>,
+    /// Spinner frame for animating active agents' status glyphs.
+    pub spinner_frame: usize,
 }
 
 /// Background task status for the info widget
@@ -554,6 +567,11 @@ const PAGE_SWITCH_SECONDS: u64 = 30;
 #[derive(Debug, Default, Clone)]
 pub struct InfoWidgetData {
     pub todos: Vec<TodoItem>,
+    /// True when `todos` is actually a projection of the shared swarm plan
+    /// (task DAG) rather than this session's private todo list. The widget
+    /// renders a "Plan" header instead of "Todos" so the two are not
+    /// conflated.
+    pub todos_are_swarm_plan: bool,
     pub context_info: Option<ContextInfo>,
     /// True when context state is being updated and no authoritative snapshot is available.
     pub context_info_stale: bool,
@@ -619,10 +637,7 @@ pub struct CompactionInfo {
 
 impl InfoWidgetData {
     fn widget_disabled(kind: WidgetKind) -> bool {
-        matches!(
-            kind,
-            WidgetKind::SwarmStatus | WidgetKind::AmbientMode | WidgetKind::Tips
-        )
+        matches!(kind, WidgetKind::AmbientMode | WidgetKind::Tips)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -712,7 +727,11 @@ impl InfoWidgetData {
                 .as_ref()
                 .map(|m| m.total_count > 0 || m.activity.is_some())
                 .unwrap_or(false),
-            WidgetKind::SwarmStatus => false,
+            WidgetKind::SwarmStatus => self
+                .swarm_info
+                .as_ref()
+                .map(|s| !s.managed_members.is_empty())
+                .unwrap_or(false),
             WidgetKind::BackgroundTasks => self
                 .background_info
                 .as_ref()
@@ -781,6 +800,17 @@ impl InfoWidgetData {
                     kind.priority()
                 }
             }
+            WidgetKind::SwarmStatus => {
+                // A session actively managing agents wants them visible: the
+                // dock is the cockpit for the swarm, so rank it just under
+                // todos while any managed agent is still live.
+                let managing = self
+                    .swarm_info
+                    .as_ref()
+                    .map(|s| !s.managed_members.is_empty())
+                    .unwrap_or(false);
+                if managing { 3 } else { kind.priority() }
+            }
             _ => kind.priority(),
         }
     }
@@ -816,6 +846,11 @@ struct WidgetsState {
     placements: Vec<WidgetPlacement>,
     /// Persistent widget anchors (HUD slot memory, including hidden-in-place ones)
     anchors: Vec<super::info_widget_layout::WidgetAnchor>,
+    /// When the SwarmStatus dock was last engaged (placed or anchored). Lets the
+    /// inline swarm strip keep standing down through brief dock dropouts instead
+    /// of popping back for a few frames (which resizes the bottom chrome and
+    /// bounces the transcript).
+    swarm_dock_last_engaged: Option<Instant>,
 }
 
 impl Default for WidgetsState {
@@ -825,6 +860,7 @@ impl Default for WidgetsState {
             widget_states: HashMap::new(),
             placements: Vec::new(),
             anchors: Vec::new(),
+            swarm_dock_last_engaged: None,
         }
     }
 }
@@ -878,7 +914,87 @@ pub fn calculate_placements(
     );
     state.anchors = outcome.anchors;
     state.placements = outcome.visible.clone();
+    if swarm_dock_engaged(state) {
+        state.swarm_dock_last_engaged = Some(Instant::now());
+    }
     outcome.visible
+}
+
+/// How long the inline swarm strip keeps standing down after the SwarmStatus
+/// dock disengages. The dock's placement naturally churns while content
+/// streams past it (hidden-in-place blinks, anchor abandonment, re-homing a
+/// few frames later). Each strip appearance adds a row to the bottom chrome
+/// and shoves the whole transcript up, so reacting instantly turns that churn
+/// into visible up/down flicker. Standing down through a short linger converts
+/// the churn into "strip stays hidden"; a genuine dock removal only delays the
+/// strip's return by this much, once.
+const SWARM_STRIP_STAND_DOWN_LINGER: Duration = Duration::from_millis(2000);
+
+/// Whether the SwarmStatus dock widget is engaged: either actually placed, or
+/// hidden-in-place behind a live anchor (a wide transcript line is momentarily
+/// covering its slot and it will pop back into the same spot).
+fn swarm_dock_engaged(state: &WidgetsState) -> bool {
+    state.enabled
+        && (state
+            .placements
+            .iter()
+            .any(|p| p.kind == WidgetKind::SwarmStatus)
+            || state
+                .anchors
+                .iter()
+                .any(|a| a.placement.kind == WidgetKind::SwarmStatus))
+}
+
+/// Whether the inline swarm strip (above the status line) should stand down
+/// because the SwarmStatus dock widget (margin HUD) is showing - or was very
+/// recently showing - the same agents.
+///
+/// The strip is built before widget placement runs each frame, so this checks
+/// the previous frame's state, like [`widget_visible_facts`]. Engagement
+/// includes hidden-in-place anchors, and disengagement is debounced by
+/// [`SWARM_STRIP_STAND_DOWN_LINGER`]: both exist so the dock's frame-to-frame
+/// placement churn cannot toggle the strip row on and off, which resizes the
+/// bottom chrome and makes the whole transcript jump up and down (flicker).
+/// One frame of overlap when the dock first appears is visually harmless.
+pub(crate) fn swarm_strip_stands_down_for_dock() -> bool {
+    let guard = get_or_init_state();
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    if swarm_dock_engaged(state) {
+        return true;
+    }
+    state
+        .swarm_dock_last_engaged
+        .is_some_and(|at| at.elapsed() < SWARM_STRIP_STAND_DOWN_LINGER)
+}
+
+/// Forget the per-frame placement/anchor state because the widget render pass
+/// was skipped this frame (idle donut takeover, or no widget data at all).
+/// Without this, `state.placements` keeps reporting widgets from the last
+/// widget-bearing frame: the swarm strip would stand down for a dock that is
+/// no longer drawn, leaving the managed agents visible nowhere.
+pub(crate) fn note_widget_pass_skipped() {
+    let mut guard = get_or_init_state();
+    if let Some(state) = guard.as_mut() {
+        state.placements.clear();
+        state.anchors.clear();
+        state.swarm_dock_last_engaged = None;
+    }
+}
+
+/// Clear the remembered per-frame widget placements (and anchors). Tests that
+/// assert on placement-dependent behavior (e.g. the swarm strip standing down
+/// while the dock is visible) call this so state from earlier tests in the
+/// same process cannot leak into their frame.
+#[cfg(test)]
+pub(crate) fn clear_widget_placements_for_tests() {
+    let mut guard = get_or_init_state();
+    if let Some(state) = guard.as_mut() {
+        state.placements.clear();
+        state.anchors.clear();
+        state.swarm_dock_last_engaged = None;
+    }
 }
 
 /// Facts surfaced by the info-widget HUD as of the last rendered frame.
@@ -920,12 +1036,7 @@ pub(crate) fn widget_visible_facts(data: &InfoWidgetData) -> crate::tui::session
             }
             WidgetKind::Overview => {
                 // The overview panel summarizes model, context, provider, dir.
-                ledger.claim_all([
-                    Fact::Model,
-                    Fact::Context,
-                    Fact::Provider,
-                    Fact::Dir,
-                ]);
+                ledger.claim_all([Fact::Model, Fact::Context, Fact::Provider, Fact::Dir]);
                 if data.reasoning_effort.is_some() {
                     ledger.claim(Fact::ReasoningEffort);
                 }
@@ -1011,19 +1122,12 @@ pub(crate) fn calculate_widget_height(
             let Some(info) = &data.swarm_info else {
                 return 0;
             };
-            if info.subagent_status.is_none()
-                && info.session_count <= 1
-                && info.client_count.is_none()
-                && info.members.is_empty()
-            {
+            if info.managed_members.is_empty() {
                 return 0;
             }
-            let mut h = 1u16; // Stats line
-            if info.subagent_status.is_some() {
-                h += 1;
-            }
-            h += info.session_names.len().min(3) as u16;
-            h
+            // Compact: agents/nodes summary line + optional plan bar.
+            let bar = u16::from(info.plan_progress.is_some());
+            (1 + bar).min(max_height.saturating_sub(border_height))
         }
         WidgetKind::BackgroundTasks => {
             if data

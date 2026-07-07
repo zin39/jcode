@@ -47,7 +47,7 @@ pub(crate) fn filtered_display_models(models: impl IntoIterator<Item = String>) 
         .into_iter()
         .filter(|model| {
             !crate::subscription_catalog::is_runtime_mode_enabled()
-                || crate::subscription_catalog::is_curated_model(model)
+                || crate::subscription_catalog::is_model_allowed_for_current_tier(model)
         })
         .collect()
 }
@@ -59,18 +59,34 @@ pub(crate) fn filtered_model_routes(routes: Vec<ModelRoute>) -> Vec<ModelRoute> 
 
     routes
         .into_iter()
-        .filter(|route| crate::subscription_catalog::is_curated_model(&route.model))
+        .filter(|route| {
+            crate::subscription_catalog::is_model_allowed_for_current_tier(&route.model)
+        })
         .collect()
 }
 
 pub(crate) fn ensure_model_allowed_for_subscription(model: &str) -> Result<()> {
-    if crate::subscription_catalog::is_runtime_mode_enabled()
-        && !crate::subscription_catalog::is_curated_model(model)
-    {
-        anyhow::bail!(
-            "Model '{}' is not included in the current jcode subscription catalog",
-            model
-        );
+    if !crate::subscription_catalog::is_runtime_mode_enabled() {
+        return Ok(());
+    }
+    match crate::subscription_catalog::find_curated_model(model) {
+        None => {
+            anyhow::bail!(
+                "Model '{}' is not included in the current jcode subscription catalog",
+                model
+            );
+        }
+        Some(curated) => {
+            let tier = crate::subscription_catalog::effective_tier();
+            if !tier.allows(curated.min_tier) {
+                anyhow::bail!(
+                    "Model '{}' requires the {} tier (current tier: {}). Upgrade your jcode subscription to use it.",
+                    curated.display_name,
+                    curated.min_tier.display_name(),
+                    tier.display_name()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -426,8 +442,8 @@ pub fn cached_openai_model_ids() -> Option<Vec<String>> {
 /// services are statics shared by every test in the process; a test that
 /// hydrates a scope (directly or via `persist_*` + `cached_*`) otherwise leaks
 /// fixture models into later tests' `known_*_model_ids()` validation.
-#[cfg(test)]
-pub(crate) fn reset_model_catalog_services_for_tests() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_model_catalog_services_for_tests() {
     OPENAI_MODEL_CATALOG_SERVICE.reset_for_tests();
     ANTHROPIC_MODEL_CATALOG_SERVICE.reset_for_tests();
 }
@@ -485,22 +501,55 @@ pub fn populate_context_limits(models: HashMap<String, usize>) {
 /// configured limit is respected globally instead of falling back to
 /// [`DEFAULT_CONTEXT_LIMIT`].
 pub fn populate_context_limits_from_config() {
-    let cfg = crate::config::config();
+    populate_context_limits_from_config_value(crate::config::config());
+}
+
+/// Seed the global context-limit cache from an explicit config reference.
+///
+/// Runtime model specs reach the lookup in several shapes, so each configured
+/// model is seeded under every key the lookup can normalize to (issue #421):
+/// - the bare lowercased id (`qwen3.6-35b-a2000-128k`);
+/// - the slash base (`x.gguf` for `/opt/models/x.gguf`), because
+///   `model_id_for_capability_lookup` reduces slash-containing ids to their
+///   final segment;
+/// - the profile-qualified spec (`cachyai-a2000:qwen3.6-35b-a2000-128k`),
+///   because session-restored models keep the `<profile>:` routing prefix and
+///   non-slash qualified specs are looked up verbatim.
+pub fn populate_context_limits_from_config_value(cfg: &crate::config::Config) {
     let mut limits = HashMap::new();
-    for provider_cfg in cfg.providers.values() {
+    for (profile_id, provider_cfg) in cfg.providers.iter() {
         for model in &provider_cfg.models {
-            let id = model.id.trim();
-            if id.is_empty() {
+            let Some(limit) = model.context_window else {
                 continue;
-            }
-            if let Some(limit) = model.context_window {
-                limits.insert(id.to_ascii_lowercase(), limit);
+            };
+            for key in config_context_limit_cache_keys(profile_id, &model.id) {
+                limits.insert(key, limit);
             }
         }
     }
     if !limits.is_empty() {
         populate_context_limits(limits);
     }
+}
+
+/// Cache keys under which a configured per-model `context_window` must be
+/// discoverable so every runtime lookup shape resolves to it. See
+/// [`populate_context_limits_from_config_value`].
+pub(crate) fn config_context_limit_cache_keys(profile_id: &str, model_id: &str) -> Vec<String> {
+    let id = model_id.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = vec![id.clone()];
+    let slash_base = jcode_provider_core::model_id::slash_base(&id).to_string();
+    if slash_base != id && !slash_base.is_empty() {
+        keys.push(slash_base);
+    }
+    let profile = profile_id.trim().to_ascii_lowercase();
+    if !profile.is_empty() {
+        keys.push(format!("{profile}:{id}"));
+    }
+    keys
 }
 
 /// Populate the account-available model list (called once at startup from the Codex API).

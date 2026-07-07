@@ -24,7 +24,7 @@ fn test_skill_prompt_integration() {
     let prompt = build_system_prompt(Some(skill_prompt), &[]);
 
     // The prompt should contain our default system prompt
-    assert!(prompt.contains("You are the Jcode Agent"));
+    assert!(prompt.contains("Your name is Jcode."));
 
     // The prompt should contain the skill prompt
     assert!(prompt.contains(skill_prompt));
@@ -87,6 +87,55 @@ fn test_split_prompt_does_not_inject_session_context_per_turn() {
 }
 
 #[test]
+fn test_sponsored_discovery_section_gated_on_config() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+    std::fs::create_dir_all(temp.path()).unwrap();
+
+    // Default (no config file): sponsored discovery is on (opt-out), so the
+    // section appears with the placement-not-preference policy.
+    crate::config::Config::invalidate_cache();
+    let (split, info) = build_system_prompt_split(None, &[], false, None, None);
+    assert!(
+        split
+            .static_part
+            .contains("# Discoverable Tools (sponsored discovery)"),
+        "discovery section must appear by default"
+    );
+    assert!(split.static_part.contains("discover_tools"));
+    assert!(
+        split
+            .static_part
+            .contains("Sponsors pay for discoverability, not recommendations"),
+        "policy line must be part of the injected prompt"
+    );
+    assert!(info.sponsored_discovery_chars > 0);
+
+    // Opted out: section is absent.
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "[sponsors]\nenabled = false\n",
+    )
+    .unwrap();
+    crate::config::Config::invalidate_cache();
+    let (split, info) = build_system_prompt_split(None, &[], false, None, None);
+    assert!(
+        !split.static_part.contains("Discoverable Tools"),
+        "discovery section must be absent when opted out"
+    );
+    assert_eq!(info.sponsored_discovery_chars, 0);
+
+    if let Some(prev) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    crate::config::Config::invalidate_cache();
+}
+
+#[test]
 fn test_prompt_overlay_files_are_loaded_from_project_and_global_jcode_dirs() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
@@ -124,6 +173,76 @@ fn test_prompt_overlay_files_are_loaded_from_project_and_global_jcode_dirs() {
     assert!(prompt.contains("project prompt overlay instructions"));
     assert!(prompt.contains("global prompt overlay instructions"));
     assert!(info.prompt_overlay_chars > 0);
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn test_prompt_overlay_suppressed_for_fable_but_kept_for_others() {
+    // Regression: `claude-fable-5` refuses (stop_reason=refusal, no output) on
+    // sensitive-sounding freeform overlays, so the overlay is omitted for it.
+    // Every other model still receives it.
+    assert!(
+        !model_should_receive_prompt_overlay("claude-fable-5"),
+        "fable-5 must NOT receive the freeform prompt overlay"
+    );
+    assert!(
+        !model_should_receive_prompt_overlay("claude-fable-5-20260101"),
+        "dated fable variants must also be excluded"
+    );
+    assert!(
+        model_should_receive_prompt_overlay("claude-opus-4-8"),
+        "opus must still receive the overlay"
+    );
+    assert!(
+        model_should_receive_prompt_overlay("claude-sonnet-4-6"),
+        "sonnet must still receive the overlay"
+    );
+    assert!(
+        model_should_receive_prompt_overlay("gpt-5.5"),
+        "non-Anthropic models must still receive the overlay"
+    );
+}
+
+#[test]
+fn test_build_system_prompt_can_suppress_overlay() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+    std::fs::create_dir_all(temp.path()).unwrap();
+    std::fs::write(
+        temp.path().join("prompt-overlay.md"),
+        "global prompt overlay instructions",
+    )
+    .unwrap();
+
+    // include_prompt_overlay = false -> overlay omitted (fable-5 path).
+    let (prompt_no, info_no) =
+        build_system_prompt_full_with_overlay(None, &[], false, None, None, false);
+    assert!(
+        !prompt_no.contains("global prompt overlay instructions"),
+        "overlay must be omitted when include_prompt_overlay=false"
+    );
+    assert_eq!(info_no.prompt_overlay_chars, 0);
+
+    // include_prompt_overlay = true -> overlay present (default path).
+    let (prompt_yes, info_yes) =
+        build_system_prompt_full_with_overlay(None, &[], false, None, None, true);
+    assert!(
+        prompt_yes.contains("global prompt overlay instructions"),
+        "overlay must be present when include_prompt_overlay=true"
+    );
+    assert!(info_yes.prompt_overlay_chars > 0);
+
+    // The split builder honors the same flag.
+    let (split_no, _) =
+        build_system_prompt_split_with_overlay(None, &[], false, None, None, false);
+    assert!(!split_no.static_part.contains("global prompt overlay instructions"));
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
@@ -201,6 +320,54 @@ fn test_preferred_tools_files_are_loaded_from_project_and_global_jcode_dirs() {
 }
 
 #[test]
+fn test_swarm_prompt_prefers_project_then_global_then_default() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+    std::fs::create_dir_all(temp.path()).unwrap();
+
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    // No override files: built-in default.
+    let prompt = load_swarm_prompt(Some(project_dir.path()));
+    assert_eq!(prompt, DEFAULT_SWARM_PROMPT.trim());
+
+    // Global override wins over the default.
+    std::fs::write(temp.path().join("swarm-prompt.md"), "global swarm routing").unwrap();
+    let prompt = load_swarm_prompt(Some(project_dir.path()));
+    assert_eq!(prompt, "global swarm routing");
+
+    // Project override wins over global.
+    std::fs::create_dir_all(project_dir.path().join(".jcode")).unwrap();
+    std::fs::write(
+        project_dir.path().join(".jcode/swarm-prompt.md"),
+        "project swarm routing",
+    )
+    .unwrap();
+    let prompt = load_swarm_prompt(Some(project_dir.path()));
+    assert_eq!(prompt, "project swarm routing");
+
+    // A blank project file falls through to global instead of going empty.
+    std::fs::write(project_dir.path().join(".jcode/swarm-prompt.md"), "   \n").unwrap();
+    let prompt = load_swarm_prompt(Some(project_dir.path()));
+    assert_eq!(prompt, "global swarm routing");
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn test_default_swarm_prompt_mentions_model_and_list_models() {
+    assert!(DEFAULT_SWARM_PROMPT.contains("list_models"));
+    assert!(DEFAULT_SWARM_PROMPT.contains("model"));
+    assert!(DEFAULT_SWARM_PROMPT.contains("effort"));
+}
+
+#[test]
 fn test_non_selfdev_prompt_includes_lightweight_selfdev_hint() {
     let prompt = build_system_prompt(None, &[]);
     assert!(prompt.contains("Self-Development Access"));
@@ -267,4 +434,100 @@ fn split_prompt_estimated_tokens_is_positive_when_populated() {
     let (split, _info) = build_system_prompt_split(None, &[], false, None, None);
     assert!(split.chars() > 0);
     assert!(split.estimated_tokens() > 0);
+}
+
+#[test]
+fn swarm_effort_directive_is_appended_only_for_swarm_sentinel() {
+    assert!(is_swarm_effort("swarm"));
+    assert!(is_swarm_effort("  Swarm "));
+    assert!(!is_swarm_effort("xhigh"));
+
+    let mut split = SplitSystemPrompt {
+        static_part: "base".to_string(),
+        dynamic_part: String::new(),
+    };
+    append_swarm_effort_directive(&mut split, Some("xhigh"));
+    assert!(!split.dynamic_part.contains("Swarm Effort"));
+
+    append_swarm_effort_directive(&mut split, Some("swarm"));
+    assert!(split.dynamic_part.contains("# Swarm Effort"));
+    assert!(split.dynamic_part.contains("swarm` tool"));
+
+    // None / empty effort should not inject.
+    let mut other = SplitSystemPrompt::default();
+    append_swarm_effort_directive(&mut other, None);
+    assert!(other.dynamic_part.is_empty());
+}
+
+#[test]
+fn web_grounding_directive_is_appended_only_when_enabled() {
+    use crate::prompt::append_web_grounding_directive;
+
+    // Disabled: no-op, static part unchanged.
+    let mut off = SplitSystemPrompt {
+        static_part: "base".to_string(),
+        dynamic_part: String::new(),
+    };
+    append_web_grounding_directive(&mut off, false);
+    assert_eq!(off.static_part, "base");
+
+    // Enabled: directive appended to the STATIC (cacheable) part.
+    let mut on = SplitSystemPrompt {
+        static_part: "base".to_string(),
+        dynamic_part: String::new(),
+    };
+    append_web_grounding_directive(&mut on, true);
+    assert!(on.static_part.contains("# Web Grounding"));
+    assert!(on.static_part.contains("websearch"));
+    assert!(
+        on.dynamic_part.is_empty(),
+        "grounding must not touch the dynamic part"
+    );
+    assert!(
+        on.static_part.starts_with("base"),
+        "existing static content is preserved"
+    );
+}
+
+#[test]
+fn swarm_deep_effort_injects_task_graph_directive() {
+    use crate::prompt::is_deep_swarm_effort;
+
+    assert!(is_swarm_effort("swarm-deep"));
+    assert!(is_deep_swarm_effort("swarm-deep"));
+    assert!(is_deep_swarm_effort("  Swarm-Deep "));
+    assert!(!is_deep_swarm_effort("swarm"));
+    assert!(!is_deep_swarm_effort("xhigh"));
+
+    // Deep sentinel injects the DAG-first task-graph directive, not the light one.
+    let mut split = SplitSystemPrompt::default();
+    append_swarm_effort_directive(&mut split, Some("swarm-deep"));
+    assert!(split.dynamic_part.contains("# Deep Task Graph"));
+    assert!(split.dynamic_part.contains("swarm task_graph"));
+    assert!(!split.dynamic_part.contains("# Swarm Effort"));
+
+    // Light sentinel still injects the fan-out directive, not the deep one.
+    let mut light = SplitSystemPrompt::default();
+    append_swarm_effort_directive(&mut light, Some("swarm"));
+    assert!(light.dynamic_part.contains("# Swarm Effort"));
+    assert!(!light.dynamic_part.contains("# Deep Task Graph"));
+}
+
+#[test]
+fn classify_effort_distinguishes_reasoning_from_swarm_modes() {
+    use crate::prompt::{EffortKind, classify_effort, is_swarm_mode_effort};
+
+    // Plain reasoning levels are not swarm modes.
+    for level in ["none", "low", "medium", "high", "xhigh", "max"] {
+        assert_eq!(classify_effort(level), EffortKind::Reasoning, "{level}");
+        assert!(!is_swarm_mode_effort(level), "{level}");
+    }
+
+    assert_eq!(classify_effort("swarm"), EffortKind::SwarmLight);
+    assert_eq!(classify_effort("swarm-deep"), EffortKind::SwarmDeep);
+    assert!(is_swarm_mode_effort("swarm"));
+    assert!(is_swarm_mode_effort("  Swarm-Deep "));
+    assert!(EffortKind::SwarmLight.is_swarm_mode());
+    assert!(EffortKind::SwarmDeep.is_swarm_mode());
+    assert!(!EffortKind::Reasoning.is_swarm_mode());
 }

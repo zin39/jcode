@@ -8,6 +8,13 @@ use std::time::Duration;
 pub const BACKGROUND_UPDATE_THRESHOLD: Duration = Duration::from_secs(15);
 const DOWNLOAD_PROGRESS_BAR_WIDTH: usize = 24;
 
+/// Summary emitted when `git pull` cannot reconcile the local and upstream
+/// histories on its own (diverged branches, non-fast-forward, unrelated
+/// histories). Callers use this to recognize a divergence and offer a merge
+/// affordance instead of a generic failure.
+pub const GIT_PULL_DIVERGED_SUMMARY: &str =
+    "Local and upstream have diverged, so the update could not fast-forward.";
+
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadProgress {
     pub downloaded: u64,
@@ -176,12 +183,8 @@ pub fn summarize_git_pull_failure(stderr: &[u8]) -> String {
         return "git pull failed".to_string();
     }
 
-    if text.contains("Need to specify how to reconcile divergent branches")
-        || text.contains("Not possible to fast-forward")
-        || text.contains("refusing to merge unrelated histories")
-    {
-        return "git pull requires manual reconciliation (local and upstream have diverged)"
-            .to_string();
+    if git_pull_failure_is_divergence(text) {
+        return GIT_PULL_DIVERGED_SUMMARY.to_string();
     }
 
     if text.contains("There is no tracking information for the current branch") {
@@ -199,6 +202,20 @@ pub fn summarize_git_pull_failure(stderr: &[u8]) -> String {
     } else {
         format!("git pull failed: {}", line)
     }
+}
+
+/// Whether `git pull` stderr indicates the local and upstream branches have
+/// diverged (and therefore need a manual merge/rebase, not a fast-forward).
+pub fn git_pull_failure_is_divergence(stderr: &str) -> bool {
+    stderr.contains("Need to specify how to reconcile divergent branches")
+        || stderr.contains("Not possible to fast-forward")
+        || stderr.contains("refusing to merge unrelated histories")
+        || stderr.contains("have diverged")
+}
+
+/// Whether a `summarize_git_pull_failure` summary describes a divergence.
+pub fn summary_is_divergence(summary: &str) -> bool {
+    summary == GIT_PULL_DIVERGED_SUMMARY
 }
 
 pub fn parse_sha256sums(contents: &str) -> Result<HashMap<String, String>> {
@@ -402,12 +419,18 @@ mod tests {
             summarize_git_pull_failure(
                 b"fatal: Need to specify how to reconcile divergent branches\n"
             ),
-            "git pull requires manual reconciliation (local and upstream have diverged)"
+            GIT_PULL_DIVERGED_SUMMARY
         );
+        assert!(summary_is_divergence(&summarize_git_pull_failure(
+            b"fatal: Need to specify how to reconcile divergent branches\n"
+        )));
         assert_eq!(
             summarize_git_pull_failure(b"hint: ignore me\nfatal: no upstream\n"),
             "git pull failed: no upstream"
         );
+        assert!(!summary_is_divergence(&summarize_git_pull_failure(
+            b"hint: ignore me\nfatal: no upstream\n"
+        )));
     }
 
     #[test]

@@ -29,6 +29,9 @@ const OPENAI_ORIGINATOR: &str = "codex_cli_rs";
 /// Claude Messages API endpoint (with beta=true for OAuth)
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
+/// Claude Messages API endpoint for direct API-key access (no OAuth beta flag).
+const CLAUDE_API_KEY_URL: &str = "https://api.anthropic.com/v1/messages";
+
 /// User-Agent for OAuth requests (must match Claude CLI format)
 const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/1.0.0";
 
@@ -393,6 +396,43 @@ impl Sidecar {
 
     /// Complete via Claude Messages API
     async fn complete_claude(&self, system: &str, user_message: &str) -> Result<String> {
+        // Respect the runtime's pinned Anthropic credential mode. The main agent
+        // may be running in API-key mode (`claude-api`), where the org forbids
+        // OAuth and Anthropic returns a 403 "OAuth authentication is currently
+        // not allowed for this organization." The sidecar previously hardcoded
+        // the OAuth path, so memory calls (consensus judge, extraction) failed
+        // even though the main agent worked fine on the API key. Mirror the main
+        // provider's resolution: use the direct API key when API-key mode is
+        // pinned (or when no OAuth credentials exist but a key does), and fall
+        // back to the API key if an OAuth request is rejected as forbidden.
+        if anthropic_sidecar_prefers_api_key()
+            && let Ok(key) = crate::provider::anthropic::load_anthropic_api_key()
+        {
+            return self
+                .complete_claude_api_key(system, user_message, &key)
+                .await;
+        }
+
+        match self.complete_claude_oauth(system, user_message).await {
+            Ok(text) => Ok(text),
+            Err(err) if is_anthropic_oauth_forbidden(&err) => {
+                match crate::provider::anthropic::load_anthropic_api_key() {
+                    Ok(key) => {
+                        crate::logging::info(
+                            "Sidecar Claude: OAuth forbidden for organization; falling back to API key",
+                        );
+                        self.complete_claude_api_key(system, user_message, &key)
+                            .await
+                    }
+                    Err(_) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// OAuth (Claude subscription) completion path.
+    async fn complete_claude_oauth(&self, system: &str, user_message: &str) -> Result<String> {
         let creds = auth::claude::load_credentials()
             .context("Failed to load Claude credentials for sidecar")?;
 
@@ -421,6 +461,47 @@ impl Sidecar {
         .await
         .context("Failed to send request to Claude API")?;
 
+        Self::parse_claude_response(response).await
+    }
+
+    /// Direct API-key completion path (`x-api-key`).
+    ///
+    /// Unlike the OAuth path this must NOT inject the "You are Claude Code"
+    /// identity spoof: that block is only valid for the OAuth/subscription
+    /// endpoint and a direct API key talks to the standard Messages API.
+    async fn complete_claude_api_key(
+        &self,
+        system: &str,
+        user_message: &str,
+        api_key: &str,
+    ) -> Result<String> {
+        let request = ClaudeMessagesRequest {
+            model: &self.model,
+            max_tokens: self.max_tokens,
+            system: build_claude_api_key_system_param(system),
+            messages: vec![ClaudeMessage {
+                role: "user",
+                content: user_message,
+            }],
+        };
+
+        let response = self
+            .client
+            .post(CLAUDE_API_KEY_URL)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send request to Claude API")?;
+
+        Self::parse_claude_response(response).await
+    }
+
+    /// Shared response parsing for both Claude credential paths.
+    async fn parse_claude_response(response: reqwest::Response) -> Result<String> {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
@@ -851,6 +932,46 @@ fn build_claude_system_param(system: &str) -> Option<ClaudeApiSystem<'_>> {
     Some(ClaudeApiSystem::Blocks(blocks))
 }
 
+/// Build the system param for the direct API-key path.
+///
+/// The "You are Claude Code" identity spoof and jcode notice are only valid
+/// for the OAuth/subscription endpoint; a direct API key talks to the standard
+/// Messages API and must not impersonate the official CLI. So this only carries
+/// the caller's own system prompt (if any).
+fn build_claude_api_key_system_param(system: &str) -> Option<ClaudeApiSystem<'_>> {
+    if system.is_empty() {
+        return None;
+    }
+    Some(ClaudeApiSystem::Blocks(vec![ClaudeApiSystemBlock {
+        block_type: "text",
+        text: system,
+    }]))
+}
+
+/// Whether the sidecar's Claude backend should use the direct API key rather
+/// than OAuth. True when the runtime is pinned to Anthropic API-key mode
+/// (`claude-api`), or when no OAuth credentials are present at all. Mirrors the
+/// main provider's resolution so memory features authenticate the same way the
+/// agent does.
+fn anthropic_sidecar_prefers_api_key() -> bool {
+    match jcode_provider_core::runtime_env_pinned_mode(
+        jcode_provider_core::DualAuthProvider::Anthropic,
+    ) {
+        Some(jcode_provider_core::AuthMode::ApiKey) => true,
+        Some(jcode_provider_core::AuthMode::Oauth) => false,
+        None => auth::claude::load_credentials().is_err(),
+    }
+}
+
+/// Recognize the Anthropic "OAuth not allowed for this organization" 403 so the
+/// sidecar can transparently fall back to the API key.
+fn is_anthropic_oauth_forbidden(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("403")
+        && (msg.contains("OAuth authentication is currently not allowed")
+            || msg.contains("permission_error"))
+}
+
 #[derive(Deserialize)]
 struct ClaudeMessagesResponse {
     content: Vec<ClaudeContentBlock>,
@@ -1115,5 +1236,65 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{provider}: provider-backed completion failed: {e}"));
             assert_eq!(out, "[1]", "{provider}: sidecar must echo provider output");
         }
+    }
+
+    #[test]
+    fn test_is_anthropic_oauth_forbidden() {
+        // The exact error string the sidecar surfaces from a forbidden OAuth org.
+        let forbidden = anyhow::anyhow!(
+            "Claude API error (403 Forbidden): {{\"type\":\"error\",\"error\":{{\"type\":\"permission_error\",\"message\":\"OAuth authentication is currently not allowed for this organization.\"}}}}"
+        );
+        assert!(is_anthropic_oauth_forbidden(&forbidden));
+
+        // Unrelated failures must NOT trigger the API-key fallback.
+        assert!(!is_anthropic_oauth_forbidden(&anyhow::anyhow!(
+            "Claude API error (401 Unauthorized): bad token"
+        )));
+        assert!(!is_anthropic_oauth_forbidden(&anyhow::anyhow!(
+            "Failed to send request to Claude API"
+        )));
+        // A 403 from a permission_error (the organization gate) still counts even
+        // if the human-readable message phrasing changes slightly.
+        assert!(is_anthropic_oauth_forbidden(&anyhow::anyhow!(
+            "Claude API error (403 Forbidden): {{\"error\":{{\"type\":\"permission_error\"}}}}"
+        )));
+    }
+
+    #[test]
+    fn test_build_claude_api_key_system_param_omits_identity_spoof() {
+        // API-key path must NOT impersonate the official Claude Code CLI.
+        let none = build_claude_api_key_system_param("");
+        assert!(none.is_none(), "empty system => no system param");
+
+        let ClaudeApiSystem::Blocks(blocks) =
+            build_claude_api_key_system_param("be terse").expect("system present");
+        assert_eq!(blocks.len(), 1, "only the caller's system prompt is sent");
+        assert_eq!(blocks[0].text, "be terse");
+
+        // The OAuth builder, by contrast, injects the Claude Code identity spoof.
+        let ClaudeApiSystem::Blocks(oauth_blocks) =
+            build_claude_system_param("be terse").expect("oauth system present");
+        assert!(
+            oauth_blocks.iter().any(|b| b.text == CLAUDE_CODE_IDENTITY),
+            "oauth path keeps the identity block"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_sidecar_prefers_api_key_respects_pinned_mode() {
+        // Pinning the runtime to API-key mode must make the sidecar prefer the key.
+        let _g =
+            EnvVarGuard::set_path("JCODE_RUNTIME_PROVIDER", std::path::Path::new("claude-api"));
+        assert!(
+            anthropic_sidecar_prefers_api_key(),
+            "claude-api runtime => prefer API key"
+        );
+
+        // Pinning to OAuth mode must NOT prefer the key.
+        let _g2 = EnvVarGuard::set_path("JCODE_RUNTIME_PROVIDER", std::path::Path::new("claude"));
+        assert!(
+            !anthropic_sidecar_prefers_api_key(),
+            "claude (oauth) runtime => do not force API key"
+        );
     }
 }

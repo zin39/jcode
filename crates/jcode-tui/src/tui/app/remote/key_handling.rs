@@ -63,15 +63,19 @@ async fn apply_remote_effort_direction(
     remote: &mut RemoteConnection,
     direction: i8,
 ) -> Result<()> {
-    let efforts = app_mod::inferred_reasoning_efforts(
-        app.remote_provider_name.as_deref(),
-        app.remote_provider_model.as_deref(),
-    );
+    // Use the best-known provider/model identity (server-reported when
+    // available, header hints during the pre-History bootstrap window) so
+    // effort cycling works immediately after spawn instead of claiming the
+    // provider does not support it until the History payload settles.
+    let (provider_name, provider_model) = app.remote_effort_identity();
+    let efforts =
+        app_mod::inferred_reasoning_efforts(provider_name.as_deref(), provider_model.as_deref());
     if efforts.is_empty() {
         app.set_status_notice("Reasoning effort not available for this provider");
         return Ok(());
     }
-    let current = app.remote_reasoning_effort.as_deref();
+    let current = app.remote_reasoning_effort_hint();
+    let current = current.as_deref();
     let current_index = current
         .and_then(|c| efforts.iter().position(|e| *e == c))
         .unwrap_or(efforts.len() - 1);
@@ -269,6 +273,13 @@ async fn handle_remote_key_internal(
     let mut modifiers = modifiers;
     ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
 
+    // The onboarding simulator owns all key handling while active (and Cmd+5
+    // toggles it on). Handle it first so it works in remote/client mode too,
+    // which is how self-dev sessions run.
+    if app.handle_onboarding_sim_key(code, modifiers) {
+        return Ok(());
+    }
+
     if app.handle_onboarding_continue_prompt_key(code) {
         return Ok(());
     }
@@ -307,6 +318,21 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    // While the runtime model picker preview is visible, route its
+    // favorite/default hotkeys (Ctrl+O set default, Ctrl+N toggle favorite) to
+    // the focused picker handler before the remote global Ctrl-key handling
+    // can claim them. This mirrors the local path in `input.rs`
+    // `handle_key_core`.
+    if app.model_picker_preview_hotkey(code, modifiers)? {
+        return Ok(());
+    }
+
+    // Inline hotkey feedback: when a known-but-rarely-used chord is pressed,
+    // show "you just pressed X → does Y". Placed after the overlay handlers so
+    // overlay-local keys stay silent. Unknown chords are reported at the
+    // fall-through points below.
+    app.observe_known_hotkey(code, modifiers, true);
+
     if input::handle_visible_copy_shortcut(app, code, modifiers) {
         return Ok(());
     }
@@ -326,6 +352,25 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    // Accept an armed post-error fallback offer: stage the route switch and
+    // resend so the remote dispatcher applies it (SetRoute + payload resend).
+    // Checked before the merge offer to match the local key-handling order
+    // (both share the same accept key).
+    if app.pending_fallback_offer.is_some()
+        && !app.is_processing
+        && app.fallback_switch_key_matches(code, modifiers)
+    {
+        app.apply_pending_fallback_offer();
+        return Ok(());
+    }
+
+    // Accept an armed "merge the diverged update" offer (self-dev/remote
+    // sessions surface the same update card as local ones).
+    if app.merge_offer_key_matches(code, modifiers) {
+        app.accept_update_merge_offer();
+        return Ok(());
+    }
+
     if app.open_resume_key_matches(code, modifiers) {
         app.open_session_picker();
         return Ok(());
@@ -339,6 +384,26 @@ async fn handle_remote_key_internal(
         app.toggle_side_panel();
         return Ok(());
     }
+
+    // Inline swarm panel: Alt+N focuses the managed-agents panel; pressing it
+    // again cycles through agents. While focused, Alt+↑/↓ select, Alt+O pops
+    // the selection out to a terminal, Esc exits. Plain typing is NOT captured
+    // (it keeps flowing to the chat input).
+    if app.toggle_keys.swarm_panel_focus.matches(code, modifiers) {
+        use crate::tui::TuiState as _;
+        if app.swarm_panel_focused() {
+            app.cycle_swarm_panel_selection();
+        } else if app.toggle_swarm_panel_focus() {
+            app.set_status_notice("Swarm: alt+n next · alt+↑/↓ select · alt+o open · esc");
+        }
+        return Ok(());
+    }
+    {
+        use crate::tui::TuiState as _;
+        if app.swarm_panel_focused() && app.handle_swarm_panel_key(code, modifiers) {
+            return Ok(());
+        }
+    }
     let macos_option_shortcut =
         crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
     if app.toggle_keys.diagram_pane.matches(code, modifiers) {
@@ -346,10 +411,12 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
     if let Some(direction) = app.model_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::ModelSwitch);
         remote.cycle_model(direction).await?;
         return Ok(());
     }
     if let Some(direction) = app.effort_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::EffortCycle);
         apply_remote_effort_direction(app, remote, direction).await?;
         return Ok(());
     }
@@ -366,7 +433,8 @@ async fn handle_remote_key_internal(
         app.toggle_typing_scroll_lock();
         return Ok(());
     }
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::Alignment);
         app.toggle_centered_mode();
         return Ok(());
     }
@@ -482,7 +550,8 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
+        app.record_keybinding_fast(crate::tui::app::shortcut_hints::LearnableAction::Alignment);
         app.toggle_centered_mode();
         return Ok(());
     }
@@ -719,6 +788,7 @@ async fn handle_remote_key_internal(
     // Never fall through and insert literal text for unhandled Ctrl+key chords. This stays after
     // text_input so Ctrl+Alt/AltGr symbols delivered as final printable text still work.
     if modifiers.contains(KeyModifiers::CONTROL) {
+        app.note_unrecognized_hotkey(code, modifiers, true);
         return Ok(());
     }
 
@@ -735,6 +805,10 @@ async fn handle_remote_key_internal(
             _ => {}
         }
     }
+
+    // A modified chord (or function key) that reached this point is not bound
+    // to anything; tell the user instead of silently swallowing it.
+    app.note_unrecognized_hotkey(code, modifiers, true);
 
     match code {
         KeyCode::Char(c) => {
@@ -1035,13 +1109,15 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/effort" {
-                    let current = app.remote_reasoning_effort.as_deref();
+                    let current = app.remote_reasoning_effort_hint();
+                    let current = current.as_deref();
                     let label = current
                         .map(app_mod::effort_display_label)
                         .unwrap_or("default");
+                    let (provider_name, provider_model) = app.remote_effort_identity();
                     let efforts = app_mod::inferred_reasoning_efforts(
-                        app.remote_provider_name.as_deref(),
-                        app.remote_provider_model.as_deref(),
+                        provider_name.as_deref(),
+                        provider_model.as_deref(),
                     );
                     if efforts.is_empty() {
                         app.push_display_message(DisplayMessage::system(
@@ -1060,7 +1136,7 @@ async fn handle_remote_key_internal(
                         })
                         .collect();
                     app.push_display_message(DisplayMessage::system(format!(
-                        "Reasoning effort: {}\nAvailable: {}\nUse /effort <level> or {} to change.",
+                        "Effort: {}\nAvailable: {}\nUse /effort <level> or {} to change.",
                         label,
                         list.join(" · "),
                         crate::tui::keybind::effort_switch_keys_label()
@@ -1074,9 +1150,10 @@ async fn handle_remote_key_internal(
                         app.push_display_message(DisplayMessage::error("Usage: /effort <level>"));
                         return Ok(());
                     }
+                    let (provider_name, provider_model) = app.remote_effort_identity();
                     let efforts = app_mod::inferred_reasoning_efforts(
-                        app.remote_provider_name.as_deref(),
-                        app.remote_provider_model.as_deref(),
+                        provider_name.as_deref(),
+                        provider_model.as_deref(),
                     );
                     if efforts.contains(&level) {
                         app.remote_reasoning_effort = Some(level.to_string());
@@ -1584,9 +1661,46 @@ async fn handle_remote_key_internal(
                     app.pasted_contents.clear();
                     app.pending_images.clear();
                     app.clear_streaming_render_state();
+                    // Full transcript discard: every registered diagram is
+                    // orphaned, so re-scope the process-global registry too
+                    // (same rationale as reset_current_session in
+                    // commands_review.rs).
+                    crate::tui::mermaid::clear_active_diagrams();
                     app.is_processing = false;
                     app.status = ProcessingStatus::Idle;
                     app.set_status_notice("Session cleared");
+                    return Ok(());
+                }
+
+                if trimmed == "/fork" || trimmed == "/split" {
+                    app.push_display_message(DisplayMessage::system(
+                        "Forking session...".to_string(),
+                    ));
+                    remote.split().await?;
+                    return Ok(());
+                }
+
+                if trimmed == "/btw"
+                    || trimmed.starts_with("/btw ")
+                    || trimmed.starts_with("/fork ")
+                {
+                    let prompt = trimmed
+                        .strip_prefix("/btw")
+                        .or_else(|| trimmed.strip_prefix("/fork"))
+                        .unwrap_or_default()
+                        .trim();
+                    if prompt.is_empty() {
+                        app.push_display_message(DisplayMessage::error(
+                            "Usage: /btw <question>".to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    let prepared = input::PreparedInput {
+                        raw_input: prompt.to_string(),
+                        expanded: prompt.to_string(),
+                        images: vec![],
+                    };
+                    route_prepared_input_to_new_remote_session(app, remote, prepared).await?;
                     return Ok(());
                 }
 
@@ -1674,7 +1788,9 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
                     app.open_session_picker();
-                    app.hint_resume_shortcut();
+                    app.record_keybinding_slow(
+                        crate::tui::app::shortcut_hints::LearnableAction::Resume,
+                    );
                     return Ok(());
                 }
 
@@ -1760,14 +1876,6 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
-                if trimmed == "/split" {
-                    app.push_display_message(DisplayMessage::system(
-                        "Splitting session...".to_string(),
-                    ));
-                    remote.split().await?;
-                    return Ok(());
-                }
-
                 if trimmed == "/transfer" {
                     if app.pending_transfer_request {
                         app.push_display_message(DisplayMessage::system(
@@ -1825,21 +1933,34 @@ async fn handle_remote_key_internal(
                 if trimmed == "/commit"
                     || trimmed == "/commit-push"
                     || trimmed == "/commit-and-push"
+                    || trimmed == "/cut-release"
+                    || trimmed == "/commit-push-release"
                 {
+                    let is_release = trimmed == "/cut-release" || trimmed == "/commit-push-release";
                     let is_push = trimmed != "/commit";
-                    let prompt = if is_push {
+                    let prompt = if is_release {
+                        app_mod::commands::build_cut_release_prompt()
+                    } else if is_push {
                         app_mod::commands::build_commit_push_prompt()
                     } else {
                         app_mod::commands::build_commit_prompt()
                     };
                     let launch_notice = |interrupted: bool| {
-                        if is_push {
+                        if is_release {
+                            app_mod::commands::cut_release_launch_notice(interrupted)
+                        } else if is_push {
                             app_mod::commands::commit_push_launch_notice(interrupted)
                         } else {
                             app_mod::commands::commit_launch_notice(interrupted)
                         }
                     };
-                    let cmd_label = if is_push { "/commit-push" } else { "/commit" };
+                    let cmd_label = if is_release {
+                        "/cut-release"
+                    } else if is_push {
+                        "/commit-push"
+                    } else {
+                        "/commit"
+                    };
                     if app.is_processing {
                         app.push_display_message(DisplayMessage::system(launch_notice(true)));
                         match remote.soft_interrupt(prompt.clone(), false).await {

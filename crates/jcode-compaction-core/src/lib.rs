@@ -18,6 +18,103 @@ pub const MANUAL_COMPACT_MIN_THRESHOLD: f32 = 0.10;
 /// Keep this many recent turns verbatim (not summarized)
 pub const RECENT_TURNS_TO_KEEP: usize = 10;
 
+/// Tool results below this size are left alone — clearing them saves nothing
+/// and destroys cheap, useful context.
+pub const MIN_CLEARABLE_TOOL_RESULT_CHARS: usize = 200;
+
+const CLEARED_MARKER_PREFIX: &str = "[tool result cleared by jcode";
+const SPILL_POINTER_NEEDLE: &str = "FULL output saved to ";
+/// Prefix of the inline pointer line the spill feature leaves behind. Only
+/// lines starting with this are treated as real spill pointers — tool output
+/// that merely mentions the needle phrase must not hijack extraction.
+const SPILL_POINTER_LINE_PREFIX: &str = "[Tool output truncated by jcode";
+
+/// Replacement text for a cleared tool result. Preserves the spill-pointer
+/// line (if the original was spilled to disk) so the agent can still retrieve
+/// the full output with the read tool.
+pub fn cleared_tool_result_content(original: &str) -> String {
+    let pointer_line = original.lines().find(|line| {
+        let line = line.trim();
+        line.starts_with(SPILL_POINTER_LINE_PREFIX) && line.contains(SPILL_POINTER_NEEDLE)
+    });
+    match pointer_line {
+        Some(line) => {
+            // Keep only from the spill-pointer needle onward — the rest of the
+            // line (e.g. "Tool output truncated by jcode: ...") is redundant
+            // with the marker we're already emitting, and dropping it keeps
+            // the replacement meaningfully smaller than the original.
+            let trimmed = line.trim().trim_end_matches(']');
+            let pointer = trimmed
+                .find(SPILL_POINTER_NEEDLE)
+                .map(|idx| &trimmed[idx..])
+                .unwrap_or(trimmed);
+            format!(
+                "{} under context pressure: {} chars removed. {}]",
+                CLEARED_MARKER_PREFIX,
+                original.chars().count(),
+                pointer,
+            )
+        }
+        None => format!(
+            "{} under context pressure: {} chars removed. Re-run the tool if this output is needed again.]",
+            CLEARED_MARKER_PREFIX,
+            original.chars().count(),
+        ),
+    }
+}
+
+/// True if this tool-result text is worth clearing (big enough, not already cleared).
+pub fn is_clearable_tool_result(text: &str) -> bool {
+    text.chars().count() >= MIN_CLEARABLE_TOOL_RESULT_CHARS
+        && !text.starts_with(CLEARED_MARKER_PREFIX)
+}
+
+/// Clear tool-result payloads in `messages[..up_to_index]` (view-time only —
+/// callers pass a cloned API view, never stored history). Returns how many
+/// results were cleared. Skips already-cleared markers and small results.
+pub fn clear_tool_results_up_to(messages: &mut [Message], up_to_index: usize) -> usize {
+    let mut cleared = 0;
+    let end = up_to_index.min(messages.len());
+    for message in &mut messages[..end] {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && is_clearable_tool_result(content)
+            {
+                *content = cleared_tool_result_content(content);
+                cleared += 1;
+            }
+        }
+    }
+    cleared
+}
+
+/// Byte length of the cleared replacement for `original`, without requiring
+/// the caller to allocate the exact string. Defers to
+/// [`cleared_tool_result_content`] itself (rather than reimplementing its
+/// layout) so this estimate can never drift out of sync with what clearing
+/// actually produces.
+pub fn cleared_tool_result_estimate_chars(original: &str) -> usize {
+    cleared_tool_result_content(original).len()
+}
+
+/// Count clearable tool-result payloads in `messages[..up_to_index]` without
+/// mutating anything. Mirrors [`clear_tool_results_up_to`]'s predicate
+/// exactly so a reported count always matches what an actual clearing pass
+/// over the same range would affect.
+pub fn count_clearable_tool_results(messages: &[Message], up_to_index: usize) -> usize {
+    let end = up_to_index.min(messages.len());
+    messages[..end]
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { content, .. } if is_clearable_tool_result(content)
+            )
+        })
+        .count()
+}
+
 /// Absolute minimum turns to keep during emergency compaction
 pub const MIN_TURNS_TO_KEEP: usize = 2;
 
@@ -124,6 +221,11 @@ pub enum CompactionAction {
     BackgroundStarted { trigger: String },
     /// Emergency hard compact performed. Contains number of messages dropped.
     HardCompacted(usize),
+    /// Stage-1 reversible tool-result clearing freed enough headroom that
+    /// summarization was skipped this turn. Contains the number of clearable
+    /// tool results affected (stored history is untouched — this only
+    /// changed the API view).
+    ToolResultsCleared { cleared: usize },
 }
 
 /// Stats about compaction state
@@ -380,6 +482,47 @@ pub fn estimate_compaction_tokens(
 ) -> usize {
     let summary_chars = summary.map(summary_payload_char_count).unwrap_or(0);
     estimate_compaction_tokens_from_chars(summary_chars + active_message_chars, token_budget)
+}
+
+/// Best-effort context size (tokens) from a provider usage report.
+///
+/// Providers disagree on what `input_tokens` means:
+/// - **Split accounting** (Anthropic-style): `input_tokens` is only the
+///   *uncached* remainder; cache reads/writes are separate counters, so the
+///   real context size is `input + cache_read + cache_creation`.
+/// - **Subset accounting** (OpenAI-style): `input_tokens` (`prompt_tokens`)
+///   already includes cached tokens; `cached_tokens` is a subset and must NOT
+///   be added again.
+///
+/// This is the single source of truth for that heuristic. Both the sidebar
+/// context figure and the compaction manager's observed-token feed must use it
+/// so the two never disagree (issue #441). When in doubt, avoid over-counting
+/// unless there is strong evidence of split accounting.
+pub fn effective_context_tokens_from_usage(
+    provider_name: &str,
+    input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+) -> u64 {
+    if input_tokens == 0 {
+        return 0;
+    }
+    let cache_read = cache_read_input_tokens.unwrap_or(0);
+    let cache_creation = cache_creation_input_tokens.unwrap_or(0);
+    let provider_name = provider_name.to_lowercase();
+
+    let split_cache_accounting = provider_name.contains("anthropic")
+        || provider_name.contains("claude")
+        || cache_creation > 0
+        || cache_read > input_tokens;
+
+    if split_cache_accounting {
+        input_tokens
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation)
+    } else {
+        input_tokens
+    }
 }
 
 pub fn estimate_compaction_tokens_from_chars(total_chars: usize, token_budget: usize) -> usize {
@@ -730,6 +873,55 @@ pub fn tail_str_boundary(value: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_context_split_accounting_adds_cache_counters() {
+        // Anthropic-style: input is the uncached remainder.
+        assert_eq!(
+            effective_context_tokens_from_usage("anthropic", 10_000, Some(300_000), Some(5_000)),
+            315_000
+        );
+        assert_eq!(
+            effective_context_tokens_from_usage("Claude", 10_000, Some(300_000), None),
+            310_000
+        );
+    }
+
+    #[test]
+    fn effective_context_subset_accounting_does_not_double_count() {
+        // OpenAI-style: prompt_tokens already includes cached tokens.
+        assert_eq!(
+            effective_context_tokens_from_usage("openai", 400_000, Some(390_000), None),
+            400_000
+        );
+        // No cache info at all: pass through.
+        assert_eq!(
+            effective_context_tokens_from_usage("opencode-go", 396_000, None, None),
+            396_000
+        );
+    }
+
+    #[test]
+    fn effective_context_infers_split_accounting_from_counter_shape() {
+        // cache_read > input implies input can't already contain it.
+        assert_eq!(
+            effective_context_tokens_from_usage("unknown", 10_000, Some(500_000), None),
+            510_000
+        );
+        // Any cache_creation implies split accounting.
+        assert_eq!(
+            effective_context_tokens_from_usage("unknown", 10_000, Some(2_000), Some(1_000)),
+            13_000
+        );
+    }
+
+    #[test]
+    fn effective_context_zero_input_reports_zero() {
+        assert_eq!(
+            effective_context_tokens_from_usage("anthropic", 0, Some(300_000), Some(5_000)),
+            0
+        );
+    }
 
     #[test]
     fn builds_compaction_prompt_with_summary_and_truncated_tool_result() {
@@ -1102,5 +1294,70 @@ mod tests {
         let stripped = emergency_strip_large_images(&mut messages, 2000);
         assert_eq!(stripped, 1);
         assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
+    }
+
+    fn tool_result_message(id: &str, text: &str) -> Message {
+        Message::tool_result_with_duration(id, text, false, None)
+    }
+
+    fn tool_result_text(message: &Message) -> &str {
+        match &message.content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected ToolResult block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cleared_content_preserves_spill_pointer() {
+        let original = "first 10KB head...\n[Tool output truncated by jcode: tool `bash` produced 80000 chars; kept first 10000 inline. FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt — use the read tool with start_line/limit for targeted sections.]";
+        let cleared = cleared_tool_result_content(original);
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(cleared.contains("FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt"));
+        assert!(cleared.len() < original.len());
+    }
+
+    #[test]
+    fn spurious_full_output_phrase_is_not_treated_as_pointer() {
+        // The needle phrase appearing in ordinary tool output (not on a real
+        // spill-pointer line) must not hijack extraction.
+        let original = format!(
+            "{}\nAnalysis notes: FULL output saved to /tmp/fake.txt\nmore output",
+            "x".repeat(300)
+        );
+        let cleared = cleared_tool_result_content(&original);
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(!cleared.contains("/tmp/fake.txt"));
+        assert!(cleared.contains("Re-run the tool if this output is needed again."));
+    }
+
+    #[test]
+    fn threshold_boundary_exactly_min_chars_is_clearable() {
+        let at_min = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
+        assert!(is_clearable_tool_result(&at_min));
+        let below_min = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS - 1);
+        assert!(!is_clearable_tool_result(&below_min));
+    }
+
+    #[test]
+    fn cleared_content_without_pointer_is_marker_only() {
+        let cleared = cleared_tool_result_content("plain big output");
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(!cleared.contains("FULL output saved"));
+    }
+
+    #[test]
+    fn clear_tool_results_respects_watermark_and_skips_small_results() {
+        let mut messages = vec![
+            tool_result_message("t1", &"a".repeat(1000)),
+            tool_result_message("t2", "short"),
+            tool_result_message("t3", &"b".repeat(1000)),
+        ];
+        let cleared = clear_tool_results_up_to(&mut messages, 2);
+        assert_eq!(cleared, 1);
+        assert!(tool_result_text(&messages[0]).starts_with("[tool result cleared"));
+        assert_eq!(tool_result_text(&messages[1]), "short");
+        assert!(tool_result_text(&messages[2]).starts_with("bbb"));
+        // Idempotent: second pass clears nothing new.
+        assert_eq!(clear_tool_results_up_to(&mut messages, 2), 0);
     }
 }

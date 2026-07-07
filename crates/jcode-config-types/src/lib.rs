@@ -530,6 +530,12 @@ pub struct AgentsConfig {
     /// Lower values keep more of the transcript visible; set near the minimum
     /// to effectively collapse the gallery to a thin strip.
     pub swarm_gallery_max_pct: Option<u8>,
+    /// Layout of the inline swarm strip above the status line:
+    /// `"vertical"` (default) lists one agent per row (session icon + status
+    /// glyph + task), capped to a few lines; `"horizontal"` packs all agents
+    /// as chips on a single row.
+    #[serde(default)]
+    pub swarm_strip_layout: SwarmStripLayout,
     /// Optional default model override for the memory sidecar.
     pub memory_model: Option<String>,
     /// Whether memory should use the sidecar for relevance/extraction.
@@ -580,6 +586,30 @@ pub struct AgentsConfig {
     /// metadata / sanity checks). Unset = inferred from the model name.
     #[serde(default)]
     pub memory_embedding_dim: Option<usize>,
+    /// Maximum seconds a direct (blocking) `subagent` tool call will wait for the
+    /// child session to produce its final answer before failing with a timeout
+    /// error. Prevents a stuck/hung child turn from blocking the caller forever.
+    /// `0` disables the bound (wait indefinitely). Default 600 (10 min).
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub subagent_timeout_secs: u64,
+    /// Maximum number of swarm worker agents `run_plan` keeps running *at once*
+    /// in a **deep**-mode task graph. This bounds parallelism, not the total
+    /// number of agents spawned over the run (that is `MAX_SWARM_MEMBERS`). Deep
+    /// mode is meant to fan out wide, so the default is high (32); the real
+    /// ceiling is still the per-swarm member cap. Light mode uses a small fixed
+    /// fan-out instead. `0` means "no extra cap": run_plan dispatches the entire
+    /// ready set every loop, bounded only by the member cap.
+    /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
+    #[serde(default = "default_swarm_max_concurrent_agents")]
+    pub swarm_max_concurrent_agents: usize,
+}
+
+fn default_swarm_max_concurrent_agents() -> usize {
+    32
+}
+
+fn default_subagent_timeout_secs() -> u64 {
+    600
 }
 
 fn default_memory_embedding_backend() -> String {
@@ -625,6 +655,7 @@ impl Default for AgentsConfig {
             cheap_route_gold_k: default_cheap_route_gold_k(),
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
+            swarm_strip_layout: SwarmStripLayout::default(),
             memory_model: None,
             memory_sidecar_enabled: default_memory_sidecar_enabled(),
             memory_rerank_cadence: default_memory_rerank_cadence(),
@@ -634,6 +665,8 @@ impl Default for AgentsConfig {
             memory_embedding_model: None,
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
+            subagent_timeout_secs: default_subagent_timeout_secs(),
+            swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
         }
     }
 }
@@ -642,13 +675,13 @@ impl Default for AgentsConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SwarmSpawnMode {
-    /// Open a visible/headed terminal window. This preserves historical behavior.
-    #[default]
+    /// Open a visible/headed terminal window. This was the historical default.
     Visible,
     /// Create the worker in-process without opening a terminal window.
     Headless,
     /// Like headless (no terminal window), but the coordinator renders a live
     /// inline gallery viewport of each worker's streaming output.
+    #[default]
     Inline,
     /// Try visible first and fall back to headless if a window cannot be opened.
     Auto,
@@ -672,6 +705,36 @@ impl SwarmSpawnMode {
             Self::Headless => "headless",
             Self::Inline => "inline",
             Self::Auto => "auto",
+        }
+    }
+}
+
+/// Layout of the inline swarm strip shown above the status line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SwarmStripLayout {
+    /// One agent per row: session icon + status glyph + task label, capped to
+    /// a few lines with a `+N more` overflow marker.
+    #[default]
+    Vertical,
+    /// All agents packed as chips on a single row (the historical layout).
+    Horizontal,
+}
+
+impl SwarmStripLayout {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "vertical" | "list" => Some(Self::Vertical),
+            "horizontal" | "chips" | "strip" => Some(Self::Horizontal),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase string for this layout (matches config/env values).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vertical => "vertical",
+            Self::Horizontal => "horizontal",
         }
     }
 }
@@ -706,6 +769,16 @@ pub struct TerminalConfig {
     ///
     /// Env override: `JCODE_FOCUS_HOOK` (set empty to disable a config hook).
     pub focus_hook: Option<String>,
+    /// Terminal used by the macOS Cmd+; launch hotkey and in-app session spawns.
+    ///
+    /// One of: `ghostty`, `iterm2`, `wezterm`, `warp`, `alacritty`, `vscode`,
+    /// `terminal` (Apple Terminal). When set, this is the source of truth for
+    /// which terminal jcode launches into and is preferred over the legacy
+    /// `~/.jcode/preferred_terminal.json` file. Re-run `jcode setup-hotkey`
+    /// after changing it so the generated launcher script picks up the change.
+    ///
+    /// macOS only; ignored on other platforms.
+    pub preferred: Option<String>,
 }
 
 /// Lifecycle hooks: external commands jcode runs at well-defined points.
@@ -723,6 +796,12 @@ pub struct TerminalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HooksConfig {
+    /// Runs when an agent turn begins (after the user message is added and
+    /// before the model starts generating). Fires before the first `pre_tool`,
+    /// so integrations can detect that the agent is actively working even while
+    /// it is only thinking/streaming text. Fields: MODEL, SOURCE
+    /// ("chat"/"resume"/"ambient"). Env override: JCODE_HOOK_TURN_START.
+    pub turn_start: Option<String>,
     /// Runs when an agent turn completes.
     /// Fields: STATUS ("ok"/"error"), DURATION_MS, MODEL, LAST_ASSISTANT_TEXT.
     /// Env override: JCODE_HOOK_TURN_END.
@@ -751,6 +830,7 @@ pub struct HooksConfig {
 impl Default for HooksConfig {
     fn default() -> Self {
         Self {
+            turn_start: None,
             turn_end: None,
             session_start: None,
             session_end: None,
@@ -769,6 +849,35 @@ pub struct AutoReviewConfig {
     pub enabled: bool,
     /// Optional model override for autoreview reviewer sessions.
     pub model: Option<String>,
+}
+
+/// Sponsored discovery configuration.
+///
+/// Sponsored discovery makes third-party developer tools discoverable to the
+/// agent via a `discover_tools` tool backed by a hosted manifest. Sponsors buy
+/// placement (discoverability), never recommendations. Each session's first
+/// use of `discover_tools` is disclosed in the UI with a
+/// `(sponsored discovery)` tag; using a discovered tool afterwards carries no
+/// extra tag. See <https://solosystems.dev/sponsored-discovery>.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SponsorsConfig {
+    /// Enable sponsored discovery. Enabled by default; set to false to opt
+    /// out. When false, no discovery categories are added to the prompt, the
+    /// `discover_tools` tool is not registered, and jcode never contacts the
+    /// discovery endpoint.
+    pub enabled: bool,
+    /// Base URL of the discovery endpoint.
+    pub endpoint: String,
+}
+
+impl Default for SponsorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: "https://api.solosystems.dev/v1/discovery".to_string(),
+        }
+    }
 }
 
 /// Automatic end-of-turn execution judging configuration.
@@ -797,6 +906,9 @@ pub struct KeybindingsConfig {
     pub model_switch_next: String,
     /// Model switch previous key (default: "ctrl+shift+tab")
     pub model_switch_prev: String,
+    /// Accept the post-error fallback offer: switch to the next best
+    /// model/auth-method and resend the failed turn (default: "ctrl+y").
+    pub fallback_switch: String,
     /// Effort increase key (default: "cmd+right" on macOS, "alt+right" elsewhere)
     pub effort_increase: String,
     /// Effort decrease key (default: "cmd+left" on macOS, "alt+left" elsewhere)
@@ -833,10 +945,15 @@ pub struct KeybindingsConfig {
     pub diff_mode_cycle: String,
     /// Toggle the info widget (default: "alt+i")
     pub info_widget_toggle: String,
+    /// Focus/unfocus the inline swarm panel for keyboard navigation (default:
+    /// "alt+n"; press again to cycle agents, alt+↑/↓ select, alt+o pop out,
+    /// esc exits). Active only when `agents.swarm_spawn_mode = "inline"` and
+    /// the session manages swarm agents.
+    pub swarm_panel_focus: String,
     /// Spawn a fresh jcode session in a new terminal window (default: unbound).
     /// Example: "alt+enter".
     pub new_terminal: String,
-    /// Open the `/resume` session picker (default: "cmd+r" on macOS, "ctrl+r"
+    /// Open the `/resume` session picker (default: "cmd+b" on macOS, "alt+r"
     /// elsewhere). Set "" to disable.
     pub open_resume: String,
     /// Session picker Enter action: "current-terminal" (default) or "new-terminal".
@@ -860,6 +977,7 @@ impl Default for KeybindingsConfig {
             scroll_page_down: get("scroll_page_down", "alt+d"),
             model_switch_next: get("model_switch_next", "ctrl+tab"),
             model_switch_prev: get("model_switch_prev", "ctrl+shift+tab"),
+            fallback_switch: get("fallback_switch", "ctrl+y"),
             effort_increase: get("effort_increase", "alt+right"),
             effort_decrease: get("effort_decrease", "alt+left"),
             centered_toggle: get("centered_toggle", "alt+c"),
@@ -878,8 +996,16 @@ impl Default for KeybindingsConfig {
             typing_scroll_lock_toggle: get("typing_scroll_lock_toggle", "alt+s"),
             diff_mode_cycle: get("diff_mode_cycle", "alt+g"),
             info_widget_toggle: get("info_widget_toggle", "alt+i"),
+            swarm_panel_focus: get("swarm_panel_focus", "alt+n"),
             new_terminal: get("new_terminal", ""),
-            open_resume: get("open_resume", if cfg!(target_os = "macos") { "cmd+r" } else { "alt+r" }),
+            open_resume: get(
+                "open_resume",
+                if cfg!(target_os = "macos") {
+                    "cmd+b"
+                } else {
+                    "alt+r"
+                },
+            ),
             session_picker_enter: SessionPickerResumeAction::CurrentTerminal,
         }
     }
@@ -903,6 +1029,10 @@ impl Default for NativeScrollbarConfig {
             side_panel: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Display/UI configuration
@@ -931,7 +1061,8 @@ pub struct DisplayConfig {
     #[serde(default)]
     reasoning_display: Option<ReasoningDisplayMode>,
     /// How to display mermaid diagrams (none/margin/pinned, default: none).
-    /// Mermaid rendering is temporarily disabled for users unless JCODE_ENABLE_MERMAID=1.
+    /// `none` still renders diagrams inline in the transcript via the inline
+    /// image pipeline; `margin`/`pinned` add dedicated widget placements.
     pub diagram_mode: DiagramDisplayMode,
     /// Markdown block spacing style (compact/document, default: compact)
     pub markdown_spacing: MarkdownSpacingMode,
@@ -953,10 +1084,22 @@ pub struct DisplayConfig {
     pub redraw_fps: u32,
     /// Show a truncated preview of the previous prompt at the top when it scrolls out of view (default: true)
     pub prompt_preview: bool,
+    /// Render swarm/file-activity notifications in a compact single-line form
+    /// instead of the full multi-line card with diff preview (default: false)
+    pub compact_notifications: bool,
     /// Override the Alt/Option label shown in copy badges. Empty = auto (⌥ on macOS, Alt elsewhere).
     pub copy_badge_alt_label: String,
+    /// Show the full agentgrep tool output inline in the transcript instead of
+    /// just the one-line summary (default: false)
+    #[serde(default)]
+    pub show_agentgrep_output: bool,
     /// Native terminal scrollbar configuration for scrollable panes
     pub native_scrollbars: NativeScrollbarConfig,
+    /// Surface occasional "learn this keybinding" nudges when the user keeps
+    /// performing an action the slow way (slash command) instead of using its
+    /// configured shortcut (default: true). Set false to disable all such hints.
+    #[serde(default = "default_true")]
+    pub keybinding_hints: bool,
 }
 
 impl Default for DisplayConfig {
@@ -982,8 +1125,11 @@ impl Default for DisplayConfig {
             animation_fps: 60,
             redraw_fps: 60,
             prompt_preview: true,
+            compact_notifications: false,
             copy_badge_alt_label: String::new(),
+            show_agentgrep_output: false,
             native_scrollbars: NativeScrollbarConfig::default(),
+            keybinding_hints: true,
         }
     }
 }
@@ -1046,6 +1192,11 @@ pub struct FeatureConfig {
     pub kv_cache_miss_notices: bool,
     /// Update channel: "stable" (releases only) or "main" (latest commits)
     pub update_channel: UpdateChannel,
+    /// Inject a system-prompt directive instructing the agent to verify
+    /// uncertain or fast-changing facts with a websearch instead of asserting
+    /// them from memory (default: false). Reduces hallucinations for questions
+    /// where the answer may have changed or the model is unsure.
+    pub web_grounding: bool,
 }
 
 impl Default for FeatureConfig {
@@ -1057,6 +1208,7 @@ impl Default for FeatureConfig {
             persist_memory_injections: false,
             kv_cache_miss_notices: true,
             update_channel: UpdateChannel::default(),
+            web_grounding: false,
         }
     }
 }
@@ -1074,12 +1226,18 @@ pub enum WebSearchEngine {
     /// `JCODE_SEARXNG_URL` env var) to point at a SearXNG instance. Useful on
     /// hosts where DuckDuckGo/Bing block the request via TLS fingerprinting.
     Searxng,
-    /// Tavily AI search API. Agent-grade results with clean extracted content.
-    /// Reads one or more API keys from the `TAVILY_API_KEYS` env var (comma- or
-    /// whitespace-separated) and rotates across them, skipping keys that are
-    /// rate-limited or out of credits, so a single exhausted free-tier key does
-    /// not break search.
+    /// Tavily Search API (fast, keyed). Reads the API key from
+    /// `websearch.tavily_api_key`, the `TAVILY_API_KEYS` env var (comma-separated
+    /// keys allowed), or `~/.jcode/tavily.env`.
     Tavily,
+    /// last30days skill (deep, engagement-scored social + web research). Shells
+    /// out to the installed `last30days.py` engine. Slow (tens of seconds) but
+    /// surfaces Reddit/HN/GitHub/etc. results ranked by real engagement.
+    Last30days,
+    /// Hybrid engine (default): fans out to Tavily and last30days concurrently,
+    /// cross-verifies their results (agreement between independent engines is a
+    /// strong quality signal), and returns a single merged, best-first ranking.
+    Hybrid,
 }
 
 impl WebSearchEngine {
@@ -1089,6 +1247,8 @@ impl WebSearchEngine {
             Self::Bing => "bing",
             Self::Searxng => "searxng",
             Self::Tavily => "tavily",
+            Self::Last30days => "last30days",
+            Self::Hybrid => "hybrid",
         }
     }
 
@@ -1098,6 +1258,8 @@ impl WebSearchEngine {
             "bing" => Some(Self::Bing),
             "searxng" | "searx" => Some(Self::Searxng),
             "tavily" => Some(Self::Tavily),
+            "last30days" | "l30d" | "last30" => Some(Self::Last30days),
+            "hybrid" | "verified" | "both" => Some(Self::Hybrid),
             _ => None,
         }
     }
@@ -1123,33 +1285,51 @@ pub struct WebSearchConfig {
     pub searxng_url: Option<String>,
     /// Environment variable containing the SearXNG base URL.
     pub searxng_url_env: String,
-    /// Environment variable holding one or more Tavily API keys, comma- or
-    /// whitespace-separated. The `tavily` engine rotates across them and skips
-    /// keys that are rate-limited or out of credits.
-    pub tavily_api_keys_env: String,
-    /// Bare filename under the jcode config dir (e.g. `~/.jcode/tavily.env`)
-    /// read for `{tavily_api_keys_env}=...` when the env var is unset. Lets keys
-    /// live in a secret file like other provider credentials instead of the
-    /// server's process environment.
-    pub tavily_api_keys_file: String,
-    /// Tavily search depth: "basic" (1 credit, fast) or "advanced" (2 credits,
-    /// deeper extraction). Defaults to "advanced".
+    /// Optional Tavily Search API key (comma-separated keys allowed; the first
+    /// usable one is used). When empty, `tavily_api_key_env` and then
+    /// `~/.jcode/tavily.env` are consulted.
+    pub tavily_api_key: Option<String>,
+    /// Environment variable containing the Tavily API key(s).
+    pub tavily_api_key_env: String,
+    /// Tavily search depth: "basic" (fast, cheap) or "advanced" (deeper).
     pub tavily_search_depth: String,
+    /// Whether the `last30days` and `hybrid` engines may shell out to the
+    /// installed last30days skill. Set false to disable the deep engine entirely.
+    pub last30days_enabled: bool,
+    /// Override path to the last30days engine script. When empty, jcode looks in
+    /// `~/.jcode/skills/last30days/scripts/last30days.py` then
+    /// `./.jcode/skills/last30days/scripts/last30days.py`.
+    pub last30days_script: Option<String>,
+    /// Max seconds the `hybrid`/`last30days` engines wait for the deep engine
+    /// before returning what the fast engine already found. Keeps searches
+    /// responsive since last30days can take tens of seconds.
+    pub last30days_timeout_secs: u64,
+    /// Comma-separated last30days source list for the deep leg (keeps it to the
+    /// keyless/free sources by default so no extra credentials are needed).
+    pub last30days_sources: String,
 }
 
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            engine: WebSearchEngine::Duckduckgo,
-            fallback_engines: vec![WebSearchEngine::Bing],
+            engine: WebSearchEngine::Hybrid,
+            fallback_engines: vec![
+                WebSearchEngine::Tavily,
+                WebSearchEngine::Duckduckgo,
+                WebSearchEngine::Bing,
+            ],
             bing_api_key: None,
             bing_api_key_env: "JCODE_BING_API_KEY".to_string(),
             bing_market: "en-US".to_string(),
             searxng_url: None,
             searxng_url_env: "JCODE_SEARXNG_URL".to_string(),
-            tavily_api_keys_env: "TAVILY_API_KEYS".to_string(),
-            tavily_api_keys_file: "tavily.env".to_string(),
-            tavily_search_depth: "advanced".to_string(),
+            tavily_api_key: None,
+            tavily_api_key_env: "TAVILY_API_KEYS".to_string(),
+            tavily_search_depth: "basic".to_string(),
+            last30days_enabled: true,
+            last30days_script: None,
+            last30days_timeout_secs: 75,
+            last30days_sources: "reddit,hackernews,github,grounding".to_string(),
         }
     }
 }
@@ -1451,4 +1631,50 @@ impl Default for PowerConfig {
             prevent_sleep_while_streaming: true,
         }
     }
+}
+
+/// A single global launch hotkey: a chord plus the directory it opens jcode in.
+///
+/// `dir` is usually an absolute path, but a few sentinels keep dynamic targets
+/// working without rewriting config on every launch:
+/// - `$HOME` -> the user's home directory.
+/// - `$LAST_DIR` -> the most recent non-home project directory jcode ran in.
+/// - `$LAST_REPO` -> the most recent jcode repo (for self-dev).
+///
+/// `self_dev = true` opens the directory as a self-dev session (passes the
+/// `self-dev` subcommand). `label` is an optional human name used in notices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchHotkeyEntry {
+    /// jcode-style chord string, e.g. `cmd+;`, `cmd+[`, `cmd+shift+'`.
+    pub chord: String,
+    /// Directory to open (absolute path or a `$HOME`/`$LAST_DIR`/`$LAST_REPO`
+    /// sentinel).
+    pub dir: String,
+    /// Optional short label (e.g. the repo's directory name) for notices.
+    #[serde(default)]
+    pub label: String,
+    /// Open as a self-dev session instead of a normal session.
+    #[serde(default)]
+    pub self_dev: bool,
+}
+
+/// Configuration for the global "launch a new jcode" hotkeys (macOS).
+///
+/// When `entries` is empty, jcode uses its built-in defaults (`Cmd+;` -> home,
+/// `Cmd+'` -> last project, `Cmd+Shift+'` -> self-dev). Auto-import can bake a
+/// richer, per-repo mapping here once: the top repo on `Cmd+;`, home on
+/// `Cmd+'`, and the next repos on `Cmd+[` / `Cmd+]` / `Cmd+\`. Once baked the
+/// mapping is static and does not move around as the user's activity changes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LaunchHotkeysConfig {
+    /// Whether the global launch hotkeys are installed at all. `None` means
+    /// "not decided yet" (fall back to the legacy auto-install gating); `Some`
+    /// is an explicit user/import choice.
+    pub enabled: Option<bool>,
+    /// Explicit chord -> directory mapping. Empty = use built-in defaults.
+    pub entries: Vec<LaunchHotkeyEntry>,
+    /// Set true once auto-import has populated `entries`, so we only bake the
+    /// per-repo mapping a single time and never clobber later user edits.
+    pub imported: bool,
 }

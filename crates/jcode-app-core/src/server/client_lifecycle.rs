@@ -48,8 +48,9 @@ use super::{
     AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
     SessionControlHandle, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
     SwarmMutationRuntime, VersionedPlan, format_structured_completion_report,
-    register_session_interrupt_queue, truncate_detail, update_member_status,
-    update_member_status_with_report,
+    register_session_interrupt_queue, send_swarm_plan_to_session, truncate_detail,
+    update_member_status, update_member_status_with_report,
+    update_member_status_with_report_tldr,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
@@ -266,9 +267,20 @@ async fn refresh_session_control_handle(
             let fallback_stop_signal = shutdown_signals.read().await.get(session_id).cloned();
             let fallback_soft_interrupt_queue =
                 soft_interrupt_queues.read().await.get(session_id).cloned();
-            if let (Some(stop_signal), Some(soft_interrupt_queue)) =
-                (fallback_stop_signal, fallback_soft_interrupt_queue)
-            {
+            if let Some(soft_interrupt_queue) = fallback_soft_interrupt_queue {
+                // A missing shutdown-signal registration (e.g. a session created
+                // through the headless spawn path) must not force this connection
+                // to block on the busy agent mutex: cancels fired through the
+                // handle fan out to the running turn's own signal via the
+                // turn-cancel registry (issue #428), so a detached signal is a
+                // safe stand-in.
+                let stop_signal = fallback_stop_signal.unwrap_or_else(|| {
+                    crate::logging::warn(&format!(
+                        "refresh_session_control_handle: no registered shutdown signal for busy session {}; using detached signal (cancels reach the running turn via the turn cancel registry)",
+                        session_id
+                    ));
+                    InterruptSignal::new()
+                });
                 crate::logging::warn(&format!(
                     "refresh_session_control_handle: using lock-free cancel-only control handle for busy session {} after {}ms",
                     session_id,
@@ -526,6 +538,7 @@ pub(super) async fn handle_client(
                 last_seen: connected_at,
                 is_processing: false,
                 current_tool_name: None,
+                terminal_env: Vec::new(),
                 disconnect_tx: disconnect_tx.clone(),
             },
         );
@@ -611,9 +624,13 @@ pub(super) async fn handle_client(
             let json = encode_event(&event);
             let mut w = writer_clone.lock().await;
             if let Err(error) = w.write_all(json.as_bytes()).await {
+                // A broken pipe here is routine (client reload/disconnect mid
+                // broadcast), so keep the line short: a full Debug dump of e.g.
+                // a SwarmStatus event prints every member and floods the log.
+                let event_desc = crate::logging::truncate_for_log(&format!("{:?}", event), 200);
                 crate::logging::warn(&format!(
-                    "event_forwarder write failed for connection {} while sending {:?}: {}",
-                    client_connection_id_for_events, event, error
+                    "event_forwarder write failed for connection {} while sending {}: {}",
+                    client_connection_id_for_events, event_desc, error
                 ));
                 break;
             }
@@ -769,10 +786,18 @@ pub(super) async fn handle_client(
                             if retry_after_secs.is_some() {
                                 crate::telemetry::record_error(crate::telemetry::ErrorCategory::RateLimited);
                             } else {
-                                let msg = e.to_string().to_lowercase();
-                                if msg.contains("timeout") {
+                                let msg = e.to_string();
+                                let lower = msg.to_lowercase();
+                                if lower.contains("timeout") {
                                     crate::telemetry::record_error(crate::telemetry::ErrorCategory::ProviderTimeout);
-                                } else if msg.contains("auth") || msg.contains("unauthorized") || msg.contains("forbidden") {
+                                } else if crate::provider::error_looks_like_credential_failure(&msg)
+                                    || lower.contains("403 forbidden")
+                                {
+                                    // Use the shared credential-failure classifier instead of a
+                                    // bare `contains("auth")`: that substring also matched
+                                    // unrelated errors (e.g. any message mentioning "author" or
+                                    // OAuth flow noise) and inflated the auth_failed telemetry
+                                    // counter.
                                     crate::telemetry::record_error(crate::telemetry::ErrorCategory::AuthFailed);
                                 }
                             }
@@ -1265,6 +1290,15 @@ pub(super) async fn handle_client(
                         {
                             break;
                         }
+                        // The truncated History replaces the client transcript
+                        // (dropping the inline plan graph); re-send the plan so
+                        // the diagram comes back.
+                        send_swarm_plan_to_session(
+                            &client_session_id,
+                            &swarm_members,
+                            &swarm_plans,
+                        )
+                        .await;
                     }
                     Err(message) => {
                         let _ = client_event_tx.send(ServerEvent::Error {
@@ -1316,6 +1350,14 @@ pub(super) async fn handle_client(
                         {
                             break;
                         }
+                        // Same as rewind: restore the inline plan graph after
+                        // the transcript replacement.
+                        send_swarm_plan_to_session(
+                            &client_session_id,
+                            &swarm_members,
+                            &swarm_plans,
+                        )
+                        .await;
                     }
                     Err(message) => {
                         let _ = client_event_tx.send(ServerEvent::Error {
@@ -1358,12 +1400,20 @@ pub(super) async fn handle_client(
                 client_instance_id,
                 client_has_local_history,
                 allow_session_takeover,
+                terminal_env,
             } => {
                 current_client_instance_id = client_instance_id.clone();
                 {
                     let mut connections = client_connections.write().await;
                     if let Some(info) = connections.get_mut(&client_connection_id) {
                         info.client_instance_id = client_instance_id.clone();
+                        // Record the client's terminal env so spawn/focus hooks
+                        // target the client's terminal, not the server's stale
+                        // startup env (#405). Only overwrite when the client sent
+                        // something, so reconnects without env don't clobber it.
+                        if !terminal_env.is_empty() {
+                            info.terminal_env = terminal_env.clone();
+                        }
                     }
                 }
                 if let Some(target_session_id) = target_session_id {
@@ -1561,6 +1611,12 @@ pub(super) async fn handle_client(
                 {
                     break;
                 }
+                // Follow the History payload with the current swarm plan: a
+                // session-changing History clears the client's plan snapshot
+                // (and the inline plan graph), so re-send it afterwards
+                // instead of leaving the graph blank until the next plan
+                // mutation broadcast.
+                send_swarm_plan_to_session(&client_session_id, &swarm_members, &swarm_plans).await;
                 if let Some(snapshot) = try_available_models_snapshot(&agent) {
                     last_available_models_snapshot = Some(snapshot);
                 }
@@ -2070,6 +2126,7 @@ pub(super) async fn handle_client(
                 channel,
                 delivery,
                 wake,
+                tldr,
             } => {
                 handle_comm_message(
                     id,
@@ -2079,6 +2136,7 @@ pub(super) async fn handle_client(
                     channel,
                     delivery,
                     wake,
+                    tldr,
                     &client_event_tx,
                     &sessions,
                     &soft_interrupt_queues,
@@ -2215,6 +2273,98 @@ pub(super) async fn handle_client(
                 .await;
             }
 
+            Request::CommSeedGraph {
+                id,
+                session_id: req_session_id,
+                mode,
+                nodes,
+            } => {
+                super::comm_graph::handle_comm_seed_graph(
+                    id,
+                    req_session_id,
+                    mode,
+                    nodes,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_plans,
+                    &swarm_coordinators,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                )
+                .await;
+            }
+
+            Request::CommExpandNode {
+                id,
+                session_id: req_session_id,
+                node_id,
+                children,
+            } => {
+                super::comm_graph::handle_comm_expand_node(
+                    id,
+                    req_session_id,
+                    node_id,
+                    children,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_plans,
+                    &swarm_coordinators,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                )
+                .await;
+            }
+
+            Request::CommCompleteNode {
+                id,
+                session_id: req_session_id,
+                node_id,
+                artifact_json,
+            } => {
+                super::comm_graph::handle_comm_complete_node(
+                    id,
+                    req_session_id,
+                    node_id,
+                    artifact_json,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_plans,
+                    &swarm_coordinators,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                )
+                .await;
+            }
+
+            Request::CommInjectGap {
+                id,
+                session_id: req_session_id,
+                gate_id,
+                nodes,
+            } => {
+                super::comm_graph::handle_comm_inject_gap(
+                    id,
+                    req_session_id,
+                    gate_id,
+                    nodes,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_plans,
+                    &swarm_coordinators,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                )
+                .await;
+            }
+
             Request::CommSpawn {
                 id,
                 session_id: req_session_id,
@@ -2222,6 +2372,9 @@ pub(super) async fn handle_client(
                 initial_message,
                 request_nonce,
                 spawn_mode,
+                model,
+                effort,
+                label,
             } => {
                 let spawn_mode = match parse_swarm_spawn_mode(id, spawn_mode, &client_event_tx) {
                     Some(spawn_mode) => spawn_mode,
@@ -2234,6 +2387,9 @@ pub(super) async fn handle_client(
                     initial_message,
                     request_nonce,
                     spawn_mode,
+                    model,
+                    effort,
+                    label,
                     &client_event_tx,
                     &sessions,
                     &global_session_id,
@@ -2250,6 +2406,23 @@ pub(super) async fn handle_client(
                     &mcp_pool,
                     &soft_interrupt_queues,
                     &swarm_mutation_runtime,
+                    &client_connections,
+                )
+                .await;
+            }
+
+            Request::CommListModels {
+                id,
+                session_id: req_session_id,
+            } => {
+                super::comm_session::handle_comm_list_models(
+                    id,
+                    &req_session_id,
+                    &sessions,
+                    &provider_template,
+                    |event| {
+                        let _ = client_event_tx.send(event);
+                    },
                 )
                 .await;
             }
@@ -2350,6 +2523,7 @@ pub(super) async fn handle_client(
                 message,
                 validation,
                 follow_up,
+                tldr,
             } => {
                 let status = status.unwrap_or_else(|| "ready".to_string());
                 let report = format_structured_completion_report(
@@ -2358,11 +2532,12 @@ pub(super) async fn handle_client(
                     follow_up.as_deref(),
                 );
                 let detail = Some(truncate_detail(&message, 160));
-                update_member_status_with_report(
+                update_member_status_with_report_tldr(
                     &req_session_id,
                     &status,
                     detail,
                     Some(report),
+                    tldr,
                     &swarm_members,
                     &swarms_by_id,
                     Some(&event_history),
@@ -2466,6 +2641,8 @@ pub(super) async fn handle_client(
                 prefer_spawn,
                 spawn_if_needed,
                 message,
+                model,
+                effort,
             } => {
                 handle_comm_assign_next(
                     id,
@@ -2475,6 +2652,8 @@ pub(super) async fn handle_client(
                     prefer_spawn,
                     spawn_if_needed,
                     message,
+                    model,
+                    effort,
                     &client_event_tx,
                     &sessions,
                     &global_session_id,
@@ -2572,6 +2751,9 @@ pub(super) async fn handle_client(
                 session_ids: requested_ids,
                 mode,
                 timeout_secs,
+                background,
+                notify,
+                wake,
             } => {
                 handle_comm_await_members(
                     id,
@@ -2580,6 +2762,9 @@ pub(super) async fn handle_client(
                     requested_ids,
                     mode,
                     timeout_secs,
+                    background,
+                    notify,
+                    wake,
                     CommAwaitMembersContext {
                         client_event_tx: &client_event_tx,
                         swarm_members: &swarm_members,
@@ -2890,7 +3075,7 @@ async fn cancel_processing_message(
             *state.task = Some(handle);
             return;
         }
-        session_control.request_cancel();
+        let cancel_epoch = session_control.request_cancel();
         crate::logging::info(&format!(
             "SERVER_INTERRUPT_CANCEL_SIGNALLED request_id={:?} session={} message_id={:?} wait_ms=500",
             request_id, session_label, *state.message_id
@@ -2930,7 +3115,10 @@ async fn cancel_processing_message(
                 }
             }
         }
-        session_control.reset_cancel();
+        // Only clear the cancel we fired: a newer cancel (repeated Esc, jade
+        // relay, another connection) must not be erased before its target
+        // observes it (issue #428).
+        session_control.reset_cancel_if_epoch(cancel_epoch);
         *state.task = None;
         *state.client_is_processing = false;
         if let Some(session_id) = state.session_id.take() {
@@ -2966,11 +3154,17 @@ async fn cancel_processing_message(
             *state.client_is_processing,
             *state.message_id
         ));
-        session_control.request_cancel();
+        let cancel_epoch = session_control.request_cancel();
         let reset_control = session_control.clone();
         tokio::spawn(async move {
+            // The running turn is not owned by this connection (post-reload
+            // recovery, server-initiated turn, or attach), so we cannot await
+            // it. Clear the flag later so the *next* turn is not aborted by a
+            // stale cancel, but only if no newer cancel fired in the meantime:
+            // an unconditional reset here used to erase rapid repeated Esc
+            // cancels before the busy turn observed them (issue #428).
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            reset_control.reset_cancel();
+            reset_control.reset_cancel_if_epoch(cancel_epoch);
         });
         *state.client_is_processing = false;
         let status_session_id = state
@@ -3123,6 +3317,10 @@ pub(super) async fn process_message_streaming_mpsc(
             )
             .with_session_id(session_id)
             .force_attribution(),
+        );
+        crate::process_memory::release_retained_heap_debounced(
+            "server_turn_completed",
+            std::time::Duration::from_secs(30),
         );
     }
     result

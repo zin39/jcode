@@ -60,11 +60,18 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/btw", "Ask a side question in the side panel"),
     RegisteredCommand::public("/ssh", "Connect to a remote machine using system SSH"),
     RegisteredCommand::public("/git", "Show git status for the session working directory"),
+    RegisteredCommand::public("/hotkeys", "List hotkeys with your personal usage"),
+    RegisteredCommand::hidden("/keys", "Alias for /hotkeys"),
     RegisteredCommand::public("/commit", "Make logical commits from current changes"),
     RegisteredCommand::public(
         "/commit-push",
         "Make logical commits from current changes, then push",
     ),
+    RegisteredCommand::public(
+        "/cut-release",
+        "Commit + push current changes, bump version, and cut a release",
+    ),
+    RegisteredCommand::hidden("/commit-push-release", "Alias for /cut-release"),
     RegisteredCommand::public("/transcript", "Open the current session transcript file"),
     RegisteredCommand::public("/subagent-model", "Show/change subagent model policy"),
     RegisteredCommand::public("/autoreview", "Show/toggle automatic end-of-turn review"),
@@ -76,13 +83,21 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/transport", "Show/change connection transport"),
     RegisteredCommand::public("/alignment", "Show/change default text alignment"),
     RegisteredCommand::public(
+        "/compact-notifications",
+        "Show/toggle single-line swarm/file-activity notifications",
+    ),
+    RegisteredCommand::public(
+        "/show-agentgrep-output",
+        "Show/toggle full agentgrep search output inline in chat",
+    ),
+    RegisteredCommand::public(
         "/reasoning",
         "Show/change reasoning display (off/full/current)",
     ),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
     RegisteredCommand::public("/poke", "Poke model to resume with incomplete todos"),
-    RegisteredCommand::public("/plan", "Create a plan-only response in the side panel"),
+    RegisteredCommand::public("/plan", "Create a plan-only response as a plan card"),
     RegisteredCommand::public("/improve", "Autonomously improve the repository"),
     RegisteredCommand::public("/refactor", "Run a safe refactor loop"),
     RegisteredCommand::public("/compact", "Compact context"),
@@ -114,6 +129,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     ),
     RegisteredCommand::public("/wrapped", "Alias for /productivity"),
     RegisteredCommand::public("/feedback", "Send feedback about jcode"),
+    RegisteredCommand::public("/support", "Email support with diagnostics prefilled"),
     RegisteredCommand::public("/subscription", "Show jcode subscription status"),
     RegisteredCommand::public("/config", "Show or edit configuration"),
     RegisteredCommand::public("/log", "Mark the current location in the jcode logs"),
@@ -129,6 +145,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
         "/onboarding-preview",
         "Preview the first-run onboarding screen",
     ),
+    RegisteredCommand::public(
+        "/onboarding-sim",
+        "Walk through every first-run onboarding screen (Cmd+5)",
+    ),
     RegisteredCommand::public("/reload", "Reload into newest available binary"),
     RegisteredCommand::public("/restart", "Restart with current binary"),
     RegisteredCommand::public("/rebuild", "Background rebuild and auto reload"),
@@ -142,7 +162,8 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/save", "Bookmark session for easy access"),
     RegisteredCommand::public("/unsave", "Remove bookmark from session"),
     RegisteredCommand::public("/rename", "Rename current session"),
-    RegisteredCommand::public("/split", "Split session into a new window"),
+    RegisteredCommand::public("/fork", "Fork session into a new window (optional prompt)"),
+    RegisteredCommand::hidden("/split", "Alias for /fork"),
     RegisteredCommand::public("/transfer", "Compact context into a fresh handoff session"),
     RegisteredCommand::public("/workspace", "Niri-style session workspace"),
     RegisteredCommand::public("/quit", "Exit jcode"),
@@ -665,7 +686,7 @@ impl App {
         }
 
         if prefix.starts_with("/effort ") {
-            let efforts = ["none", "low", "medium", "high", "xhigh"];
+            let efforts = ["none", "low", "medium", "high", "xhigh", "max"];
             return self.rank_suggestions(
                 input,
                 efforts
@@ -937,6 +958,46 @@ impl App {
             );
         }
 
+        if prefix.starts_with("/compact-notifications ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/compact-notifications status".into(),
+                        "Show whether notifications are compact",
+                    ),
+                    (
+                        "/compact-notifications on".into(),
+                        "Collapse swarm/file-activity notifications to one line",
+                    ),
+                    (
+                        "/compact-notifications off".into(),
+                        "Show full multi-line notification cards",
+                    ),
+                ],
+            );
+        }
+
+        if prefix.starts_with("/show-agentgrep-output ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/show-agentgrep-output status".into(),
+                        "Show whether agentgrep output is shown inline",
+                    ),
+                    (
+                        "/show-agentgrep-output on".into(),
+                        "Render full agentgrep search results inline in chat",
+                    ),
+                    (
+                        "/show-agentgrep-output off".into(),
+                        "Show only the one-line agentgrep summary",
+                    ),
+                ],
+            );
+        }
+
         if prefix.starts_with("/config ") {
             return self.rank_suggestions(
                 input,
@@ -992,7 +1053,7 @@ impl App {
 
         if prefix.starts_with("/rewind ") {
             let arg = prefix.strip_prefix("/rewind ").unwrap_or_default().trim();
-            let visible_count = self.session.visible_conversation_message_count();
+            let visible_count = self.session.rewind_target_count();
 
             // Rewind targets are 1-based visible conversation message numbers.
             // Do not fuzzy-rank numeric arguments: `/rewind 10` should never be
@@ -1019,13 +1080,22 @@ impl App {
 
     /// Get command suggestions based on current input
     pub fn command_suggestions(&self) -> Vec<(String, &'static str)> {
-        if self
-            .inline_interactive_state
-            .as_ref()
-            .is_some_and(|picker| picker.preview && picker.kind == crate::tui::PickerKind::Model)
+        // While an inline picker preview is open for the command being typed,
+        // the picker itself is the suggestion surface. Rendering the textual
+        // suggestion list underneath would duplicate it (and its rows are not
+        // arrow-navigable anyway, since the preview claims Up/Down first).
+        if let Some(picker) = self.inline_interactive_state.as_ref()
+            && picker.preview
         {
             let input = self.input.trim_start();
-            if input.starts_with("/model") || input.starts_with("/models") {
+            let suppress = match picker.kind {
+                crate::tui::PickerKind::Model => {
+                    input.starts_with("/model") || input.starts_with("/models")
+                }
+                crate::tui::PickerKind::Login => input.starts_with("/login"),
+                _ => false,
+            };
+            if suppress {
                 return Vec::new();
             }
         }
@@ -1105,6 +1175,7 @@ impl App {
         self.cursor_pos = self.input.len();
         self.tab_completion_state = None;
         self.command_suggestion_selected = 0;
+        self.sync_model_picker_preview_from_input();
         true
     }
 
@@ -1153,6 +1224,7 @@ impl App {
                         rows,
                         cursor: review.cursor,
                         continue_focused: review.continue_focused,
+                        choosing: review.choosing,
                         checked_count: review.checked_count(),
                         seconds_left: review.seconds_remaining(),
                     }
@@ -1248,6 +1320,17 @@ impl App {
                 "Find a recent file or project I've been working on, read through it, and give me concrete suggestions on how I could improve it.".to_string(),
             ),
         ];
+
+        // macOS-only: offer to install ScrollWM, a scrolling window manager for
+        // macOS. The web installer downloads the latest release, strips the
+        // Gatekeeper quarantine, installs to ~/Applications, and launches it,
+        // with no sudo and no system files touched.
+        if cfg!(target_os = "macos") {
+            prompts.push((
+                "Install ScrollWM (scrolling window manager for macOS)".to_string(),
+                "Install ScrollWM, the scrolling window manager for macOS, by running its official one-line installer: `curl -fsSL https://raw.githubusercontent.com/1jehuang/scrollwm/main/scripts/web-install.sh | bash`. It downloads the latest release, removes the Gatekeeper quarantine, installs to ~/Applications, and launches it (no sudo, no system files touched). Run the command for me and report whether it succeeded.".to_string(),
+            ));
+        }
 
         prompts.push((
             "Continue my last Codex CLI / Claude Code session".to_string(),
@@ -1364,6 +1447,7 @@ impl App {
             "/help"
                 | "/?"
                 | "/btw"
+                | "/fork"
                 | "/git"
                 | "/transcript"
                 | "/observe"
@@ -1406,6 +1490,8 @@ impl App {
                 | "/compact"
                 | "/compact mode"
                 | "/alignment"
+                | "/compact-notifications"
+                | "/show-agentgrep-output"
                 | "/reasoning"
                 | "/config"
                 | "/save"

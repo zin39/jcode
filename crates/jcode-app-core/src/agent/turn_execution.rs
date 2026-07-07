@@ -59,7 +59,7 @@ impl Agent {
         let alerts = self.take_alerts();
         if !alerts.is_empty() {
             let alert_text = format!(
-                "[NOTIFICATION]\nYou received {} notification(s) from other agents working in this codebase:\n\n{}\n\nUse the communicate tool (actions: list, read, message/broadcast, dm, channel, share) to coordinate with other agents.",
+                "[NOTIFICATION]\nYou received {} notification(s) from other agents working in this codebase:\n\n{}\n\nUse the communicate tool to coordinate with other agents (prefer dm; broadcast reaches only your spawned subtree).",
                 alerts.len(),
                 alerts.join("\n\n---\n\n")
             );
@@ -96,6 +96,7 @@ impl Agent {
         self.session.save()?;
         let turn_started_at = Instant::now();
         let start_message_index = self.message_count();
+        self.fire_turn_start_hook("chat");
         let mut result = self.run_turn_streaming_mpsc(event_tx.clone()).await;
         // Cheap workers (swarm members) auto-switch to the next-cheapest healthy
         // model if their pinned model rate-limited/quota-failed, instead of the
@@ -116,6 +117,26 @@ impl Agent {
         self.current_turn_system_reminder = None;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
         result
+    }
+
+    /// Fire the `turn_start` observer hook when a turn begins, before the model
+    /// starts generating (and before the first `pre_tool`). This lets external
+    /// integrations (terminal multiplexers, status bars) detect that the agent
+    /// is actively working during the otherwise-invisible window between prompt
+    /// submission and the first tool call. No-op (without building the payload)
+    /// when the hook is not configured.
+    fn fire_turn_start_hook(&self, source: &str) {
+        if !crate::hooks::hook_configured("turn_start") {
+            return;
+        }
+        let mut event = crate::hooks::HookEvent::new("turn_start")
+            .session_id(self.session.id.clone())
+            .field("MODEL", self.provider_model())
+            .field("SOURCE", source.to_string());
+        if let Some(cwd) = self.working_dir() {
+            event = event.cwd(cwd);
+        }
+        crate::hooks::dispatch_observer(event);
     }
 
     /// Fire the `turn_end` observer hook with turn outcome metadata.
@@ -185,22 +206,27 @@ impl Agent {
         self.persist_session_best_effort("provider session reset");
     }
 
-    /// Rewind the conversation to a 1-based visible conversation message index.
+    /// Rewind the conversation to a 1-based visible transcript message index.
+    ///
+    /// The index is interpreted against the same rendered transcript the TUI
+    /// numbers in `/rewind` (user/assistant entries only, tool cards and
+    /// system notices excluded). Mapping through raw stored messages instead
+    /// would count tool-result messages the UI never numbers, sending
+    /// `/rewind N` far earlier than the on-screen message N (issue #432).
     ///
     /// Provider-side resumable sessions are reset so the next request sends the
     /// truncated context from scratch instead of continuing from a stale upstream
     /// conversation.
     pub fn rewind_to_message(&mut self, message_index: usize) -> Result<usize, String> {
-        let message_count = self.session.visible_conversation_message_count();
-        let Some(stored_len) = self
-            .session
-            .stored_len_for_visible_conversation_message(message_index)
-        else {
+        let targets = self.session.rewind_target_stored_indices();
+        let message_count = targets.len();
+        if message_index == 0 || message_index > message_count {
             return Err(format!(
                 "Invalid message number: {}. Valid range: 1-{}",
                 message_index, message_count
             ));
-        };
+        }
+        let stored_len = targets[message_index - 1] + 1;
 
         let removed = message_count - message_index;
         self.rewind_undo_snapshot = Some(RewindUndoSnapshot {
@@ -225,7 +251,7 @@ impl Agent {
             return Err("No rewind to undo.".to_string());
         };
 
-        let current_count = self.session.visible_conversation_message_count();
+        let current_count = self.session.rewind_target_count();
         let restored = snapshot.visible_message_count.saturating_sub(current_count);
         self.session.replace_messages(snapshot.messages);
         self.provider_session_id = snapshot.provider_session_id;
@@ -383,6 +409,20 @@ impl Agent {
     /// Whether this session streams an inline output tail to the bus.
     pub(crate) fn inline_output_tap(&self) -> bool {
         self.inline_output_tap
+    }
+
+    /// Publish the current rolling activity tail to the bus for the
+    /// coordinator's inline gallery. No-op unless the inline tap is enabled.
+    pub(crate) fn publish_inline_tail(&self) {
+        if !self.inline_output_tap {
+            return;
+        }
+        crate::bus::Bus::global().publish(crate::bus::BusEvent::SwarmOutputTail(
+            crate::bus::SwarmOutputTail {
+                session_id: self.session.id.clone(),
+                tail: self.inline_tail.render(),
+            },
+        ));
     }
 
     /// Check whether memory features are enabled for this session.

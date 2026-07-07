@@ -97,6 +97,15 @@ pub struct PreparedMessages {
     /// synthetic/test prepared bodies); prefix reuse simply degrades to a full
     /// rebuild in that case.
     pub message_boundaries: Vec<MessageBoundary>,
+    /// Deferred-mermaid staleness stamp: `Some(epoch)` when `wrapped_lines`
+    /// bakes in at least one "rendering mermaid diagram..." placeholder for a
+    /// diagram still rendering in the background, where `epoch` is the
+    /// deferred-render epoch observed *before* the markdown was rendered.
+    /// Cache layers treat the prepared content as stale once the live epoch
+    /// advances past this value and re-render the pending tail so the
+    /// completed diagram replaces its placeholder. `None` when no pending
+    /// placeholder is present.
+    pub mermaid_pending_epoch: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -137,6 +146,16 @@ pub struct PreparedChatFrame {
 impl PreparedChatFrame {
     pub fn from_single(prepared: Arc<PreparedMessages>) -> Self {
         Self::from_sections(vec![(PreparedSectionKind::Body, prepared)])
+    }
+
+    /// Earliest deferred-mermaid pending stamp across all sections, if any
+    /// section still bakes in a "rendering mermaid diagram..." placeholder.
+    /// See [`PreparedMessages::mermaid_pending_epoch`].
+    pub fn mermaid_pending_epoch(&self) -> Option<u64> {
+        self.sections
+            .iter()
+            .filter_map(|section| section.prepared.mermaid_pending_epoch)
+            .min()
     }
 
     pub fn from_sections(sections: Vec<(PreparedSectionKind, Arc<PreparedMessages>)>) -> Self {
@@ -300,6 +319,23 @@ impl PreparedChatFrame {
             start_col: map.start_col,
             end_col: map.end_col,
         })
+    }
+
+    /// Transcript message index whose rendered lines contain `abs_line`, when
+    /// the line falls inside a Body section with message-boundary tracking.
+    /// Boundaries record the cumulative wrapped length after each message, so
+    /// the owning message is the first boundary strictly beyond the line.
+    pub fn message_index_at_line(&self, abs_line: usize) -> Option<usize> {
+        let (section, local) = self.line_section(abs_line)?;
+        if section.kind != PreparedSectionKind::Body {
+            return None;
+        }
+        let boundaries = &section.prepared.message_boundaries;
+        if boundaries.is_empty() {
+            return None;
+        }
+        let idx = boundaries.partition_point(|boundary| boundary.wrapped_len <= local);
+        (idx < boundaries.len()).then_some(idx)
     }
 
     pub fn materialize_line_slice(&self, start: usize, end: usize) -> Vec<Line<'static>> {

@@ -303,6 +303,10 @@ impl App {
             covers_up_to_turn: compacted_count,
             original_turn_count: compacted_count,
             compacted_count,
+            // Native-provider compaction re-bases indexing entirely, so the
+            // stage-1 clearing watermark (which is meaningful only relative
+            // to the previous message indexing) does not carry forward.
+            tool_cleared_up_to: None,
         };
 
         self.session.compaction = Some(state.clone());
@@ -345,6 +349,10 @@ impl App {
                             self.set_status_notice("Compacting context");
                         }
                         crate::compaction::CompactionAction::HardCompacted(_) => {}
+                        // Lightweight, reversible, no provider round-trip —
+                        // does not warrant interrupting the user like a real
+                        // (summarizing) compaction does.
+                        crate::compaction::CompactionAction::ToolResultsCleared { .. } => {}
                         crate::compaction::CompactionAction::None => {}
                     }
                 }
@@ -381,6 +389,15 @@ impl App {
         self.provider_session_id = None;
         self.session.provider_session_id = None;
         self.context_warning_shown = false;
+        // The sidebar/status context figure is derived from the last
+        // provider-reported stream usage, which described the *pre-compaction*
+        // message list. Mark it stale so the display falls back to the local
+        // estimate over the new (summary + recent) active messages until the
+        // next provider usage report arrives (issue #441). The raw counters
+        // are kept intact for turn footers and cost accounting.
+        self.streaming.streaming_context_stale = true;
+        self.streaming.streaming_usage_call_reset_pending = true;
+        self.bump_context_revision();
         if let Err(err) = self.session.save() {
             crate::logging::warn(&format!(
                 "Failed to persist provider session reset after compaction for session {}: {}",
@@ -399,6 +416,50 @@ impl App {
 
     pub fn set_status_notice(&mut self, text: impl Into<String>) {
         self.status_notice = Some((text.into(), Instant::now()));
+    }
+
+    /// Stash a persistent startup notice card and show it immediately.
+    ///
+    /// The card is also re-applied once the remote History bootstrap clears the
+    /// transcript for a brand-new session, so launch-hotkey / welcome tips stay
+    /// visible on the idle screen instead of flashing for a moment and vanishing.
+    pub fn set_pending_startup_notice(
+        &mut self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        let title = title.into();
+        let message = message.into();
+        self.push_display_message(
+            DisplayMessage::system(message.clone()).with_title(title.clone()),
+        );
+        self.pending_startup_notice = Some((title, message));
+    }
+
+    /// Re-apply the stashed startup notice card if it is no longer present in the
+    /// transcript (e.g. after the History bootstrap reset the display history).
+    /// Scoped to the idle screen: once a real conversation has started the notice
+    /// is consumed so it never reappears (and never leaks into a switched-to
+    /// session).
+    pub(crate) fn reapply_pending_startup_notice_if_cleared(&mut self) {
+        let Some((title, message)) = self.pending_startup_notice.clone() else {
+            return;
+        };
+        let conversation_started = self
+            .display_messages
+            .iter()
+            .any(|m| matches!(m.role.as_str(), "user" | "assistant" | "tool" | "reasoning"));
+        if conversation_started {
+            self.pending_startup_notice = None;
+            return;
+        }
+        let already_present = self
+            .display_messages
+            .iter()
+            .any(|m| m.role == "system" && m.content == message);
+        if !already_present {
+            self.push_display_message(DisplayMessage::system(message).with_title(title));
+        }
     }
 
     pub(crate) fn set_remote_startup_phase(&mut self, phase: super::RemoteStartupPhase) {
@@ -754,6 +815,14 @@ impl App {
 
         self.clear_provider_messages();
         self.clear_display_messages();
+        // Ctrl+R is reachable mid-stream (turn.rs key handling); drop the
+        // in-flight streaming render state (including the ephemeral mermaid
+        // preview slot) so it cannot leak into the recovered session's
+        // transcript. ACTIVE_DIAGRAMS deliberately survives: recovery keeps
+        // every text block, so registered diagrams still back retained
+        // messages, and body-cache prefix reuse (ui_prepare.rs) would skip
+        // re-registering them if we cleared the registry here.
+        self.clear_streaming_render_state();
         self.queued_messages.clear();
         self.pasted_contents.clear();
         self.pending_images.clear();

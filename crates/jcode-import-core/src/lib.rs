@@ -7,7 +7,26 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+pub mod repo_ranking;
+
 pub type ImportCoreResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Truncate a string at a valid UTF-8 character boundary.
+///
+/// Returns a slice of at most `max_bytes` bytes, ending at a valid char
+/// boundary so it never panics on multibyte input. This mirrors
+/// `jcode_core::util::truncate_str`, duplicated here to keep this leaf crate
+/// free of the heavier `jcode-core` dependency.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Entry in the Claude Code sessions-index.json file.
 #[derive(Debug, Deserialize)]
@@ -113,12 +132,76 @@ pub enum ClaudeCodeContentBlock {
     },
     ToolResult {
         tool_use_id: String,
+        // Claude Code (notably newer/macOS builds, observed on CLI v2.1.x)
+        // sometimes writes `tool_result.content` as an array of content blocks
+        // (e.g. `[{"type":"text","text":"..."}]` or `[{"type":"image",...}]`)
+        // rather than a plain string. The previous `content: String` shape made
+        // the *entire* JSONL entry fail to deserialize on the untagged
+        // `ClaudeCodeContent` enum, so such messages were silently dropped on
+        // import (real data loss). Accept string, null, and array forms.
+        #[serde(default, deserialize_with = "deserialize_tool_result_content")]
         content: String,
         #[serde(default)]
         is_error: Option<bool>,
     },
     #[serde(other)]
     Unknown,
+}
+
+/// Deserialize a Claude Code `tool_result` content value that may be a plain
+/// string, `null`, or an array of content blocks. The whole entry must keep
+/// parsing (never get dropped) regardless of shape.
+///
+/// Array forms are flattened to their textual content. Crucially, `image`
+/// blocks are reduced to a compact `[image]` placeholder rather than their
+/// base64 payload: real sessions can carry hundreds of KiB of inline image
+/// data per tool result, which would otherwise bloat the imported transcript
+/// (and any downstream context) with unreadable base64 text.
+fn deserialize_tool_result_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(tool_result_content_to_text(&value))
+}
+
+/// Convert a `tool_result` content value (string / null / array of blocks) to
+/// plain text, replacing `image` blocks with a `[image]` placeholder.
+fn tool_result_content_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(items) => {
+            let mut parts: Vec<String> = Vec::new();
+            for item in items {
+                match item {
+                    serde_json::Value::String(text) if !text.trim().is_empty() => {
+                        parts.push(text.trim().to_string());
+                    }
+                    serde_json::Value::Object(map) => {
+                        let block_type =
+                            map.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                        if block_type == "image" {
+                            parts.push("[image]".to_string());
+                        } else if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
+                            if !text.trim().is_empty() {
+                                parts.push(text.trim().to_string());
+                            }
+                        } else if let Some(content) = map.get("content").and_then(|v| v.as_str())
+                            && !content.trim().is_empty()
+                        {
+                            parts.push(content.trim().to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            parts.join("\n")
+        }
+        // Defensive: an unexpected scalar/object shape still yields readable
+        // text instead of dropping the message.
+        other => extract_external_text_from_json(other, true),
+    }
 }
 
 pub fn parse_rfc3339_string(value: Option<&str>) -> Option<DateTime<Utc>> {
@@ -222,7 +305,7 @@ pub fn ordered_claude_code_message_entries(entries: &[ClaudeCodeEntry]) -> Vec<&
     let mut ordered_entries: Vec<&ClaudeCodeEntry> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
 
-    let roots: Vec<&ClaudeCodeEntry> = message_entries
+    let mut roots: Vec<&ClaudeCodeEntry> = message_entries
         .iter()
         .filter(|e| {
             e.parent_uuid.is_none()
@@ -230,6 +313,25 @@ pub fn ordered_claude_code_message_entries(entries: &[ClaudeCodeEntry]) -> Vec<&
         })
         .copied()
         .collect();
+
+    // Multiple roots occur when a session's parent chain is broken (e.g. a
+    // resumed/forked transcript whose first assistant entry references a
+    // parent that lives in another file). Without a tiebreak the roots would
+    // be walked in raw file order, which can place a later reply before the
+    // prompt it answers (observed on real data: an "assistant" error emitted
+    // before its "user" prompt). Order roots by timestamp so the reconstructed
+    // transcript stays chronological; entries without a timestamp keep their
+    // relative file order behind timestamped ones.
+    roots.sort_by(|a, b| {
+        let a_ts = parse_rfc3339_string(a.timestamp.as_deref());
+        let b_ts = parse_rfc3339_string(b.timestamp.as_deref());
+        match (a_ts, b_ts) {
+            (Some(a_ts), Some(b_ts)) => a_ts.cmp(&b_ts),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
 
     for root in roots {
         let mut current = root;
@@ -423,7 +525,10 @@ pub fn extract_opencode_part_text(
         let Ok(part) = serde_json::from_reader::<_, serde_json::Value>(file) else {
             continue;
         };
-        let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        let part_type = part
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         match part_type {
             "text" => {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str())
@@ -614,11 +719,8 @@ pub fn load_codex_external_session(
     Ok(Some(ExternalSessionRecord {
         source: "codex",
         session_id: session_id.to_string(),
-        short_name: Some(format!("codex {}", &session_id[..session_id.len().min(8)])),
-        title: Some(format!(
-            "Codex session {}",
-            &session_id[..session_id.len().min(8)]
-        )),
+        short_name: Some(format!("codex {}", truncate_str(session_id, 8))),
+        title: Some(format!("Codex session {}", truncate_str(session_id, 8))),
         working_dir,
         provider_key: Some("openai-codex".to_string()),
         model: None,
@@ -709,11 +811,8 @@ pub fn load_pi_external_session(
     Ok(Some(ExternalSessionRecord {
         source: "pi",
         session_id: session_id.to_string(),
-        short_name: Some(format!("pi {}", &session_id[..session_id.len().min(8)])),
-        title: Some(format!(
-            "Pi session {}",
-            &session_id[..session_id.len().min(8)]
-        )),
+        short_name: Some(format!("pi {}", truncate_str(session_id, 8))),
+        title: Some(format!("Pi session {}", truncate_str(session_id, 8))),
         working_dir,
         provider_key,
         model,
@@ -757,12 +856,7 @@ pub fn load_opencode_external_session(
         .get("title")
         .and_then(|v| v.as_str())
         .map(|title| truncate_title_text(title, 72))
-        .unwrap_or_else(|| {
-            format!(
-                "OpenCode session {}",
-                &session_id[..session_id.len().min(8)]
-            )
-        });
+        .unwrap_or_else(|| format!("OpenCode session {}", truncate_str(session_id, 8)));
     let mut provider_key = Some("opencode".to_string());
     let mut model = None;
     let mut messages = Vec::new();
@@ -825,10 +919,7 @@ pub fn load_opencode_external_session(
     Ok(Some(ExternalSessionRecord {
         source: "opencode",
         session_id: session_id.to_string(),
-        short_name: Some(format!(
-            "opencode {}",
-            &session_id[..session_id.len().min(8)]
-        )),
+        short_name: Some(format!("opencode {}", truncate_str(session_id, 8))),
         title: Some(title),
         working_dir,
         provider_key,
@@ -840,7 +931,177 @@ pub fn load_opencode_external_session(
     }))
 }
 
-fn truncate_title_text(text: &str, max_chars: usize) -> String {
+/// Decode a Cursor transcript file's session id.
+///
+/// Cursor agent stores transcripts at
+/// `~/.cursor/projects/<project>/agent-transcripts/<session-id>/<session-id>.jsonl`,
+/// so the file stem is the session UUID. Fall back to a hash of the path when the
+/// stem is not a UUID (e.g. unexpected layouts).
+pub fn cursor_session_id_from_path(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if looks_like_uuid(&stem) {
+        return stem;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..8])
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != groups.len() {
+        return false;
+    }
+    parts
+        .iter()
+        .zip(groups.iter())
+        .all(|(part, &len)| part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Whether a Cursor transcript path is a *subagent* transcript rather than a
+/// top-level session. Cursor nests subagent runs at
+/// `.../agent-transcripts/<parent>/subagents/<child>.jsonl`; these are not
+/// independently resumable sessions, so the resume picker skips them (they would
+/// otherwise appear as duplicate/stray rows alongside the parent session).
+pub fn is_cursor_subagent_transcript(path: &Path) -> bool {
+    path.parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| name == "subagents")
+        .unwrap_or(false)
+}
+
+/// Best-effort decode of a Cursor project directory name back into an absolute
+/// path. Cursor encodes the working directory by replacing `/` with `-`, e.g.
+/// `/Users/alex/Repo` -> `Users-alex-Repo`. Because real path segments can also
+/// contain hyphens, we greedily walk segment boundaries and prefer prefixes that
+/// exist on disk, always returning a decoded absolute path even when the final
+/// directory no longer exists.
+pub fn cursor_cwd_from_project_dir(project_name: &str) -> Option<String> {
+    if project_name.is_empty() || project_name == "projects" || project_name == "empty-window" {
+        return None;
+    }
+    let segments: Vec<&str> = project_name.split('-').collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let mut resolved_prefix = String::new();
+    let mut current = segments[0].to_string();
+    let mut i = 1;
+    while i < segments.len() {
+        let candidate = format!("{resolved_prefix}/{current}");
+        if Path::new(&candidate).is_dir() {
+            resolved_prefix = candidate;
+            current = segments[i].to_string();
+        } else {
+            current = format!("{current}-{}", segments[i]);
+        }
+        i += 1;
+    }
+    let best_effort = format!("{resolved_prefix}/{current}");
+    Some(best_effort)
+}
+
+/// Infer the Cursor working directory from a transcript path by walking up to the
+/// `<project>/agent-transcripts/` boundary and decoding the project dir name.
+pub fn cursor_cwd_from_transcript_path(path: &Path) -> Option<String> {
+    let mut components: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let idx = components.iter().position(|c| c == "agent-transcripts")?;
+    if idx == 0 {
+        return None;
+    }
+    let project = std::mem::take(&mut components[idx - 1]);
+    cursor_cwd_from_project_dir(&project)
+}
+
+/// Load a Cursor agent transcript into an [`ExternalSessionRecord`].
+///
+/// Cursor transcripts are JSONL with one object per line; each line has `role`
+/// at the top level and an Anthropic-style `message.content[]` array of blocks
+/// (`text`, `thinking`, `tool_use`, `tool_result`). There are no per-line
+/// timestamps or model hints in the transcript, so created/updated fall back to
+/// the file mtime and the working dir is inferred from the project dir name.
+pub fn load_cursor_external_session(
+    path: &Path,
+    include_tools: bool,
+) -> ImportCoreResult<Option<ExternalSessionRecord>> {
+    // Skip Cursor subagent transcripts: they are nested runs of a parent session,
+    // not independently resumable/searchable top-level sessions.
+    if is_cursor_subagent_transcript(path) {
+        return Ok(None);
+    }
+    let file = File::open(path)?;
+    let mut messages = Vec::new();
+    for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let role = match value
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+        {
+            "user" | "human" => "user",
+            "assistant" | "model" => "assistant",
+            _ => continue,
+        };
+        let content = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .or_else(|| value.get("content"))
+            .unwrap_or(&serde_json::Value::Null);
+        let text = extract_external_text_from_json(content, include_tools);
+        if text.trim().is_empty() {
+            continue;
+        }
+        messages.push(ExternalMessageRecord {
+            role: role.to_string(),
+            text,
+            timestamp: None,
+            id: None,
+        });
+    }
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    let session_id = cursor_session_id_from_path(path);
+    let created_at = file_modified_datetime(path).unwrap_or_else(Utc::now);
+    let updated_at = created_at;
+    let working_dir = cursor_cwd_from_transcript_path(path);
+    let title = messages
+        .iter()
+        .find(|message| message.role == "user")
+        .map(|message| truncate_title_text(&message.text, 72))
+        .unwrap_or_else(|| format!("Cursor session {}", truncate_str(&session_id, 8)));
+    Ok(Some(ExternalSessionRecord {
+        source: "cursor",
+        session_id: session_id.clone(),
+        short_name: Some(format!("cursor {}", truncate_str(&session_id, 8))),
+        title: Some(title),
+        working_dir,
+        provider_key: Some("cursor".to_string()),
+        model: None,
+        created_at,
+        updated_at,
+        path: path.to_path_buf(),
+        messages,
+    }))
+}
+
+pub fn truncate_title_text(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= max_chars {
         trimmed.to_string()
@@ -924,6 +1185,44 @@ pub fn codex_title_candidate(text: &str) -> Option<String> {
     Some(truncate_title(cleaned))
 }
 
+/// Decide whether a Claude Code user message makes a good session title.
+///
+/// Claude Code injects synthetic "user" messages for slash commands, command
+/// output, and local-command caveats (wrapped in tags like
+/// `<local-command-caveat>`, `<command-name>`, `<local-command-stdout>`). Using
+/// the raw first user message as the title surfaces this noise (observed on
+/// real data: a session titled `<local-command-caveat>Caveat: ...`). Skip those
+/// wrapper messages so the first *real* prompt becomes the title instead.
+pub fn claude_title_candidate(text: &str) -> Option<String> {
+    let cleaned = text.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    const WRAPPER_PREFIXES: [&str; 6] = [
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<local-command-stderr>",
+        "<command-name>",
+        "<command-message>",
+        "<command-args>",
+    ];
+    if WRAPPER_PREFIXES
+        .iter()
+        .any(|prefix| cleaned.starts_with(prefix))
+    {
+        return None;
+    }
+    // Caveat blocks sometimes lead with stray whitespace/newlines before the
+    // tag; catch those too without being so broad we drop legitimate prompts
+    // that merely mention a command.
+    if cleaned.contains("<local-command-caveat>")
+        && cleaned.starts_with("Caveat: The messages below were generated")
+    {
+        return None;
+    }
+    Some(truncate_title(cleaned))
+}
+
 pub fn imported_claude_code_session_id(session_id: &str) -> String {
     format!("imported_cc_{}", session_id)
 }
@@ -943,6 +1242,10 @@ pub fn imported_pi_session_id(session_path: &str) -> String {
     format!("imported_pi_{}", hex::encode(&digest[..8]))
 }
 
+pub fn imported_cursor_session_id(session_id: &str) -> String {
+    format!("imported_cursor_{}", session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +1258,127 @@ mod tests {
         );
         assert_eq!(clean_optional_text(Some("   ".into())), None);
         assert_eq!(clean_optional_text(None), None);
+    }
+
+    #[test]
+    fn cursor_session_id_from_path_uses_uuid_stem() {
+        let path = Path::new(
+            "/home/u/.cursor/projects/demo/agent-transcripts/\
+11111111-2222-3333-4444-555555555555/11111111-2222-3333-4444-555555555555.jsonl",
+        );
+        assert_eq!(
+            cursor_session_id_from_path(path),
+            "11111111-2222-3333-4444-555555555555"
+        );
+        // Non-UUID stems fall back to a stable hash (hex, 16 chars).
+        let other = Path::new("/tmp/not-a-uuid.jsonl");
+        let id = cursor_session_id_from_path(other);
+        assert_eq!(id.len(), 16);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn cursor_cwd_decodes_project_dir_with_hyphenated_segment() {
+        // The greedy decoder commits prefixes that exist on disk and rejoins the
+        // rest with literal hyphens. With no real dirs it returns the all-slash
+        // best-effort decode of the first segment plus a hyphen-joined tail.
+        let decoded = cursor_cwd_from_project_dir("tmp-cursor-demo").unwrap();
+        assert!(
+            decoded.starts_with('/'),
+            "decoded path must be absolute: {decoded}"
+        );
+        assert!(decoded.contains("tmp"));
+        assert_eq!(cursor_cwd_from_project_dir("projects"), None);
+        assert_eq!(cursor_cwd_from_project_dir("empty-window"), None);
+    }
+
+    #[test]
+    fn cursor_cwd_from_transcript_path_walks_to_project_dir() {
+        let path =
+            Path::new("/home/u/.cursor/projects/Users-alex-Repo/agent-transcripts/abc/abc.jsonl");
+        let cwd = cursor_cwd_from_transcript_path(path).unwrap();
+        assert!(cwd.starts_with('/'));
+        assert!(cwd.contains("Users"));
+    }
+
+    #[test]
+    fn cursor_subagent_transcripts_are_detected() {
+        let subagent = Path::new(
+            "/home/u/.cursor/projects/demo/agent-transcripts/parent/subagents/child.jsonl",
+        );
+        assert!(is_cursor_subagent_transcript(subagent));
+        let top_level =
+            Path::new("/home/u/.cursor/projects/demo/agent-transcripts/parent/parent.jsonl");
+        assert!(!is_cursor_subagent_transcript(top_level));
+    }
+
+    #[test]
+    fn load_cursor_external_session_skips_subagent_transcripts() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-cursor-subagent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sub_dir = dir.join("projects/demo/agent-transcripts/parent/subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let path = sub_dir.join("child.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{{\"role\":\"user\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"subagent work\"}}]}}}}"
+        )
+        .unwrap();
+        drop(file);
+        assert!(
+            load_cursor_external_session(&path, false)
+                .unwrap()
+                .is_none(),
+            "subagent transcripts should be skipped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_cursor_external_session_parses_content_blocks() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-cursor-loader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_dir = dir.join("projects/demo/agent-transcripts/abc");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("abc.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{{\"role\":\"user\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"hello cursor\"}}]}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"hi there\"}}]}}}}"
+        )
+        .unwrap();
+        drop(file);
+
+        let record = load_cursor_external_session(&path, false)
+            .unwrap()
+            .expect("cursor record");
+        assert_eq!(record.source, "cursor");
+        assert_eq!(record.provider_key.as_deref(), Some("cursor"));
+        assert_eq!(record.messages.len(), 2);
+        assert_eq!(record.messages[0].role, "user");
+        assert!(record.messages[0].text.contains("hello cursor"));
+        assert_eq!(record.title.as_deref(), Some("hello cursor"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -997,6 +1421,87 @@ mod tests {
                 .map(|entry| entry.uuid.as_deref())
                 .collect::<Vec<_>>(),
             vec![Some("a"), Some("b")]
+        );
+    }
+
+    #[test]
+    fn tool_result_content_accepts_array_blocks() {
+        // Newer/macOS Claude Code writes tool_result.content as an array of
+        // content blocks. The entry must still parse (not be dropped) and the
+        // array must flatten to its textual content.
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"hello world"}]}]}}"#;
+        let entry = serde_json::from_str::<ClaudeCodeEntry>(line)
+            .expect("entry with array tool_result content should parse");
+        let ClaudeCodeContent::Blocks(blocks) = entry.message.unwrap().content else {
+            panic!("expected block content");
+        };
+        match &blocks[0] {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "hello world");
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_content_accepts_string() {
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"plain"}]}}"#;
+        let entry = serde_json::from_str::<ClaudeCodeEntry>(line).unwrap();
+        let ClaudeCodeContent::Blocks(blocks) = entry.message.unwrap().content else {
+            panic!("expected block content");
+        };
+        match &blocks[0] {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => assert_eq!(content, "plain"),
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_claude_entries_sort_broken_chain_roots_by_timestamp() {
+        // Real-data shape (session b18f57b9): the assistant reply has a
+        // parentUuid that is NOT present in the file, so both entries are
+        // "roots". The user prompt has an earlier timestamp than the assistant
+        // reply, so it must come first even though it appears second in the
+        // file.
+        let jsonl = [
+            r#"{"type":"assistant","uuid":"b","parentUuid":"missing","timestamp":"2026-06-25T23:37:31.001Z","message":{"role":"assistant","content":"Not logged in"}}"#,
+            r#"{"type":"user","uuid":"a","timestamp":"2026-06-25T23:37:30.839Z","message":{"role":"user","content":"hi"}}"#,
+        ];
+        let entries = jsonl
+            .iter()
+            .map(|line| serde_json::from_str::<ClaudeCodeEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        let ordered = ordered_claude_code_message_entries(&entries);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|entry| entry.uuid.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("a"), Some("b")],
+            "earlier-timestamped user prompt should precede the assistant reply"
+        );
+    }
+
+    #[test]
+    fn claude_title_candidate_skips_command_wrappers() {
+        assert_eq!(
+            claude_title_candidate("<local-command-caveat>Caveat: The messages below..."),
+            None
+        );
+        assert_eq!(
+            claude_title_candidate("<command-name>/model</command-name>"),
+            None
+        );
+        assert_eq!(
+            claude_title_candidate(
+                "<local-command-stdout>Set model to Opus</local-command-stdout>"
+            ),
+            None
+        );
+        assert_eq!(claude_title_candidate("   "), None);
+        assert_eq!(
+            claude_title_candidate("can you fix my jcode server version?"),
+            Some("can you fix my jcode server version?".into())
         );
     }
 
@@ -1055,5 +1560,86 @@ Do x"
             ),
             None
         );
+    }
+
+    fn tool_result_block(line: &str) -> ClaudeCodeContentBlock {
+        let entry = serde_json::from_str::<ClaudeCodeEntry>(line)
+            .expect("entry should parse regardless of tool_result content shape");
+        let ClaudeCodeContent::Blocks(blocks) = entry.message.unwrap().content else {
+            panic!("expected block content");
+        };
+        blocks.into_iter().next().expect("at least one block")
+    }
+
+    #[test]
+    fn tool_result_content_accepts_plain_string() {
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"plain"}]}}"#;
+        match tool_result_block(line) {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => assert_eq!(content, "plain"),
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_content_accepts_array_text_blocks() {
+        // Newer/macOS Claude Code writes tool_result.content as an array of
+        // content blocks. The entry must still parse and flatten to text.
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"hello"},{"type":"text","text":"world"}]}]}}"#;
+        match tool_result_block(line) {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "hello\nworld");
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_image_block_becomes_placeholder_not_base64() {
+        // Image tool_result content must not leak its base64 payload into the
+        // imported transcript; it collapses to a compact `[image]` placeholder.
+        let blob = "Q".repeat(120_000);
+        let line = format!(
+            r#"{{"type":"user","uuid":"u1","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{blob}"}}}}]}}]}}}}"#
+        );
+        match tool_result_block(&line) {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "[image]");
+                assert!(
+                    !content.contains('Q'),
+                    "base64 image data leaked into tool_result text"
+                );
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_mixed_text_and_image_blocks() {
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"see this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}}"#;
+        match tool_result_block(line) {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "see this\n[image]");
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_null_content_keeps_entry_alive() {
+        // A null/missing content must not drop the whole JSONL entry.
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":null}]}}"#;
+        match tool_result_block(line) {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => assert_eq!(content, ""),
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_missing_content_defaults_to_empty() {
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
+        match tool_result_block(line) {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => assert_eq!(content, ""),
+            other => panic!("expected tool_result, got {other:?}"),
+        }
     }
 }

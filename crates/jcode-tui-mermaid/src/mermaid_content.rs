@@ -59,17 +59,173 @@ pub fn result_to_content(result: RenderResult, max_width: Option<usize>) -> Merm
     }
 }
 
-/// Convert render result to lines (legacy API, uses placeholder for images)
+/// Minimum placeholder height for an inline-fit image or diagram.
+pub const INLINE_FIT_MIN_ROWS: u16 = 3;
+
+/// Row cap for mermaid diagrams embedded inline in the transcript. Generous so
+/// diagrams keep near-natural (readable) size, but bounded below Kitty's
+/// virtual-placement row limit (296 diacritic slots) so stable-fit rendering
+/// keeps working.
+pub const INLINE_DIAGRAM_MAX_ROWS: u16 = 200;
+
+/// Rows assumed consumed by non-transcript chrome (status line, input box,
+/// hint line, spacing) when converting the chat column height into a
+/// readable-height budget for the inline aspect goal.
+const INLINE_ASPECT_CHROME_ROWS: u16 = 4;
+
+/// Coarse quantization step for the inline transcript aspect goal. Per-mille
+/// bucketing alone would mint a new render (and a new on-disk cache entry)
+/// for nearly every one-cell terminal resize; snapping the goal to 0.25-wide
+/// steps keeps resize jitter from re-rendering diagrams constantly.
+const INLINE_ASPECT_QUANT_STEP: f32 = 0.25;
+
+/// Never request an aspect goal taller (narrower) than the 4:3 sizing
+/// default: `calculate_render_size` only adjusts height from width, so a
+/// portrait goal in a narrow terminal would just produce a taller render
+/// than today's default behavior.
+const INLINE_ASPECT_MIN: f32 = 4.0 / 3.0;
+
+/// Cap on how flat an inline aspect goal can get in very wide, short
+/// terminals; beyond this the layout goal stops improving readability.
+const INLINE_ASPECT_MAX: f32 = 6.0;
+
+/// Best-effort aspect-ratio goal (width / height) for mermaid diagrams
+/// rendered inline in the chat transcript, so a wide terminal asks the
+/// renderer for a landscape layout that fits a visible-viewport height
+/// budget instead of the tall 4:3 default.
+///
+/// The goal is optional and advisory: the renderer fits the diagram's
+/// natural aspect toward it but may not hit it. Returns `None` when font or
+/// terminal geometry is unknown (no picker), preserving today's behavior.
+pub fn inline_transcript_aspect_goal_with_font(
+    chat_width: u16,
+    chat_height: u16,
+    font_size: Option<(u16, u16)>,
+) -> Option<f32> {
+    let (cell_w, cell_h) = font_size?;
+    if chat_width == 0 || chat_height == 0 {
+        return None;
+    }
+    // Mirror inline_fit_geometry: the border bar + padding take 2 cells.
+    let avail_cells = chat_width.saturating_sub(2).max(1);
+    let width_px = avail_cells as f32 * cell_w.max(1) as f32;
+    let goal_rows = chat_height
+        .saturating_sub(INLINE_ASPECT_CHROME_ROWS)
+        .clamp(INLINE_FIT_MIN_ROWS, INLINE_DIAGRAM_MAX_ROWS);
+    let height_px = goal_rows as f32 * cell_h.max(1) as f32;
+    let raw = (width_px / height_px).clamp(INLINE_ASPECT_MIN, INLINE_ASPECT_MAX);
+    let quantized = (raw / INLINE_ASPECT_QUANT_STEP).round() * INLINE_ASPECT_QUANT_STEP;
+    Some(quantized.clamp(INLINE_ASPECT_MIN, INLINE_ASPECT_MAX))
+}
+
+/// [`inline_transcript_aspect_goal_with_font`] using the global picker's font
+/// size. Without a picker (no image protocol) inline diagrams render as text
+/// placeholders anyway, so no goal is produced.
+pub fn inline_transcript_aspect_goal(chat_width: u16, chat_height: u16) -> Option<f32> {
+    inline_transcript_aspect_goal_with_font(chat_width, chat_height, get_font_size())
+}
+
+/// Aspect profile for transcript renders: an explicit pinned-pane aspect
+/// always wins (inline and pane then share one cached PNG); otherwise fall
+/// back to the terminal-friendly inline goal.
+pub fn transcript_preferred_aspect_ratio_with_font(
+    pinned_pane_aspect: Option<f32>,
+    chat_width: u16,
+    chat_height: u16,
+    font_size: Option<(u16, u16)>,
+) -> Option<f32> {
+    pinned_pane_aspect
+        .or_else(|| inline_transcript_aspect_goal_with_font(chat_width, chat_height, font_size))
+}
+
+/// [`transcript_preferred_aspect_ratio_with_font`] using the global picker's
+/// font size.
+pub fn transcript_preferred_aspect_ratio(
+    pinned_pane_aspect: Option<f32>,
+    chat_width: u16,
+    chat_height: u16,
+) -> Option<f32> {
+    transcript_preferred_aspect_ratio_with_font(
+        pinned_pane_aspect,
+        chat_width,
+        chat_height,
+        get_font_size(),
+    )
+}
+
+/// Compute `(rows, cols)` for an image/diagram scaled to fit `chat_width`
+/// cells wide (including the 2-cell left border) and at most `cap_rows` tall,
+/// preserving aspect ratio. This is the single source of placeholder geometry
+/// for the inline-fit pipeline: prepare-time placeholders and the draw-time
+/// scale use the same math so borders and labels hug the rendered pixels.
+pub fn inline_fit_geometry(width: u32, height: u32, chat_width: u16, cap_rows: u16) -> (u16, u16) {
+    if width == 0 || height == 0 {
+        return (INLINE_FIT_MIN_ROWS, chat_width.min(2));
+    }
+    let (cell_w, cell_h) = get_font_size().unwrap_or((8, 16));
+    let cell_w = cell_w.max(1) as u32;
+    let cell_h = cell_h.max(1) as u32;
+
+    // Available width in pixels (border bar + padding take 2 cells, matching
+    // the renderer's BORDER_WIDTH).
+    let avail_cells = chat_width.saturating_sub(2).max(1) as u32;
+    let avail_px = avail_cells * cell_w;
+
+    let cap_rows_u32 = (cap_rows as u32).max(INLINE_FIT_MIN_ROWS as u32);
+    let cap_px = cap_rows_u32 * cell_h;
+
+    // Scale to fit *both* the width and the row cap, preserving aspect ratio,
+    // exactly like the draw-time fit does.
+    let scale_num_w = avail_px.min(width);
+    let scaled_h_by_w = height.saturating_mul(scale_num_w) / width.max(1);
+    let (final_w_px, final_h_px) = if scaled_h_by_w <= cap_px {
+        (scale_num_w, scaled_h_by_w)
+    } else {
+        // Height-bound: shrink further so the height fits the cap.
+        let w = width.saturating_mul(cap_px) / height.max(1);
+        (w.min(avail_px).max(1), cap_px)
+    };
+
+    let rows = final_h_px
+        .max(1)
+        .div_ceil(cell_h)
+        .max(INLINE_FIT_MIN_ROWS as u32) as u16;
+    let cols = (final_w_px.max(1).div_ceil(cell_w) as u16)
+        .saturating_add(2)
+        .min(chat_width);
+    (
+        rows.min(cap_rows_u32.min(u16::MAX as u32) as u16)
+            .max(INLINE_FIT_MIN_ROWS),
+        cols,
+    )
+}
+
+/// Convert render result to lines. Diagrams emit the same inline-fit
+/// placeholder raster images use, so they share the fit/border/stable-scroll
+/// draw pipeline. Video export keeps the legacy crop marker, whose draw path
+/// writes the printable region markers the SVG exporter scans for.
 pub fn result_to_lines(result: RenderResult, max_width: Option<usize>) -> Vec<Line<'static>> {
-    match result_to_content(result, max_width) {
-        MermaidContent::Lines(lines) => lines,
-        MermaidContent::Image {
+    match result {
+        RenderResult::Image {
             hash,
-            estimated_height,
+            width,
+            height,
+            ..
         } => {
-            // Return placeholder lines that will be replaced by image widget
-            image_widget_placeholder(hash, estimated_height)
+            if VIDEO_EXPORT_MODE.load(Ordering::Relaxed) {
+                let max_w = max_width.map(|w| w as u16).unwrap_or(80);
+                let estimated_height = estimate_image_height(width, height, max_w);
+                return image_widget_placeholder(hash, estimated_height);
+            }
+            if PICKER.get().and_then(|p| p.as_ref()).is_none() {
+                return image_placeholder_lines(width, height);
+            }
+            let chat_width = max_width.map(|w| w as u16).unwrap_or(80);
+            let (rows, cols) =
+                inline_fit_geometry(width, height, chat_width, INLINE_DIAGRAM_MAX_ROWS);
+            inline_image_placeholder_lines(hash, rows, cols)
         }
+        RenderResult::Error(msg) => error_to_lines(&msg),
     }
 }
 
@@ -112,13 +268,19 @@ pub fn image_widget_placeholder_markdown(hash: u64) -> String {
     )
 }
 
+/// First non-blank span of a line: centering/padding passes may insert a
+/// leading whitespace span before a marker, so marker parsing skips
+/// whitespace-only spans instead of assuming the marker sits in `spans[0]`.
+fn first_content_span<'a>(line: &'a Line<'_>) -> Option<&'a str> {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .find(|content| !content.trim().is_empty())
+}
+
 /// Check if a line is a mermaid image placeholder and extract the hash
 pub fn parse_image_placeholder(line: &Line<'_>) -> Option<u64> {
-    if line.spans.is_empty() {
-        return None;
-    }
-
-    let content = &line.spans[0].content;
+    let content = first_content_span(line)?;
     if content.starts_with(MERMAID_MARKER_PREFIX) && content.ends_with(MERMAID_MARKER_SUFFIX) {
         // Extract hex between prefix and suffix
         let start = MERMAID_MARKER_PREFIX.len();
@@ -161,10 +323,7 @@ pub fn inline_image_placeholder_lines(hash: u64, rows: u16, cols: u16) -> Vec<Li
 /// Check if a line is an inline raster image placeholder and extract
 /// `(hash, rows, cols)`.
 pub fn parse_inline_image_placeholder(line: &Line<'_>) -> Option<(u64, u16, u16)> {
-    if line.spans.is_empty() {
-        return None;
-    }
-    let content = &line.spans[0].content;
+    let content = first_content_span(line)?;
     let rest = content.strip_prefix(INLINE_IMAGE_MARKER_PREFIX)?;
     let rest = rest.strip_suffix(MERMAID_MARKER_SUFFIX)?;
     let mut parts = rest.split(':');
@@ -264,7 +423,12 @@ pub fn terminal_theme() -> Theme {
         // Uses transparent canvas so the rendered PNG integrates with the TUI,
         // while keeping nodes/labels readable against dark panes.
         background: "#00000000".to_string(),
-        font_family: "Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif"
+        // Include common Linux-native sans families (DejaVu/Liberation/Noto) so
+        // label glyphs still resolve a face when Inter/Segoe UI are not installed
+        // (the typical Linux case). resvg matches the first family in this list
+        // that exists in the loaded font DB.
+        font_family: "Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, \
+                      \"Noto Sans\", \"DejaVu Sans\", \"Liberation Sans\", sans-serif"
             .to_string(),
         font_size: 15.0,
         primary_color: "#313244".to_string(),

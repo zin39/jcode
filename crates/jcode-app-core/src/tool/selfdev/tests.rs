@@ -442,6 +442,7 @@ async fn enter_creates_selfdev_session_in_test_mode() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count: 1,
+        tool_cleared_up_to: None,
     });
     parent.record_replay_display_message("system", None, "remember this context");
     parent.save().expect("save parent session");
@@ -1070,6 +1071,8 @@ async fn build_ignores_stale_pending_requests_when_computing_queue_position() {
             completed_at: None,
             duration_secs: None,
             pid: None,
+            owner_pid: None,
+            owner_instance: None,
             detached: false,
             notify: true,
             wake: true,
@@ -1169,6 +1172,8 @@ fn reconcile_pending_state_maps_superseded_background_status() {
             completed_at: Some(Utc::now().to_rfc3339()),
             duration_secs: Some(1.0),
             pid: None,
+            owner_pid: None,
+            owner_instance: None,
             detached: false,
             notify: true,
             wake: true,
@@ -1257,6 +1262,8 @@ fn reconcile_keeps_running_request_not_yet_registered_in_live_task_map() {
             completed_at: None,
             duration_secs: None,
             pid: None,
+            owner_pid: None,
+            owner_instance: None,
             detached: false,
             notify: true,
             wake: true,

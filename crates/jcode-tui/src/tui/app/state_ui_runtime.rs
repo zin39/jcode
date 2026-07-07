@@ -10,6 +10,29 @@ impl App {
             .unwrap_or_else(|_| self.skills.clone())
     }
 
+    /// Re-read skills from disk for the active session working directory and
+    /// sync the TUI-side registry snapshot.
+    ///
+    /// The agent-side `skill_manage reload_all` tool updates only the server
+    /// process's `SkillRegistry`; the TUI keeps an independent copy that was
+    /// otherwise refreshed only at startup or on a slash-command miss. Calling
+    /// this before rendering `/skills` (and on demand elsewhere) keeps newly
+    /// added skills visible without a session restart (issue #431).
+    pub(super) fn refresh_skills_snapshot(&mut self) {
+        let working_dir = self
+            .session
+            .working_dir
+            .as_deref()
+            .map(std::path::Path::new);
+        if let Ok(reloaded) = crate::skill::SkillRegistry::load_for_working_dir(working_dir) {
+            self.skills = std::sync::Arc::new(reloaded.clone());
+            if let Ok(mut shared) = self.registry.skills().try_write() {
+                *shared = reloaded;
+            }
+            self.invalidate_command_candidates_cache();
+        }
+    }
+
     pub fn cursor_pos(&self) -> usize {
         self.cursor_pos
     }
@@ -23,9 +46,12 @@ impl App {
     }
 
     /// Keep a power inhibitor held while a turn is processing/streaming so the
-    /// machine does not idle-sleep mid-stream. No-op on unsupported platforms.
+    /// machine does not idle-sleep mid-stream. No-op on unsupported platforms
+    /// or when `[power].prevent_sleep_while_streaming` is disabled (#452).
     pub(super) fn sync_sleep_guard(&mut self) {
-        self.power_inhibitor.set_active(self.is_processing());
+        let enabled = crate::config::config().power.prevent_sleep_while_streaming;
+        self.power_inhibitor
+            .set_active(enabled && self.is_processing());
     }
 
     pub fn streaming_text(&self) -> &str {
@@ -102,7 +128,15 @@ impl App {
         self.last_api_completed_provider = Some(<Self as TuiState>::provider_name(self));
         self.last_api_completed_model = Some(<Self as TuiState>::provider_model(self));
         self.last_turn_input_tokens = {
-            let input = self.streaming.streaming_input_tokens;
+            // Effective prompt size (input + cache read + creation): for
+            // split-accounting providers bare input is only the uncached
+            // remainder, and this figure feeds the cache countdown/cold
+            // indicators as "what gets resent".
+            let input = crate::tui::info_widget::effective_prompt_tokens(
+                self.streaming.streaming_input_tokens,
+                self.streaming.streaming_cache_read_tokens.unwrap_or(0),
+                self.streaming.streaming_cache_creation_tokens.unwrap_or(0),
+            );
             if input > 0 { Some(input) } else { None }
         };
 

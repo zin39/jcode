@@ -14,16 +14,9 @@ pub mod google;
 pub(crate) mod google_oauth;
 pub mod integration;
 pub mod lifecycle;
-#[cfg(any(test, feature = "test-support"))]
-// The driver's items are exercised by its internal #[cfg(test)] tests; under
-// a plain `--features test-support` lib build they are intentionally unused.
-#[cfg_attr(not(test), allow(dead_code, unused_imports))]
-pub(crate) mod lifecycle_driver;
-pub(crate) mod live_provider_probes;
 pub mod login_diagnostics;
 pub mod login_flows;
 pub mod oauth;
-pub mod provider_e2e;
 pub(crate) mod refresh_coordinator;
 pub mod refresh_state;
 mod status_types;
@@ -719,16 +712,30 @@ impl AuthStatus {
                 )
             }
             crate::provider_catalog::LoginProviderTarget::OpenAiCompatible(profile) => {
-                let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
-                let (source, detail) = summarize_sources(vec![
-                    env_source(&resolved.api_key_env),
-                    config_source(
-                        &resolved.api_key_env,
-                        &resolved.env_file,
-                        format!("~/.config/jcode/{}", resolved.env_file),
-                    ),
-                    external_api_key_source(&resolved.api_key_env),
-                ]);
+                // Prefer the active named config profile's credential location
+                // (set via `--provider-profile`) over the built-in profile env
+                // so the reported source matches what runtime actually uses (#402).
+                let (source, detail) = if let Some((key_env, env_file)) =
+                    crate::provider_catalog::active_named_provider_profile_credential_source()
+                {
+                    summarize_sources(vec![
+                        env_source(&key_env),
+                        config_source(&key_env, &env_file, format!("~/.config/jcode/{}", env_file)),
+                        external_api_key_source(&key_env),
+                    ])
+                } else {
+                    let resolved =
+                        crate::provider_catalog::resolve_openai_compatible_profile(profile);
+                    summarize_sources(vec![
+                        env_source(&resolved.api_key_env),
+                        config_source(
+                            &resolved.api_key_env,
+                            &resolved.env_file,
+                            format!("~/.config/jcode/{}", resolved.env_file),
+                        ),
+                        external_api_key_source(&resolved.api_key_env),
+                    ])
+                };
                 (
                     source,
                     detail,
@@ -763,6 +770,7 @@ impl AuthStatus {
             *cache = None;
         }
         crate::auth::copilot::invalidate_github_token_cache();
+        crate::provider::pricing::invalidate_auth_pricing_memos();
         crate::logging::auth_event("auth_status_cache_invalidated", "all", &[]);
     }
 
@@ -890,7 +898,7 @@ fn probe_anthropic_status(status: &mut AuthStatus) {
 }
 
 fn probe_openrouter_status(status: &mut AuthStatus) {
-    if crate::provider::openrouter::OpenRouterProvider::has_credentials() {
+    if crate::provider::openrouter::has_credentials() {
         status.openrouter = AuthState::Available;
     }
 }

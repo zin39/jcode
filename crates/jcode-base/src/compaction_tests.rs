@@ -1223,3 +1223,284 @@ fn test_bug2_hard_compact_loop_checks_effective_tokens() {
         token_budget
     );
 }
+
+// ── stage-1 reversible tool-result clearing ─────────────────────────────
+
+fn make_tool_result_message(tool_use_id: &str, content: &str) -> Message {
+    Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: content.to_string(),
+            is_error: Some(false),
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        crate::env::set_var(key, value);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = &self.prev {
+            crate::env::set_var(self.key, prev);
+        } else {
+            crate::env::remove_var(self.key);
+        }
+    }
+}
+
+#[test]
+fn clearing_applies_in_api_view_but_not_history() {
+    let mut manager = CompactionManager::new().with_budget(50_000);
+    let mut messages = Vec::new();
+    // 3 old messages carrying big, clearable tool results.
+    for i in 0..3 {
+        messages.push(make_tool_result_message(
+            &format!("t{}", i),
+            &"A".repeat(900),
+        ));
+        manager.notify_message_added();
+    }
+    // Padding so the watermark (len - RECENT_TURNS_TO_KEEP) lands past the
+    // big tool results and into the small recent tail.
+    for i in 0..12 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+    assert_eq!(messages.len(), 15);
+
+    let watermark = messages.len() - RECENT_TURNS_TO_KEEP; // 5
+    manager.set_tool_cleared_up_to(watermark);
+
+    let view = manager.messages_for_api_with(&messages);
+    assert_eq!(view.len(), messages.len(), "no summary yet, view keeps all messages");
+
+    // The 3 big tool results (indexes 0..3) must be cleared in the view.
+    for i in 0..3 {
+        match &view[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert!(
+                    content.starts_with("[tool result cleared by jcode"),
+                    "message {} should be cleared in the view, got: {}",
+                    i,
+                    content
+                );
+                assert!(content.len() < 900, "cleared content should be much smaller");
+            }
+            other => panic!("expected tool result at index {}, got {:?}", i, other),
+        }
+    }
+
+    // Messages 3..5 (still below the watermark but plain text) must be
+    // untouched — clearing only ever rewrites ToolResult blocks.
+    for i in 3..5 {
+        match &view[i].content[0] {
+            ContentBlock::Text { text, .. } => {
+                assert!(text.starts_with("recent"))
+            }
+            other => panic!("expected text at index {}, got {:?}", i, other),
+        }
+    }
+
+    // The recent tail (>= watermark) must be byte-for-byte identical to the
+    // original messages.
+    for i in watermark..messages.len() {
+        assert_eq!(view[i].role, messages[i].role, "recent message {} role changed", i);
+        match (&view[i].content[0], &messages[i].content[0]) {
+            (ContentBlock::Text { text: a, .. }, ContentBlock::Text { text: b, .. }) => {
+                assert_eq!(a, b, "recent message {} must be untouched", i);
+            }
+            other => panic!("expected matching text content at index {}, got {:?}", i, other),
+        }
+    }
+
+    // Stored history (the caller's own Vec) must never be mutated — clearing
+    // only ever rewrites the cloned view returned above.
+    for i in 0..3 {
+        match &messages[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, &"A".repeat(900), "stored history must keep full content");
+            }
+            other => panic!("expected tool result at index {}, got {:?}", i, other),
+        }
+    }
+}
+
+#[tokio::test]
+async fn stage1_clearing_skips_summarization_when_it_frees_enough() {
+    // Serialize against env_kill_switch_disables_stage1: this test relies on
+    // JCODE_DISABLE_TOOL_RESULT_CLEARING being unset, and that test sets it
+    // under the same lock.
+    let _env_lock = crate::storage::lock_test_env();
+
+    // Small budget so 3 big (but individually clearable) tool results push
+    // usage above 80%, but the cleared marker text is small enough to bring
+    // it back down once stage-1 clears them.
+    let mut manager = CompactionManager::new().with_budget(2_000);
+    let mut messages = Vec::new();
+    for i in 0..3 {
+        messages.push(make_tool_result_message(
+            &format!("t{}", i),
+            &"A".repeat(900),
+        ));
+        manager.notify_message_added();
+    }
+    for i in 0..10 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+    assert_eq!(messages.len(), 13);
+
+    // Sanity: raw usage (before any clearing) should already be in the
+    // reactive-but-not-critical band so we reach the stage-1 code path.
+    let raw_usage = manager.context_usage_with(&messages);
+    assert!(
+        (COMPACTION_THRESHOLD..CRITICAL_THRESHOLD).contains(&raw_usage),
+        "test setup should land usage in [80%, 95%), got {:.3}",
+        raw_usage
+    );
+
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+    let action = manager.ensure_context_fits(&messages, provider);
+
+    assert_eq!(
+        action,
+        CompactionAction::ToolResultsCleared { cleared: 3 },
+        "stage-1 clearing should free enough headroom to skip summarization"
+    );
+    assert!(
+        !manager.is_compacting(),
+        "background summarization should not have started"
+    );
+    assert_eq!(manager.compacted_count, 0, "stage-1 clearing must not touch compacted_count");
+    assert!(
+        manager.context_usage_with(&messages) < COMPACTION_THRESHOLD,
+        "usage should have dropped below the threshold after clearing"
+    );
+}
+
+#[tokio::test]
+async fn stage1_falls_through_to_summarization_when_not_enough() {
+    // Serialize against env_kill_switch_disables_stage1 (see
+    // stage1_clearing_skips_summarization_when_it_frees_enough).
+    let _env_lock = crate::storage::lock_test_env();
+
+    // Big plain-text messages (no tool results at all) push usage above 80%.
+    // Stage-1 clearing has nothing to clear, so it must fall through to
+    // background summarization instead of silently doing nothing.
+    let mut manager = CompactionManager::new().with_budget(2_000);
+    let mut messages = Vec::new();
+    for i in 0..3 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("old {} {}", i, "x".repeat(850)),
+        ));
+        manager.notify_message_added();
+    }
+    for i in 0..10 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+    assert_eq!(messages.len(), 13);
+
+    let raw_usage = manager.context_usage_with(&messages);
+    assert!(
+        (COMPACTION_THRESHOLD..CRITICAL_THRESHOLD).contains(&raw_usage),
+        "test setup should land usage in [80%, 95%), got {:.3}",
+        raw_usage
+    );
+
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+    let action = manager.ensure_context_fits(&messages, provider);
+
+    assert!(
+        matches!(action, CompactionAction::BackgroundStarted { .. }),
+        "expected fallthrough to background summarization, got {:?}",
+        action
+    );
+    assert!(
+        manager.is_compacting(),
+        "background summarization should be in flight"
+    );
+    // The watermark still advances (nothing to clear doesn't mean nothing to
+    // mark), but it had zero effect since there were no clearable results.
+    assert_eq!(manager.tool_cleared_up_to(), 3);
+}
+
+#[test]
+fn tool_cleared_watermark_round_trips_through_persistence() {
+    let mut manager = CompactionManager::new().with_budget(500);
+    let mut messages = Vec::new();
+    for i in 0..20 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("turn {} {}", i, "x".repeat(40)),
+        ));
+        manager.notify_message_added();
+    }
+    manager.update_observed_input_tokens(490);
+    manager
+        .hard_compact_with(&messages)
+        .expect("should compact before persisting");
+
+    manager.set_tool_cleared_up_to(7);
+
+    let persisted = manager
+        .persisted_state()
+        .expect("compaction state should be exportable");
+    assert_eq!(persisted.tool_cleared_up_to, Some(7));
+
+    let mut restored = CompactionManager::new().with_budget(500);
+    restored.restore_persisted_state(&persisted, messages.len());
+
+    assert_eq!(restored.tool_cleared_up_to(), 7);
+}
+
+#[tokio::test]
+async fn env_kill_switch_disables_stage1() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _guard = EnvVarGuard::set("JCODE_DISABLE_TOOL_RESULT_CLEARING", "1");
+
+    // Same setup as `stage1_clearing_skips_summarization_when_it_frees_enough`:
+    // without the kill switch this would return ToolResultsCleared.
+    let mut manager = CompactionManager::new().with_budget(2_000);
+    let mut messages = Vec::new();
+    for i in 0..3 {
+        messages.push(make_tool_result_message(
+            &format!("t{}", i),
+            &"A".repeat(900),
+        ));
+        manager.notify_message_added();
+    }
+    for i in 0..10 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+    let action = manager.ensure_context_fits(&messages, provider);
+
+    assert!(
+        !matches!(action, CompactionAction::ToolResultsCleared { .. }),
+        "kill switch must disable stage-1, got {:?}",
+        action
+    );
+    assert_eq!(
+        manager.tool_cleared_up_to(),
+        0,
+        "watermark must not advance while stage-1 is disabled"
+    );
+}

@@ -80,6 +80,49 @@ impl KeyChord {
         parts.join("+")
     }
 
+    /// Like [`KeyChord::display`] but renders the `cmd` modifier as `Super`
+    /// (the Linux/Wayland convention), e.g. `Super+;` or `Super+Shift+'`.
+    /// Punctuation keys render as their literal character instead of the XKB
+    /// name, so `Super+Semicolon` becomes `Super+;`.
+    pub fn display_super(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.cmd {
+            parts.push("Super".to_string());
+        }
+        if self.ctrl {
+            parts.push("Ctrl".to_string());
+        }
+        if self.alt {
+            parts.push("Alt".to_string());
+        }
+        if self.shift {
+            parts.push("Shift".to_string());
+        }
+        parts.push(pretty_key(&self.key));
+        parts.join("+")
+    }
+
+    /// Compact macOS-style symbol form, e.g. `⌘;` or `⌘⇧K`. Modifier symbols
+    /// follow the standard Apple ordering (⌃⌥⇧⌘ is conventional, but we keep
+    /// jcode's cmd-first canonical order for consistency with `display`).
+    pub fn display_symbols(&self) -> String {
+        let mut out = String::new();
+        if self.ctrl {
+            out.push('⌃');
+        }
+        if self.alt {
+            out.push('⌥');
+        }
+        if self.shift {
+            out.push('⇧');
+        }
+        if self.cmd {
+            out.push('⌘');
+        }
+        out.push_str(&pretty_key(&self.key));
+        out
+    }
+
     /// Parse a jcode-style binding string such as `ctrl+k`, `alt+right`, or
     /// `cmd+shift+[` into a chord. Mirrors jcode's own keybinding grammar so the
     /// conflict detector compares like with like. Returns `None` for empty or
@@ -215,6 +258,33 @@ mod tests {
         let c = KeyChord::new(true, false, true, true, "K");
         assert_eq!(c.canonical(), "cmd+alt+shift+k");
         assert_eq!(c.display(), "Cmd+Alt+Shift+K");
+    }
+
+    #[test]
+    fn display_super_renders_characters_not_key_names() {
+        assert_eq!(KeyChord::parse("cmd+;").unwrap().display_super(), "Super+;");
+        assert_eq!(
+            KeyChord::parse("cmd+shift+'").unwrap().display_super(),
+            "Super+Shift+'"
+        );
+        assert_eq!(KeyChord::parse("cmd+[").unwrap().display_super(), "Super+[");
+        assert_eq!(
+            KeyChord::parse("cmd+\\").unwrap().display_super(),
+            "Super+\\"
+        );
+    }
+
+    #[test]
+    fn display_symbols_renders_modifier_glyphs() {
+        assert_eq!(KeyChord::parse("cmd+;").unwrap().display_symbols(), "⌘;");
+        assert_eq!(
+            KeyChord::parse("cmd+shift+'").unwrap().display_symbols(),
+            "⇧⌘'"
+        );
+        assert_eq!(
+            KeyChord::parse("ctrl+alt+k").unwrap().display_symbols(),
+            "⌃⌥K"
+        );
     }
 
     #[test]

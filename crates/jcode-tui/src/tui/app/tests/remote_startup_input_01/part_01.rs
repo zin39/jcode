@@ -25,6 +25,7 @@ fn test_finish_turn_does_not_duplicate_existing_poke_followup() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -244,6 +245,7 @@ fn test_prepare_review_spawned_session_uses_visible_transcript_for_judge_session
                 covers_up_to_turn: 1,
                 original_turn_count: 1,
                 compacted_count: 1,
+                tool_cleared_up_to: None,
             });
             child.save().expect("save child session");
 

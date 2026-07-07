@@ -120,7 +120,7 @@ impl Tool for MemoryTool {
 
         let input: MemoryInput = serde_json::from_value(input)?;
         let action_label = input.action.clone();
-        let session_id_for_error = ctx.session_id.clone();
+        let session_id = ctx.session_id.clone();
 
         match input.action.as_str() {
             "remember" => {
@@ -148,6 +148,14 @@ impl Tool for MemoryTool {
                 } else {
                     self.manager.remember_project(entry)?
                 };
+                // The agent just wrote this memory itself; the content is in
+                // the transcript (tool call + result), so auto-recall should
+                // not inject it back into this session.
+                memory::mark_memories_known(
+                    &session_id,
+                    std::slice::from_ref(&id),
+                    "stored via memory tool in this session",
+                );
                 memory::add_event(MemoryEventKind::ToolRemembered {
                     content: truncate_for_widget(&content, 60),
                     scope: scope.to_string(),
@@ -421,7 +429,7 @@ impl Tool for MemoryTool {
         .map_err(|err| {
             crate::logging::warn(&format!(
                 "[tool:memory] action failed action={} session_id={} error={}",
-                action_label, session_id_for_error, err
+                action_label, session_id, err
             ));
             err
         })

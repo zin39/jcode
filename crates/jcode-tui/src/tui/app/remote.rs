@@ -24,11 +24,15 @@ mod server_event_handlers;
 mod server_events;
 mod session_persistence;
 mod swarm_plan_core;
+mod swarm_status_core;
 mod workspace;
 
 #[cfg(test)]
 pub(super) use key_handling::reload_stale_remote_server_before_update;
-use queue_recovery::{recover_local_interleave_to_queue, recover_stranded_soft_interrupts};
+use queue_recovery::{
+    recover_local_interleave_to_queue, recover_stranded_soft_interrupts,
+    recover_undelivered_queued_continuation,
+};
 // Re-export for sibling modules and tests that access reconnect state and helpers
 // through `super::remote::*` without reaching into private submodules directly.
 #[allow(unused_imports)]
@@ -76,6 +80,10 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     });
     let mut needs_redraw = crate::tui::periodic_redraw_required(app);
     app.maybe_capture_runtime_memory_heartbeat();
+    app.maybe_release_idle_heap();
+    // Surface the cold-cache transcript warning the moment the TTL expires
+    // while idle, not only when the next request starts.
+    needs_redraw |= app.maybe_push_idle_cold_cache_warning();
     needs_redraw |= app.progress_copy_selection_edge_autoscroll();
     app.progress_mouse_scroll_animation();
     needs_redraw |= app.update_chat_overscroll();
@@ -221,11 +229,32 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
         for msg in &messages {
             app.push_display_message(DisplayMessage::user(msg.clone()));
         }
-        if begin_remote_send(app, remote, combined, vec![], true, reminder, auto_retry, 0)
-            .await
-            .is_err()
+        if begin_remote_send(
+            app,
+            remote,
+            combined.clone(),
+            vec![],
+            true,
+            reminder.clone(),
+            auto_retry,
+            0,
+        )
+        .await
+        .is_err()
         {
-            crate::logging::error("Failed to send queued continuation message");
+            // The send never reached the server (e.g. the socket died under a
+            // reload handoff). Dropping the dequeued messages here would lose
+            // them permanently (issue #391); put them back so the queue
+            // re-dispatches after reconnect.
+            crate::logging::error(
+                "Failed to send queued continuation message; restoring it to the queue",
+            );
+            if let Some(reminder) = reminder {
+                app.hidden_queued_system_messages.insert(0, reminder);
+            }
+            if !combined.is_empty() {
+                app.queued_messages.insert(0, combined);
+            }
         }
         needs_redraw = true;
     }
@@ -243,14 +272,17 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             String::new(),
             vec![],
             true,
-            Some(combined),
+            Some(combined.clone()),
             true,
             0,
         )
         .await
         .is_err()
         {
-            crate::logging::error("Failed to send hidden continuation reminder");
+            crate::logging::error(
+                "Failed to send hidden continuation reminder; restoring it to the queue",
+            );
+            app.hidden_queued_system_messages.insert(0, combined);
         }
         needs_redraw = true;
     }
@@ -258,6 +290,31 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     detect_and_cancel_stall(app, remote).await;
     needs_redraw |= recover_stuck_remote_history(app, remote).await;
     needs_redraw
+}
+
+/// Forward the reasoning-effort variant staged by a model-picker selection
+/// (e.g. "gpt-5.5 (high)") to the server right after the model-switch request.
+/// In remote mode the picker cannot apply effort to `app.provider` (a local
+/// stand-in), so skipping this leaves the server on its configured default
+/// effort - typically low - silently downgrading the request (issue #427).
+async fn forward_pending_reasoning_effort(app: &mut App, remote: &mut RemoteConnection) {
+    let Some(effort) = app.pending_reasoning_effort.take() else {
+        return;
+    };
+    match remote.set_reasoning_effort(&effort).await {
+        Ok(()) => {
+            // Optimistically track the requested effort so the widget/header
+            // reflect the picker choice; ReasoningEffortChanged confirms it.
+            app.remote_reasoning_effort = Some(effort);
+        }
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to request reasoning effort '{}': {}",
+                effort, error
+            )));
+            app.set_status_notice("Effort switch failed");
+        }
+    }
 }
 
 pub(super) async fn handle_terminal_event(
@@ -297,8 +354,13 @@ pub(super) async fn handle_terminal_event(
                     match remote.set_route_selection(selection).await {
                         Ok(_) => {
                             app.remote_model_switch_in_flight = true;
+                            forward_pending_reasoning_effort(app, remote).await;
                         }
                         Err(error) => {
+                            app.pending_reasoning_effort = None;
+                            // A fallback-offer resend must not fire without its
+                            // route switch; drop it with the failed request.
+                            app.pending_fallback_resend = None;
                             app.push_display_message(DisplayMessage::error(format!(
                                 "Failed to request model switch: {}",
                                 error
@@ -310,8 +372,10 @@ pub(super) async fn handle_terminal_event(
                     match remote.set_model(&spec).await {
                         Ok(_) => {
                             app.remote_model_switch_in_flight = true;
+                            forward_pending_reasoning_effort(app, remote).await;
                         }
                         Err(error) => {
+                            app.pending_reasoning_effort = None;
                             app.push_display_message(DisplayMessage::error(format!(
                                 "Failed to request model switch: {}",
                                 error
@@ -561,12 +625,14 @@ fn auth_provider_hint_for_login_provider(provider: &str) -> Option<&'static str>
 }
 
 fn auth_changed_event_for_login_provider(provider: &str) -> Option<crate::protocol::AuthChanged> {
+    use crate::provider_catalog::LoginProviderTarget;
     let provider_id = auth_provider_hint_for_login_provider(provider)?;
     let mut auth = crate::protocol::AuthChanged::new(provider_id);
     // These fields are informational; the server routes off `provider` and the
     // `expected_*` hints. Reflect the descriptor's auth kind so OAuth logins are
     // not recorded as API-key pastes.
-    let api_key_login = crate::provider_catalog::resolve_login_provider_loose(provider)
+    let descriptor = crate::provider_catalog::resolve_login_provider_loose(provider);
+    let api_key_login = descriptor
         .map(|descriptor| {
             use crate::provider_catalog::LoginProviderAuthKind;
             matches!(
@@ -579,11 +645,18 @@ fn auth_changed_event_for_login_provider(provider: &str) -> Option<crate::protoc
         auth.auth_method = Some(crate::protocol::AuthMethod::RemoteTuiPasteApiKey);
         auth.credential_source = Some(crate::protocol::AuthCredentialSource::ApiKeyFile);
     }
+    // Only logins whose descriptor actually targets the OpenAI-compatible
+    // runtime claim its namespace. Do not key this off
+    // `openai_compatible_profile_by_id`: native providers (`anthropic-api`,
+    // `openai-api`) alias doctor-probe compat profiles with the same id, but
+    // their auth activation deliberately routes through the native runtime.
     if provider_id == "azure-openai" {
         auth.expected_runtime = Some(crate::protocol::RuntimeProviderKey::new("azure-openai"));
         auth.expected_catalog_namespace =
             Some(crate::protocol::CatalogNamespace::new("azure-openai"));
-    } else if crate::provider_catalog::openai_compatible_profile_by_id(provider_id).is_some() {
+    } else if descriptor
+        .is_some_and(|d| matches!(d.target, LoginProviderTarget::OpenAiCompatible(_)))
+    {
         auth.expected_runtime = Some(crate::protocol::RuntimeProviderKey::new(
             "openai-compatible",
         ));
@@ -741,7 +814,14 @@ pub(super) fn handle_disconnect(
     let scheduled_retry =
         app.schedule_pending_remote_retry(&format!("⚡ Connection lost ({detail})."));
     if !scheduled_retry {
-        app.clear_pending_remote_retry();
+        // A queued follow-up that was already dispatched (dequeued into an
+        // in-flight send) has no auto-retry path. Dropping it here would lose
+        // the user's queued message when a reload/disconnect races the
+        // turn-end dispatch (issue #391); put it back on the queue instead so
+        // it is re-sent once the turn is proven idle after reconnect.
+        if !recover_undelivered_queued_continuation(app, "disconnect") {
+            app.clear_pending_remote_retry();
+        }
     }
     let recovered_local = recover_local_interleave_to_queue(app, "disconnect");
     app.current_message_id = None;
@@ -1003,6 +1083,44 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
 
     if !app.remote_model_switch_in_flight
         && !app.is_processing
+        && let Some(payload) = app.pending_fallback_resend.take()
+    {
+        // A fallback offer was accepted and the server confirmed the route
+        // switch: resend the failed turn's payload on the new route. The
+        // original user message is already in the transcript from the failed
+        // attempt, so do not echo it again; just clear the input box if the
+        // error path restored the prompt there.
+        if let Some(raw_input) = payload.raw_input.as_deref()
+            && app.input == raw_input
+        {
+            app.input.clear();
+            app.cursor_pos = 0;
+        }
+        app.last_submitted_input = payload.raw_input.clone();
+        crate::logging::info("Resending failed turn after accepted fallback route switch");
+        if let Err(error) = begin_remote_send(
+            app,
+            remote,
+            payload.content,
+            payload.images,
+            payload.is_system,
+            payload.system_reminder,
+            payload.auto_retry,
+            0,
+        )
+        .await
+        {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to resend after fallback switch: {}",
+                error
+            )));
+            app.set_status_notice("Fallback resend failed");
+        }
+        return;
+    }
+
+    if !app.remote_model_switch_in_flight
+        && !app.is_processing
         && let Some(prepared) = app.pending_prompt_after_model_switch.take()
     {
         if let Err(error) = submit_prepared_remote_input(app, remote, prepared).await {
@@ -1198,35 +1316,94 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 app.visible_turn_started = Some(Instant::now());
             }
         }
-        let _ =
-            begin_remote_send(app, remote, combined, vec![], true, reminder, auto_retry, 0).await;
+        if begin_remote_send(
+            app,
+            remote,
+            combined.clone(),
+            vec![],
+            true,
+            reminder.clone(),
+            auto_retry,
+            0,
+        )
+        .await
+        .is_err()
+        {
+            // Do not drop a dequeued follow-up whose send never reached the
+            // server (issue #391); restore it for redispatch after reconnect.
+            crate::logging::error(
+                "Failed to send queued continuation message; restoring it to the queue",
+            );
+            if let Some(reminder) = reminder {
+                app.hidden_queued_system_messages.insert(0, reminder);
+            }
+            if !combined.is_empty() {
+                app.queued_messages.insert(0, combined);
+            }
+        }
     } else if !app.hidden_queued_system_messages.is_empty() {
         let reminders = std::mem::take(&mut app.hidden_queued_system_messages);
         let combined = reminders.join("\n\n");
-        let _ = begin_remote_send(
+        if begin_remote_send(
             app,
             remote,
             String::new(),
             vec![],
             true,
-            Some(combined),
+            Some(combined.clone()),
             true,
             0,
         )
-        .await;
+        .await
+        .is_err()
+        {
+            crate::logging::error(
+                "Failed to send hidden continuation reminder; restoring it to the queue",
+            );
+            app.hidden_queued_system_messages.insert(0, combined);
+        }
+    }
+}
+
+/// Client-side stall budget before the TUI cancels an in-flight turn.
+///
+/// The server relays provider events over the local socket; when the upstream
+/// model reasons silently, no events cross the socket, so a hardcoded short
+/// watchdog cannot distinguish a dead connection from a healthy long think
+/// (issue #434). Derive the budget from the provider-agnostic
+/// `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`
+/// setting plus grace time so the server-side idle timeout (which produces a
+/// visible error event) always fires first. Never below 2 minutes.
+fn stall_timeout() -> Duration {
+    const MIN_STALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+    const GRACE: Duration = Duration::from_secs(30);
+    let provider_idle = crate::provider::stream_idle_timeout();
+    provider_idle.saturating_add(GRACE).max(MIN_STALL_TIMEOUT)
+}
+
+/// Human-readable stall duration for user-facing stall messages, e.g.
+/// "2 minutes", "3.5 minutes", or "90 seconds".
+fn format_stall_duration(timeout: Duration) -> String {
+    let secs = timeout.as_secs();
+    if secs < 120 {
+        format!("{} seconds", secs)
+    } else if secs.is_multiple_of(60) {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{:.1} minutes", secs as f64 / 60.0)
     }
 }
 
 async fn detect_and_cancel_stall(app: &mut App, remote: &mut RemoteConnection) {
-    const STALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+    let stall_timeout = stall_timeout();
     let is_running_tool = matches!(app.status, ProcessingStatus::RunningTool(_));
     if app.is_processing && !is_running_tool {
         let stalled = app
             .last_stream_activity
-            .map(|t| t.elapsed() > STALL_TIMEOUT)
+            .map(|t| t.elapsed() > stall_timeout)
             .unwrap_or_else(|| {
                 app.processing_started
-                    .map(|t| t.elapsed() > STALL_TIMEOUT)
+                    .map(|t| t.elapsed() > stall_timeout)
                     .unwrap_or(false)
             });
         if stalled {
@@ -1276,13 +1453,23 @@ async fn detect_and_cancel_stall(app: &mut App, remote: &mut RemoteConnection) {
                     });
                 }
             }
-            if !app.schedule_pending_remote_retry(
-                "⚠ Stream stalled (no response for 2 minutes). Processing cancelled.",
-            ) {
+            let stall_desc = format_stall_duration(stall_timeout);
+            if !app.schedule_pending_remote_retry(&format!(
+                "⚠ Stream stalled (no response for {stall_desc}). Processing cancelled.",
+            )) {
+                // Keep a dispatched-but-unfinished queued follow-up on the
+                // queue instead of silently dropping it (issue #391).
+                let recovered = recover_undelivered_queued_continuation(app, "stream stall");
                 app.clear_pending_remote_retry();
-                app.push_display_message(DisplayMessage::system(
-                    "⚠ Stream stalled (no response for 2 minutes). Processing cancelled. You can resend your message.".to_string(),
-                ));
+                if recovered {
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "⚠ Stream stalled (no response for {stall_desc}). Processing cancelled. Your queued follow-up stays queued.",
+                    )));
+                } else {
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "⚠ Stream stalled (no response for {stall_desc}). Processing cancelled. You can resend your message. Raise `[provider] stream_idle_timeout_secs` in config.toml if your model thinks silently for longer.",
+                    )));
+                }
             }
         }
     }
@@ -1402,6 +1589,7 @@ fn handle_disconnected_local_command(app: &mut App, trimmed: &str) -> bool {
         || super::commands::handle_model_command(app, trimmed)
         || super::commands::handle_usage_command(app, trimmed)
         || super::commands::handle_feedback_command(app, trimmed)
+        || super::support::handle_support_command(app, trimmed)
         || super::state_ui::handle_info_command(app, trimmed)
         || super::auth::handle_auth_command(app, trimmed)
         || super::commands::handle_dev_command(app, trimmed);
@@ -1624,4 +1812,42 @@ fn handle_disconnected_key_internal(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod stall_guard_tests {
+    use super::*;
+
+    #[test]
+    fn stall_timeout_never_below_two_minutes() {
+        // Even with the default 180s provider idle timeout, the client stall
+        // guard must give the server-side timeout room to fire first.
+        let timeout = stall_timeout();
+        assert!(
+            timeout >= Duration::from_secs(2 * 60),
+            "stall timeout regressed below 2 minutes: {timeout:?}"
+        );
+        // And it must exceed the provider idle timeout so a healthy silent
+        // reasoning stretch is cancelled server-side (visible error + retry)
+        // rather than by the client watchdog (issue #434).
+        let provider_idle = crate::provider::stream_idle_timeout();
+        assert!(
+            timeout > provider_idle,
+            "stall timeout {timeout:?} must exceed provider idle timeout {provider_idle:?}"
+        );
+    }
+
+    #[test]
+    fn format_stall_duration_is_human_readable() {
+        assert_eq!(format_stall_duration(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(format_stall_duration(Duration::from_secs(120)), "2 minutes");
+        assert_eq!(
+            format_stall_duration(Duration::from_secs(210)),
+            "3.5 minutes"
+        );
+        assert_eq!(
+            format_stall_duration(Duration::from_secs(430)),
+            "7.2 minutes"
+        );
+    }
 }

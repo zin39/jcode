@@ -755,10 +755,14 @@ fn test_filter_mode_cycles_through_requested_session_sources() {
     opencode.provider_key = Some("opencode".to_string());
     opencode.source = SessionSource::OpenCode;
 
-    let mut picker = SessionPicker::new(vec![saved, claude_code, codex, pi, opencode]);
+    let mut cursor = make_session("session_cursor", "cursor", false, SessionStatus::Closed);
+    cursor.provider_key = Some("cursor".to_string());
+    cursor.source = SessionSource::Cursor;
+
+    let mut picker = SessionPicker::new(vec![saved, claude_code, codex, pi, opencode, cursor]);
 
     assert_eq!(picker.filter_mode, SessionFilterMode::All);
-    assert_eq!(picker.visible_sessions.len(), 5);
+    assert_eq!(picker.visible_sessions.len(), 6);
 
     picker.cycle_filter_mode();
     assert_eq!(picker.filter_mode, SessionFilterMode::CatchUp);
@@ -812,8 +816,17 @@ fn test_filter_mode_cycles_through_requested_session_sources() {
     );
 
     picker.cycle_filter_mode();
+    assert_eq!(picker.filter_mode, SessionFilterMode::Cursor);
+    assert_eq!(picker.visible_sessions.len(), 1);
+    assert!(
+        picker
+            .visible_session_iter()
+            .all(SessionPicker::session_is_cursor)
+    );
+
+    picker.cycle_filter_mode();
     assert_eq!(picker.filter_mode, SessionFilterMode::All);
-    assert_eq!(picker.visible_sessions.len(), 5);
+    assert_eq!(picker.visible_sessions.len(), 6);
 }
 
 #[test]
@@ -1574,6 +1587,84 @@ fn test_preview_sticky_prompt_header_appears_after_scrolling() {
 }
 
 #[test]
+fn test_preview_sticky_prompt_header_survives_async_preview_load() {
+    // Regression: when the selected session's transcript is still loading on a
+    // background thread, the first render only shows a "Loading…" placeholder
+    // (max_scroll == 0). The auto-scroll flag must NOT be consumed on that
+    // placeholder frame; otherwise the populated transcript stays pinned at the
+    // top and the sticky "previous prompt" header never appears (it only renders
+    // when scrolled past a prompt). This reproduces the intermittent "/resume
+    // sometimes doesn't show your last prompt at the top" bug.
+    let mut session = make_session_with_many_turns("async_sticky", 60);
+    let full_preview = std::mem::take(&mut session.messages_preview);
+    session.first_user_prompt = full_preview.first().map(|m| m.content.clone());
+
+    let mut picker = SessionPicker::new(vec![session.clone()]);
+    picker.focus = PaneFocus::Preview;
+
+    // Simulate an in-flight background load for the selected session: empty
+    // preview + a pending load whose id matches. Keep the sender alive so the
+    // receiver reports `Empty` (still loading) rather than `Disconnected`.
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<PreviewMessage>>>();
+    picker.pending_preview_load = Some(PendingSessionPreviewLoad {
+        session_id: "async_sticky".to_string(),
+        receiver: rx,
+    });
+
+    let w = 100u16;
+    let h = 16u16;
+    let render = |picker: &mut SessionPicker| {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| picker.render(frame))
+            .expect("render picker");
+        terminal.backend().buffer().clone()
+    };
+
+    // First frame: transcript still loading -> placeholder shown, auto-scroll
+    // must remain armed.
+    let _ = render(&mut picker);
+    assert!(
+        picker.auto_scroll_preview,
+        "auto-scroll should stay armed while the preview is still loading"
+    );
+
+    // The background load completes: deliver the real transcript exactly the way
+    // `poll_preview_load` would (drop the channel + populate the preview).
+    drop(tx);
+    picker.pending_preview_load = None;
+    picker.apply_session_preview("async_sticky", full_preview);
+
+    // Second frame: now that content is present we snap to the bottom and the
+    // top prompts scroll off-screen, so the sticky header should pin a prompt.
+    let buffer = render(&mut picker);
+    assert!(
+        picker.scroll_offset > 0,
+        "preview should auto-scroll to the bottom once content loads, got {}",
+        picker.scroll_offset
+    );
+
+    let preview_inner_x = (w as f32 * 0.40) as u16 + 1;
+    let header_row: String = (preview_inner_x..w.saturating_sub(1))
+        .map(|x| buffer[(x, 1)].symbol())
+        .collect();
+    assert!(
+        header_row.contains('›'),
+        "sticky prompt header should appear after an async preview load:\n\
+         row={header_row:?}"
+    );
+    assert!(
+        header_row
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit()),
+        "sticky header should begin with a prompt number:\nrow={header_row:?}"
+    );
+}
+
+#[test]
 fn preview_render_cache_is_reused_across_scroll_and_rebuilt_on_selection_change() {
     // The preview pane caches its fully-wrapped content keyed by a content hash
     // and pane geometry, so scrolling reuses the cache instead of re-rendering
@@ -1951,7 +2042,11 @@ fn highlight_spans_marks_query_occurrences() {
         .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
         .map(|s| s.content.as_ref())
         .collect();
-    assert_eq!(highlighted, vec!["Resume"], "match should be highlighted case-insensitively");
+    assert_eq!(
+        highlighted,
+        vec!["Resume"],
+        "match should be highlighted case-insensitively"
+    );
 }
 
 #[test]
@@ -1968,7 +2063,11 @@ fn highlight_spans_marks_each_token_independently() {
         .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
         .map(|s| s.content.as_ref())
         .collect();
-    assert_eq!(highlighted, vec!["Resume", "bug"], "every token should be highlighted");
+    assert_eq!(
+        highlighted,
+        vec!["Resume", "bug"],
+        "every token should be highlighted"
+    );
 }
 
 #[test]
@@ -1990,7 +2089,10 @@ fn search_highlights_matching_title_in_rendered_rows() {
         .spans
         .iter()
         .any(|s| s.content.as_ref() == "sess" && s.style.add_modifier.contains(Modifier::BOLD));
-    assert!(has_highlight, "query substring in title should be highlighted");
+    assert!(
+        has_highlight,
+        "query substring in title should be highlighted"
+    );
 }
 
 #[test]
@@ -2010,7 +2112,10 @@ fn search_highlights_match_in_preview_and_scrolls_to_it() {
     // Baseline: no search -> auto-scrolls to bottom.
     let _ = buffer_text(&mut picker, w, h);
     let bottom_scroll = picker.scroll_offset;
-    assert!(bottom_scroll > 0, "long preview should scroll to bottom by default");
+    assert!(
+        bottom_scroll > 0,
+        "long preview should scroll to bottom by default"
+    );
 
     // Now search for the unique early term. Reset auto-scroll like a keystroke would.
     picker.search_query = "flibbertigibbet".to_string();
@@ -2041,7 +2146,10 @@ fn search_highlights_match_in_preview_and_scrolls_to_it() {
             s.content.to_lowercase().contains("flibbertigibbet")
                 && s.style.add_modifier.contains(Modifier::BOLD)
         });
-    assert!(highlighted, "matched term in preview body should be highlighted");
+    assert!(
+        highlighted,
+        "matched term in preview body should be highlighted"
+    );
 }
 
 #[test]
@@ -2050,7 +2158,10 @@ fn preview_without_search_has_no_highlight_and_scrolls_to_bottom() {
     let mut picker = SessionPicker::new(vec![session]);
     picker.focus = PaneFocus::Preview;
     let _ = buffer_text(&mut picker, 100, 16);
-    assert!(picker.scroll_offset > 0, "should scroll to bottom without search");
+    assert!(
+        picker.scroll_offset > 0,
+        "should scroll to bottom without search"
+    );
     let any_highlight = picker
         .preview_cache
         .as_ref()
@@ -2058,6 +2169,11 @@ fn preview_without_search_has_no_highlight_and_scrolls_to_bottom() {
         .wrapped_lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .any(|s| s.style.add_modifier.contains(Modifier::BOLD) && s.style.fg == Some(rgb(255, 214, 90)));
-    assert!(!any_highlight, "no search means no highlight color in preview");
+        .any(|s| {
+            s.style.add_modifier.contains(Modifier::BOLD) && s.style.fg == Some(rgb(255, 214, 90))
+        });
+    assert!(
+        !any_highlight,
+        "no search means no highlight color in preview"
+    );
 }

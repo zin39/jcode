@@ -509,7 +509,9 @@ impl GmailClient {
     }
 
     pub async fn get_thread(&self, id: &str) -> Result<Thread> {
-        let url = format!("{}/threads/{}?format=metadata", GMAIL_API_BASE, id);
+        // Full format so message parts (and therefore attachment filenames)
+        // are available; metadata format omits the MIME tree.
+        let url = format!("{}/threads/{}?format=full", GMAIL_API_BASE, id);
         let value = self.request(reqwest::Method::GET, &url, None).await?;
         Ok(serde_json::from_value(value)?)
     }
@@ -534,20 +536,26 @@ impl GmailClient {
         in_reply_to: Option<&str>,
         thread_id: Option<&str>,
     ) -> Result<Draft> {
+        self.create_draft_with_attachments(to, subject, body, in_reply_to, thread_id, &[])
+            .await
+    }
+
+    /// Create a draft, optionally with file attachments. When `attachments` is
+    /// empty this produces the same plain-text draft as `create_draft`;
+    /// otherwise it builds a `multipart/mixed` MIME body with each file
+    /// base64-encoded.
+    pub async fn create_draft_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        in_reply_to: Option<&str>,
+        thread_id: Option<&str>,
+        attachments: &[std::path::PathBuf],
+    ) -> Result<Draft> {
         let url = format!("{}/drafts", GMAIL_API_BASE);
 
-        let mut headers = format!(
-            "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n",
-            to, subject
-        );
-        if let Some(reply_to) = in_reply_to {
-            headers.push_str(&format!(
-                "In-Reply-To: {}\r\nReferences: {}\r\n",
-                reply_to, reply_to
-            ));
-        }
-
-        let raw = format!("{}\r\n{}", headers, body);
+        let raw = build_raw_mime(to, subject, body, in_reply_to, attachments)?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
 
         let mut message = json!({ "raw": encoded });
@@ -581,20 +589,26 @@ impl GmailClient {
         in_reply_to: Option<&str>,
         thread_id: Option<&str>,
     ) -> Result<Message> {
+        self.send_message_with_attachments(to, subject, body, in_reply_to, thread_id, &[])
+            .await
+    }
+
+    /// Send a message, optionally with file attachments. When `attachments` is
+    /// empty this produces the same plain-text message as `send_message`;
+    /// otherwise it builds a `multipart/mixed` MIME body with each file
+    /// base64-encoded.
+    pub async fn send_message_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        in_reply_to: Option<&str>,
+        thread_id: Option<&str>,
+        attachments: &[std::path::PathBuf],
+    ) -> Result<Message> {
         let url = format!("{}/messages/send", GMAIL_API_BASE);
 
-        let mut headers = format!(
-            "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n",
-            to, subject
-        );
-        if let Some(reply_to) = in_reply_to {
-            headers.push_str(&format!(
-                "In-Reply-To: {}\r\nReferences: {}\r\n",
-                reply_to, reply_to
-            ));
-        }
-
-        let raw = format!("{}\r\n{}", headers, body);
+        let raw = build_raw_mime(to, subject, body, in_reply_to, attachments)?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
 
         let mut message = json!({ "raw": encoded });
@@ -628,6 +642,100 @@ impl GmailClient {
         self.request(reqwest::Method::POST, &url, Some(payload))
             .await?;
         Ok(())
+    }
+}
+
+/// Build a raw RFC 5322 message, optionally `multipart/mixed` with file
+/// attachments. Returns the full message including headers, suitable for
+/// base64url-encoding into the Gmail API `raw` field.
+fn build_raw_mime(
+    to: &str,
+    subject: &str,
+    body: &str,
+    in_reply_to: Option<&str>,
+    attachments: &[std::path::PathBuf],
+) -> Result<String> {
+    let mut reply_headers = String::new();
+    if let Some(reply_to) = in_reply_to {
+        reply_headers.push_str(&format!(
+            "In-Reply-To: {}\r\nReferences: {}\r\n",
+            reply_to, reply_to
+        ));
+    }
+
+    if attachments.is_empty() {
+        return Ok(format!(
+            "To: {}\r\nSubject: {}\r\n{}Content-Type: text/plain; charset=utf-8\r\n\r\n{}",
+            to, subject, reply_headers, body
+        ));
+    }
+
+    let boundary = format!(
+        "jcode_boundary_{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    let mut raw = format!(
+        "To: {}\r\nSubject: {}\r\n{}MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n",
+        to, subject, reply_headers, boundary
+    );
+
+    // Body part.
+    raw.push_str(&format!("--{}\r\n", boundary));
+    raw.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+    raw.push_str(body);
+    raw.push_str("\r\n");
+
+    // Attachment parts.
+    for path in attachments {
+        let data = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read attachment {}: {}", path.display(), e))?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment");
+        let mime_type = guess_mime_type(path);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+
+        raw.push_str(&format!("--{}\r\n", boundary));
+        raw.push_str(&format!(
+            "Content-Type: {}; name=\"{}\"\r\n",
+            mime_type, file_name
+        ));
+        raw.push_str("Content-Transfer-Encoding: base64\r\n");
+        raw.push_str(&format!(
+            "Content-Disposition: attachment; filename=\"{}\"\r\n\r\n",
+            file_name
+        ));
+        // Wrap base64 at 76 chars per RFC 2045.
+        for chunk in encoded.as_bytes().chunks(76) {
+            raw.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            raw.push_str("\r\n");
+        }
+    }
+
+    raw.push_str(&format!("--{}--\r\n", boundary));
+    Ok(raw)
+}
+
+/// Best-effort MIME type from a file extension for email attachments.
+fn guess_mime_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("txt") | Some("md") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("json") => "application/json",
+        Some("zip") => "application/zip",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        _ => "application/octet-stream",
     }
 }
 
@@ -740,18 +848,56 @@ impl Message {
     pub fn body_text(&self) -> Option<String> {
         self.payload.as_ref().and_then(|p| p.extract_text())
     }
+
+    /// All attachment parts (parts with a non-empty filename), flattened
+    /// across nested multipart structures.
+    pub fn attachments(&self) -> Vec<AttachmentInfo> {
+        let mut out = Vec::new();
+        if let Some(ref payload) = self.payload {
+            payload.collect_attachments(&mut out);
+        }
+        out
+    }
+}
+
+/// Summary of one attachment part on a message.
+#[derive(Debug, Clone)]
+pub struct AttachmentInfo {
+    pub filename: String,
+    pub mime_type: Option<String>,
+    pub size: Option<u32>,
+    pub attachment_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MessagePayload {
     #[serde(rename = "mimeType")]
     pub mime_type: Option<String>,
+    pub filename: Option<String>,
     pub headers: Option<Vec<Header>>,
     pub body: Option<MessageBody>,
     pub parts: Option<Vec<MessagePayload>>,
 }
 
 impl MessagePayload {
+    fn collect_attachments(&self, out: &mut Vec<AttachmentInfo>) {
+        if let Some(ref filename) = self.filename
+            && !filename.is_empty()
+        {
+            out.push(AttachmentInfo {
+                filename: filename.clone(),
+                mime_type: self.mime_type.clone(),
+                size: self.body.as_ref().and_then(|b| b.size),
+                attachment_id: self.body.as_ref().and_then(|b| b.attachment_id.clone()),
+            });
+        }
+        if let Some(ref parts) = self.parts {
+            for part in parts {
+                part.collect_attachments(out);
+            }
+        }
+    }
+
     #[expect(
         clippy::collapsible_if,
         reason = "Nested MIME/body decoding is kept explicit for readability"
@@ -790,6 +936,8 @@ impl MessagePayload {
 pub struct MessageBody {
     pub size: Option<u32>,
     pub data: Option<String>,
+    #[serde(rename = "attachmentId")]
+    pub attachment_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -858,11 +1006,48 @@ pub fn format_message_summary(msg: &Message) -> String {
 
 pub fn format_message_full(msg: &Message) -> String {
     let mut out = format_message_summary(msg);
+    let attachments = msg.attachments();
+    if !attachments.is_empty() {
+        out.push_str(&format!("\nAttachments ({}):\n", attachments.len()));
+        out.push_str(&format_attachment_lines(&attachments));
+    }
     if let Some(body) = msg.body_text() {
         out.push_str("\n\n--- Body ---\n");
         out.push_str(&body);
     }
     out
+}
+
+/// One "  - name (mime, size)" line per attachment.
+pub fn format_attachment_lines(attachments: &[AttachmentInfo]) -> String {
+    attachments
+        .iter()
+        .map(|a| {
+            let mut details = Vec::new();
+            if let Some(ref mime) = a.mime_type {
+                details.push(mime.clone());
+            }
+            if let Some(size) = a.size {
+                details.push(format_size(size));
+            }
+            if details.is_empty() {
+                format!("  - {}", a.filename)
+            } else {
+                format!("  - {} ({})", a.filename, details.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_size(bytes: u32) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 #[cfg(test)]
@@ -877,6 +1062,63 @@ mod tests {
             user_id: Some("me".to_string()),
             auth_config_id: Some("ac_123".to_string()),
         }
+    }
+
+    #[test]
+    fn message_attachments_flatten_nested_parts() {
+        let msg: Message = serde_json::from_value(json!({
+            "id": "m1",
+            "threadId": "t1",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "filename": "",
+                "parts": [
+                    {
+                        "mimeType": "multipart/alternative",
+                        "filename": "",
+                        "parts": [
+                            { "mimeType": "text/plain", "filename": "", "body": { "size": 10 } }
+                        ]
+                    },
+                    {
+                        "mimeType": "application/pdf",
+                        "filename": "receipt.pdf",
+                        "body": { "size": 2048, "attachmentId": "att-1" }
+                    },
+                    {
+                        "mimeType": "image/png",
+                        "filename": "photo.png",
+                        "body": { "size": 3670016, "attachmentId": "att-2" }
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        let attachments = msg.attachments();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].filename, "receipt.pdf");
+        assert_eq!(attachments[0].attachment_id.as_deref(), Some("att-1"));
+        assert_eq!(attachments[1].filename, "photo.png");
+
+        let lines = format_attachment_lines(&attachments);
+        assert!(lines.contains("receipt.pdf (application/pdf, 2.0 KB)"));
+        assert!(lines.contains("photo.png (image/png, 3.5 MB)"));
+
+        let full = format_message_full(&msg);
+        assert!(full.contains("Attachments (2):"));
+    }
+
+    #[test]
+    fn message_without_attachments_formats_clean() {
+        let msg: Message = serde_json::from_value(json!({
+            "id": "m2",
+            "threadId": "t2",
+            "payload": { "mimeType": "text/plain", "filename": "", "body": { "size": 5 } }
+        }))
+        .unwrap();
+        assert!(msg.attachments().is_empty());
+        assert!(!format_message_full(&msg).contains("Attachments"));
     }
 
     #[test]

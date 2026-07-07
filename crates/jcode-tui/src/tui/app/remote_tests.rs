@@ -38,6 +38,12 @@ impl Provider for MockProvider {
 }
 
 fn create_test_app() -> crate::tui::app::App {
+    ensure_test_jcode_home_if_unset();
+    // `has_notification()` (via `unfocused_redraw_warranted`) consults a
+    // process-wide ambient-info cache that another test may have populated
+    // from its own JCODE_HOME (scheduled reminders read as a notification).
+    // Reset it so these tests observe only their own state.
+    crate::tui::app::helpers::clear_ambient_info_cache_for_tests();
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let registry = rt.block_on(crate::tool::Registry::new(provider.clone()));
@@ -45,6 +51,28 @@ fn create_test_app() -> crate::tui::app::App {
     app.queue_mode = false;
     app.diff_mode = crate::config::DiffDisplayMode::Inline;
     app
+}
+
+/// Point JCODE_HOME at a per-process temp dir when the environment does not
+/// already pin one, so tests never read the developer's real `~/.jcode`
+/// state (e.g. a populated ambient queue turns `has_notification()` on and
+/// breaks the unfocused-redraw assertions). Mirrors the helper of the same
+/// name used by the main app test suite.
+fn ensure_test_jcode_home_if_unset() {
+    use std::sync::OnceLock;
+
+    static TEST_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+    if std::env::var_os("JCODE_HOME").is_some() {
+        return;
+    }
+
+    let path = TEST_HOME.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("jcode-test-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&path);
+        path
+    });
+    crate::env::set_var("JCODE_HOME", path);
 }
 
 #[test]
@@ -346,7 +374,24 @@ fn auth_changed_event_for_cerebras_login_carries_runtime_and_catalog_identity() 
 
 #[test]
 fn reload_handoff_inactive_without_flag_or_marker() {
-    assert!(!reconnect::reload_handoff_active(&RemoteRunState::default()));
+    // `reload_handoff_active` falls back to the on-disk reload marker in the
+    // runtime dir. Point the runtime dir at an empty tempdir so a real
+    // `jcode.reload` left by a live self-dev reload on this machine cannot
+    // leak into the assertion.
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("create temp dir");
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+
+    let inactive = !reconnect::reload_handoff_active(&RemoteRunState::default());
+
+    if let Some(prev_runtime) = prev_runtime {
+        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_DIR");
+    }
+
+    assert!(inactive);
 }
 
 #[test]
@@ -838,4 +883,74 @@ fn remote_history_watchdog_advises_restart_after_giving_up() {
     });
     assert!(!redraw2);
     assert_eq!(app.display_messages().len(), before + 1);
+}
+
+/// Regression for issue #427: picking an effort-variant model row (e.g.
+/// "gpt-5.5 (high)") in remote mode must forward the chosen effort to the
+/// server after the model-switch request. Previously the effort was applied
+/// only to the local stand-in provider, so the server kept its configured
+/// default (low by default) and silently ran the new model at low effort.
+#[test]
+fn forward_pending_reasoning_effort_sends_effort_request_to_server() {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.pending_reasoning_effort = Some("high".to_string());
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let line = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        let peer = remote
+            .take_dummy_peer()
+            .expect("dummy remote should retain peer stream");
+        let (reader, _writer) = peer.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        super::forward_pending_reasoning_effort(&mut app, &mut remote).await;
+
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("effort request should be readable by peer");
+        line
+    });
+
+    match serde_json::from_str::<crate::protocol::Request>(&line)
+        .expect("effort request should deserialize")
+    {
+        crate::protocol::Request::SetReasoningEffort { effort, .. } => {
+            assert_eq!(effort, "high", "the picker-selected effort must be sent");
+        }
+        other => panic!("expected SetReasoningEffort request, got {:?}", other),
+    }
+
+    assert!(
+        app.pending_reasoning_effort.is_none(),
+        "staged effort must be consumed after dispatch"
+    );
+    assert_eq!(
+        app.remote_reasoning_effort.as_deref(),
+        Some("high"),
+        "requested effort should be tracked optimistically for the UI"
+    );
+}
+
+/// The dispatcher must be a no-op when no effort variant was staged (plain
+/// model rows without an effort suffix).
+#[test]
+fn forward_pending_reasoning_effort_is_noop_without_staged_effort() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    assert!(app.pending_reasoning_effort.is_none());
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        super::forward_pending_reasoning_effort(&mut app, &mut remote).await;
+    });
+
+    assert!(app.remote_reasoning_effort.is_none());
+    assert!(app.pending_reasoning_effort.is_none());
 }

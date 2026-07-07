@@ -4,11 +4,11 @@ use crate::session::Session;
 use crate::storage;
 use crate::{logging, util};
 use ::agentgrep::cli::{FindArgs, FullRegionMode, GrepArgs, OutlineArgs, SmartArgs};
-use ::agentgrep::find::{FindFile, FindResult, run_find};
-use ::agentgrep::outline::{OutlineResult, run_outline};
-use ::agentgrep::search::{FileMatches, GrepResult, run_grep};
-use ::agentgrep::smart_dsl::{Relation, SmartQuery, parse_smart_query};
-use ::agentgrep::smart_engine::{SmartFile, SmartRegion, SmartResult, run_smart};
+use ::agentgrep::find::{FindResult, run_find};
+use ::agentgrep::outline::run_outline;
+use ::agentgrep::search::{GrepResult, run_grep};
+use ::agentgrep::smart_dsl::{SmartQuery, parse_smart_query};
+use ::agentgrep::smart_engine::{SmartResult, run_smart};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,7 +21,6 @@ use std::sync::OnceLock;
 
 mod args;
 mod context;
-mod render;
 
 #[cfg(test)]
 use self::args::trace_or_smart_terms_owned;
@@ -34,7 +33,7 @@ use self::context::maybe_write_context_json;
 use self::context::{
     collect_bash_exposure, collect_trace_exposure, tune_known_file, tune_known_region,
 };
-use self::render::{
+use ::agentgrep::render::{
     render_find_output, render_grep_output, render_outline_output, render_smart_output,
 };
 
@@ -42,9 +41,11 @@ use self::render::{
 struct AgentGrepInput {
     #[serde(default = "default_agentgrep_mode")]
     mode: String,
-    #[serde(default)]
+    // `pattern` accepted for legacy grep-tool calls aliased to agentgrep.
+    #[serde(default, alias = "pattern")]
     query: Option<String>,
-    #[serde(default)]
+    // `file_path` accepted because agents frequently pass it instead of `file`.
+    #[serde(default, alias = "file_path")]
     file: Option<String>,
     #[serde(default)]
     terms: Option<Vec<String>>,
@@ -52,7 +53,8 @@ struct AgentGrepInput {
     regex: Option<bool>,
     #[serde(default)]
     path: Option<String>,
-    #[serde(default)]
+    // `include` accepted for legacy grep-tool calls aliased to agentgrep.
+    #[serde(default, alias = "include")]
     glob: Option<String>,
     #[serde(rename = "type", default)]
     file_type: Option<String>,
@@ -235,40 +237,55 @@ impl Tool for AgentGrepTool {
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params: AgentGrepInput = serde_json::from_value(input)?;
-        let context_path = maybe_write_context_json(&params, &ctx)?;
-        let request = summarize_agentgrep_request(&params, &ctx, context_path.as_deref());
-        let started_at = std::time::Instant::now();
-        let outcome = execute_linked_agentgrep(&params, &ctx, context_path.as_deref());
-        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        // The search shells out to ripgrep and walks/reads files (and for
+        // trace/outline modes also loads the session and reads more files),
+        // all of which is blocking work with no async yield points. Offload it
+        // to the blocking pool so we never stall a tokio worker thread. When it
+        // ran inline, a single poll of this future executed the whole search to
+        // completion, freezing the TUI's select! render/input loop, which made
+        // the first cold-cache search feel like it "takes forever" with no
+        // spinner and an unresponsive interrupt. This mirrors how the sibling
+        // grep/glob/ls tools offload their work.
+        tokio::task::spawn_blocking(move || run_agentgrep_blocking(&params, &ctx))
+            .await
+            .map_err(|err| anyhow::anyhow!("agentgrep task failed to join: {err}"))?
+    }
+}
 
-        if let Some(path) = context_path {
-            let _ = std::fs::remove_file(path);
-        }
+fn run_agentgrep_blocking(params: &AgentGrepInput, ctx: &ToolContext) -> Result<ToolOutput> {
+    let context_path = maybe_write_context_json(params, ctx)?;
+    let request = summarize_agentgrep_request(params, ctx, context_path.as_deref());
+    let started_at = std::time::Instant::now();
+    let outcome = execute_linked_agentgrep(params, ctx, context_path.as_deref());
+    let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-        match outcome {
-            Ok(output) => {
-                if elapsed_ms >= 2_000 {
-                    logging::warn(&format!(
-                        "agentgrep slow mode={} elapsed_ms={} request={}",
-                        params.mode, elapsed_ms, request
-                    ));
-                }
-                Ok(output)
-            }
-            Err(err) => {
-                let detail = err.to_string();
-                let detail = util::truncate_str(detail.trim(), 600);
+    if let Some(path) = context_path {
+        let _ = std::fs::remove_file(path);
+    }
+
+    match outcome {
+        Ok(output) => {
+            if elapsed_ms >= 2_000 {
                 logging::warn(&format!(
-                    "agentgrep failure mode={} elapsed_ms={} request={} error={}",
-                    params.mode, elapsed_ms, request, detail
+                    "agentgrep slow mode={} elapsed_ms={} request={}",
+                    params.mode, elapsed_ms, request
                 ));
-                Err(anyhow::anyhow!(
-                    "agentgrep {} failed after {}ms: {}",
-                    params.mode,
-                    elapsed_ms,
-                    err
-                ))
             }
+            Ok(output)
+        }
+        Err(err) => {
+            let detail = err.to_string();
+            let detail = util::truncate_str(detail.trim(), 600);
+            logging::warn(&format!(
+                "agentgrep failure mode={} elapsed_ms={} request={} error={}",
+                params.mode, elapsed_ms, request, detail
+            ));
+            Err(anyhow::anyhow!(
+                "agentgrep {} failed after {}ms: {}",
+                params.mode,
+                elapsed_ms,
+                err
+            ))
         }
     }
 }

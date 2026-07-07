@@ -557,6 +557,10 @@ impl App {
                                             if let Some(key) = Self::experimental_feature_key_for_tool(&tool) {
                                                 self.note_experimental_feature_use(key);
                                             }
+                                            if tool.name == "swarm" {
+                                                self.maybe_surface_swarm_config_hint();
+                                            }
+                                            self.maybe_surface_sponsor_disclosure(&tool.name);
                                             if let Some(streaming_tool) = self
                                                 .streaming_tool_calls
                                                 .iter_mut()
@@ -609,25 +613,18 @@ impl App {
                                         cache_read_input_tokens,
                                         cache_creation_input_tokens,
                                     } => {
-                                        let mut usage_changed = false;
-                                        if let Some(input) = input_tokens {
-                                            self.streaming.streaming_input_tokens = input;
-                                            usage_changed = true;
-                                        }
+                                        let mut usage_changed = self
+                                            .apply_stream_usage_input_report(
+                                                input_tokens,
+                                                cache_read_input_tokens,
+                                                cache_creation_input_tokens,
+                                            );
                                         if let Some(output) = output_tokens {
                                             self.streaming.streaming_output_tokens = output;
                                             self.accumulate_streaming_output_tokens(
                                                 output,
                                                 &mut call_output_tokens_seen,
                                             );
-                                        }
-                                        if cache_read_input_tokens.is_some() {
-                                            self.streaming.streaming_cache_read_tokens = cache_read_input_tokens;
-                                            usage_changed = true;
-                                        }
-                                        if cache_creation_input_tokens.is_some() {
-                                            self.streaming.streaming_cache_creation_tokens =
-                                                cache_creation_input_tokens;
                                             usage_changed = true;
                                         }
                                         if usage_changed {
@@ -649,9 +646,20 @@ impl App {
                                         self.update_terminal_title();
                                     }
                                     StreamEvent::ConnectionPhase { phase } => {
+                                        let was_connecting = matches!(
+                                            self.status,
+                                            ProcessingStatus::Connecting(_)
+                                        );
                                         self.status = if matches!(phase, crate::message::ConnectionPhase::Streaming) {
+                                            self.connection_phase_started = None;
                                             ProcessingStatus::Streaming
                                         } else {
+                                            // Measure "suspiciously long" per connection attempt:
+                                            // start the timer when entering the connecting group,
+                                            // not on every sub-phase transition.
+                                            if !was_connecting {
+                                                self.connection_phase_started = Some(Instant::now());
+                                            }
                                             ProcessingStatus::Connecting(phase)
                                         };
                                         if eager_stream_redraw {
@@ -697,6 +705,7 @@ impl App {
                                         openai_native_compaction = None;
                                         saw_message_end = false;
                                         self.rollback_streaming_attempt();
+                                        self.connection_phase_started = Some(Instant::now());
                                         self.status = ProcessingStatus::Connecting(
                                             crate::message::ConnectionPhase::Retrying {
                                                 attempt,

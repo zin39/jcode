@@ -17,6 +17,11 @@ enum Theme {
     static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight, design: .monospaced)
     }
+
+    /// Decorative icon font (SF Symbols) at a fixed point size.
+    static func icon(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight)
+    }
 }
 
 extension Color {
@@ -27,6 +32,31 @@ extension Color {
             blue: Double(hex & 0xFF) / 255.0
         )
     }
+}
+
+/// Extra edge padding for chrome pinned to an edge with no system inset.
+///
+/// Home-button devices (iPhone SE class) report a zero bottom safe-area inset,
+/// so edge-pinned chrome needs explicit breathing room there; Dynamic Island
+/// devices already get it from the system insets. Derived from the root
+/// GeometryReader in RootView and injected via the environment: reading
+/// UIKit window insets during a SwiftUI body evaluation creates an
+/// AttributeGraph cycle that corrupts view-hierarchy updates.
+struct CompactEdgePads: Equatable {
+    var top: CGFloat = 0
+    var bottom: CGFloat = 0
+
+    /// Derives the pads from the container's safe-area insets.
+    init(safeArea: EdgeInsets) {
+        top = safeArea.top < 24 ? 12 : 0
+        bottom = safeArea.bottom > 0 ? 0 : 12
+    }
+
+    init() {}
+}
+
+extension EnvironmentValues {
+    @Entry var compactEdgePads = CompactEdgePads()
 }
 
 /// Card container used across screens.

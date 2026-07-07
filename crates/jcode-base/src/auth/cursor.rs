@@ -10,9 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CURSOR_API_BASE: &str = "https://api2.cursor.sh";
 // Cursor's server rejects stale client versions for chat ("Update Required").
-// Keep this at a version Cursor currently accepts; override at runtime with
+// This must track a real, currently-served Cursor IDE release (e.g. 3.8.x),
+// not the Composer model number. Override at runtime with
 // `JCODE_CURSOR_CLIENT_VERSION` if Cursor moves the floor again.
-const CURSOR_DIRECT_CLIENT_VERSION_DEFAULT: &str = "2.5.0";
+const CURSOR_DIRECT_CLIENT_VERSION_DEFAULT: &str = "3.8.24";
 const CURSOR_OAUTH_CLIENT_ID: &str = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
 const CURSOR_EXTERNAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CURSOR_AUTH_FILE_SOURCE_ID: &str = "cursor_auth_json";
@@ -247,6 +248,12 @@ fn cursor_vscdb_paths() -> Vec<PathBuf> {
     let relatives = [
         "AppData/Roaming/Cursor/User/globalStorage/state.vscdb",
         "AppData/Roaming/cursor/User/globalStorage/state.vscdb",
+    ];
+    // Other Unix platforms (e.g. FreeBSD) follow the XDG-style layout like Linux.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let relatives = [
+        ".config/Cursor/User/globalStorage/state.vscdb",
+        ".config/cursor/User/globalStorage/state.vscdb",
     ];
 
     relatives

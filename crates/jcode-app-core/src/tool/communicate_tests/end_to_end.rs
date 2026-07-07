@@ -70,7 +70,8 @@ async fn communicate_list_and_await_members_work_end_to_end() {
             json!({
                 "action": "await_members",
                 "session_ids": [peer_session.clone()],
-                "timeout_minutes": 1
+                "timeout_minutes": 1,
+                "background": false
             }),
             ctx.clone(),
         )
@@ -100,6 +101,164 @@ async fn communicate_list_and_await_members_work_end_to_end() {
         .find(|member| member.session_id == peer_session)
         .expect("peer should still be listed when ready");
     assert_eq!(ready_peer.status.as_deref(), Some("ready"));
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn communicate_await_members_background_returns_immediately_and_notifies() {
+    let _env_lock = crate::storage::lock_test_env();
+    let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
+    let repo_dir = std::env::current_dir().expect("repo cwd");
+    let socket_path = runtime_dir.path().join("jcode.sock");
+    let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
+    let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
+
+    let provider: Arc<dyn Provider> = Arc::new(DelayedTestProvider {
+        delay: Duration::from_millis(300),
+    });
+    let server = Arc::new(Server::new(provider));
+    let mut server_task = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let socket_path = runtime_dir.path().join("jcode.sock");
+    wait_for_server_socket(&socket_path, &mut server_task)
+        .await
+        .expect("server socket should be ready");
+
+    let mut watcher = RawClient::connect(&socket_path)
+        .await
+        .expect("watcher should connect");
+    let mut peer = RawClient::connect(&socket_path)
+        .await
+        .expect("peer should connect");
+    watcher
+        .subscribe(&repo_dir)
+        .await
+        .expect("watcher subscribe");
+    peer.subscribe(&repo_dir).await.expect("peer subscribe");
+
+    let watcher_session = watcher.session_id().await.expect("watcher session id");
+    let peer_session = peer.session_id().await.expect("peer session id");
+
+    let tool = CommunicateTool::new();
+    let ctx = test_ctx(&watcher_session, &repo_dir);
+
+    // Put the peer into a running state so the await actually has to wait.
+    let peer_message_id = peer
+        .send_message("Reply with a short acknowledgement.")
+        .await
+        .expect("peer message request should send");
+    wait_for_member_status(&mut watcher, &watcher_session, &peer_session, "running")
+        .await
+        .expect("peer should enter running state");
+
+    // Background await (the default) must return promptly with a hand-off
+    // message instead of blocking until the peer finishes.
+    let await_output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tool.execute(
+            json!({
+                "action": "await_members",
+                "session_ids": [peer_session.clone()],
+                "timeout_minutes": 1
+            }),
+            ctx.clone(),
+        ),
+    )
+    .await
+    .expect("background await should return promptly")
+    .expect("await_members should succeed");
+    assert!(
+        await_output.output.contains("background"),
+        "expected background hand-off message, got: {}",
+        await_output.output
+    );
+
+    peer.wait_for_done(peer_message_id)
+        .await
+        .expect("peer message should finish");
+
+    // The backgrounded watcher should deliver a swarm-await notification to the
+    // requesting (watcher) session once the peer reaches ready.
+    let event = watcher
+        .read_until(Duration::from_secs(5), |event| {
+            matches!(
+                event,
+                ServerEvent::Notification {
+                    notification_type: NotificationType::Message { scope: Some(scope), .. },
+                    ..
+                } if scope == "swarm_await"
+            )
+        })
+        .await
+        .expect("background await should deliver a swarm_await notification");
+    let ServerEvent::Notification { message, .. } = event else {
+        panic!("expected swarm_await notification, got: {event:?}");
+    };
+    assert!(
+        message.contains("Swarm await finished"),
+        "expected swarm await completion body, got: {}",
+        message
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn communicate_run_plan_with_empty_plan_returns_inline_even_in_background_mode() {
+    let _env_lock = crate::storage::lock_test_env();
+    let runtime_dir = tempfile::TempDir::new().expect("runtime tempdir");
+    let repo_dir = std::env::current_dir().expect("repo cwd");
+    let socket_path = runtime_dir.path().join("jcode.sock");
+    let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", runtime_dir.path());
+    let _socket = EnvGuard::set("JCODE_SOCKET", &socket_path);
+    let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
+
+    let provider: Arc<dyn Provider> = Arc::new(DelayedTestProvider {
+        delay: Duration::from_millis(50),
+    });
+    let server = Arc::new(Server::new(provider));
+    let mut server_task = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let socket_path = runtime_dir.path().join("jcode.sock");
+    wait_for_server_socket(&socket_path, &mut server_task)
+        .await
+        .expect("server socket should be ready");
+
+    let mut client = RawClient::connect(&socket_path)
+        .await
+        .expect("client should connect");
+    client.subscribe(&repo_dir).await.expect("subscribe");
+    let session = client.session_id().await.expect("session id");
+
+    let tool = CommunicateTool::new();
+    let ctx = test_ctx(&session, &repo_dir);
+
+    // Background is the default; with no plan the validation happens inline and
+    // no background task should be started.
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tool.execute(json!({"action": "run_plan"}), ctx.clone()),
+    )
+    .await
+    .expect("run_plan should return promptly")
+    .expect("run_plan should succeed");
+    assert!(
+        output.output.contains("No swarm plan items to run."),
+        "expected inline empty-plan response, got: {}",
+        output.output
+    );
+    assert!(
+        output.metadata.is_none(),
+        "empty plan must not start a background driver"
+    );
 
     server_task.abort();
 }
@@ -248,6 +407,7 @@ async fn communicate_spawn_reports_completion_back_to_spawner() {
                     notification_type: crate::protocol::NotificationType::Message {
                         scope: Some(scope),
                         channel: None,
+                        tldr: None,
                     },
                     message,
                     ..
@@ -359,7 +519,8 @@ async fn communicate_spawn_with_prompt_and_summary_work_end_to_end() {
 }
 
 /// `message` routes by the fields supplied (DM when `to_session` is set,
-/// broadcast otherwise), while `broadcast` always targets the whole swarm.
+/// broadcast otherwise), while `broadcast` is a group send scoped to the
+/// sender's spawned subtree (whole swarm when the sender is the coordinator).
 /// Regression test for the bug where `message` and `broadcast` were identical
 /// because the tool discarded `to_session`/`channel` for both.
 #[tokio::test]
@@ -435,6 +596,27 @@ async fn communicate_message_routes_as_dm_while_broadcast_targets_swarm() {
         "message with to_session should be delivered with dm scope"
     );
 
+    // Broadcasts are scoped to the sender's spawned subtree; the coordinator
+    // keeps whole-swarm reach as an escape hatch. The peer was not spawned by
+    // the sender, so promote the sender to coordinator (self-promotion is
+    // allowed while the swarm has no coordinator) so the broadcast reaches it.
+    let assign_output = tool
+        .execute(
+            json!({
+                "action": "assign_role",
+                "target_session": sender_session.clone(),
+                "role": "coordinator"
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("self-promotion to coordinator should succeed");
+    assert!(
+        assign_output.output.contains("Assigned role 'coordinator'"),
+        "unexpected assign_role output: {}",
+        assign_output.output
+    );
+
     // `broadcast` should reach the peer scoped as a broadcast even though no
     // explicit target is supplied.
     let broadcast_output = tool
@@ -448,8 +630,10 @@ async fn communicate_message_routes_as_dm_while_broadcast_targets_swarm() {
         .await
         .expect("broadcast should succeed");
     assert!(
-        broadcast_output.output.contains("Broadcast sent to all agents"),
-        "broadcast should report a group send, got: {}",
+        broadcast_output
+            .output
+            .contains("Broadcast sent to your spawned subtree"),
+        "broadcast should report a subtree-scoped group send, got: {}",
         broadcast_output.output
     );
     let broadcast_scope = peer

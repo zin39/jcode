@@ -1,9 +1,9 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Jcode Desktop
+Name=Jcode Desktop (Beta)
 GenericName=AI Development Workspace
-Comment=Jcode fullscreen desktop workspace prototype
+Comment=Jcode fullscreen desktop workspace (beta)
 Exec=jcode-desktop
 Icon=jcode
 Terminal=false

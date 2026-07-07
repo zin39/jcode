@@ -1,9 +1,17 @@
 use super::*;
+use crate::tui::TuiState as _;
 use std::cell::RefCell;
 use std::sync::Mutex;
 use std::time::Duration;
 
 const REMOTE_STARTUP_HEADER_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// How long a routine `LoadingSession` phase may keep showing the known model
+/// hint before the header falls back to the "loading session…" label. History
+/// bootstrap normally lands in ~1s, so the common spawn path never flashes a
+/// transient loading label; genuinely stuck loads still surface after this
+/// grace period.
+const REMOTE_LOADING_HEADER_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WidgetProviderKind {
@@ -79,22 +87,79 @@ impl App {
             .or_else(|| self.configured_remote_model_hint())
     }
 
+    /// Provider/model identity used for reasoning-effort UI decisions in remote
+    /// mode. Prefers the server-reported values, falling back to the same hints
+    /// the header uses (session stub, `JCODE_MODEL`, config default) so effort
+    /// cycling works during the pre-History bootstrap window instead of
+    /// reporting "not available" until the server payload settles.
+    pub(super) fn remote_effort_identity(&self) -> (Option<String>, Option<String>) {
+        let model = self.effective_remote_provider_model();
+        let provider = self.remote_provider_name.clone().or_else(|| {
+            model
+                .as_deref()
+                .and_then(|model| {
+                    crate::provider::provider_for_model_with_hint(model, None).map(str::to_string)
+                })
+                .or_else(|| self.configured_remote_provider_hint())
+        });
+        (provider, model)
+    }
+
+    /// Best-known current reasoning effort for the remote session. Falls back
+    /// to the configured provider-family default when the server has not
+    /// reported one yet, so pre-settle effort cycling starts from the value the
+    /// session will actually use instead of assuming the maximum.
+    pub(super) fn remote_reasoning_effort_hint(&self) -> Option<String> {
+        self.remote_reasoning_effort.clone().or_else(|| {
+            let (provider, model) = self.remote_effort_identity();
+            let provider = provider.unwrap_or_default().to_ascii_lowercase();
+            let model = model.unwrap_or_default().to_ascii_lowercase();
+            let cfg = &crate::config::config().provider;
+            if provider.contains("anthropic")
+                || provider.contains("claude")
+                || model.starts_with("claude-")
+            {
+                cfg.anthropic_reasoning_effort.clone()
+            } else if provider.contains("openai")
+                || provider.contains("codex")
+                || model.starts_with("gpt-")
+            {
+                cfg.openai_reasoning_effort.clone()
+            } else {
+                None
+            }
+        })
+    }
+
     fn remote_header_provider_model(&self) -> Option<String> {
         let effective_model = self.effective_remote_provider_model();
 
         self.remote_startup_phase
             .as_ref()
             .and_then(|phase| {
-                if matches!(phase, super::RemoteStartupPhase::Connecting)
-                    && effective_model.is_some()
-                {
-                    return effective_model.clone();
-                }
-
                 let elapsed = self
                     .remote_startup_phase_started
                     .map(|started| started.elapsed())
                     .unwrap_or_default();
+
+                // Routine bootstrap phases (connecting, then loading the
+                // session history) should not repaint the header when we
+                // already know which model this session runs: the pre-settle
+                // flicker ("model -> loading session… -> model") reads as
+                // instability. Keep showing the model and only surface the
+                // phase label once it overstays its expected budget.
+                match phase {
+                    super::RemoteStartupPhase::Connecting if effective_model.is_some() => {
+                        return effective_model.clone();
+                    }
+                    super::RemoteStartupPhase::LoadingSession
+                        if effective_model.is_some() && elapsed < REMOTE_LOADING_HEADER_GRACE =>
+                    {
+                        return effective_model.clone();
+                    }
+                    _ => {}
+                }
+
                 let should_defer_header = matches!(phase, super::RemoteStartupPhase::Connecting)
                     && elapsed < REMOTE_STARTUP_HEADER_DEBOUNCE;
 
@@ -633,6 +698,14 @@ impl crate::tui::TuiState for App {
         }
     }
 
+    fn connection_phase_elapsed(&self) -> Option<std::time::Duration> {
+        // Fall back to the whole-turn elapsed only if we somehow entered a
+        // connecting status without recording a phase start.
+        self.connection_phase_started
+            .map(|t| t.elapsed())
+            .or_else(|| self.elapsed())
+    }
+
     fn command_suggestions(&self) -> Vec<(String, &'static str)> {
         App::command_suggestions(self)
     }
@@ -793,6 +866,30 @@ impl crate::tui::TuiState for App {
         }
         self.status_notice.as_ref().and_then(|(text, at)| {
             if at.elapsed() <= Duration::from_secs(3) {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn learn_hint(&self) -> Option<String> {
+        self.learn_hint.as_ref().and_then(|(text, at)| {
+            // Learn-hints linger a little longer than status notices so the user
+            // has time to read and register the keybinding.
+            if at.elapsed() <= Duration::from_secs(8) {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn hotkey_feedback(&self) -> Option<String> {
+        self.hotkey_feedback.as_ref().and_then(|(text, at)| {
+            // Long enough to read the chord and its action, short enough to
+            // stay out of the way during rapid keying.
+            if at.elapsed() <= Duration::from_secs(5) {
                 Some(text.clone())
             } else {
                 None
@@ -1109,21 +1206,9 @@ impl crate::tui::TuiState for App {
             Some(self.session.id.as_str())
         };
 
-        let todos = if self.swarm_enabled && !self.swarm_plan_items.is_empty() {
-            self.swarm_plan_items
-                .iter()
-                .map(|item| crate::todo::TodoItem {
-                    content: item.content.clone(),
-                    status: item.status.clone(),
-                    priority: item.priority.clone(),
-                    id: item.id.clone(),
-                    group: None,
-                    blocked_by: item.blocked_by.clone(),
-                    assigned_to: item.assigned_to.clone(),
-                    confidence: None,
-                    completion_confidence: None,
-                })
-                .collect()
+        let todos_are_swarm_plan = self.swarm_enabled && !self.swarm_plan_items.is_empty();
+        let todos = if todos_are_swarm_plan {
+            crate::tui::info_widget::swarm_plan_todos(&self.swarm_plan_items)
         } else {
             gather_todos_for_session(session_id)
         };
@@ -1235,11 +1320,15 @@ impl crate::tui::TuiState for App {
                         friendly_name: Some(self.session.display_name().to_string()),
                         status,
                         detail,
+                        task_label: None,
                         role: None,
                         is_headless: Some(false),
                         live_attachments: Some(1),
                         status_age_secs: Some(0),
                         output_tail: None,
+                        report_back_to_session_id: None,
+                        todo_progress: None,
+                        todo_items: Vec::new(),
                     });
                 }
                 (
@@ -1250,14 +1339,50 @@ impl crate::tui::TuiState for App {
                 )
             };
 
+            // Dock data: the agents this session actually manages (spawn
+            // subtree), the shared panel selection/focus, and plan progress.
+            // This is what the SwarmStatus widget renders. Computed outside
+            // the activity gate: managing agents is itself "interesting".
+            let managed_members = self.inline_swarm_members();
+
             // Only show if there's something interesting
-            if has_activity || session_count > 1 || client_count.is_some() {
+            if has_activity
+                || session_count > 1
+                || client_count.is_some()
+                || !managed_members.is_empty()
+            {
+                let plan_progress = if self.swarm_plan_items.is_empty() {
+                    None
+                } else {
+                    let total = self.swarm_plan_items.len() as u32;
+                    let done = self
+                        .swarm_plan_items
+                        .iter()
+                        .filter(|item| matches!(item.status.as_str(), "completed" | "done"))
+                        .count() as u32;
+                    let running = self
+                        .swarm_plan_items
+                        .iter()
+                        .filter(|item| matches!(item.status.as_str(), "running" | "running_stale"))
+                        .count() as u32;
+                    Some((done, running, total))
+                };
                 Some(crate::tui::info_widget::SwarmInfo {
                     session_count,
                     subagent_status,
                     client_count,
                     session_names,
                     members,
+                    selected: if managed_members.is_empty() {
+                        0
+                    } else {
+                        self.swarm_panel_selected
+                            .min(managed_members.len().saturating_sub(1))
+                    },
+                    focused: self.swarm_panel_focused,
+                    plan_progress,
+                    spinner_frame: (self.animation_elapsed() * 8.0) as usize,
+                    managed_members,
                 })
             } else {
                 None
@@ -1371,6 +1496,7 @@ impl crate::tui::TuiState for App {
 
         crate::tui::info_widget::InfoWidgetData {
             todos,
+            todos_are_swarm_plan,
             context_info,
             context_info_stale: !context_snapshot.fresh,
             queue_mode: Some(self.queue_mode),
@@ -1474,7 +1600,38 @@ impl crate::tui::TuiState for App {
         if !self.swarm_enabled {
             return Vec::new();
         }
-        self.remote_swarm_members.clone()
+        // Scope the inline gallery to the subtree this session actually spawned.
+        // Other sessions can share the same swarm (e.g. same repo) without this
+        // session having spawned them; showing those would be noise. The spawn
+        // tree is reconstructed from each member's `report_back_to_session_id`
+        // parent edge.
+        let self_id = if self.is_remote {
+            self.remote_session_id.as_deref()
+        } else {
+            Some(self.session.id.as_str())
+        };
+        match self_id {
+            Some(self_id) => filter_inline_swarm_subtree(&self.remote_swarm_members, self_id),
+            // Session identity is not known yet (e.g. right after connect,
+            // before the History event sets `remote_session_id`). Showing all
+            // swarm members here caused the inline strip to flash on startup
+            // and then disappear once the subtree filter kicked in. Hide the
+            // strip until we know who we are.
+            None => Vec::new(),
+        }
+    }
+
+    fn swarm_panel_selected(&self) -> usize {
+        let count = self.inline_swarm_members().len();
+        if count == 0 {
+            0
+        } else {
+            self.swarm_panel_selected.min(count - 1)
+        }
+    }
+
+    fn swarm_panel_focused(&self) -> bool {
+        self.swarm_panel_focused
     }
 
     fn diagram_focus(&self) -> bool {
@@ -1693,7 +1850,407 @@ impl crate::tui::TuiState for App {
             remaining_secs: remaining,
             ttl_secs,
             is_cold: remaining == 0,
+            cold_for_secs: elapsed.saturating_sub(ttl_secs),
             cached_tokens: self.last_turn_input_tokens,
         })
+    }
+}
+
+impl App {
+    /// Toggle keyboard focus on the inline swarm panel. Returns the new state.
+    /// Focus is only meaningful while the panel is actually visible.
+    pub(crate) fn toggle_swarm_panel_focus(&mut self) -> bool {
+        if !self.inline_swarm_gallery_active() {
+            self.swarm_panel_focused = false;
+            return false;
+        }
+        self.swarm_panel_focused = !self.swarm_panel_focused;
+        if self.swarm_panel_focused {
+            // Clamp selection on entry.
+            let count = self.inline_swarm_members().len();
+            if count > 0 {
+                self.swarm_panel_selected = self.swarm_panel_selected.min(count - 1);
+            }
+        }
+        self.swarm_panel_focused
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_swarm_panel_focus(&mut self, focused: bool) {
+        self.swarm_panel_focused = focused && self.inline_swarm_gallery_active();
+    }
+
+    /// Move the swarm panel selection by `delta` (e.g. +1 for next, -1 for
+    /// previous), saturating at the ends.
+    pub(crate) fn move_swarm_panel_selection(&mut self, delta: isize) {
+        let count = self.inline_swarm_members().len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.swarm_panel_selected.min(count - 1) as isize;
+        let next = (cur + delta).clamp(0, count as isize - 1);
+        self.swarm_panel_selected = next as usize;
+    }
+
+    /// Advance the swarm panel selection by one, wrapping at the end. Used by
+    /// repeated presses of the focus chord (alt+n, alt+n, ... cycles agents).
+    pub(crate) fn cycle_swarm_panel_selection(&mut self) {
+        let count = self.inline_swarm_members().len();
+        if count == 0 {
+            return;
+        }
+        self.swarm_panel_selected = (self.swarm_panel_selected + 1) % count;
+    }
+
+    /// Handle a key while the swarm panel is focused. Returns true if the key was
+    /// consumed.
+    ///
+    /// Only Esc and Alt-chords are captured (see [`swarm_panel_action_for_key`]):
+    /// the panel is an overlay, not a modal, so plain typing keeps flowing to
+    /// the chat input while it is focused.
+    pub(crate) fn handle_swarm_panel_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
+        if !self.swarm_panel_focused || !self.inline_swarm_gallery_active() {
+            return false;
+        }
+        match swarm_panel_action_for_key(code, modifiers) {
+            Some(SwarmPanelAction::SelectNext) => {
+                self.move_swarm_panel_selection(1);
+                true
+            }
+            Some(SwarmPanelAction::SelectPrev) => {
+                self.move_swarm_panel_selection(-1);
+                true
+            }
+            Some(SwarmPanelAction::PopOut) => {
+                self.pop_out_selected_swarm_agent();
+                true
+            }
+            Some(SwarmPanelAction::Exit) => {
+                self.swarm_panel_focused = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Open the currently selected swarm agent's session in a new terminal
+    /// window (pop-out), reusing the resume-in-new-terminal launcher.
+    pub(crate) fn pop_out_selected_swarm_agent(&mut self) {
+        let members = self.inline_swarm_members();
+        if members.is_empty() {
+            self.set_status_notice("No swarm agents to open");
+            return;
+        }
+        let order = crate::tui::info_widget::swarm_gallery::members_display_order(&members);
+        let idx = self.swarm_panel_selected.min(order.len().saturating_sub(1));
+        let Some(session_id) = order.get(idx).cloned() else {
+            self.set_status_notice("No swarm agent selected");
+            return;
+        };
+        let label = members
+            .iter()
+            .find(|m| m.session_id == session_id)
+            .and_then(|m| m.friendly_name.clone())
+            .unwrap_or_else(|| session_id.chars().take(8).collect());
+
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("jcode"));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match jcode_app_core::session_launch::spawn_resume_in_new_terminal(&exe, &session_id, &cwd)
+        {
+            Ok(true) => self.set_status_notice(format!("Opened {label} in a new window")),
+            Ok(false) => self.set_status_notice(format!(
+                "Could not open a terminal for {label} (no emulator found)"
+            )),
+            Err(e) => self.set_status_notice(format!("Failed to open {label}: {e}")),
+        }
+    }
+}
+
+/// What a key press should do while the swarm panel is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwarmPanelAction {
+    SelectNext,
+    SelectPrev,
+    PopOut,
+    Exit,
+}
+
+/// Map a key to a focused-swarm-panel action.
+///
+/// Deliberately narrow: the focused panel must NOT swallow plain typing (the
+/// user may keep writing into the chat input while glancing at agents), so
+/// only Esc and Alt-chords are claimed:
+/// - Alt+↑ / Alt+↓ (also Alt+k / Alt+j): move the selection
+/// - Alt+o / Alt+Enter: pop the selected agent out to a terminal
+/// - Esc: exit the panel
+///
+/// (Alt+N itself cycles the selection; that is handled at the toggle-key
+/// call sites since the chord is user-configurable.)
+pub(crate) fn swarm_panel_action_for_key(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Option<SwarmPanelAction> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if code == KeyCode::Esc && modifiers.is_empty() {
+        return Some(SwarmPanelAction::Exit);
+    }
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    // macOS Option+letter often arrives as a transformed glyph with no ALT
+    // modifier; normalize through the shared shortcut helper.
+    let macos_letter = crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    match code {
+        KeyCode::Down | KeyCode::Char('j') if alt => Some(SwarmPanelAction::SelectNext),
+        KeyCode::Up | KeyCode::Char('k') if alt => Some(SwarmPanelAction::SelectPrev),
+        KeyCode::Char('o') | KeyCode::Enter if alt => Some(SwarmPanelAction::PopOut),
+        _ => match macos_letter {
+            Some('j') => Some(SwarmPanelAction::SelectNext),
+            Some('k') => Some(SwarmPanelAction::SelectPrev),
+            Some('o') => Some(SwarmPanelAction::PopOut),
+            _ => None,
+        },
+    }
+}
+
+/// Restrict swarm members to the descendants `self_id` actually spawned: every
+/// member whose `report_back_to_session_id` chain reaches `self_id`, *excluding*
+/// `self_id` itself.
+///
+/// This keeps the inline swarm strip scoped to the agents a session manages,
+/// without listing the viewing session as one of "its" agents and without
+/// showing unrelated members that merely share the swarm (e.g. other sessions in
+/// the same repository).
+///
+/// Returns empty when the session has not spawned anyone, which the caller uses
+/// to hide the strip entirely.
+pub(crate) fn filter_inline_swarm_subtree(
+    members: &[crate::protocol::SwarmMemberStatus],
+    self_id: &str,
+) -> Vec<crate::protocol::SwarmMemberStatus> {
+    use std::collections::{HashMap, HashSet};
+
+    let parent_of: HashMap<&str, Option<&str>> = members
+        .iter()
+        .map(|m| {
+            (
+                m.session_id.as_str(),
+                m.report_back_to_session_id.as_deref(),
+            )
+        })
+        .collect();
+
+    // A member is a descendant of `self_id` if walking its parent chain reaches
+    // `self_id`. The member itself (start == self_id) is intentionally excluded:
+    // the viewing agent should not appear as one of the agents it manages.
+    let is_descendant = |start: &str| -> bool {
+        if start == self_id {
+            return false;
+        }
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut current = start;
+        while let Some(Some(parent)) = parent_of.get(current) {
+            if !visited.insert(current) {
+                break; // cycle guard
+            }
+            if *parent == self_id {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    };
+
+    members
+        .iter()
+        .filter(|m| is_descendant(m.session_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod swarm_panel_key_tests {
+    use super::{SwarmPanelAction, swarm_panel_action_for_key};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// Plain typing (letters, space, enter, arrows without alt) must pass
+    /// through so the user can keep writing into the chat input while the
+    /// panel is focused.
+    #[test]
+    fn plain_typing_is_not_captured() {
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('o'),
+            KeyCode::Char('g'),
+            KeyCode::Char('G'),
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Backspace,
+        ] {
+            let mods = if code == KeyCode::Char('G') {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            assert_eq!(
+                swarm_panel_action_for_key(code, mods),
+                None,
+                "{code:?} must pass through to the chat input"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_chords_drive_the_panel() {
+        assert_eq!(
+            swarm_panel_action_for_key(KeyCode::Down, KeyModifiers::ALT),
+            Some(SwarmPanelAction::SelectNext)
+        );
+        assert_eq!(
+            swarm_panel_action_for_key(KeyCode::Up, KeyModifiers::ALT),
+            Some(SwarmPanelAction::SelectPrev)
+        );
+        assert_eq!(
+            swarm_panel_action_for_key(KeyCode::Char('j'), KeyModifiers::ALT),
+            Some(SwarmPanelAction::SelectNext)
+        );
+        assert_eq!(
+            swarm_panel_action_for_key(KeyCode::Char('k'), KeyModifiers::ALT),
+            Some(SwarmPanelAction::SelectPrev)
+        );
+        assert_eq!(
+            swarm_panel_action_for_key(KeyCode::Char('o'), KeyModifiers::ALT),
+            Some(SwarmPanelAction::PopOut)
+        );
+        assert_eq!(
+            swarm_panel_action_for_key(KeyCode::Enter, KeyModifiers::ALT),
+            Some(SwarmPanelAction::PopOut)
+        );
+        assert_eq!(
+            swarm_panel_action_for_key(KeyCode::Esc, KeyModifiers::NONE),
+            Some(SwarmPanelAction::Exit)
+        );
+    }
+
+    #[test]
+    fn ctrl_chords_pass_through() {
+        for code in [KeyCode::Char('j'), KeyCode::Char('o'), KeyCode::Down] {
+            assert_eq!(
+                swarm_panel_action_for_key(code, KeyModifiers::CONTROL),
+                None,
+                "{code:?}+ctrl belongs to other handlers"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod inline_swarm_subtree_tests {
+    use super::filter_inline_swarm_subtree;
+    use crate::protocol::SwarmMemberStatus;
+
+    fn member(id: &str, parent: Option<&str>) -> SwarmMemberStatus {
+        SwarmMemberStatus {
+            session_id: id.to_string(),
+            friendly_name: Some(id.to_string()),
+            status: "running".to_string(),
+            detail: None,
+            task_label: None,
+            role: None,
+            is_headless: Some(true),
+            live_attachments: None,
+            status_age_secs: Some(1),
+            output_tail: None,
+            report_back_to_session_id: parent.map(str::to_string),
+            todo_progress: None,
+            todo_items: Vec::new(),
+        }
+    }
+
+    fn ids(members: Vec<SwarmMemberStatus>) -> Vec<String> {
+        let mut v: Vec<String> = members.into_iter().map(|m| m.session_id).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn includes_direct_children_but_not_self() {
+        let members = vec![
+            member("me", None),
+            member("child_a", Some("me")),
+            member("child_b", Some("me")),
+            member("stranger", None),
+        ];
+        // The viewing session ("me") is excluded; only its spawned children show.
+        assert_eq!(
+            ids(filter_inline_swarm_subtree(&members, "me")),
+            vec!["child_a", "child_b"]
+        );
+    }
+
+    #[test]
+    fn includes_transitive_descendants() {
+        let members = vec![
+            member("me", None),
+            member("child", Some("me")),
+            member("grandchild", Some("child")),
+        ];
+        assert_eq!(
+            ids(filter_inline_swarm_subtree(&members, "me")),
+            vec!["child", "grandchild"]
+        );
+    }
+
+    #[test]
+    fn excludes_siblings_and_unrelated_sessions() {
+        // Two coordinators sharing one swarm. Each should only see its own kids.
+        let members = vec![
+            member("coord_a", None),
+            member("a_child", Some("coord_a")),
+            member("coord_b", None),
+            member("b_child", Some("coord_b")),
+        ];
+        assert_eq!(
+            ids(filter_inline_swarm_subtree(&members, "coord_a")),
+            vec!["a_child"]
+        );
+        assert_eq!(
+            ids(filter_inline_swarm_subtree(&members, "coord_b")),
+            vec!["b_child"]
+        );
+    }
+
+    #[test]
+    fn session_with_no_children_shows_nothing() {
+        // A session that spawned no one (even if it is itself a swarm member)
+        // produces an empty list so the strip is hidden entirely.
+        let members = vec![
+            member("me", None),
+            member("stranger", None),
+            member("other", None),
+        ];
+        assert!(filter_inline_swarm_subtree(&members, "me").is_empty());
+    }
+
+    #[test]
+    fn cycle_is_guarded() {
+        // Pathological parent cycle must not loop forever.
+        let members = vec![
+            member("a", Some("b")),
+            member("b", Some("a")),
+            member("me", None),
+            member("child", Some("me")),
+        ];
+        assert_eq!(
+            ids(filter_inline_swarm_subtree(&members, "me")),
+            vec!["child"]
+        );
     }
 }

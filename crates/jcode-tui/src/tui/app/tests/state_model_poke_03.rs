@@ -1779,6 +1779,93 @@ fn test_login_picker_preview_enter_starts_login_flow() {
 }
 
 #[test]
+fn test_typing_login_auto_inserts_filter_space() {
+    let mut app = create_test_app();
+
+    for c in "/login".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+
+    // The trailing space arms provider filtering immediately, so the next
+    // keystrokes filter the login picker instead of extending the command.
+    assert_eq!(app.input(), "/login ");
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("login picker preview should be open");
+    assert!(picker.preview);
+    assert_eq!(picker.kind, crate::tui::PickerKind::Login);
+    assert_eq!(picker.filter, "");
+
+    // A habitual manually-typed space is swallowed instead of doubling up.
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::empty())
+        .unwrap();
+    assert_eq!(app.input(), "/login ");
+
+    for c in "za".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    assert_eq!(app.input(), "/login za");
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("login picker preview should stay open");
+    assert_eq!(picker.filter, "za");
+}
+
+#[test]
+fn test_login_preview_enter_without_selection_focuses_picker_instead_of_logging_in() {
+    let mut app = create_test_app();
+
+    for c in "/login".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    // No filter and no explicit selection: Enter must not launch the first
+    // provider's login flow. It focuses the picker for a deliberate choice.
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("login picker should stay open after bare Enter");
+    assert!(!picker.preview, "picker should be focused (not preview)");
+    assert_eq!(picker.kind, crate::tui::PickerKind::Login);
+    assert!(app.pending_login.is_none());
+    assert_eq!(app.input(), "");
+}
+
+#[test]
+fn test_login_preview_enter_after_navigation_starts_selected_login() {
+    let mut app = create_test_app();
+
+    for c in "/login".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    // Explicit navigation makes the selection deliberate, so Enter activates.
+    // Navigate to the Anthropic API key row (an offline api-key prompt flow).
+    app.handle_key(KeyCode::Down, KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Down, KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(
+        app.inline_interactive_state.is_none(),
+        "picker should close after selecting a provider"
+    );
+    assert!(
+        app.pending_login.is_some(),
+        "selected provider login flow should start"
+    );
+}
+
+#[test]
 fn test_subagent_model_command_sets_and_resets_session_preference() {
     let mut app = create_test_app();
 
@@ -1867,6 +1954,7 @@ fn test_poke_arms_auto_poke_until_todos_are_done() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1898,6 +1986,7 @@ fn test_poke_status_reports_current_state() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1951,6 +2040,7 @@ fn test_poke_off_disarms_and_clears_queued_followup() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -1999,6 +2089,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -2034,6 +2125,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
                 crate::todo::TodoItem {
                     group: None,
@@ -2045,6 +2137,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
                     assigned_to: None,
                     confidence: None,
                     completion_confidence: None,
+                    confidence_history: Vec::new(),
                 },
             ],
         )
@@ -2061,7 +2154,7 @@ fn test_poke_queues_when_turn_is_in_progress() {
 }
 
 #[test]
-fn test_btw_does_not_present_as_queued_when_turn_is_in_progress() {
+fn test_btw_forks_even_when_turn_is_in_progress() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
         app.is_processing = true;
@@ -2071,19 +2164,13 @@ fn test_btw_does_not_present_as_queued_when_turn_is_in_progress() {
             "/btw should this fork context?"
         ));
 
-        assert!(app.is_processing);
-        assert_eq!(app.status_notice(), Some("/btw noted".to_string()));
+        assert!(app.is_processing, "parent turn should keep running");
         assert!(app.queued_messages().is_empty());
-        assert_eq!(app.hidden_queued_system_messages.len(), 1);
+        assert!(app.hidden_queued_system_messages.is_empty());
         assert!(app.display_messages().iter().any(|msg| {
-            msg.content
-                .contains("/btw noted - answer will appear in the side panel.")
+            msg.content.contains("created for the next prompt")
+                || msg.content.contains("Next prompt launched in")
         }));
-        assert!(
-            !app.display_messages()
-                .iter()
-                .any(|msg| { msg.content.to_ascii_lowercase().contains("queued /btw") })
-        );
     });
 }
 
@@ -2103,6 +2190,7 @@ fn test_finish_turn_auto_pokes_again_when_todos_remain() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -2134,6 +2222,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
                     assigned_to: None,
                     confidence: Some(70),
                     completion_confidence: Some(80),
+                    confidence_history: Vec::new(),
                 },
                 crate::todo::TodoItem {
                     group: None,
@@ -2145,6 +2234,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
                     assigned_to: None,
                     confidence: Some(90),
                     completion_confidence: Some(95),
+                    confidence_history: Vec::new(),
                 },
             ],
         )
@@ -2170,11 +2260,18 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         assert!(!summary.contains("Finish risky provider path"));
         assert!(!summary.contains("Confidence meets the threshold"));
         assert!(summary.contains("1 completed todo is below the 90% confidence threshold"));
-        assert!(summary.contains("\n- Suggested action: validate or test before finalizing."));
+        // Reference the shared prompt constant so this test cannot drift when
+        // the guidance wording changes.
+        assert!(summary.contains(&format!(
+            "\n- {}",
+            crate::prompt::TODO_CONFIDENCE_NEEDS_VALIDATION_PROMPT.trim()
+        )));
         assert!(
             app.display_messages()
                 .iter()
-                .any(|msg| msg.content.contains("queued hidden confidence reminder"))
+                .any(|msg| msg
+                    .content
+                    .contains("Todos complete. Auto-poke finished. Cumulative confidence: 86%."))
         );
     });
 }
@@ -2209,6 +2306,7 @@ fn test_finish_turn_without_auto_poke_does_not_queue_confidence_summary() {
                 assigned_to: None,
                 confidence: Some(90),
                 completion_confidence: Some(90),
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");
@@ -2243,6 +2341,7 @@ fn test_finish_turn_auto_poke_preserves_visible_turn_started() {
                 assigned_to: None,
                 confidence: None,
                 completion_confidence: None,
+                confidence_history: Vec::new(),
             }],
         )
         .expect("save todos");

@@ -82,8 +82,9 @@ mod wrap;
 #[cfg(test)]
 pub(crate) use context::with_markdown_spacing_mode_override;
 pub use context::{
-    center_code_blocks, get_diagram_mode_override, set_center_code_blocks,
-    set_diagram_mode_override, with_deferred_mermaid_render_context,
+    center_code_blocks, get_diagram_mode_override, mermaid_rendering_enabled,
+    set_center_code_blocks, set_diagram_mode_override, with_deferred_mermaid_render_context,
+    with_diagram_mode_scope, with_mermaid_rendering_override,
 };
 use context::{
     deferred_mermaid_render_context_enabled, effective_diagram_mode,
@@ -104,7 +105,7 @@ pub use render_core_adapter::{
     styled_line_to_line,
 };
 
-pub use render_full::render_markdown_with_width;
+pub use render_full::{render_markdown_with_width, thread_render_count};
 pub use render_lazy::render_markdown_lazy;
 pub use render_support::extract_copy_targets_from_rendered_lines;
 
@@ -345,23 +346,51 @@ fn push_block_separator(
 }
 
 fn normalize_block_separators(lines: &mut Vec<Line<'static>>) {
-    let mut normalized = Vec::with_capacity(lines.len());
+    let mut normalized: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     let mut previous_blank = true;
+    // Blank lines that belong to an image/diagram placeholder body. The
+    // marker line is followed by `rows - 1` intentionally blank lines that the
+    // draw step paints the image over, and the region scan
+    // (`compute_image_regions`) sizes the image by the blank run following the
+    // marker. Collapsing that run shrinks the rendered diagram to a sliver, so
+    // it must survive separator normalization verbatim.
+    let mut preserve_blanks: usize = 0;
+    // Prefix of `normalized` that trailing-blank trimming must not touch:
+    // a placeholder body can legitimately end the rendered text.
+    let mut protected_len = 0usize;
 
     for line in lines.drain(..) {
         let is_blank = line_is_blank(&line);
         if is_blank {
+            if preserve_blanks > 0 {
+                preserve_blanks -= 1;
+                normalized.push(Line::default());
+                protected_len = normalized.len();
+                previous_blank = true;
+                continue;
+            }
             if previous_blank {
                 continue;
             }
             normalized.push(Line::default());
         } else {
+            preserve_blanks =
+                if let Some((_, rows, _)) = mermaid::parse_inline_image_placeholder(&line) {
+                    rows.saturating_sub(1) as usize
+                } else if mermaid::parse_image_placeholder(&line).is_some() {
+                    // Crop-style markers (video export) do not encode their
+                    // height; keep every directly following blank fill line.
+                    usize::MAX
+                } else {
+                    0
+                };
             normalized.push(line);
         }
         previous_blank = is_blank;
     }
 
-    while normalized.last().map(line_is_blank).unwrap_or(false) {
+    while normalized.len() > protected_len && normalized.last().map(line_is_blank).unwrap_or(false)
+    {
         normalized.pop();
     }
 
@@ -473,18 +502,8 @@ struct CenteredStructuredBlockState {
     ranges: Vec<std::ops::Range<usize>>,
 }
 
-fn diagram_side_only() -> bool {
-    matches!(effective_diagram_mode(), DiagramDisplayMode::Pinned)
-}
-
 fn mermaid_should_register_active() -> bool {
     !matches!(effective_diagram_mode(), DiagramDisplayMode::None)
-}
-
-fn mermaid_rendering_enabled() -> bool {
-    // Temporarily disable Mermaid for users while the renderer is unstable.
-    // Developers can opt in explicitly to keep iterating on the feature.
-    std::env::var("JCODE_ENABLE_MERMAID").is_ok_and(|value| value == "1")
 }
 
 fn mermaid_sidebar_placeholder(text: &str) -> Line<'static> {
@@ -493,6 +512,32 @@ fn mermaid_sidebar_placeholder(text: &str) -> Line<'static> {
         Style::default().fg(md_dim_color()),
     ))
     .left_aligned()
+}
+
+/// Placeholder text emitted while a deferred mermaid render runs in the
+/// background. Cache layers above the markdown renderer use
+/// [`line_is_mermaid_pending_placeholder`] to detect prepared content that
+/// must be re-rendered once the background render completes (the deferred
+/// render epoch advances).
+pub const MERMAID_PENDING_PLACEHOLDER_TEXT: &str = "↻ rendering mermaid diagram...";
+
+/// Prefix used to recognize the pending placeholder even when a narrow width
+/// wraps its tail onto a following line.
+const MERMAID_PENDING_MATCH_PREFIX: &str = "↻ rendering mermaid";
+
+/// True when `line` is the deferred-mermaid pending placeholder. Tolerates
+/// leading/trailing padding spans added by centered display modes and the
+/// truncated tail produced when a narrow width wraps the placeholder.
+pub fn line_is_mermaid_pending_placeholder(line: &Line<'_>) -> bool {
+    let mut spans = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref().trim())
+        .filter(|content| !content.is_empty());
+    let Some(first) = spans.next() else {
+        return false;
+    };
+    first.starts_with(MERMAID_PENDING_MATCH_PREFIX) && spans.next().is_none()
 }
 
 fn apply_inline_decorations(mut style: Style, strike: bool, in_link: bool) -> Style {

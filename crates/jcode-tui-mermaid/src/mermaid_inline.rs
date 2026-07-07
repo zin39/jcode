@@ -116,13 +116,20 @@ pub fn materialize_inline_image(media_type: &str, data_b64: &str) -> Option<(u64
 }
 
 /// Cheap presence probe: is this inline image already registered in the
-/// in-memory render cache? One mutex lock + map lookup; no payload hashing,
-/// no payload clone, no filesystem access. Used by the per-frame draw path so
-/// steady-state scrolling never touches the multi-megabyte payload.
+/// in-memory render cache? One mutex lock + bounded key scan; no payload
+/// hashing, no payload clone, no filesystem access. Used by the per-frame
+/// draw path so steady-state scrolling never touches the multi-megabyte
+/// payload.
+///
+/// Matches ANY render profile for the hash, not just the default: mermaid
+/// diagrams rendered toward an inline aspect goal are cached under an
+/// aspect-tagged profile key, and a default-only probe would report them as
+/// missing forever (the draw path would then spin on prewarms that succeed
+/// without ever flipping this probe, leaving a permanently blank placeholder).
 pub fn inline_image_is_materialized(id: u64) -> bool {
     RENDER_CACHE
         .lock()
-        .map(|cache| cache.entries.contains_key(&(id, RenderProfile::default())))
+        .map(|cache| cache.entries.keys().any(|(hash, _)| *hash == id))
         .unwrap_or(false)
 }
 
@@ -187,6 +194,53 @@ fn inline_image_extension(media_type: &str) -> &'static str {
         "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
         _ => "img",
     }
+}
+
+/// Every extension [`materialize_inline_image_by_id`] can write, so
+/// [`rediscover_inline_image`] probes exactly the files that can exist.
+const INLINE_EXTENSIONS: [&str; 7] = ["png", "jpg", "gif", "webp", "bmp", "ico", "img"];
+
+/// Re-register an inline image from its persisted cache file.
+///
+/// Payloads are staged in the UI's payload registry only until first
+/// materialization (which writes the decoded bytes to the cache dir); after
+/// that the base64 copy is dropped to keep multi-megabyte screenshots from
+/// being resident twice. If the in-memory `RENDER_CACHE` entry is later
+/// LRU-evicted, this path restores it from disk without needing the payload.
+///
+/// Returns `(id, width, height)` when the cache file exists and decodes.
+pub fn rediscover_inline_image(id: u64) -> Option<(u64, u32, u32)> {
+    let cache_dir = RENDER_CACHE.lock().ok()?.cache_dir.clone();
+    let path = INLINE_EXTENSIONS
+        .iter()
+        .map(|ext| cache_dir.join(format!("{:016x}_inline.{}", id, ext)))
+        .find(|path| path.exists())?;
+    let image = image::open(&path).ok()?;
+    let (width, height) = image.dimensions();
+    dims_cache_put(id, InlineDims { width, height });
+    if let Ok(mut source) = SOURCE_CACHE.lock() {
+        source.insert(id, path.clone(), image);
+    }
+    if let Ok(mut cache) = RENDER_CACHE.lock() {
+        cache.insert(
+            id,
+            RenderProfile::default(),
+            CachedDiagram {
+                path,
+                width,
+                height,
+            },
+        );
+        return Some((id, width, height));
+    }
+    None
+}
+
+/// Test-only view of [`inline_image_extension`], used to prove the eviction
+/// path recognizes every extension the materialize path can write.
+#[cfg(test)]
+pub(crate) fn mermaid_inline_extension_for_test(media_type: &str) -> &'static str {
+    inline_image_extension(media_type)
 }
 
 /// Decode a bounded prefix of the base64 payload and try to read image

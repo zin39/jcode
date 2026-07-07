@@ -674,9 +674,38 @@ pub(super) fn insert_input_text(app: &mut App, text: &str) {
         return;
     }
 
+    let at_end = app.cursor_pos == app.input.len();
+
+    // A habitual space typed right after `/login ` (auto-inserted below)
+    // would only add noise; swallow it so `/login` + space + filter still
+    // produces a single separator.
+    if text == " " && at_end && app.input.trim_start() == "/login " {
+        return;
+    }
+
     app.remember_input_undo_state();
+
+    // After `/login` is fully typed (or tab-completed without a trailing
+    // space), the next printable character starts the provider filter;
+    // insert the separating space so it filters the login picker instead of
+    // producing `/loginzai` and closing the preview.
+    if at_end && app.input.trim_start() == "/login" && !text.starts_with(char::is_whitespace) {
+        app.input.push(' ');
+        app.cursor_pos = app.input.len();
+    }
+
     app.input.insert_str(app.cursor_pos, text);
     app.cursor_pos += text.len();
+
+    // Typing the final char of `/login` immediately arms provider filtering:
+    // insert the separating space so the very next keystrokes filter the
+    // login picker. Without this, users press Enter without realizing they
+    // can filter first.
+    if app.cursor_pos == app.input.len() && app.input.trim_start() == "/login" {
+        app.input.push(' ');
+        app.cursor_pos = app.input.len();
+    }
+
     app.reset_tab_completion();
     app.sync_model_picker_preview_from_input();
 }
@@ -792,6 +821,17 @@ pub(super) fn handle_multiline_input_navigation(
 
     app.cursor_pos = target;
     true
+}
+
+/// True when `modifiers` is exactly one of Ctrl, Alt(Option) or Cmd(Super),
+/// the set of single modifiers we treat as "recall queued prompts / browse
+/// history" when combined with Up/Down. Shift or any combination is excluded so
+/// it doesn't shadow selection-extension or other chords.
+pub(super) fn is_prompt_recall_modifier(modifiers: KeyModifiers) -> bool {
+    matches!(
+        modifiers,
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
+    )
 }
 
 pub(super) fn handle_prompt_history_navigation(
@@ -1108,6 +1148,19 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// Whether the configured `keybindings.fallback_switch` chord matches this key.
+    pub(crate) fn fallback_switch_key_matches(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        self.fallback_switch_key
+            .binding
+            .as_ref()
+            .map(|binding| binding.matches(code, modifiers))
+            .unwrap_or(false)
+    }
+
     /// Spawn a brand-new jcode session in a new terminal window.
     pub(crate) fn handle_new_terminal_hotkey(&mut self) {
         let cwd = commands::active_working_dir(self)
@@ -1296,6 +1349,12 @@ pub(super) fn delete_input_to_end(app: &mut App) {
 
 pub(super) fn handle_super_key(app: &mut App, code: KeyCode) -> bool {
     match code {
+        // Cmd+5 toggles the onboarding simulator (a dev aid for walking through
+        // every first-run onboarding screen without touching real auth state).
+        KeyCode::Char('5') => {
+            app.toggle_onboarding_simulator();
+            true
+        }
         // macOS terminals that forward Command may report Command+Delete as Super+Backspace,
         // Super+Delete, or Super+DEL. Treat all of them as delete-the-previous-word, matching
         // the requested Cmd+Backspace = delete-by-word behavior.
@@ -1568,19 +1627,42 @@ pub(super) fn handle_pre_control_shortcuts(
         app.handle_dictation_trigger();
         return true;
     }
+
+    // Inline swarm panel: Alt+N focuses the managed-agents panel; pressing it
+    // again cycles through agents. While focused, Alt+↑/↓ select, Alt+O pops
+    // the selection out to a terminal, Esc exits. Plain typing is NOT captured
+    // (it keeps flowing to the chat input).
+    if app.toggle_keys.swarm_panel_focus.matches(code, modifiers) {
+        use crate::tui::TuiState as _;
+        if app.swarm_panel_focused() {
+            app.cycle_swarm_panel_selection();
+        } else if app.toggle_swarm_panel_focus() {
+            app.set_status_notice("Swarm: alt+n next · alt+↑/↓ select · alt+o open · esc");
+        }
+        return true;
+    }
+    {
+        use crate::tui::TuiState as _;
+        if app.swarm_panel_focused() && app.handle_swarm_panel_key(code, modifiers) {
+            return true;
+        }
+    }
     if app.new_terminal_key_matches(code, modifiers) {
         app.handle_new_terminal_hotkey();
         return true;
     }
     if app.open_resume_key_matches(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::Resume);
         app.open_session_picker();
         return true;
     }
     if let Some(direction) = app.model_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::ModelSwitch);
         app.cycle_model(direction);
         return true;
     }
     if let Some(direction) = app.effort_switch_keys.direction_for(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::EffortCycle);
         app.cycle_effort(direction);
         return true;
     }
@@ -1593,7 +1675,8 @@ pub(super) fn handle_pre_control_shortcuts(
         app.cycle_effort(direction);
         return true;
     }
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
+        app.record_keybinding_fast(super::shortcut_hints::LearnableAction::Alignment);
         app.toggle_centered_mode();
         return true;
     }
@@ -2065,9 +2148,21 @@ impl App {
             return Ok(());
         }
 
+        // The onboarding simulator owns all key handling while active so the
+        // real onboarding handlers never fire (no real logins/imports).
+        if self.handle_onboarding_sim_key(code, modifiers) {
+            return Ok(());
+        }
+
         if self.handle_onboarding_continue_prompt_key(code) {
             return Ok(());
         }
+
+        // Inline hotkey feedback: when a known-but-rarely-used chord is pressed,
+        // show "you just pressed X → does Y". Placed after the modal/overlay
+        // handlers so overlay-local keys stay silent. Unknown chords are
+        // reported at the fall-through points below.
+        self.observe_known_hotkey(code, modifiers, false);
 
         if code == KeyCode::BackTab {
             self.cycle_model_favorite_hotkey();
@@ -2075,9 +2170,10 @@ impl App {
         }
 
         // While the model picker preview is visible, route its favorite/default
-        // hotkeys (Ctrl+B, Ctrl+F, Alt+F) to the focused picker handler before the
-        // global control shortcuts can claim them. This makes the hotkeys work
-        // directly in the preview list the user always sees.
+        // hotkeys (Ctrl+O set default, Ctrl+N toggle favorite) to the focused
+        // picker handler before the global control shortcuts can claim them. This
+        // makes the hotkeys work directly in the preview list the user always
+        // sees, without colliding with the readline/tmux keys (Ctrl+B/Ctrl+F).
         if self.model_picker_preview_hotkey(code, modifiers)? {
             return Ok(());
         }
@@ -2090,6 +2186,23 @@ impl App {
             if !is_scroll_only_key(self, code, modifiers) {
                 self.cancel_pending_provider_failover("Provider auto-switch canceled");
             }
+        }
+
+        // Accept an armed post-error fallback offer: switch to the next best
+        // model/auth-method and resend the failed turn.
+        if self.pending_fallback_offer.is_some()
+            && !self.is_processing
+            && self.fallback_switch_key_matches(code, modifiers)
+        {
+            self.apply_pending_fallback_offer();
+            return Ok(());
+        }
+
+        // Accept an armed "merge the diverged update" offer: spawn a jcode agent
+        // to reconcile the branches. Shares the fallback-switch accept key.
+        if self.merge_offer_key_matches(code, modifiers) {
+            self.accept_update_merge_offer();
+            return Ok(());
         }
 
         if is_next_prompt_new_session_hotkey(code, modifiers) {
@@ -2108,16 +2221,23 @@ impl App {
         self.normalize_diagram_state();
         let diagram_available = self.diagram_available();
 
-        if modifiers == KeyModifiers::CONTROL && code == KeyCode::Up {
+        // Ctrl / Alt(Option) / Cmd(Super) + Up all recall queued/pending messages
+        // for editing and then walk prompt history. We accept any of the three
+        // single modifiers so the gesture works regardless of which one a given
+        // terminal forwards (some send Option as Alt, some forward Command as
+        // Super), without the user having to rebind anything.
+        if code == KeyCode::Up && is_prompt_recall_modifier(modifiers) {
             if retrieve_pending_message_for_edit(self) {
                 return Ok(());
             }
-            handle_prompt_history_navigation(self, code, modifiers);
+            // Normalize to CONTROL so handle_prompt_history_navigation takes its
+            // explicit-history path (jump straight into history even mid-draft).
+            handle_prompt_history_navigation(self, KeyCode::Up, KeyModifiers::CONTROL);
             return Ok(());
         }
 
-        if modifiers == KeyModifiers::CONTROL && code == KeyCode::Down {
-            handle_prompt_history_navigation(self, code, modifiers);
+        if code == KeyCode::Down && is_prompt_recall_modifier(modifiers) {
+            handle_prompt_history_navigation(self, KeyCode::Down, KeyModifiers::CONTROL);
             return Ok(());
         }
 
@@ -2171,6 +2291,7 @@ impl App {
         // Never fall through and insert literal text for unhandled Ctrl+key chords. This stays
         // after text_input so Ctrl+Alt/AltGr symbols delivered as final printable text still work.
         if modifiers.contains(KeyModifiers::CONTROL) {
+            self.note_unrecognized_hotkey(code, modifiers, false);
             return Ok(());
         }
 
@@ -2190,6 +2311,11 @@ impl App {
             return Ok(());
         }
 
+        // A modified chord (or function key) that reached this point is not
+        // bound to anything; tell the user instead of silently swallowing it or
+        // inserting a surprise character.
+        self.note_unrecognized_hotkey(code, modifiers, false);
+
         if handle_basic_key(self, code) {
             return Ok(());
         }
@@ -2199,6 +2325,14 @@ impl App {
 
     pub(super) fn request_full_redraw(&mut self) {
         self.force_full_redraw = true;
+    }
+
+    /// Arm a full re-emit of every cell on the next frame without an
+    /// intermediate ED2 clear escape. Prefer this over `request_full_redraw`
+    /// when the real screen has not diverged from ratatui's model (e.g. chat
+    /// scrolling), so image placeholder cells do not flash blank (issue #404).
+    pub(super) fn request_full_repaint(&mut self) {
+        self.force_full_repaint = true;
     }
 
     pub(super) fn should_redraw_after_resize(&mut self) -> bool {
@@ -2810,9 +2944,19 @@ impl App {
             // Tool-only boundary (no answer text): keep the retained trace on
             // screen so the thought stays readable while the tool runs. It
             // folds when superseded by the next trace or at end of turn.
+            //
+            // The ephemeral mermaid preview slot mirrors the (now empty) live
+            // buffer, so any surviving entry here is stale by definition. The
+            // buffer can only become empty without the slot being cleared via
+            // `replace_streaming_text` (remote TextReplace, debug snapshot
+            // restore); `take_streaming_text` and `clear_streaming_render_state`
+            // both clear it themselves.
+            crate::tui::mermaid::clear_streaming_preview_diagram();
             return false;
         }
 
+        // `take_streaming_text` also clears the streaming mermaid preview
+        // slot, so the whitespace-only early return below cannot leak it.
         let content = self.take_streaming_text();
         let content = self.collapse_reasoning_for_commit(content);
         if content.trim().is_empty() {
@@ -2903,6 +3047,7 @@ impl App {
             || super::commands::handle_usage_command(self, trimmed)
             || super::productivity::handle_productivity_command(self, trimmed)
             || super::commands::handle_feedback_command(self, trimmed)
+            || super::support::handle_support_command(self, trimmed)
             || super::state_ui::handle_info_command(self, trimmed)
             || super::auth::handle_auth_command(self, trimmed)
             || super::tui_lifecycle_runtime::handle_dev_command(self, trimmed);
@@ -2954,19 +3099,8 @@ impl App {
             // directory before reporting Unknown skill so project-local skills such
             // as .jcode/skills/optimization work immediately after reload/build.
             if skill.is_none() {
-                let working_dir = self
-                    .session
-                    .working_dir
-                    .as_deref()
-                    .map(std::path::Path::new);
-                if let Ok(reloaded) = SkillRegistry::load_for_working_dir(working_dir) {
-                    skill = reloaded.get(skill_name).cloned();
-                    self.skills = std::sync::Arc::new(reloaded.clone());
-                    if let Ok(mut shared) = self.registry.skills().try_write() {
-                        *shared = reloaded;
-                    }
-                    self.invalidate_command_candidates_cache();
-                }
+                self.refresh_skills_snapshot();
+                skill = self.current_skills_snapshot().get(skill_name).cloned();
             }
 
             if let Some(skill) = skill {
@@ -2980,9 +3114,26 @@ impl App {
                     tool_data: None,
                 });
             } else {
+                // Distinguish an endorsed-but-not-installed skill from a
+                // typo: the skill list advertises endorsed skills, so a bare
+                // "Unknown skill" for them reads like a bug (issue #445).
+                let endorsed_hint = crate::skill::endorsed_skills()
+                    .iter()
+                    .find(|endorsed| endorsed.name == skill_name)
+                    .map(|endorsed| match endorsed.install {
+                        Some(install) => format!(
+                            "Skill /{} is endorsed but not installed. Install it with `{}`, then run /skills or skill_manage reload_all.",
+                            skill_name, install
+                        ),
+                        None => format!(
+                            "Skill /{} is endorsed but not installed (source: {}). Install it into ~/.jcode/skills/{}/SKILL.md.",
+                            skill_name, endorsed.source, skill_name
+                        ),
+                    });
                 self.push_display_message(DisplayMessage {
                     role: "error".to_string(),
-                    content: format!("Unknown skill: /{}", skill_name),
+                    content: endorsed_hint
+                        .unwrap_or_else(|| format!("Unknown skill: /{}", skill_name)),
                     tool_calls: vec![],
                     duration_secs: None,
                     title: None,
@@ -3045,6 +3196,12 @@ impl App {
         }
         crate::telemetry::record_turn();
         self.session_save_pending = true;
+
+        // A fresh user turn supersedes any post-error fallback offer from the
+        // previous turn; drop it so a stale keypress can't switch+resend.
+        self.clear_pending_fallback_offer();
+        // Likewise drop any armed "merge the diverged update" offer.
+        self.clear_update_merge_offer();
 
         // Set up processing state - actual processing happens after UI redraws
         self.is_processing = true;

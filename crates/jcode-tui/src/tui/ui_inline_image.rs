@@ -23,12 +23,6 @@ use ratatui::text::{Line, Span};
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, OnceLock, mpsc};
 
-#[inline]
-fn div_ceil_u32(value: u32, divisor: u32) -> u32 {
-    let divisor = divisor.max(1);
-    value.div_ceil(divisor)
-}
-
 /// One image to render inline, resolved from a `RenderedImage`.
 #[derive(Clone)]
 pub(crate) struct InlineImageItem {
@@ -38,8 +32,6 @@ pub(crate) struct InlineImageItem {
     pub label: String,
 }
 
-/// Default font cell size when the terminal has not reported one yet.
-const DEFAULT_CELL: (u16, u16) = (8, 16);
 /// Cap an inline image at this fraction of the chat viewport height so a tall
 /// image cannot push the rest of the transcript off-screen.
 const MAX_VIEWPORT_FRACTION_PERCENT: u16 = 55;
@@ -63,36 +55,30 @@ pub enum ImageExpandLevel {
     Fit,
     /// Roughly 2.5x taller, for a closer look without leaving the transcript.
     Large,
-    /// Maximum inline size before the user should use the side panel.
-    Huge,
+    /// Effectively uncapped height: tall enough that virtually every image is
+    /// width-bound, i.e. rendered at the largest size the chat pane allows.
+    Full,
 }
 
 impl ImageExpandLevel {
-    /// Next level in the click cycle (Fit -> Large -> Huge -> Fit).
+    /// Next level in the click cycle (Fit -> Large -> Full -> Fit).
     pub(crate) fn next(self) -> Self {
         match self {
             ImageExpandLevel::Fit => ImageExpandLevel::Large,
-            ImageExpandLevel::Large => ImageExpandLevel::Huge,
-            ImageExpandLevel::Huge => ImageExpandLevel::Fit,
+            ImageExpandLevel::Large => ImageExpandLevel::Full,
+            ImageExpandLevel::Full => ImageExpandLevel::Fit,
         }
     }
 
     /// Anchored row cap for this level. Stays viewport independent so the
-    /// width-keyed body cache remains valid across resizes.
+    /// width-keyed body cache remains valid across resizes. The `Full` cap is
+    /// bounded by kitty's virtual-placement row limit (296 diacritic slots),
+    /// with margin, so stable fit rendering keeps working at every level.
     fn anchored_cap_rows(self) -> u16 {
         match self {
             ImageExpandLevel::Fit => ANCHORED_MAX_ROWS,
             ImageExpandLevel::Large => 40,
-            ImageExpandLevel::Huge => 80,
-        }
-    }
-
-    /// 0-based filled-dot count for the click-progress badge (Fit shows none).
-    fn filled_dots(self) -> usize {
-        match self {
-            ImageExpandLevel::Fit => 0,
-            ImageExpandLevel::Large => 1,
-            ImageExpandLevel::Huge => 2,
+            ImageExpandLevel::Full => 200,
         }
     }
 }
@@ -130,10 +116,17 @@ static PAYLOAD_REGISTRY: LazyLock<Mutex<PayloadRegistry>> =
     LazyLock::new(|| Mutex::new(PayloadRegistry::new()));
 
 const PAYLOAD_REGISTRY_MAX: usize = 512;
+/// Byte budget for the payload registry. Entries hold the *full base64
+/// payload* (a 5 MB screenshot is ~6.7 MB of base64), so a pure entry-count
+/// bound could still pin gigabytes of RAM across a screenshot-heavy session.
+/// Evicted payloads are re-registered by the next prepare pass that resolves
+/// the image, so the only cost of a tight budget is a string clone later.
+const PAYLOAD_REGISTRY_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 struct PayloadRegistry {
     map: std::collections::HashMap<u64, (String, String)>,
     order: std::collections::VecDeque<u64>,
+    total_bytes: usize,
 }
 
 impl PayloadRegistry {
@@ -141,32 +134,82 @@ impl PayloadRegistry {
         Self {
             map: std::collections::HashMap::new(),
             order: std::collections::VecDeque::new(),
+            total_bytes: 0,
         }
     }
 
-    fn insert(&mut self, id: u64, media_type: &str, data_b64: &str) {
+    /// Insert a payload. Returns true when the id was newly inserted (false
+    /// when it was already registered).
+    fn insert(&mut self, id: u64, media_type: &str, data_b64: &str) -> bool {
         if self.map.contains_key(&id) {
-            return;
+            return false;
         }
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(media_type.len() + data_b64.len());
         self.map
             .insert(id, (media_type.to_string(), data_b64.to_string()));
         self.order.push_back(id);
-        while self.order.len() > PAYLOAD_REGISTRY_MAX {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        // Evict oldest-first past either bound, but never the entry just
+        // inserted: a single over-budget payload must stay resident or its
+        // image could never materialize.
+        while (self.order.len() > PAYLOAD_REGISTRY_MAX
+            || self.total_bytes > PAYLOAD_REGISTRY_MAX_BYTES)
+            && self.order.len() > 1
+        {
+            if let Some(old) = self.order.pop_front()
+                && let Some((media_type, data_b64)) = self.map.remove(&old)
+            {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(media_type.len() + data_b64.len());
             }
         }
+        true
     }
 
     fn get(&self, id: u64) -> Option<(String, String)> {
         self.map.get(&id).cloned()
     }
+
+    fn remove(&mut self, id: u64) {
+        if let Some((media_type, data_b64)) = self.map.remove(&id) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(media_type.len() + data_b64.len());
+            if let Some(pos) = self.order.iter().position(|entry| *entry == id) {
+                self.order.remove(pos);
+            }
+        }
+    }
 }
 
 /// Record an image payload so [`materialize_visible`] can decode it on demand.
+///
+/// Skipped entirely for images that are already materialized: their decoded
+/// bytes live in the render cache (memory) and cache dir (disk), so staging
+/// the base64 copy again would just hold multi-megabyte payloads resident
+/// twice. [`materialize_visible`] rediscovers evicted entries from disk.
 pub(crate) fn register_payload(id: u64, media_type: &str, data_b64: &str) {
+    if mermaid::inline_image_is_materialized(id) {
+        return;
+    }
+    let newly_inserted = match PAYLOAD_REGISTRY.lock() {
+        Ok(mut reg) => reg.insert(id, media_type, data_b64),
+        Err(_) => false,
+    };
+    // A fresh payload may succeed where a previously evicted/corrupt one
+    // failed, so give the prewarm pipeline its retries back.
+    if newly_inserted && let Ok(mut failures) = PREWARM_FAILURES.lock() {
+        failures.remove(&id);
+    }
+}
+
+/// Drop the staged base64 payload for an image whose decoded bytes are now
+/// persisted in the render cache; see [`register_payload`].
+fn release_payload(id: u64) {
     if let Ok(mut reg) = PAYLOAD_REGISTRY.lock() {
-        reg.insert(id, media_type, data_b64);
+        reg.remove(id);
     }
 }
 
@@ -181,9 +224,23 @@ pub(crate) fn materialize_visible(id: u64) -> bool {
         return true;
     }
     if let Some((media_type, data_b64)) = PAYLOAD_REGISTRY.lock().ok().and_then(|reg| reg.get(id)) {
-        return mermaid::materialize_inline_image_by_id(id, &media_type, &data_b64).is_some();
+        let materialized = mermaid::materialize_inline_image_by_id(id, &media_type, &data_b64);
+        if materialized.is_some() {
+            // The decoded bytes now live in the render cache and cache dir;
+            // holding the base64 copy too would double-count every image.
+            release_payload(id);
+            return true;
+        }
+        return false;
     }
-    false
+    // No staged payload: either it was dropped after a successful
+    // materialization and the render-cache entry has since been LRU-evicted
+    // (restore it from the persisted cache file), or this is a mermaid
+    // diagram whose PNG lives in the shared render cache/disk.
+    if mermaid::rediscover_inline_image(id).is_some() {
+        return true;
+    }
+    mermaid::get_cached_path(id).is_some()
 }
 
 /// One pending prewarm request: build everything needed to draw image `id`
@@ -201,6 +258,43 @@ static PREWARM_TX: OnceLock<mpsc::Sender<PrewarmRequest>> = OnceLock::new();
 /// image dozens of times before the worker finishes it.
 static PREWARM_INFLIGHT: LazyLock<Mutex<HashSet<PrewarmRequest>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Per-image count of failed materialize attempts. Without this memo an
+/// undecodable payload (or one evicted from the registry) would loop forever:
+/// draw schedules a prewarm, the worker fails and nudges a repaint, the
+/// repaint reschedules the same prewarm. After
+/// [`PREWARM_FAILURE_MAX_ATTEMPTS`] failures the id is skipped until
+/// [`register_payload`] sees a fresh payload for it.
+static PREWARM_FAILURES: LazyLock<Mutex<HashMap<u64, u8>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const PREWARM_FAILURE_MAX_ATTEMPTS: u8 = 3;
+/// Bound the failure memo; it only holds pathological ids, so if it fills up
+/// something is systemically wrong and starting over is harmless.
+const PREWARM_FAILURES_MAX: usize = 512;
+
+fn prewarm_failures_exhausted(id: u64) -> bool {
+    PREWARM_FAILURES
+        .lock()
+        .ok()
+        .and_then(|failures| failures.get(&id).copied())
+        .is_some_and(|count| count >= PREWARM_FAILURE_MAX_ATTEMPTS)
+}
+
+fn record_prewarm_failure(id: u64) {
+    if let Ok(mut failures) = PREWARM_FAILURES.lock() {
+        if failures.len() >= PREWARM_FAILURES_MAX && !failures.contains_key(&id) {
+            failures.clear();
+        }
+        let count = failures.entry(id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == PREWARM_FAILURE_MAX_ATTEMPTS {
+            crate::logging::warn(&format!(
+                "inline image {id:#018x} failed to materialize {PREWARM_FAILURE_MAX_ATTEMPTS} times; \
+                 suspending prewarm until its payload is re-registered"
+            ));
+        }
+    }
+}
 
 fn prewarm_sender() -> &'static mpsc::Sender<PrewarmRequest> {
     PREWARM_TX.get_or_init(|| {
@@ -220,10 +314,22 @@ fn prewarm_sender() -> &'static mpsc::Sender<PrewarmRequest> {
 
 fn prewarm_worker(rx: mpsc::Receiver<PrewarmRequest>) {
     for req in rx {
-        materialize_visible(req.id);
-        mermaid::prewarm_inline_fit_state(req.id, req.target_cols, req.target_rows, true);
+        let materialized = materialize_visible(req.id);
+        if materialized {
+            mermaid::prewarm_inline_fit_state(req.id, req.target_cols, req.target_rows, true);
+            if let Ok(mut failures) = PREWARM_FAILURES.lock() {
+                failures.remove(&req.id);
+            }
+        } else {
+            record_prewarm_failure(req.id);
+        }
         if let Ok(mut inflight) = PREWARM_INFLIGHT.lock() {
             inflight.remove(&req);
+        }
+        if !materialized {
+            // Nothing new to draw; nudging a repaint would only make the
+            // draw path reschedule this same failed request.
+            continue;
         }
         // Nudge the UI exactly like a finished deferred Mermaid render so the
         // placeholder fills in on the next frame without user input. The
@@ -270,6 +376,9 @@ pub(crate) fn ensure_drawable(id: u64, target_cols: u16, target_rows: u16) -> bo
 }
 
 fn schedule_prewarm(id: u64, target_cols: u16, target_rows: u16) {
+    if prewarm_failures_exhausted(id) {
+        return;
+    }
     let req = PrewarmRequest {
         id,
         target_cols,
@@ -455,43 +564,10 @@ pub(crate) fn resolve_anchored_items_cached(
 /// the draw step actually paints, so layout (e.g. info widget placement) can
 /// know the real horizontal extent.
 fn fit_geometry_with_cap(width: u32, height: u32, chat_width: u16, cap_rows: u16) -> (u16, u16) {
-    if width == 0 || height == 0 {
-        return (MIN_IMAGE_ROWS, chat_width.min(2));
-    }
-    let (cell_w, cell_h) = mermaid::get_font_size().unwrap_or(DEFAULT_CELL);
-    let cell_w = cell_w.max(1) as u32;
-    let cell_h = cell_h.max(1) as u32;
-
-    // Available width in pixels (border bar + padding take 2 cells, matching
-    // the renderer's BORDER_WIDTH).
-    let avail_cells = chat_width.saturating_sub(2).max(1) as u32;
-    let avail_px = avail_cells * cell_w;
-
-    let cap_rows = (cap_rows as u32).max(MIN_IMAGE_ROWS as u32);
-    let cap_px = cap_rows * cell_h;
-
-    // Scale to fit *both* the width and the row cap, preserving aspect ratio,
-    // exactly like the draw-time fit does. This keeps the placeholder geometry
-    // and the rendered pixels in lockstep so borders/labels hug the image.
-    let scale_num_w = avail_px.min(width);
-    let scaled_h_by_w = height.saturating_mul(scale_num_w) / width.max(1);
-    let (final_w_px, final_h_px) = if scaled_h_by_w <= cap_px {
-        (scale_num_w, scaled_h_by_w)
-    } else {
-        // Height-bound: shrink further so the height fits the cap.
-        let w = width.saturating_mul(cap_px) / height.max(1);
-        (w.min(avail_px).max(1), cap_px)
-    };
-
-    let rows = div_ceil_u32(final_h_px.max(1), cell_h).max(MIN_IMAGE_ROWS as u32) as u16;
-    let cols = (div_ceil_u32(final_w_px.max(1), cell_w) as u16)
-        .saturating_add(2)
-        .min(chat_width);
-    (
-        rows.min(cap_rows.min(u16::MAX as u32) as u16)
-            .max(MIN_IMAGE_ROWS),
-        cols,
-    )
+    // Single source of truth for inline-fit placeholder geometry, shared with
+    // the mermaid crate so diagrams and raster images stay in lockstep with
+    // the draw-time fit math.
+    mermaid::inline_fit_geometry(width, height, chat_width, cap_rows)
 }
 
 /// Compute `(rows, cols)` for an inline image at `chat_width`, given a viewport
@@ -523,21 +599,16 @@ fn fit_rows(width: u32, height: u32, chat_width: u16, viewport_height: u16) -> u
 }
 
 /// Build the dim label line shown above an inline image, e.g.
-/// `  🖼 screenshot.png  1920×1080`, with a trailing show/hide badge
+/// `  screenshot.png  1920×1080`, with a trailing show/hide badge
 /// (`[Alt] [⇧] [I] hide` / `[Alt] [⇧] [I] show image`) so the toggle is
-/// discoverable right where the image renders, plus a clickable `expand` badge
-/// that cycles the per-image size. The expand badge renders a three-dot
-/// progress indicator (`○○○` -> `●○○` -> `●●○`) reflecting the current level so
-/// clicking it feels like a multi-step zoom.
-/// Click/cursor icon that prefixes the clickable expand badge. Doubles as the
-/// anchor cell for badge hit detection (see `expand_badge_start_col`), so any
-/// change here must stay in sync with that scanner.
-pub(crate) const EXPAND_BADGE_CLICK_ICON: &str = "🖱";
-
+/// discoverable right where the image renders. The line is kept deliberately
+/// short so it fits on one row; there is no visible expand badge, but clicking
+/// the rendered image body still cycles the per-image size
+/// (see `inline_image_body_target_from_screen`).
 pub(crate) fn image_label_line(
     item: &InlineImageItem,
     images_visible: bool,
-    level: ImageExpandLevel,
+    _level: ImageExpandLevel,
 ) -> Line<'static> {
     let dims = format!("{}×{}", item.width, item.height);
     let label = if item.label.is_empty() {
@@ -547,7 +618,7 @@ pub(crate) fn image_label_line(
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut spans = vec![
-        Span::styled("  🖼 ", dim),
+        Span::styled("  ", dim),
         Span::styled(label, dim),
         Span::raw("  "),
         Span::styled(super::viewport::copy_badge_alt_badge(), dim),
@@ -555,16 +626,6 @@ pub(crate) fn image_label_line(
     ];
     if images_visible {
         spans.push(Span::styled("hide", dim));
-        // Clickable expand badge: a click/cursor icon signals the badge is
-        // clickable, the dots show how far through the size cycle we are, then a
-        // verb hints the next click's effect. The icon is also the first cell of
-        // the badge hit-region (see `expand_badge_start_col`).
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(EXPAND_BADGE_CLICK_ICON, dim));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(expand_dots(level), dim));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(expand_verb(level), dim));
     } else {
         spans.push(Span::styled(
             "show image",
@@ -572,26 +633,6 @@ pub(crate) fn image_label_line(
         ));
     }
     Line::from(spans)
-}
-
-/// Three-dot progress indicator for the expand badge, filled to the current
-/// level (`○○○` at Fit, `●○○` at Large, `●●○` at Huge).
-fn expand_dots(level: ImageExpandLevel) -> String {
-    const SLOTS: usize = 3;
-    let filled = level.filled_dots();
-    let mut out = String::with_capacity(SLOTS * 3);
-    for slot in 0..SLOTS {
-        out.push(if slot < filled { '●' } else { '○' });
-    }
-    out
-}
-
-/// Verb describing what the next expand-badge click does.
-fn expand_verb(level: ImageExpandLevel) -> &'static str {
-    match level {
-        ImageExpandLevel::Fit | ImageExpandLevel::Large => "expand",
-        ImageExpandLevel::Huge => "reset",
-    }
 }
 
 /// Lines for images anchored at a transcript message: per image, a leading
@@ -657,12 +698,9 @@ pub(crate) fn build_section(
                 ImageExpandLevel::Fit => {
                     fit_geometry(item.width, item.height, width, viewport_height)
                 }
-                _ => fit_geometry_with_cap(
-                    item.width,
-                    item.height,
-                    width,
-                    level.anchored_cap_rows(),
-                ),
+                _ => {
+                    fit_geometry_with_cap(item.width, item.height, width, level.anchored_cap_rows())
+                }
             };
             let region_start = lines.len();
             for _ in 0..rows {
@@ -701,6 +739,7 @@ pub(crate) fn build_section(
         edit_tool_ranges: Vec::new(),
         copy_targets: Vec::new(),
         message_boundaries: Vec::new(),
+        mermaid_pending_epoch: None,
     }
 }
 
@@ -720,6 +759,7 @@ fn empty() -> PreparedMessages {
         edit_tool_ranges: Vec::new(),
         copy_targets: Vec::new(),
         message_boundaries: Vec::new(),
+        mermaid_pending_epoch: None,
     }
 }
 
@@ -908,26 +948,35 @@ mod tests {
     }
 
     #[test]
-    fn expand_badge_dots_track_level() {
-        // Fit shows no filled dots; each level fills one more.
-        assert_eq!(expand_dots(ImageExpandLevel::Fit), "○○○");
-        assert_eq!(expand_dots(ImageExpandLevel::Large), "●○○");
-        assert_eq!(expand_dots(ImageExpandLevel::Huge), "●●○");
+    fn expand_level_cycle_visits_every_level_and_wraps() {
+        assert_eq!(ImageExpandLevel::Fit.next(), ImageExpandLevel::Large);
+        assert_eq!(ImageExpandLevel::Large.next(), ImageExpandLevel::Full);
+        assert_eq!(ImageExpandLevel::Full.next(), ImageExpandLevel::Fit);
     }
 
     #[test]
-    fn expand_badge_verb_resets_at_max() {
-        assert_eq!(expand_verb(ImageExpandLevel::Fit), "expand");
-        assert_eq!(expand_verb(ImageExpandLevel::Large), "expand");
-        assert_eq!(expand_verb(ImageExpandLevel::Huge), "reset");
+    fn expand_level_caps_grow_monotonically() {
+        assert!(
+            ImageExpandLevel::Fit.anchored_cap_rows() < ImageExpandLevel::Large.anchored_cap_rows()
+        );
+        assert!(
+            ImageExpandLevel::Large.anchored_cap_rows()
+                < ImageExpandLevel::Full.anchored_cap_rows()
+        );
+        // Full must stay under kitty's virtual-placement row limit (296) so
+        // stable fit rendering keeps working at every level.
+        assert!(ImageExpandLevel::Full.anchored_cap_rows() < 296);
     }
 
     #[test]
-    fn visible_label_line_shows_expand_badge() {
-        let line = image_label_line(&item(600, 400), true, ImageExpandLevel::Large);
+    fn visible_label_line_stays_single_purpose_without_expand_badge() {
+        // The label must stay a short single line: no expand badge, no dots.
+        let line = image_label_line(&item(600, 400), true, ImageExpandLevel::Fit);
         let text = jcode_tui_render::line_plain_text(&line);
-        assert!(text.contains("expand"), "expand badge missing: {text:?}");
-        assert!(text.contains("●○○"), "expand dots missing: {text:?}");
+        assert!(
+            !text.contains("expand") && !text.contains('○') && !text.contains('●'),
+            "label line must not carry an expand badge: {text:?}"
+        );
     }
 
     #[test]
@@ -935,23 +984,19 @@ mod tests {
         let line = image_label_line(&item(600, 400), false, ImageExpandLevel::Fit);
         let text = jcode_tui_render::line_plain_text(&line);
         assert!(text.contains("show image"), "show badge missing: {text:?}");
-        assert!(!text.contains("expand"), "hidden image must hide expand badge: {text:?}");
-    }
-
-    #[test]
-    fn expand_level_cycles_fit_large_huge() {
-        assert_eq!(ImageExpandLevel::Fit.next(), ImageExpandLevel::Large);
-        assert_eq!(ImageExpandLevel::Large.next(), ImageExpandLevel::Huge);
-        assert_eq!(ImageExpandLevel::Huge.next(), ImageExpandLevel::Fit);
+        assert!(
+            !text.contains("expand"),
+            "hidden image must hide expand badge: {text:?}"
+        );
     }
 
     #[test]
     fn expanded_level_makes_anchored_image_taller() {
         let fit = fit_geometry_anchored(1000, 4000, 100, ImageExpandLevel::Fit).0;
         let large = fit_geometry_anchored(1000, 4000, 100, ImageExpandLevel::Large).0;
-        let huge = fit_geometry_anchored(1000, 4000, 100, ImageExpandLevel::Huge).0;
+        let full = fit_geometry_anchored(1000, 4000, 100, ImageExpandLevel::Full).0;
         assert!(large > fit, "Large ({large}) should exceed Fit ({fit})");
-        assert!(huge > large, "Huge ({huge}) should exceed Large ({large})");
+        assert!(full > large, "Full ({full}) should exceed Large ({large})");
     }
 
     #[test]
@@ -979,6 +1024,115 @@ mod tests {
         register_payload(0xDEAD_BEEF, "image/png", "AAAA");
         let got = PAYLOAD_REGISTRY.lock().unwrap().get(0xDEAD_BEEF);
         assert_eq!(got, Some(("image/png".to_string(), "AAAA".to_string())));
+    }
+
+    /// The registry holds full base64 payloads, so it must be bounded by bytes
+    /// as well as entry count, and eviction must keep the byte accounting and
+    /// the map/order queue in sync. A single over-budget payload must survive
+    /// (or its image could never materialize).
+    #[test]
+    fn payload_registry_evicts_by_byte_budget() {
+        let mut reg = PayloadRegistry::new();
+        // Payloads sized so ~5 of them exceed the byte budget long before the
+        // 512-entry count bound.
+        let payload = "x".repeat(PAYLOAD_REGISTRY_MAX_BYTES / 4);
+        for id in 0..8u64 {
+            reg.insert(id, "image/png", &payload);
+            assert!(
+                reg.total_bytes <= PAYLOAD_REGISTRY_MAX_BYTES || reg.order.len() == 1,
+                "byte budget exceeded with {} entries / {} bytes",
+                reg.order.len(),
+                reg.total_bytes
+            );
+            assert_eq!(reg.map.len(), reg.order.len(), "map/order desynced");
+        }
+        // Newest payload always survives.
+        assert!(reg.get(7).is_some(), "newest payload must not be evicted");
+        // Oldest payloads were evicted to make room.
+        assert!(reg.get(0).is_none(), "oldest payload should be evicted");
+        // A single payload larger than the whole budget still gets stored.
+        let mut solo = PayloadRegistry::new();
+        let huge = "y".repeat(PAYLOAD_REGISTRY_MAX_BYTES + 1);
+        solo.insert(99, "image/png", &huge);
+        assert!(
+            solo.get(99).is_some(),
+            "an over-budget payload must stay resident so its image can draw"
+        );
+    }
+
+    /// Re-registering a payload must clear the prewarm failure memo so a fresh
+    /// payload gets its decode retries back.
+    #[test]
+    fn reregistering_payload_resets_prewarm_failures() {
+        const ID: u64 = 0xFA11_ED01;
+        for _ in 0..PREWARM_FAILURE_MAX_ATTEMPTS {
+            record_prewarm_failure(ID);
+        }
+        assert!(
+            prewarm_failures_exhausted(ID),
+            "failure memo should suspend prewarm after max attempts"
+        );
+        register_payload(ID, "image/png", "BBBB");
+        assert!(
+            !prewarm_failures_exhausted(ID),
+            "fresh payload registration must reset the failure memo"
+        );
+    }
+
+    /// Materialization must release the staged base64 payload (the decoded
+    /// bytes are persisted in the render cache + cache dir), and later
+    /// re-registrations for a materialized image must be no-ops so the payload
+    /// is never staged twice. Draws must keep working afterwards.
+    #[test]
+    fn materialize_releases_payload_and_blocks_restaging() {
+        // Distinct payload so this test's id cannot collide with others.
+        let id = mermaid::inline_image_id("image/png", MATERIALIZE_PNG_B64_RELEASE);
+        register_payload(id, "image/png", MATERIALIZE_PNG_B64_RELEASE);
+        assert!(
+            PAYLOAD_REGISTRY.lock().unwrap().get(id).is_some(),
+            "payload staged before materialization"
+        );
+        assert!(materialize_visible(id), "materialization succeeds");
+        assert!(
+            PAYLOAD_REGISTRY.lock().unwrap().get(id).is_none(),
+            "payload must be released after materialization"
+        );
+        // Prepare passes keep calling register_payload; it must stay empty.
+        register_payload(id, "image/png", MATERIALIZE_PNG_B64_RELEASE);
+        assert!(
+            PAYLOAD_REGISTRY.lock().unwrap().get(id).is_none(),
+            "re-registering a materialized image must not restage its payload"
+        );
+        // And the image must still be drawable without the payload.
+        assert!(
+            materialize_visible(id),
+            "materialized image stays visible after payload release"
+        );
+    }
+
+    /// 1x1 red PNG distinct from `MATERIALIZE_PNG_B64` so payload-release
+    /// tests own their image id.
+    const MATERIALIZE_PNG_B64_RELEASE: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
+    /// PayloadRegistry::remove must keep byte accounting and the eviction
+    /// queue in sync.
+    #[test]
+    fn payload_registry_remove_keeps_accounting_consistent() {
+        let mut reg = PayloadRegistry::new();
+        reg.insert(1, "image/png", "AAAA");
+        reg.insert(2, "image/png", "BBBBBBBB");
+        let bytes_with_both = reg.total_bytes;
+        reg.remove(1);
+        assert!(reg.get(1).is_none());
+        assert_eq!(reg.map.len(), reg.order.len(), "map/order desynced");
+        assert_eq!(
+            reg.total_bytes,
+            bytes_with_both - ("image/png".len() + "AAAA".len()),
+            "byte accounting must shrink by exactly the removed entry"
+        );
+        // Removing an absent id is a no-op.
+        reg.remove(42);
+        assert_eq!(reg.map.len(), 1);
     }
 
     /// 1x1 transparent PNG, used to exercise the real header parse.

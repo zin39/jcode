@@ -25,7 +25,9 @@ pub(crate) fn copy_badge_alt_badge() -> String {
 }
 
 fn copy_badge_shortcut_width(key_label: &str) -> usize {
-    UnicodeWidthStr::width(format!("{} [⇧] [{key_label}]", copy_badge_alt_badge()).as_str())
+    // Includes the single separator space rendered between the row content and
+    // the first badge.
+    UnicodeWidthStr::width(format!(" {} [⇧] [{key_label}]", copy_badge_alt_badge()).as_str())
 }
 
 /// Display width reserved for the inline expand-edit badge (`[Alt] [⇧] [E] …`).
@@ -86,74 +88,7 @@ fn resolve_tail_follow_scroll(max_scroll: usize, viewport_height: usize) -> usiz
     }
 }
 
-fn selection_bg_for(base_bg: Option<Color>) -> Color {
-    let fallback = rgb(32, 38, 48);
-    blend_color(base_bg.unwrap_or(fallback), accent_color(), 0.34)
-}
-
-fn selection_fg_for(base_fg: Option<Color>) -> Option<Color> {
-    base_fg.map(|fg| blend_color(fg, Color::White, 0.15))
-}
-
-fn highlight_line_selection(
-    line: &Line<'static>,
-    start_col: usize,
-    end_col: usize,
-) -> Line<'static> {
-    if end_col <= start_col {
-        return line.clone();
-    }
-
-    let mut rebuilt: Vec<Span<'static>> = Vec::new();
-    let mut current_text = String::new();
-    let mut current_style: Option<Style> = None;
-    let mut col = 0usize;
-
-    let flush = |rebuilt: &mut Vec<Span<'static>>, text: &mut String, style: &mut Option<Style>| {
-        if !text.is_empty() {
-            let span = match style.take() {
-                Some(style) => Span::styled(std::mem::take(text), style),
-                None => Span::raw(std::mem::take(text)),
-            };
-            rebuilt.push(span);
-        }
-    };
-
-    for span in &line.spans {
-        let mut selected_style = span.style.bg(selection_bg_for(span.style.bg));
-        if let Some(fg) = selection_fg_for(span.style.fg) {
-            selected_style = selected_style.fg(fg);
-        }
-        for ch in span.content.chars() {
-            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            let selected = if width == 0 {
-                col > start_col && col <= end_col
-            } else {
-                col < end_col && col.saturating_add(width) > start_col
-            };
-
-            let style = if selected { selected_style } else { span.style };
-
-            if current_style == Some(style) {
-                current_text.push(ch);
-            } else {
-                flush(&mut rebuilt, &mut current_text, &mut current_style);
-                current_text.push(ch);
-                current_style = Some(style);
-            }
-
-            col = col.saturating_add(width);
-        }
-    }
-
-    flush(&mut rebuilt, &mut current_text, &mut current_style);
-
-    Line {
-        spans: rebuilt,
-        style: line.style,
-        alignment: line.alignment,
-    }
-}
+use super::selection_highlight::highlight_line_selection;
 
 pub(crate) fn truncate_line_in_place_to_width(line: &mut Line<'static>, max_width: usize) {
     let mut remaining = max_width;
@@ -190,6 +125,75 @@ pub(crate) fn truncate_line_in_place_to_width(line: &mut Line<'static>, max_widt
     line.spans = kept;
 }
 
+/// Remove trailing plain spaces from a line so an appended badge sits exactly
+/// one separator space after the content, regardless of how the source line
+/// was rendered (code block headers end with a space, blockquote lines don't).
+pub(crate) fn trim_line_trailing_spaces(line: &mut Line<'static>) {
+    while let Some(last) = line.spans.last_mut() {
+        let trimmed = last.content.trim_end_matches(' ');
+        if trimmed.len() == last.content.len() {
+            break;
+        }
+        if trimmed.is_empty() {
+            line.spans.pop();
+        } else {
+            last.content = std::borrow::Cow::Owned(trimmed.to_string());
+            break;
+        }
+    }
+}
+
+/// Prepare a line to host an inline badge within `max_content_width` cells.
+/// When the content already fits, only trailing spaces are trimmed (the badge
+/// separator space is accounted for in the reserved width). When the content
+/// must be cut, end it with a dim ellipsis so the truncation is visible
+/// instead of silently swallowing words.
+pub(crate) fn truncate_line_for_copy_badge(line: &mut Line<'static>, max_content_width: usize) {
+    if line.width() <= max_content_width {
+        trim_line_trailing_spaces(line);
+        return;
+    }
+    truncate_line_in_place_to_width(line, max_content_width.saturating_sub(1));
+    trim_line_trailing_spaces(line);
+    line.spans
+        .push(Span::styled("…", Style::default().fg(dim_color())));
+}
+
+/// Choose the wrapped line that hosts an inline copy badge for a copy target
+/// spanning `block_start..block_end`.
+///
+/// Prefers the target's natural badge line (the `┌─ lang` header for code
+/// blocks), but when that line is too wide to fit the badge without cutting
+/// content (e.g. a full-width blockquote line), falls back to the first
+/// visible line of the block with enough free width. Returns the natural line
+/// when nothing fits; the caller then truncates with a visible ellipsis.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pick_copy_badge_line(
+    preferred: usize,
+    block_start: usize,
+    block_end: usize,
+    scroll: usize,
+    visible_end: usize,
+    visible_lines: &[Line<'_>],
+    content_width: usize,
+    reserved: usize,
+) -> usize {
+    let fits = |abs_line: usize| -> bool {
+        if abs_line < scroll || abs_line >= visible_end {
+            return false;
+        }
+        visible_lines
+            .get(abs_line - scroll)
+            .is_some_and(|line| line.width().saturating_add(reserved) <= content_width)
+    };
+    if fits(preferred) {
+        return preferred;
+    }
+    (block_start.max(scroll)..block_end.min(visible_end))
+        .find(|&abs_line| abs_line != preferred && fits(abs_line))
+        .unwrap_or(preferred)
+}
+
 pub(crate) fn copy_badge_reserved_width(
     key: char,
     copy_badge_ui: &crate::tui::app::CopyBadgeUiState,
@@ -197,8 +201,10 @@ pub(crate) fn copy_badge_reserved_width(
 ) -> usize {
     let mut reserved = copy_badge_shortcut_width("A");
     if copy_badge_ui.feedback_for_key(key, now).is_some() {
-        // Includes the trailing spacer inserted between feedback and the shortcut badges.
-        reserved = reserved.saturating_add(UnicodeWidthStr::width(" ✓ Copied! "));
+        // Feedback text plus the spacer between it and the shortcut badges.
+        // The separator before the feedback is already counted in
+        // `copy_badge_shortcut_width`.
+        reserved = reserved.saturating_add(UnicodeWidthStr::width("✓ Copied! "));
     }
     reserved
 }
@@ -535,7 +541,19 @@ pub(super) fn draw_messages(
             copied_notice: target.kind.copied_notice(),
             content: target.content.clone(),
         });
-        badge_assignments.push((target.badge_line, key));
+        // Prefer a line in the block with enough free width so the badge
+        // doesn't cut off content (full-width blockquote lines especially).
+        let badge_line = pick_copy_badge_line(
+            target.badge_line,
+            target.start_line,
+            target.end_line,
+            scroll,
+            visible_end,
+            &visible_lines,
+            content_area.width as usize,
+            copy_badge_reserved_width(key, &copy_badge_ui, copy_badge_now),
+        );
+        badge_assignments.push((badge_line, key));
     }
     reserve_copy_badge_margins(
         &mut margins,
@@ -693,7 +711,7 @@ pub(super) fn draw_messages(
                 };
                 let reserved = expand_badge_reserved_width(badge_text);
                 let max_content_width = (content_area.width as usize).saturating_sub(reserved);
-                truncate_line_in_place_to_width(line, max_content_width);
+                truncate_line_for_copy_badge(line, max_content_width);
 
                 // Reserve the badge's width in the info-widget margin profile so a
                 // floating widget (e.g. the KV cache panel) docks far enough left to
@@ -747,7 +765,11 @@ pub(super) fn draw_messages(
         if let Some(line) = visible_lines.get_mut(rel_idx) {
             let reserved = copy_badge_reserved_width(key, &copy_badge_ui, copy_badge_now);
             let max_content_width = (content_area.width as usize).saturating_sub(reserved);
-            truncate_line_in_place_to_width(line, max_content_width);
+            // Trims trailing spaces so the badge sits exactly one separator
+            // space after the content; ends with a dim ellipsis when the
+            // content genuinely has to be cut.
+            truncate_line_for_copy_badge(line, max_content_width);
+            line.spans.push(Span::raw(" "));
 
             let alt_style = if copy_badge_ui.alt_is_active(copy_badge_now) {
                 Style::default().fg(queued_color()).bold()
@@ -772,9 +794,9 @@ pub(super) fn draw_messages(
                     Style::default().fg(Color::Red).bold()
                 };
                 let feedback_text = if success {
-                    " ✓ Copied!"
+                    "✓ Copied!"
                 } else {
-                    " ✗ Copy failed"
+                    "✗ Copy failed"
                 };
                 line.spans.push(Span::styled(feedback_text, feedback_style));
                 line.spans.push(Span::raw(" "));
@@ -822,6 +844,31 @@ pub(super) fn draw_messages(
                         .unwrap_or_else(|| line.width())
                 };
                 *line = highlight_line_selection(line, start_col, end_col);
+            }
+        }
+    }
+
+    // Never draw image-placeholder marker text to the terminal. The marker
+    // row only exists to carry `(hash, rows, cols)` into the prepare step,
+    // which has already turned it into `prepared.image_regions`. Historically
+    // it was drawn styled black-on-black and relied on staying invisible, but
+    // terminal features can defeat that (kitty's translucent background /
+    // contrast compositing, selection highlighting), leaking raw
+    // "IIMG:<hash>:..." junk into the transcript whenever the image itself
+    // is not painted over it (cold cache after a reload, prewarm in flight,
+    // pinned mode). Video export is the one consumer that intentionally
+    // scans printable markers out of the buffer, so it keeps them.
+    if !crate::tui::mermaid::is_video_export_mode() {
+        let marker_start = prepared
+            .image_regions
+            .partition_point(|region| region.abs_line_idx < scroll);
+        for region in &prepared.image_regions[marker_start..] {
+            if region.abs_line_idx >= visible_end {
+                break;
+            }
+            let rel_idx = region.abs_line_idx - scroll;
+            if let Some(line) = visible_lines.get_mut(rel_idx) {
+                *line = Line::default();
             }
         }
     }

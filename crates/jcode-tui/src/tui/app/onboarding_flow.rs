@@ -42,6 +42,7 @@ pub(crate) enum ExternalCli {
     ClaudeCode,
     Pi,
     OpenCode,
+    Cursor,
 }
 
 impl ExternalCli {
@@ -51,18 +52,19 @@ impl ExternalCli {
             ExternalCli::ClaudeCode => "Claude Code",
             ExternalCli::Pi => "Pi",
             ExternalCli::OpenCode => "OpenCode",
+            ExternalCli::Cursor => "Cursor",
         }
     }
 }
 
-/// Single-screen multi-select review for importing detected external logins.
+/// Single-screen review for importing detected external logins.
 ///
 /// On a fresh install we may detect logins left behind by other tools (Codex,
-/// Claude Code, Copilot, ...). Rather than walking the user through one yes/no
-/// page per login, we show them ALL at once as a checkbox list. Every login is
-/// pre-checked (the safe, common default is "import everything"), the user can
-/// move a cursor and toggle any row off, and a single "Import" action commits
-/// all checked logins together. This collapses N pages into one screen.
+/// Claude Code, Copilot, OpenClaw, Hermes, ...). The default screen is a
+/// read-only SUMMARY: it lists everything we detected and lands the user on a
+/// preselected "Continue" pill that imports all of it with one Enter. A second
+/// "Choose what to import" pill switches to the per-login checkbox list
+/// (`choosing = true`) for users who want to opt logins out individually.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImportReview {
     /// All detected importable logins, in display order.
@@ -72,18 +74,25 @@ pub(crate) struct ImportReview {
     pub(crate) checked: Vec<bool>,
     /// Index of the row the cursor is currently on (for toggling/highlight).
     pub(crate) cursor: usize,
-    /// When `true`, focus is on the "Continue" pill (rendered above and below
-    /// the list) rather than on a login row. Moving down past the last row, or
-    /// up past the first row, lands here; pressing Enter commits the import.
-    /// This lets the user reach the commit action purely by arrowing, instead
-    /// of relying on the "Press Enter" instruction text.
+    /// Focus flag for the "Continue" pill.
+    ///
+    /// On the summary screen (`choosing == false`) this is `true` when the
+    /// "Continue" pill is focused (the default landing spot) and `false` when
+    /// the "Choose what to import" pill is focused.
+    ///
+    /// On the checkbox list (`choosing == true`) it is `true` while the
+    /// "Continue" pill above/below the rows is focused rather than a login row.
     pub(crate) continue_focused: bool,
+    /// `false` = the default summary screen (detected logins listed read-only,
+    /// Continue preselected). `true` = the per-login checkbox list.
+    pub(crate) choosing: bool,
     /// When the screen was first shown, for the single decision countdown.
     pub(crate) shown_at: Instant,
 }
 
 impl ImportReview {
-    /// Create a review for the given candidates with every login pre-checked.
+    /// Create a review for the given candidates with every login pre-checked,
+    /// starting on the summary screen with "Continue" preselected.
     /// Returns `None` if there are no candidates.
     pub(crate) fn new(
         candidates: Vec<crate::external_auth::ExternalAuthReviewCandidate>,
@@ -96,13 +105,23 @@ impl ImportReview {
             candidates,
             checked,
             cursor: 0,
-            continue_focused: false,
+            continue_focused: true,
+            choosing: false,
             shown_at: Instant::now(),
         })
     }
 
+    /// Switch from the summary screen to the per-login checkbox list, with the
+    /// cursor on the first login row.
+    pub(crate) fn enter_choose_mode(&mut self) {
+        self.choosing = true;
+        self.continue_focused = false;
+        self.cursor = 0;
+    }
+
     /// The candidate the cursor is currently on, if any. Returns `None` while
     /// the "Continue" pill is focused.
+    #[allow(dead_code)] // Accessor kept for the import-review UI; not wired to a caller yet.
     pub(crate) fn current(&self) -> Option<&crate::external_auth::ExternalAuthReviewCandidate> {
         if self.continue_focused {
             return None;
@@ -111,6 +130,7 @@ impl ImportReview {
     }
 
     /// 1-based position of the cursor row (for "1 of 3" display).
+    #[allow(dead_code)] // Accessor kept for the import-review UI; not wired to a caller yet.
     pub(crate) fn position(&self) -> usize {
         self.cursor + 1
     }
@@ -181,6 +201,7 @@ impl ImportReview {
 
     /// Whether the row under the cursor is currently checked. False while the
     /// "Continue" pill is focused.
+    #[allow(dead_code)] // Accessor kept for the import-review UI; not wired to a caller yet.
     pub(crate) fn current_checked(&self) -> bool {
         if self.continue_focused {
             return false;
@@ -398,19 +419,81 @@ impl OnboardingFlow {
 /// then OpenCode, but callers should not treat that as a preference.
 pub(crate) fn detect_external_cli_oauths() -> Vec<ExternalCli> {
     let mut found = Vec::new();
-    if external_oauth_present(&external_home_path(".codex/auth.json")) {
+    // Detection drives the first-run "continue where you left off" picker, whose
+    // only requirement is that resumable transcripts exist. We therefore treat a
+    // CLI as present when EITHER its OAuth login file exists OR it has written
+    // transcripts. The transcript fallback matters because some tools store
+    // credentials outside a plain JSON file (Claude Code and Cursor use the
+    // macOS keychain / a vscdb), so an auth-file-only check would silently hide
+    // sessions the user clearly has.
+    if external_oauth_present(&external_home_path(".codex/auth.json"))
+        || external_transcripts_present(&external_home_path(".codex/sessions"), "jsonl")
+    {
         found.push(ExternalCli::Codex);
     }
-    if external_oauth_present(&external_home_path(".claude/.credentials.json")) {
+    if external_oauth_present(&external_home_path(".claude/.credentials.json"))
+        || external_transcripts_present(&external_home_path(".claude/projects"), "jsonl")
+    {
         found.push(ExternalCli::ClaudeCode);
     }
-    if external_oauth_present(&external_home_path(".pi/agent/auth.json")) {
+    if external_oauth_present(&external_home_path(".pi/agent/auth.json"))
+        || external_transcripts_present(&external_home_path(".pi/agent/sessions"), "jsonl")
+    {
         found.push(ExternalCli::Pi);
     }
-    if external_oauth_present(&external_home_path(".local/share/opencode/auth.json")) {
+    if external_oauth_present(&external_home_path(".local/share/opencode/auth.json"))
+        || external_transcripts_present(
+            &external_home_path(".local/share/opencode/storage/session"),
+            "json",
+        )
+    {
         found.push(ExternalCli::OpenCode);
     }
+    // Cursor agent stores its credentials in a vscdb/keychain rather than a
+    // plain JSON file, so the reliable "can we resume?" signal is the presence
+    // of agent transcripts under ~/.cursor/projects. Fall back to the optional
+    // auth.json when transcripts have not been written yet.
+    if external_transcripts_present(&external_home_path(".cursor/projects"), "jsonl")
+        || external_oauth_present(&external_home_path(".cursor/auth.json"))
+        || external_oauth_present(&external_home_path(".config/cursor/auth.json"))
+    {
+        found.push(ExternalCli::Cursor);
+    }
     found
+}
+
+/// Whether `root` contains at least one file with the given extension, searched
+/// shallowly-recursively. Cheap directory walk used for resume detection.
+fn external_transcripts_present(root: &std::path::Path, ext: &str) -> bool {
+    fn walk(dir: &std::path::Path, ext: &str, budget: &mut u32) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            let path = entry.path();
+            if path.is_dir() {
+                if walk(&path, ext, budget) {
+                    return true;
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
+                return true;
+            }
+        }
+        false
+    }
+    if !root.exists() {
+        return false;
+    }
+    // Bound the walk so a pathological tree cannot stall onboarding.
+    let mut budget = 20_000u32;
+    walk(root, ext, &mut budget)
 }
 
 /// Resolve a path under the (sandbox-aware) external home so onboarding honors
@@ -495,6 +578,27 @@ mod tests {
         assert!(!external_oauth_present(&empty));
         assert!(external_oauth_present(&full));
         assert!(!external_oauth_present(&dir.join("missing.json")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_transcripts_present_finds_nested_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-onb-transcripts-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = dir.join("projects/demo/agent-transcripts/uuid");
+        std::fs::create_dir_all(&nested).unwrap();
+        // No matching files yet.
+        assert!(!external_transcripts_present(&dir, "jsonl"));
+        std::fs::write(nested.join("uuid.jsonl"), b"{}\n").unwrap();
+        assert!(external_transcripts_present(&dir, "jsonl"));
+        // A different extension should not match.
+        assert!(!external_transcripts_present(&dir, "json"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

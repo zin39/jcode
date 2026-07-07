@@ -5,21 +5,18 @@ mod bash;
 mod batch;
 mod bg;
 mod browser;
-mod codesearch;
 mod communicate;
 #[cfg(target_os = "macos")]
 mod computer;
 mod conversation_search;
 mod debug_socket;
+mod discover;
 mod edit;
-mod glob;
 mod gmail;
 mod goal;
-mod grep;
 mod invalid;
 mod load_tools;
 mod ls;
-mod lsp;
 pub mod mcp;
 mod memory;
 mod multiedit;
@@ -29,10 +26,12 @@ mod read;
 pub mod selfdev;
 pub(crate) mod serde_coerce;
 mod session_search;
+pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
 mod cheap_route_tool;
 mod task;
+mod task_state;
 mod todo;
 mod tournament;
 mod webfetch;
@@ -60,7 +59,7 @@ pub(crate) use session_search::spawn_recent_index_warmup;
 /// never expand anything.
 pub const CORE_FULL_SCHEMA_TOOLS: &[&str] = &[
     "bash", "read", "write", "edit", "multiedit", "ls", "glob", "grep",
-    "todo", "subagent", "load_tools",
+    "todo", "subagent", "load_tools", "update_task_state",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -223,8 +222,6 @@ impl Registry {
                 "apply_patch",
                 apply_patch::ApplyPatchTool::new,
             );
-            Self::insert_tool_timed(&mut m, &mut timings, "glob", glob::GlobTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "grep", grep::GrepTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "ls", ls::LsTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bash", bash::BashTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
@@ -248,14 +245,7 @@ impl Registry {
                 "websearch",
                 websearch::WebSearchTool::new,
             );
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "codesearch",
-                codesearch::CodeSearchTool::new,
-            );
             Self::insert_tool_timed(&mut m, &mut timings, "invalid", invalid::InvalidTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "lsp", lsp::LspTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
             Self::insert_tool_timed(
@@ -355,6 +345,21 @@ impl Registry {
             "load_tools",
             load_tools::LoadToolsTool::new(registry.clone()),
         );
+        Self::insert_tool(
+            &mut tools_map,
+            "update_task_state",
+            task_state::UpdateTaskStateTool::new(),
+        );
+        // Sponsored discovery is on by default (opt-out); when disabled the
+        // tool is never registered and no discovery endpoint is ever
+        // contacted.
+        if crate::config::config().sponsors.enabled {
+            Self::insert_tool(
+                &mut tools_map,
+                "discover_tools",
+                discover::DiscoverToolsTool::new(),
+            );
+        }
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 
         let write_start = std::time::Instant::now();
@@ -827,13 +832,32 @@ impl Registry {
         shared_pool: Option<std::sync::Arc<crate::mcp::SharedMcpPool>>,
         session_id: Option<String>,
     ) {
+        self.register_mcp_tools_for_dir(event_tx, shared_pool, session_id, None)
+            .await
+    }
+
+    /// Like [`Self::register_mcp_tools`], but resolves project-local MCP config
+    /// (`.mcp.json`, `.jcode/mcp.json`, `.claude/mcp.json`) against
+    /// `working_dir` instead of the server process cwd. Remote/client sessions
+    /// must pass their session working directory here (issue #420).
+    pub async fn register_mcp_tools_for_dir(
+        &self,
+        event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::protocol::ServerEvent>>,
+        shared_pool: Option<std::sync::Arc<crate::mcp::SharedMcpPool>>,
+        session_id: Option<String>,
+        working_dir: Option<std::path::PathBuf>,
+    ) {
         use crate::mcp::McpManager;
         use std::sync::Arc;
         use tokio::sync::RwLock;
 
         let mcp_manager = if let Some(pool) = shared_pool {
             let sid = session_id.unwrap_or_else(|| "unknown".to_string());
-            Arc::new(RwLock::new(McpManager::with_shared_pool(pool, sid)))
+            Arc::new(RwLock::new(McpManager::with_shared_pool_for_dir(
+                pool,
+                sid,
+                working_dir,
+            )))
         } else {
             Arc::new(RwLock::new(McpManager::new()))
         };
@@ -844,14 +868,29 @@ impl Registry {
         self.register("mcp".to_string(), Arc::new(mcp_tool) as Arc<dyn Tool>)
             .await;
 
-        // Check if we have servers to connect to
-        let server_count = {
+        // Check if we have enabled servers to connect to. Disabled servers stay
+        // configured (visible to the mcp management tool, connectable by name)
+        // but are not spawned, advertised, or shown as connecting (issue #436).
+        let (enabled_count, disabled_count) = {
             let manager = mcp_manager.read().await;
-            manager.config().servers.len()
+            let enabled = manager
+                .config()
+                .servers
+                .values()
+                .filter(|cfg| cfg.is_enabled())
+                .count();
+            (enabled, manager.config().servers.len() - enabled)
         };
 
-        if server_count > 0 {
-            crate::logging::info(&format!("MCP: Found {} server(s) in config", server_count));
+        if disabled_count > 0 {
+            crate::logging::info(&format!(
+                "MCP: {} disabled server(s) in config (kept, not spawned)",
+                disabled_count
+            ));
+        }
+
+        if enabled_count > 0 {
+            crate::logging::info(&format!("MCP: Found {} server(s) in config", enabled_count));
 
             // Send immediate "connecting" status so the TUI shows loading state
             // Server names with count 0 means "connecting..."
@@ -861,8 +900,9 @@ impl Registry {
                     manager
                         .config()
                         .servers
-                        .keys()
-                        .map(|name| format!("{}:0", name))
+                        .iter()
+                        .filter(|(_, cfg)| cfg.is_enabled())
+                        .map(|(name, _)| format!("{}:0", name))
                         .collect()
                 };
                 let _ = tx.send(crate::protocol::ServerEvent::McpStatus {
@@ -887,6 +927,7 @@ impl Registry {
                         .config()
                         .servers
                         .iter()
+                        .filter(|(_, cfg)| cfg.is_enabled())
                         .map(|(name, cfg)| (name.clone(), cfg.clone()))
                         .collect()
                 };

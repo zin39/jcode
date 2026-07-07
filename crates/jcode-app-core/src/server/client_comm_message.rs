@@ -108,6 +108,7 @@ pub(super) async fn handle_comm_message(
     channel: Option<String>,
     delivery: Option<CommDeliveryMode>,
     wake: Option<bool>,
+    tldr: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
     soft_interrupt_queues: &SessionInterruptQueues,
@@ -142,6 +143,13 @@ pub(super) async fn handle_comm_message(
             ),
             ("wake", wake.unwrap_or(false).to_string()),
             ("message_chars", message.chars().count().to_string()),
+            (
+                "tldr_chars",
+                tldr.as_deref()
+                    .map(|t| t.chars().count())
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
         ],
     );
     let swarm_id = swarm_id_for_session(&from_session, swarm_members).await;
@@ -219,6 +227,27 @@ pub(super) async fn handle_comm_message(
             members.keys().cloned().collect()
         };
 
+        // Broadcast-style sends are subtree-scoped: a sender reaches only the
+        // agents it (transitively) spawned, via the report-back ancestry chain.
+        // The swarm coordinator keeps whole-swarm reach as an escape hatch.
+        // This prevents one agent from producing a member-cap-sized
+        // notification storm (see docs/SWARM_TASK_GRAPH.md section 8a).
+        let subtree_broadcast_targets: Vec<String> = {
+            let members = swarm_members.read().await;
+            let sender_is_coordinator = members
+                .get(&from_session)
+                .is_some_and(|member| member.role == "coordinator");
+            swarm_session_ids
+                .iter()
+                .filter(|session_id| *session_id != &from_session)
+                .filter(|session_id| {
+                    sender_is_coordinator
+                        || super::swarm_is_self_or_ancestor(&members, &from_session, session_id)
+                })
+                .cloned()
+                .collect()
+        };
+
         let target_sessions: Vec<String> = if let Some(target) = resolved_to_session {
             vec![target]
         } else if let Some(ref channel_name) = channel {
@@ -229,11 +258,9 @@ pub(super) async fn handle_comm_message(
             };
             let channel_members = index.members(&swarm_id, channel_name);
             if channel_members.is_empty() {
-                swarm_session_ids
-                    .iter()
-                    .filter(|session_id| *session_id != &from_session)
-                    .cloned()
-                    .collect()
+                // No subscribers: fall back to the subtree scope rather than
+                // blasting the whole swarm.
+                subtree_broadcast_targets.clone()
             } else {
                 channel_members
                     .into_iter()
@@ -241,11 +268,7 @@ pub(super) async fn handle_comm_message(
                     .collect()
             }
         } else {
-            swarm_session_ids
-                .iter()
-                .filter(|session_id| *session_id != &from_session)
-                .cloned()
-                .collect()
+            subtree_broadcast_targets
         };
 
         let mut delivered_targets = 0usize;
@@ -273,6 +296,7 @@ pub(super) async fn handle_comm_message(
                         notification_type: NotificationType::Message {
                             scope: Some(scope.to_string()),
                             channel: channel.clone(),
+                            tldr: tldr.clone(),
                         },
                         message: notification_msg.clone(),
                     },

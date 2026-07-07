@@ -53,7 +53,9 @@ fn launches_after_third_do_not_show_generic_alignment_tip() {
     assert!(startup_hints_for_launch(&state).is_none());
 }
 
-#[cfg(any(test, target_os = "macos"))]
+// Asserts the macOS-specific spawn notice text (`Cmd+;` etc.), so it only makes
+// sense on macOS. On other platforms the notice uses different chords/wording.
+#[cfg(target_os = "macos")]
 #[test]
 fn first_three_launches_can_include_hotkey_notice_too() {
     let state = SetupHintsState {
@@ -74,45 +76,56 @@ fn first_three_launches_can_include_hotkey_notice_too() {
 }
 
 #[test]
-fn home_hotkey_shell_command_cds_home_with_no_args() {
-    let cmd = macos_terminal::hotkey_shell_command(
+fn default_resolved_hotkeys_match_legacy_three() {
+    // With no config, the resolver reproduces the historical three hotkeys.
+    let resolved = launch_hotkeys::resolve_launch_hotkeys(
+        &jcode_config_types::LaunchHotkeysConfig::default(),
         "/usr/local/bin/jcode",
-        macos_terminal::HotkeyTarget::Home,
         "/home/u/.jcode/hotkey/last_dir",
         "/home/u/.jcode/hotkey/last_repo",
     );
-    assert!(cmd.starts_with("cd \"$HOME\"; "));
-    // Home launch passes no extra subcommand to jcode.
-    assert!(!cmd.contains("self-dev"));
-    assert!(cmd.contains("'/usr/local/bin/jcode';"));
+    let chords: Vec<&str> = resolved.iter().map(|r| r.chord.as_str()).collect();
+    assert_eq!(chords, vec!["cmd+;", "cmd+'", "cmd+shift+'"]);
+
+    // Home launch passes no extra subcommand; self-dev passes `self-dev`.
+    let home = launch_hotkeys::shell_command_for(&resolved[0], "/usr/local/bin/jcode");
+    assert!(home.starts_with("cd \"$HOME\"; "));
+    assert!(!home.contains("self-dev"));
+
+    let last_dir = launch_hotkeys::shell_command_for(&resolved[1], "/usr/local/bin/jcode");
+    assert!(last_dir.contains("cat '/home/u/.jcode/hotkey/last_dir'"));
+    assert!(last_dir.contains("cd \"$HOME\""));
+
+    let selfdev = launch_hotkeys::shell_command_for(&resolved[2], "/usr/local/bin/jcode");
+    assert!(selfdev.contains("cat '/home/u/.jcode/hotkey/last_repo'"));
+    assert!(selfdev.contains("'/usr/local/bin/jcode' 'self-dev';"));
 }
 
 #[test]
-fn last_dir_hotkey_shell_command_reads_dir_file_at_launch() {
-    let cmd = macos_terminal::hotkey_shell_command(
+fn baked_repo_hotkey_cds_into_fixed_dir() {
+    // A config-baked per-repo hotkey opens a fixed directory.
+    let config = jcode_config_types::LaunchHotkeysConfig {
+        enabled: Some(true),
+        imported: true,
+        entries: vec![jcode_config_types::LaunchHotkeyEntry {
+            chord: "cmd+[".to_string(),
+            dir: "/Users/jeremy/jcode-github".to_string(),
+            label: "jcode-github".to_string(),
+            self_dev: false,
+        }],
+    };
+    let resolved = launch_hotkeys::resolve_launch_hotkeys(
+        &config,
         "/usr/local/bin/jcode",
-        macos_terminal::HotkeyTarget::LastDir,
         "/home/u/.jcode/hotkey/last_dir",
         "/home/u/.jcode/hotkey/last_repo",
     );
-    // Reads the recorded directory at fire time, falls back to $HOME.
-    assert!(cmd.contains("cat '/home/u/.jcode/hotkey/last_dir'"));
-    assert!(cmd.contains("cd \"$__jc_dir\""));
-    assert!(cmd.contains("cd \"$HOME\""));
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].chord, "cmd+[");
+    let cmd = launch_hotkeys::shell_command_for(&resolved[0], "/usr/local/bin/jcode");
+    assert!(cmd.contains("/Users/jeremy/jcode-github"));
+    assert!(cmd.contains("cd \"$HOME\""), "must keep a home fallback");
     assert!(!cmd.contains("self-dev"));
-}
-
-#[test]
-fn selfdev_hotkey_shell_command_reads_repo_file_and_passes_self_dev() {
-    let cmd = macos_terminal::hotkey_shell_command(
-        "/usr/local/bin/jcode",
-        macos_terminal::HotkeyTarget::SelfDev,
-        "/home/u/.jcode/hotkey/last_dir",
-        "/home/u/.jcode/hotkey/last_repo",
-    );
-    assert!(cmd.contains("cat '/home/u/.jcode/hotkey/last_repo'"));
-    // Self-dev launch invokes the `self-dev` subcommand.
-    assert!(cmd.contains("'/usr/local/bin/jcode' 'self-dev';"));
 }
 
 #[test]
@@ -130,52 +143,41 @@ fn should_record_last_dir_skips_home_only() {
     assert!(super::should_record_last_dir(home, None));
 }
 
-#[test]
-fn hotkey_targets_have_distinct_scripts_and_chords() {
-    use macos_terminal::HotkeyTarget;
-    let scripts: Vec<&str> = HotkeyTarget::ALL
-        .iter()
-        .map(|t| t.script_file_name())
-        .collect();
-    let chords: Vec<&str> = HotkeyTarget::ALL.iter().map(|t| t.chord_label()).collect();
-    // No two targets share a script file or a chord label.
-    for i in 0..scripts.len() {
-        for j in (i + 1)..scripts.len() {
-            assert_ne!(scripts[i], scripts[j], "scripts must be unique");
-            assert_ne!(chords[i], chords[j], "chords must be unique");
-        }
-    }
-}
-
 #[cfg(target_os = "macos")]
 #[test]
-fn install_writes_all_three_executable_launch_scripts() {
-    use macos_terminal::HotkeyTarget;
+fn install_writes_executable_scripts_and_plan() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    super::write_hotkey_launch_scripts(
-        dir.path(),
-        MacTerminalKind::Ghostty,
+    let resolved = launch_hotkeys::resolve_launch_hotkeys(
+        &jcode_config_types::LaunchHotkeysConfig::default(),
         "/usr/local/bin/jcode",
         "/home/u/.jcode/hotkey/last_dir",
         "/home/u/.jcode/hotkey/last_repo",
+    );
+    let plan = super::write_hotkey_launch_scripts(
+        dir.path(),
+        MacTerminalKind::Ghostty,
+        "/usr/local/bin/jcode",
+        &resolved,
     )
     .expect("scripts should write");
 
-    for target in HotkeyTarget::ALL {
-        let path = dir.path().join(target.script_file_name());
-        let body = std::fs::read_to_string(&path).expect("script exists");
-        assert!(body.starts_with("#!/bin/bash"), "{target:?} is a bash script");
-        // Executable bit set so the listener can `sh script` / `open` it.
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o111, 0o111, "{target:?} should be executable");
+    // One plan entry per resolved hotkey, each pointing at an executable bash
+    // script that exists on disk.
+    assert_eq!(plan.len(), resolved.len());
+    for entry in &plan {
+        let path = std::path::Path::new(&entry.script);
+        let body = std::fs::read_to_string(path).expect("script exists");
+        assert!(body.starts_with("#!/bin/bash"));
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "script should be executable");
     }
 
-    // Only the self-dev script invokes the self-dev subcommand.
-    let selfdev = std::fs::read_to_string(dir.path().join("launch_jcode_selfdev.sh")).unwrap();
+    // Only the self-dev (3rd) script invokes the self-dev subcommand.
+    let selfdev = std::fs::read_to_string(&plan[2].script).unwrap();
     assert!(selfdev.contains("self-dev"));
-    let home = std::fs::read_to_string(dir.path().join("launch_jcode_home.sh")).unwrap();
+    let home = std::fs::read_to_string(&plan[0].script).unwrap();
     assert!(!home.contains("self-dev"));
 }
 
@@ -450,7 +452,10 @@ fn glyph_safe_notice_shows_once_then_debounces() {
 
     // First launch in a fragile terminal: disclose the tradeoff and persist.
     let (hint, changed) = glyph_safe_notice_for(true, &mut state);
-    assert!(hint.is_some(), "should disclose glyph-safe mode on first launch");
+    assert!(
+        hint.is_some(),
+        "should disclose glyph-safe mode on first launch"
+    );
     assert!(changed, "state should be marked shown");
     assert!(state.glyph_safe_notice_shown);
     let (title, body) = hint.unwrap().display_message.unwrap();
@@ -468,7 +473,76 @@ fn glyph_safe_notice_shows_once_then_debounces() {
 fn glyph_safe_notice_silent_on_robust_terminals() {
     let mut state = SetupHintsState::default();
     let (hint, changed) = glyph_safe_notice_for(false, &mut state);
-    assert!(hint.is_none(), "no disclosure when glyph-safe mode is inactive");
+    assert!(
+        hint.is_none(),
+        "no disclosure when glyph-safe mode is inactive"
+    );
     assert!(!changed);
     assert!(!state.glyph_safe_notice_shown);
+}
+
+fn row(chord: &str, label: &str, self_dev: bool) -> LaunchHotkeyRow {
+    LaunchHotkeyRow {
+        chord: chord.to_string(),
+        display: keymap::KeyChord::parse(chord)
+            .map(|c| c.display_symbols())
+            .unwrap_or_else(|| chord.to_string()),
+        label: label.to_string(),
+        cwd_display: format!("/repos/{label}"),
+        self_dev,
+    }
+}
+
+#[test]
+fn launch_hotkey_notice_lists_all_unlearned_bindings() {
+    let rows = vec![
+        row("cmd+;", "home", false),
+        row("cmd+'", "last project", false),
+        row("cmd+shift+'", "self-dev", true),
+    ];
+    let usage = std::collections::HashMap::new();
+    let lines = launch_hotkey_notice_lines(&rows, &usage, 1).expect("should show all bindings");
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].starts_with("⌘; → home (/repos/home)"));
+    assert!(lines[2].ends_with("[self-dev]"));
+}
+
+#[test]
+fn launch_hotkey_notice_hides_individually_learned_bindings() {
+    let rows = vec![
+        row("cmd+;", "home", false),
+        row("cmd+'", "last project", false),
+    ];
+    let mut usage = std::collections::HashMap::new();
+    // cmd+; used enough to be considered learned; cmd+' still new.
+    usage.insert("cmd+;".to_string(), LAUNCH_HOTKEY_LEARNED_USES);
+    let lines = launch_hotkey_notice_lines(&rows, &usage, 3).expect("one binding still new");
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].starts_with("⌘' → last project"));
+}
+
+#[test]
+fn launch_hotkey_notice_stops_once_learned_and_experienced() {
+    let rows = vec![
+        row("cmd+;", "home", false),
+        row("cmd+'", "last project", false),
+    ];
+    let mut usage = std::collections::HashMap::new();
+    usage.insert("cmd+;".to_string(), LAUNCH_HOTKEY_LEARNED_USES);
+    // Learned at least one binding AND launched enough overall -> stop entirely,
+    // even though cmd+' was never used.
+    assert!(
+        launch_hotkey_notice_lines(&rows, &usage, LAUNCH_HOTKEY_NOTICE_MIN_LAUNCHES_TO_STOP)
+            .is_none()
+    );
+}
+
+#[test]
+fn launch_hotkey_notice_keeps_showing_for_new_user_with_many_launches() {
+    // Many launches but no binding learned yet: keep showing so they can adopt it.
+    let rows = vec![row("cmd+;", "home", false)];
+    let usage = std::collections::HashMap::new();
+    let lines =
+        launch_hotkey_notice_lines(&rows, &usage, 50).expect("never learned -> keep showing");
+    assert_eq!(lines.len(), 1);
 }

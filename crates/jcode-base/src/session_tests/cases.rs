@@ -146,6 +146,7 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
         covers_up_to_turn: 7,
         original_turn_count: 9,
         compacted_count: 7,
+        tool_cleared_up_to: None,
     });
 
     let _ = session.provider_messages();
@@ -737,6 +738,7 @@ fn test_save_persists_compaction_state() -> Result<()> {
         covers_up_to_turn: 8,
         original_turn_count: 8,
         compacted_count: 8,
+        tool_cleared_up_to: None,
     });
 
     session.save()?;
@@ -892,6 +894,189 @@ fn test_save_checkpoints_after_full_mutation_and_clears_journal() -> Result<()> 
 }
 
 #[test]
+fn test_journal_replay_skips_corrupt_line_and_keeps_tail() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-journal-corrupt-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_journal_corrupt_tail_test";
+    let mut session = Session::create_with_id(
+        session_id.to_string(),
+        None,
+        Some("corrupt journal test".to_string()),
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    // Two good journal entries.
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "third".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    // Corrupt the middle line (torn write) but keep the final line intact.
+    let journal_path = session_journal_path(session_id)?;
+    let journal = std::fs::read_to_string(&journal_path)?;
+    let lines: Vec<&str> = journal.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let torn = &lines[0][..lines[0].len() / 2];
+    std::fs::write(&journal_path, format!("{}\n{}\n", torn, lines[1]))?;
+
+    // The last prompt ("third") must survive even though an earlier journal
+    // line is unparseable.
+    let loaded = Session::load(session_id)?;
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[0].content_preview(), "first");
+    assert_eq!(loaded.messages[1].content_preview(), "third");
+
+    let remote = Session::load_for_remote_startup(session_id)?;
+    assert_eq!(remote.messages.len(), 2);
+    assert_eq!(remote.messages[1].content_preview(), "third");
+    Ok(())
+}
+
+#[test]
+fn test_journal_replay_salvages_glued_entries_on_torn_line() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-journal-glued-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_journal_glued_test";
+    let mut session = Session::create_with_id(
+        session_id.to_string(),
+        None,
+        Some("glued journal test".to_string()),
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "third".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    // Simulate a torn append glued to the next complete entry: half of entry 1
+    // followed (no newline) by all of entry 2 on the same line.
+    let journal_path = session_journal_path(session_id)?;
+    let journal = std::fs::read_to_string(&journal_path)?;
+    let lines: Vec<&str> = journal.lines().collect();
+    assert_eq!(lines.len(), 2);
+    let torn = &lines[0][..lines[0].len() / 2];
+    std::fs::write(&journal_path, format!("{}{}\n", torn, lines[1]))?;
+
+    // The glued complete entry ("third") must be salvaged from the corrupt line.
+    let loaded = Session::load(session_id)?;
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[0].content_preview(), "first");
+    assert_eq!(loaded.messages[1].content_preview(), "third");
+    Ok(())
+}
+
+#[test]
+fn test_corrupt_journal_heals_via_checkpoint_on_next_save() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-journal-heal-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_journal_heal_test";
+    let mut session = Session::create_with_id(
+        session_id.to_string(),
+        None,
+        Some("heal journal test".to_string()),
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    // Corrupt the only journal line.
+    let journal_path = session_journal_path(session_id)?;
+    let journal = std::fs::read_to_string(&journal_path)?;
+    let line = journal.lines().next().unwrap_or_default();
+    std::fs::write(&journal_path, &line[..line.len() / 2])?;
+
+    let mut loaded = Session::load(session_id)?;
+    assert_eq!(loaded.messages.len(), 1);
+
+    // A forensic backup of the corrupt journal is kept.
+    let backup_path = journal_path.with_extension("corrupt.jsonl");
+    assert!(backup_path.exists());
+
+    // The next save checkpoints a full snapshot and removes the corrupt journal,
+    // so the bad line is never replayed again.
+    loaded.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "after heal".to_string(),
+            cache_control: None,
+        }],
+    );
+    loaded.save()?;
+    assert!(!journal_path.exists());
+
+    let reloaded = Session::load(session_id)?;
+    assert_eq!(reloaded.messages.len(), 2);
+    assert_eq!(reloaded.messages[1].content_preview(), "after heal");
+    Ok(())
+}
+
+#[test]
 fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
     let mut session = Session::create_with_id(
         "session_redact_persist_test".to_string(),
@@ -962,6 +1147,10 @@ fn test_redacted_for_export_redacts_replay_events() -> Result<()> {
         live_attachments: None,
         status_age_secs: None,
         output_tail: None,
+        report_back_to_session_id: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        task_label: None,
     }]);
     session.record_swarm_plan_event(
         "swarm_test".to_string(),
@@ -1064,6 +1253,82 @@ fn test_render_messages_honors_system_display_role_override() {
     assert_eq!(rendered.len(), 1);
     assert_eq!(rendered[0].role, "system");
     assert!(rendered[0].content.contains("Background Task Completed"));
+}
+
+#[test]
+fn test_render_messages_shows_auto_poke_continuations_as_system_not_user() {
+    // Regression: auto-poke continuations ("You have N incomplete todos...",
+    // "All todos are done. Todo confidence summary:...") are persisted as
+    // Role::User so the model continues the turn, but the live UI hides them.
+    // On reload/resume/remote attach the renderer must not resurrect them as
+    // the user's last prompt.
+    let mut session = Session::create_with_id(
+        "session_render_auto_poke_test".to_string(),
+        None,
+        Some("auto poke render test".to_string()),
+    );
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "please fix the login bug".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "Working on it.".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: crate::todo::build_auto_poke_message(2),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: format!(
+                "{} core work 95%",
+                crate::todo::TODO_CONFIDENCE_SUMMARY_PREFIX
+            ),
+            cache_control: None,
+        }],
+    );
+
+    let rendered = render_messages(&session);
+    let user_messages: Vec<_> = rendered
+        .iter()
+        .filter(|message| message.role == "user")
+        .collect();
+    assert_eq!(
+        user_messages.len(),
+        1,
+        "only the real prompt should render as a user message: {rendered:?}"
+    );
+    assert_eq!(user_messages[0].content, "please fix the login bug");
+
+    let system_contents: Vec<_> = rendered
+        .iter()
+        .filter(|message| message.role == "system")
+        .map(|message| message.content.as_str())
+        .collect();
+    assert!(
+        system_contents
+            .iter()
+            .any(|content| content.contains("incomplete todo")),
+        "auto-poke continuation should render as system: {rendered:?}"
+    );
+    assert!(
+        system_contents
+            .iter()
+            .any(|content| content.contains("Todo confidence summary")),
+        "confidence summary should render as system: {rendered:?}"
+    );
 }
 
 #[test]
@@ -1359,6 +1624,7 @@ fn test_render_messages_shows_recent_compacted_history_by_default() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        tool_cleared_up_to: None,
     });
 
     let rendered = render_messages(&session);
@@ -1408,6 +1674,7 @@ fn test_render_messages_can_expand_compacted_history_window() {
         covers_up_to_turn: 2,
         original_turn_count: 2,
         compacted_count: 2,
+        tool_cleared_up_to: None,
     });
 
     // A small compacted prefix (few renderable messages, a single turn) must
@@ -1484,6 +1751,7 @@ fn test_compacted_history_truncates_only_when_long_and_many_turns() {
         covers_up_to_turn: prefix_turns,
         original_turn_count: prefix_turns,
         compacted_count,
+        tool_cleared_up_to: None,
     });
 
     let total_renderable = prefix_turns * 5; // 100
@@ -1553,6 +1821,7 @@ fn test_compacted_history_never_truncates_single_long_turn() {
         covers_up_to_turn: 1,
         original_turn_count: 1,
         compacted_count,
+        tool_cleared_up_to: None,
     });
 
     // Even with a tiny requested window, a single long turn is never truncated.
@@ -1613,6 +1882,7 @@ fn test_compacted_history_window_counts_renderable_messages_not_hidden_reminders
         covers_up_to_turn: 4,
         original_turn_count: 4,
         compacted_count: 4,
+        tool_cleared_up_to: None,
     });
 
     let (rendered, _images, info) = render_messages_and_images_with_compacted_history(&session, 1);
@@ -1673,9 +1943,19 @@ fn test_render_messages_and_images_share_tool_resolution_and_labels() {
     );
 
     let (rendered, images) = render_messages_and_images(&session);
-    assert_eq!(rendered.len(), 2);
+    // The `[Attached image associated with the preceding tool result: ...]`
+    // text block is synthetic image metadata, not a visible message. It must be
+    // folded into the image label and never rendered as a (user) message,
+    // otherwise it leaks out as a bogus "last prompt".
+    assert_eq!(rendered.len(), 1);
     assert_eq!(rendered[0].role, "tool");
     assert_eq!(rendered[0].content, "rendered image");
+    assert!(
+        !rendered
+            .iter()
+            .any(|m| m.content.contains("Attached image associated")),
+        "attached-image label must not render as its own message"
+    );
     assert_eq!(
         rendered[0]
             .tool_data
@@ -1973,4 +2253,103 @@ fn gold_mode_enabled_roundtrips() -> anyhow::Result<()> {
     let loaded = Session::load(&s.id).unwrap();
     assert_eq!(loaded.gold_mode_enabled, Some(true));
     Ok(())
+}
+
+/// Issue #432: `/rewind N` must interpret N against the same numbered list the
+/// TUI shows, even in tool-heavy sessions where stored user-role tool-result
+/// messages vastly outnumber real prompts.
+#[test]
+fn test_rewind_targets_match_rendered_transcript_numbering() {
+    let mut session = Session::create_with_id(
+        "session_rewind_numbering_test".to_string(),
+        None,
+        Some("rewind numbering".to_string()),
+    );
+
+    // Turn 1: prompt, assistant tool call, tool result, assistant answer.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "prompt-1".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "tool_1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
+        }],
+    );
+    // Tool results are stored as user-role messages; the old index mapping
+    // counted them as rewind targets even though the UI never numbers them.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::ToolResult {
+            tool_use_id: "tool_1".to_string(),
+            content: "file-a file-b".to_string(),
+            is_error: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "answer-1".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    // Turn 2: prompt + answer.
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "prompt-2".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "answer-2".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    // The numbered /rewind list shows user/assistant transcript entries only:
+    // 1 prompt-1, 2 answer-1, 3 prompt-2, 4 answer-2.
+    let rendered_targets: Vec<String> = render_messages(&session)
+        .into_iter()
+        .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
+        .map(|m| m.content)
+        .collect();
+    assert_eq!(
+        rendered_targets,
+        ["prompt-1", "answer-1", "prompt-2", "answer-2"]
+    );
+
+    let targets = session.rewind_target_stored_indices();
+    assert_eq!(session.rewind_target_count(), 4);
+    assert_eq!(targets.len(), 4);
+
+    // Rewinding to entry 3 ("prompt-2") must keep everything through the
+    // stored prompt-2 message (stored index 4 → len 5) and drop answer-2.
+    assert_eq!(targets[2], 4);
+    let mut rewound = session.clone();
+    rewound.truncate_messages(targets[2] + 1);
+    let remaining: Vec<String> = render_messages(&rewound)
+        .into_iter()
+        .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
+        .map(|m| m.content)
+        .collect();
+    assert_eq!(remaining, ["prompt-1", "answer-1", "prompt-2"]);
+
+    // The old stored-message mapping counted the tool result as target 3,
+    // which would have chopped the transcript mid-turn (the #432 bug).
+    assert_eq!(
+        session.stored_len_for_visible_conversation_message(3),
+        Some(3),
+        "sanity: raw stored counting diverges, which is why rewind must not use it"
+    );
 }

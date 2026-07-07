@@ -18,7 +18,6 @@ use serde_json::Value;
 use state_support::*;
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const TELEMETRY_ENDPOINT: &str = "https://jcode-telemetry.jeremyhuang55555.workers.dev/v1/event";
@@ -27,15 +26,12 @@ const BLOCKING_INSTALL_TIMEOUT: Duration = Duration::from_millis(1200);
 const BLOCKING_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(800);
 const TELEMETRY_SCHEMA_VERSION: u32 = 5;
 
+// Error/switch counters live inside `SessionTelemetry` (guarded by
+// `SESSION_STATE`) so increments, snapshots, and resets all happen under a
+// single critical section and are naturally scoped to the owning session.
+// Keeping them in a separate lock-free atomic domain previously let trailing
+// `record_*` calls drift across session boundaries (see issue #394).
 static SESSION_STATE: Mutex<Option<SessionTelemetry>> = Mutex::new(None);
-
-static ERROR_PROVIDER_TIMEOUT: AtomicU32 = AtomicU32::new(0);
-static ERROR_AUTH_FAILED: AtomicU32 = AtomicU32::new(0);
-static ERROR_TOOL_ERROR: AtomicU32 = AtomicU32::new(0);
-static ERROR_MCP_ERROR: AtomicU32 = AtomicU32::new(0);
-static ERROR_RATE_LIMITED: AtomicU32 = AtomicU32::new(0);
-static PROVIDER_SWITCHES: AtomicU32 = AtomicU32::new(0);
-static MODEL_SWITCHES: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone)]
 struct TurnTelemetry {
@@ -185,6 +181,15 @@ struct SessionTelemetry {
     current_turn: Option<TurnTelemetry>,
     resumed_session: bool,
     start_event_sent: bool,
+    // Error/switch counters scoped to this session (see issue #394). Kept here
+    // so all updates and reads stay under the SESSION_STATE lock.
+    error_provider_timeout: u32,
+    error_auth_failed: u32,
+    error_tool_error: u32,
+    error_mcp_error: u32,
+    error_rate_limited: u32,
+    provider_switches: u32,
+    model_switches: u32,
 }
 
 impl TurnTelemetry {
@@ -903,23 +908,13 @@ fn send_payload(payload: serde_json::Value, mode: DeliveryMode) -> bool {
     }
 }
 
-fn reset_counters() {
-    ERROR_PROVIDER_TIMEOUT.store(0, Ordering::Relaxed);
-    ERROR_AUTH_FAILED.store(0, Ordering::Relaxed);
-    ERROR_TOOL_ERROR.store(0, Ordering::Relaxed);
-    ERROR_MCP_ERROR.store(0, Ordering::Relaxed);
-    ERROR_RATE_LIMITED.store(0, Ordering::Relaxed);
-    PROVIDER_SWITCHES.store(0, Ordering::Relaxed);
-    MODEL_SWITCHES.store(0, Ordering::Relaxed);
-}
-
-fn current_error_counts() -> ErrorCounts {
+fn current_error_counts(state: &SessionTelemetry) -> ErrorCounts {
     ErrorCounts {
-        provider_timeout: ERROR_PROVIDER_TIMEOUT.load(Ordering::Relaxed),
-        auth_failed: ERROR_AUTH_FAILED.load(Ordering::Relaxed),
-        tool_error: ERROR_TOOL_ERROR.load(Ordering::Relaxed),
-        mcp_error: ERROR_MCP_ERROR.load(Ordering::Relaxed),
-        rate_limited: ERROR_RATE_LIMITED.load(Ordering::Relaxed),
+        provider_timeout: state.error_provider_timeout,
+        auth_failed: state.error_auth_failed,
+        tool_error: state.error_tool_error,
+        mcp_error: state.error_mcp_error,
+        rate_limited: state.error_rate_limited,
     }
 }
 
@@ -948,8 +943,8 @@ fn session_has_meaningful_activity(state: &SessionTelemetry, errors: &ErrorCount
         || state.feature_selfdev_used
         || state.feature_background_used
         || state.feature_subagent_used
-        || PROVIDER_SWITCHES.load(Ordering::Relaxed) > 0
-        || MODEL_SWITCHES.load(Ordering::Relaxed) > 0
+        || state.provider_switches > 0
+        || state.model_switches > 0
         || has_any_errors(errors)
 }
 
@@ -1482,11 +1477,17 @@ fn begin_session_with_mode(
         current_turn: None,
         resumed_session,
         start_event_sent: false,
+        error_provider_timeout: 0,
+        error_auth_failed: 0,
+        error_tool_error: 0,
+        error_mcp_error: 0,
+        error_rate_limited: 0,
+        provider_switches: 0,
+        model_switches: 0,
     };
     if let Ok(mut guard) = SESSION_STATE.lock() {
         *guard = Some(state);
     }
-    reset_counters();
 }
 
 pub fn record_turn() {
@@ -1661,6 +1662,16 @@ pub fn record_token_usage(
 }
 
 pub fn record_error(category: ErrorCategory) {
+    /// Per-session ceiling for each error counter. A runaway retry loop once
+    /// logged 18k+ auth failures in one session, which distorted daily sums
+    /// (one session looked like a fleet-wide auth outage). Past a few hundred
+    /// occurrences the count carries no extra diagnostic signal, only skew.
+    const ERROR_COUNT_SESSION_CAP: u32 = 500;
+
+    fn capped_increment(counter: &mut u32) {
+        *counter = counter.saturating_add(1).min(ERROR_COUNT_SESSION_CAP);
+    }
+
     if let Ok(mut guard) = SESSION_STATE.lock()
         && let Some(ref mut state) = *guard
     {
@@ -1668,22 +1679,22 @@ pub fn record_error(category: ErrorCategory) {
         if let Some(turn) = state.current_turn.as_mut() {
             update_turn_activity_timestamp(turn, Instant::now());
         }
-    }
-    match category {
-        ErrorCategory::ProviderTimeout => {
-            ERROR_PROVIDER_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-        }
-        ErrorCategory::AuthFailed => {
-            ERROR_AUTH_FAILED.fetch_add(1, Ordering::Relaxed);
-        }
-        ErrorCategory::ToolError => {
-            ERROR_TOOL_ERROR.fetch_add(1, Ordering::Relaxed);
-        }
-        ErrorCategory::McpError => {
-            ERROR_MCP_ERROR.fetch_add(1, Ordering::Relaxed);
-        }
-        ErrorCategory::RateLimited => {
-            ERROR_RATE_LIMITED.fetch_add(1, Ordering::Relaxed);
+        match category {
+            ErrorCategory::ProviderTimeout => {
+                capped_increment(&mut state.error_provider_timeout);
+            }
+            ErrorCategory::AuthFailed => {
+                capped_increment(&mut state.error_auth_failed);
+            }
+            ErrorCategory::ToolError => {
+                capped_increment(&mut state.error_tool_error);
+            }
+            ErrorCategory::McpError => {
+                capped_increment(&mut state.error_mcp_error);
+            }
+            ErrorCategory::RateLimited => {
+                capped_increment(&mut state.error_rate_limited);
+            }
         }
     }
     maybe_emit_session_start();
@@ -1697,8 +1708,8 @@ pub fn record_provider_switch() {
         if let Some(turn) = state.current_turn.as_mut() {
             update_turn_activity_timestamp(turn, Instant::now());
         }
+        state.provider_switches = state.provider_switches.saturating_add(1);
     }
-    PROVIDER_SWITCHES.fetch_add(1, Ordering::Relaxed);
     maybe_emit_session_start();
 }
 
@@ -1710,8 +1721,8 @@ pub fn record_model_switch() {
         if let Some(turn) = state.current_turn.as_mut() {
             update_turn_activity_timestamp(turn, Instant::now());
         }
+        state.model_switches = state.model_switches.saturating_add(1);
     }
-    MODEL_SWITCHES.fetch_add(1, Ordering::Relaxed);
     maybe_emit_session_start();
 }
 

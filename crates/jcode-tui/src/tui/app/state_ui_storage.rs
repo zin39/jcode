@@ -98,6 +98,43 @@ fn compact_tool_input_for_display(name: &str, input: &serde_json::Value) -> serd
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
         )]),
+        // Web/search tools: keep the URL/query so the transcript row still
+        // shows what was fetched or searched after storage compaction.
+        "webfetch" => obj(vec![(
+            "url",
+            input
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
+                .unwrap_or(serde_json::Value::Null),
+        )]),
+        "websearch" | "codesearch" | "session_search" | "conversation_search" => obj(vec![(
+            "query",
+            input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|s| serde_json::Value::String(crate::util::truncate_str(s, 200).to_string()))
+                .unwrap_or(serde_json::Value::Null),
+        )]),
+        "open" => obj(vec![
+            (
+                "action",
+                input
+                    .get("action")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "target",
+                input
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .map(|s| {
+                        serde_json::Value::String(crate::util::truncate_str(s, 200).to_string())
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+        ]),
         "grep" => obj(vec![
             (
                 "pattern",
@@ -170,6 +207,72 @@ fn compact_tool_input_for_display(name: &str, input: &serde_json::Value) -> serd
                     .and_then(|v| v.as_str())
                     .map(|s| {
                         serde_json::Value::String(crate::util::truncate_str(s, 240).to_string())
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+        ]),
+        // Swarm rows: keep the action and routing fields so the transcript
+        // summary ("spawn '...'", "dm → worker-1", ...) survives compaction.
+        "swarm" => obj(vec![
+            (
+                "action",
+                input
+                    .get("action")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "to_session",
+                input
+                    .get("to_session")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "target_session",
+                input
+                    .get("target_session")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "channel",
+                input
+                    .get("channel")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "working_dir",
+                input
+                    .get("working_dir")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "task_id",
+                input
+                    .get("task_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "prompt",
+                input
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| {
+                        serde_json::Value::String(crate::util::truncate_str(s, 160).to_string())
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "message",
+                input
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(|s| {
+                        serde_json::Value::String(crate::util::truncate_str(s, 160).to_string())
                     })
                     .unwrap_or(serde_json::Value::Null),
             ),
@@ -268,4 +371,131 @@ pub(super) fn infer_spawned_session_startup_hints(
     };
 
     Some((format!("{} starting", label), (label.to_string(), body)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_message(name: &str, input: serde_json::Value) -> DisplayMessage {
+        DisplayMessage {
+            role: "tool".to_string(),
+            content: "output".to_string(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: Some(crate::message::ToolCall {
+                id: "call-1".to_string(),
+                name: name.to_string(),
+                input: input.clone(),
+                intent: crate::message::ToolCall::intent_from_input(&input),
+                thought_signature: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_webfetch_url_for_transcript_summary() {
+        let mut message = tool_message(
+            "webfetch",
+            serde_json::json!({
+                "url": "https://example.com/docs/api",
+                "format": "markdown",
+                "timeout": 30
+            }),
+        );
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.expect("tool data");
+        assert_eq!(
+            tool.input.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/docs/api")
+        );
+        let summary = crate::tui::ui::tools_ui::get_tool_summary(&tool);
+        assert!(
+            summary.contains("example.com"),
+            "summary should surface the fetched URL: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_websearch_query_for_transcript_summary() {
+        let mut message = tool_message(
+            "websearch",
+            serde_json::json!({ "query": "rust async traits", "num_results": 5 }),
+        );
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.expect("tool data");
+        assert_eq!(
+            tool.input.get("query").and_then(|v| v.as_str()),
+            Some("rust async traits")
+        );
+        let summary = crate::tui::ui::tools_ui::get_tool_summary(&tool);
+        assert!(
+            summary.contains("rust async traits"),
+            "summary should surface the search query: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_model_provided_intent() {
+        let mut message = tool_message(
+            "webfetch",
+            serde_json::json!({
+                "intent": "Check release notes",
+                "url": "https://example.com/releases"
+            }),
+        );
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.expect("tool data");
+        assert_eq!(tool.intent.as_deref(), Some("Check release notes"));
+    }
+
+    #[test]
+    fn compaction_keeps_swarm_action_and_intent_for_transcript_summary() {
+        let mut message = tool_message(
+            "swarm",
+            serde_json::json!({
+                "intent": "Spin up a parser-fix worker",
+                "action": "spawn",
+                "prompt": "Fix the parser bug in crates/parser and add tests",
+                "spawn_mode": "inline"
+            }),
+        );
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.expect("tool data");
+        assert_eq!(tool.intent.as_deref(), Some("Spin up a parser-fix worker"));
+        assert_eq!(
+            tool.input.get("action").and_then(|v| v.as_str()),
+            Some("spawn")
+        );
+        let summary = crate::tui::ui::tools_ui::get_tool_summary(&tool);
+        assert!(
+            summary.contains("spawn"),
+            "summary should surface the swarm action: {summary:?}"
+        );
+        assert!(
+            summary.contains("Fix the parser bug"),
+            "summary should keep the spawn prompt: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_swarm_dm_target_for_transcript_summary() {
+        let mut message = tool_message(
+            "swarm",
+            serde_json::json!({
+                "action": "dm",
+                "to_session": "worker-1",
+                "message": "status update please",
+                "delivery": "notify"
+            }),
+        );
+        compact_display_message_tool_data(&mut message);
+        let tool = message.tool_data.expect("tool data");
+        let summary = crate::tui::ui::tools_ui::get_tool_summary(&tool);
+        assert!(
+            summary.contains("dm") && summary.contains("worker-1"),
+            "summary should keep the dm target: {summary:?}"
+        );
+    }
 }

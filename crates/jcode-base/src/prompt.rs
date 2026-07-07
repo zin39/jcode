@@ -5,6 +5,147 @@ use std::process::Command;
 
 /// Default system prompt for jcode (embedded at compile time)
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("prompt/system_prompt.md");
+
+/// Built-in default swarm prompt: model-routing guidance for spawned swarm
+/// agents (which model/effort to pick per task kind). Users can override it by
+/// creating `~/.jcode/swarm-prompt.md` (global) or `./.jcode/swarm-prompt.md`
+/// (project). See [`load_swarm_prompt`].
+pub const DEFAULT_SWARM_PROMPT: &str = include_str!("prompt/swarm_prompt.md");
+
+/// Load the swarm prompt used to steer swarm model routing. Precedence:
+/// project `./.jcode/swarm-prompt.md`, then global `~/.jcode/swarm-prompt.md`,
+/// then the built-in [`DEFAULT_SWARM_PROMPT`].
+pub fn load_swarm_prompt(working_dir: Option<&Path>) -> String {
+    let project_dir = working_dir.unwrap_or(Path::new("."));
+    let candidates = [
+        Some(project_dir.join(".jcode").join("swarm-prompt.md")),
+        crate::storage::jcode_dir()
+            .ok()
+            .map(|dir| dir.join("swarm-prompt.md")),
+    ];
+    for path in candidates.into_iter().flatten() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    DEFAULT_SWARM_PROMPT.trim().to_string()
+}
+
+/// Reasoning-effort sentinel that means "use the strongest reasoning the model
+/// supports, AND actively orchestrate the work with the swarm tool". Providers
+/// translate this to their strongest real effort when building API requests,
+/// while the UI/session keep the literal `swarm` marker so the agent knows to
+/// inject [`SWARM_EFFORT_DIRECTIVE`].
+pub const SWARM_EFFORT: &str = "swarm";
+
+/// Reasoning-effort sentinel for the **deep task graph** mode: strongest model
+/// reasoning AND the comprehensive DAG-first swarm workflow (decompose into a
+/// validated task graph, critique/verify gates, typed artifact handoffs). Sits
+/// one rung above [`SWARM_EFFORT`] on the effort ladder: `... xhigh`, `swarm`
+/// (light fan-out), `swarm-deep` (deep task graph). Providers translate this to
+/// their strongest real effort, while the UI/session keep the literal marker so
+/// the agent knows to inject [`SWARM_DEEP_EFFORT_DIRECTIVE`].
+pub const SWARM_DEEP_EFFORT: &str = "swarm-deep";
+
+/// System-prompt directive injected when the active reasoning effort is
+/// [`SWARM_EFFORT`]. Instructs the agent to lean on the swarm tooling.
+pub const SWARM_EFFORT_DIRECTIVE: &str = "# Swarm Effort\n\nYou are running at the maximum reasoning effort with swarm orchestration enabled. For any non-trivial task, decompose the work and use the `swarm` tool to spawn and coordinate parallel agents (spawn workers with concrete prompts, assign tasks, and collect their reports) instead of doing everything yourself in one thread. Prefer parallelizing independent subtasks across swarm members, and use a coordinator/plan when the work has multiple stages. Only skip the swarm for trivial, single-step requests.";
+
+/// System-prompt directive injected when the active reasoning effort is
+/// [`SWARM_DEEP_EFFORT`]. Instructs the agent to run the comprehensive DAG-first
+/// task-graph workflow.
+pub const SWARM_DEEP_EFFORT_DIRECTIVE: &str = "# Deep Task Graph\n\nYou are running at maximum reasoning effort with the deep task-graph swarm workflow. Treat the task DAG as the primary object, not ad hoc agent chat. Workflow:\n\n1. Seed a graph with `swarm task_graph` using `mode: \"deep\"`: lay out nodes (kind explore|implement|verify|fix|synthesize) and `depends_on` edges instead of answering directly. (At this effort the server already defaults the plan to deep, but pass `mode: \"deep\"` explicitly anyway.) The engine auto-inserts a plan-wide root gate over your seed: the plan cannot finish until a final adversarial audit passes, and that audit can inject new top-level work.\n2. For any node that is too big, `swarm expand_node` to decompose it into a child sub-DAG (you become its planner/integrator). In deep mode a critique/verify gate is auto-inserted before a composite node can close. The graph is EXPECTED to outgrow its seed, often by several times: growth (expansions and gate-injected gaps) is the system working, not scope creep. plan_status reports seeded-vs-grown counts.\n3. Finish each node with `swarm complete_node` and a typed artifact: `findings`, `evidence` (file:line / commit refs), `validation`, `open_questions`, a required `confidence` (low|medium|high; report low honestly, it routes follow-up work to shore up that scope), and an honest `what_i_did_not_check`. Downstream nodes are hydrated with these artifacts automatically. There is no other way to close a deep node: a turn ending without expand_node/complete_node re-queues the node to a fresh worker and fails it on repeat.\n4. When a critique/verify gate finds gaps or failures, use `swarm inject_gap` to add new nodes; the parent cannot close until they drain. A passing gate artifact must account for EVERY node it audited by id (the server rejects rubber stamps), and cannot pass over a low-confidence sibling without addressing it explicitly, so treat low-confidence siblings as priority probe targets.\n5. Use `swarm run_plan` to drive the graph to completion. It returns immediately and drives the plan as a background task (progress card + wake on completion), so keep working or answer the user while it runs; check `swarm plan_status` or `bg` for progress. Deep mode fans out wide automatically (many workers run in parallel, bounded only by the swarm member cap), so prefer decomposing into MANY independent sibling nodes rather than a few serial ones: keep the ready set wide so run_plan can dispatch lots of agents at once. Only add `depends_on` edges for real data dependencies.\n\nComprehensiveness is structural: prefer decomposition + gates over a single thorough answer, so it is very unlikely any nook or cranny is missed.";
+
+/// System-prompt directive injected when the `web_grounding` feature is on.
+/// Instructs the agent to verify uncertain or fast-changing facts with a
+/// websearch instead of asserting them from memory, cutting hallucinations.
+pub const WEB_GROUNDING_DIRECTIVE: &str = "# Web Grounding\n\nProactively ground your answers in real sources instead of relying on memory. Before stating any fact that is uncertain, could have changed since your training data, or that you are not highly confident about, use the `websearch` tool to verify it and cite what you found. This applies to current events, versions/releases, prices, APIs, library behavior, people, dates, statistics, documentation, and any claim the user is depending on for correctness. When facts conflict, trust the fresher, higher-quality source. It is better to take an extra second to search than to state something wrong from memory. You do not need to search for stable, well-established facts, your own reasoning, or things you can verify directly from the workspace (files, command output, code).";
+
+/// Returns true when `effort` is either swarm sentinel (light or deep),
+/// case-insensitive. Used by providers to map to the strongest real effort.
+pub fn is_swarm_effort(effort: &str) -> bool {
+    let trimmed = effort.trim();
+    trimmed.eq_ignore_ascii_case(SWARM_EFFORT) || trimmed.eq_ignore_ascii_case(SWARM_DEEP_EFFORT)
+}
+
+/// Returns true when `effort` is specifically the deep task-graph sentinel.
+pub fn is_deep_swarm_effort(effort: &str) -> bool {
+    effort.trim().eq_ignore_ascii_case(SWARM_DEEP_EFFORT)
+}
+
+/// The user-facing "general effort" ladder is one list, but each rung is one of
+/// two internal kinds: a plain reasoning level (mapped straight to the provider
+/// wire effort) or a swarm orchestration mode (which also pins reasoning to the
+/// model's max). [`EffortKind`] is the single classifier all consumers use so the
+/// UI, providers, and scheduler never disagree about what a rung means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortKind {
+    /// A plain reasoning level (none/low/medium/high/xhigh/max).
+    Reasoning,
+    /// Light swarm mode: max reasoning + parallel fan-out.
+    SwarmLight,
+    /// Deep swarm mode: max reasoning + DAG-first task graph.
+    SwarmDeep,
+}
+
+impl EffortKind {
+    /// True when this rung is a swarm orchestration mode rather than a plain
+    /// reasoning level. Such rungs must not be treated as per-model effort
+    /// variants (e.g. they should not generate `model (effort)` picker rows).
+    pub fn is_swarm_mode(self) -> bool {
+        matches!(self, EffortKind::SwarmLight | EffortKind::SwarmDeep)
+    }
+}
+
+/// Classify a general-effort rung string into its [`EffortKind`].
+pub fn classify_effort(effort: &str) -> EffortKind {
+    let trimmed = effort.trim();
+    if trimmed.eq_ignore_ascii_case(SWARM_DEEP_EFFORT) {
+        EffortKind::SwarmDeep
+    } else if trimmed.eq_ignore_ascii_case(SWARM_EFFORT) {
+        EffortKind::SwarmLight
+    } else {
+        EffortKind::Reasoning
+    }
+}
+
+/// True when an effort rung is a swarm orchestration mode (light or deep) rather
+/// than a plain reasoning level. Convenience wrapper over [`classify_effort`].
+pub fn is_swarm_mode_effort(effort: &str) -> bool {
+    classify_effort(effort).is_swarm_mode()
+}
+
+/// Append the appropriate swarm directive to a split prompt's dynamic part when
+/// the active reasoning effort is a swarm sentinel. The deep sentinel injects the
+/// DAG-first task-graph directive; the light sentinel injects the fan-out
+/// directive. No-op otherwise.
+pub fn append_swarm_effort_directive(split: &mut SplitSystemPrompt, effort: Option<&str>) {
+    let directive = match effort {
+        Some(effort) if is_deep_swarm_effort(effort) => SWARM_DEEP_EFFORT_DIRECTIVE,
+        Some(effort) if is_swarm_effort(effort) => SWARM_EFFORT_DIRECTIVE,
+        _ => return,
+    };
+    if !split.dynamic_part.is_empty() {
+        split.dynamic_part.push_str("\n\n");
+    }
+    split.dynamic_part.push_str(directive);
+}
+
+/// Append the web-grounding directive to a split prompt's *static* (cacheable)
+/// part when `enabled`. Static because it depends only on the `web_grounding`
+/// feature flag, not on per-turn state, so it stays in the KV-cached prefix.
+pub fn append_web_grounding_directive(split: &mut SplitSystemPrompt, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if !split.static_part.is_empty() {
+        split.static_part.push_str("\n\n");
+    }
+    split.static_part.push_str(WEB_GROUNDING_DIRECTIVE);
+}
 /// Mission-continuation template (embedded at compile time). Consumed by the
 /// `mission` module in the upper `jcode-app-core` layer; the asset lives here
 /// alongside the other prompt templates.
@@ -82,6 +223,8 @@ pub struct ContextInfo {
     pub prompt_overlay_chars: usize,
     /// Preferred tools section size (chars)
     pub preferred_tools_chars: usize,
+    /// Sponsored discovery section size (chars)
+    pub sponsored_discovery_chars: usize,
 
     // === Dynamic (Conversation) ===
     /// Tool definitions sent to API (chars)
@@ -125,6 +268,7 @@ impl ContextInfo {
             + self.memory_chars
             + self.prompt_overlay_chars
             + self.preferred_tools_chars
+            + self.sponsored_discovery_chars
             + self.tool_defs_chars
     }
 
@@ -162,6 +306,9 @@ impl ContextInfo {
         }
         if self.preferred_tools_chars > 0 {
             parts.push(("tools", self.preferred_tools_chars, "🧰"));
+        }
+        if self.sponsored_discovery_chars > 0 {
+            parts.push(("sponsored", self.sponsored_discovery_chars, "$"));
         }
         parts
     }
@@ -215,6 +362,26 @@ pub fn build_system_prompt_full(
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
 ) -> (String, ContextInfo) {
+    build_system_prompt_full_with_overlay(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        true,
+    )
+}
+
+/// Like [`build_system_prompt_full`], but lets the caller suppress the freeform
+/// `prompt-overlay.md` injection (see [`model_should_receive_prompt_overlay`]).
+pub fn build_system_prompt_full_with_overlay(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    include_prompt_overlay: bool,
+) -> (String, ContextInfo) {
     let mut parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
     let mut info = ContextInfo {
         system_prompt_chars: DEFAULT_SYSTEM_PROMPT.len(),
@@ -243,7 +410,11 @@ pub fn build_system_prompt_full(
     info.global_agents_md_chars = md_info.global_agents_md_chars;
 
     // Add optional prompt overlays from ~/.jcode/ and ./.jcode/
-    let (overlay_content, overlay_chars) = load_prompt_overlay_files_from_dir(working_dir);
+    let (overlay_content, overlay_chars) = if include_prompt_overlay {
+        load_prompt_overlay_files_from_dir(working_dir)
+    } else {
+        (None, 0)
+    };
     if let Some(content) = overlay_content {
         info.prompt_overlay_chars = overlay_chars;
         parts.push(content);
@@ -255,6 +426,12 @@ pub fn build_system_prompt_full(
     if let Some(content) = preferred_tools_content {
         info.preferred_tools_chars = preferred_tools_chars;
         parts.push(content);
+    }
+
+    // Add sponsored discovery categories (on by default, opt-out; see sponsors.rs)
+    if let Some(section) = crate::sponsors::build_discovery_prompt_section() {
+        info.sponsored_discovery_chars = section.len();
+        parts.push(section);
     }
 
     if let Some(memory) = memory_prompt {
@@ -295,6 +472,26 @@ pub fn build_system_prompt_split(
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
 ) -> (SplitSystemPrompt, ContextInfo) {
+    build_system_prompt_split_with_overlay(
+        skill_prompt,
+        available_skills,
+        is_selfdev,
+        memory_prompt,
+        working_dir,
+        true,
+    )
+}
+
+/// Like [`build_system_prompt_split`], but lets the caller suppress the freeform
+/// `prompt-overlay.md` injection (see [`model_should_receive_prompt_overlay`]).
+pub fn build_system_prompt_split_with_overlay(
+    skill_prompt: Option<&str>,
+    available_skills: &[SkillInfo],
+    is_selfdev: bool,
+    memory_prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    include_prompt_overlay: bool,
+) -> (SplitSystemPrompt, ContextInfo) {
     let mut static_parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
     let mut dynamic_parts = Vec::new();
     let mut info = ContextInfo {
@@ -325,7 +522,11 @@ pub fn build_system_prompt_split(
     info.global_agents_md_chars = md_info.global_agents_md_chars;
 
     // Add optional prompt overlays from ~/.jcode/ and ./.jcode/
-    let (overlay_content, overlay_chars) = load_prompt_overlay_files_from_dir(working_dir);
+    let (overlay_content, overlay_chars) = if include_prompt_overlay {
+        load_prompt_overlay_files_from_dir(working_dir)
+    } else {
+        (None, 0)
+    };
     if let Some(content) = overlay_content {
         info.prompt_overlay_chars = overlay_chars;
         static_parts.push(content);
@@ -337,6 +538,12 @@ pub fn build_system_prompt_split(
     if let Some(content) = preferred_tools_content {
         info.preferred_tools_chars = preferred_tools_chars;
         static_parts.push(content);
+    }
+
+    // Add sponsored discovery categories (static; on by default, opt-out)
+    if let Some(section) = crate::sponsors::build_discovery_prompt_section() {
+        info.sponsored_discovery_chars = section.len();
+        static_parts.push(section);
     }
 
     // Add available skills list (fairly static)
@@ -536,6 +743,16 @@ fn get_git_info(working_dir: Option<&Path>) -> Option<String> {
 }
 
 fn hardware_context() -> Option<String> {
+    // Hardware never changes for the life of the process, but this used to be
+    // rebuilt for every session create/attach, forking `lspci` each time. On a
+    // busy shared server that meant one subprocess per client connection.
+    static HARDWARE_CONTEXT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HARDWARE_CONTEXT
+        .get_or_init(hardware_context_uncached)
+        .clone()
+}
+
+fn hardware_context_uncached() -> Option<String> {
     let mut lines = Vec::new();
 
     if let Some(machine) = machine_model() {
@@ -719,6 +936,29 @@ fn load_prompt_overlay_files_from_dir(working_dir: Option<&Path>) -> (Option<Str
     } else {
         (Some(contents.join("\n\n")), total_chars)
     }
+}
+
+/// Whether the user's freeform prompt overlay (`prompt-overlay.md`) should be
+/// injected for `model`.
+///
+/// Anthropic's `claude-fable-5` ships a much stricter safety guardrail than the
+/// Opus/Sonnet tiers. Freeform overlays that describe otherwise-legitimate but
+/// sensitive-sounding work (e.g. a credential-leak-scanning pipeline that
+/// mentions API keys, OAuth tokens, and secret validation) make fable-5 return
+/// `stop_reason=refusal` and emit no output at all, even though Opus answers the
+/// identical prompt. The overlay is a user convenience, not load-bearing, so we
+/// omit it for fable-5 rather than let it silently break every turn. Verified
+/// live 2026-07-03: the same overlay text refuses on fable-5 and succeeds on
+/// opus-4-8.
+///
+/// Matching is a normalized substring so dated variants (`claude-fable-5-YYYY...`)
+/// are covered too. Every other model keeps the overlay.
+pub fn model_should_receive_prompt_overlay(model: &str) -> bool {
+    let normalized = jcode_provider_core::model_id::strip_date_suffix(
+        &jcode_provider_core::model_id::canonical(model),
+    )
+    .to_ascii_lowercase();
+    !normalized.contains("claude-fable")
 }
 
 /// Load optional preferred-tool guidance from ~/.jcode/ and ./.jcode/

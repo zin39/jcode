@@ -263,29 +263,7 @@ pub fn maybe_unload_if_idle(idle_for: Duration) -> bool {
             .force_attribution(),
         );
 
-        #[cfg(feature = "jemalloc")]
-        if let Err(err) = crate::process_memory::purge_allocator() {
-            crate::logging::info(&format!(
-                "jemalloc purge after model unload failed: {}",
-                err
-            ));
-        }
-
-        #[cfg(all(target_os = "linux", not(feature = "jemalloc")))]
-        {
-            unsafe extern "C" {
-                fn malloc_trim(pad: usize) -> i32;
-            }
-            let trimmed = unsafe { malloc_trim(0) };
-            crate::logging::info(&format!(
-                "malloc_trim after model unload: {}",
-                if trimmed == 1 {
-                    "released pages"
-                } else {
-                    "no pages to release"
-                }
-            ));
-        }
+        crate::process_memory::release_retained_heap("embedding_model_idle_unload");
     }
 
     unloaded
@@ -314,21 +292,7 @@ pub fn unload_now() -> bool {
             .force_attribution(),
         );
 
-        #[cfg(feature = "jemalloc")]
-        if let Err(err) = crate::process_memory::purge_allocator() {
-            crate::logging::info(&format!(
-                "jemalloc purge after force unload failed: {}",
-                err
-            ));
-        }
-
-        #[cfg(all(target_os = "linux", not(feature = "jemalloc")))]
-        {
-            unsafe extern "C" {
-                fn malloc_trim(pad: usize) -> i32;
-            }
-            let _ = unsafe { malloc_trim(0) };
-        }
+        crate::process_memory::release_retained_heap("embedding_model_force_unload");
     }
 
     unloaded

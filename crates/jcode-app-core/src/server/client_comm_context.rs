@@ -90,8 +90,30 @@ pub(super) async fn handle_comm_share(
                 .unwrap_or_default()
         };
 
-        for sid in &swarm_session_ids {
-            if sid != &req_session_id {
+        // Shared-context updates are subtree-scoped like broadcasts: notify only
+        // the sessions the writer (transitively) spawned, so a share cannot
+        // become a member-cap-sized notification storm. The coordinator keeps
+        // whole-swarm reach. Everyone can still `read` the key on demand.
+        //
+        // Compute the target set up front and drop the read guard before the
+        // fanout loop: `fanout_session_event` takes a write lock on members.
+        let notify_targets: Vec<String> = {
+            let members = swarm_members.read().await;
+            let sender_is_coordinator = members
+                .get(&req_session_id)
+                .is_some_and(|member| member.role == "coordinator");
+            swarm_session_ids
+                .iter()
+                .filter(|sid| *sid != &req_session_id)
+                .filter(|sid| {
+                    sender_is_coordinator
+                        || super::swarm_is_self_or_ancestor(&members, &req_session_id, sid)
+                })
+                .cloned()
+                .collect()
+        };
+        for sid in &notify_targets {
+            {
                 let _ = fanout_session_event(
                     swarm_members,
                     sid,
@@ -221,6 +243,7 @@ pub(super) async fn handle_comm_list(
             files: Vec<String>,
             status: String,
             detail: Option<String>,
+            task_label: Option<String>,
             role: String,
             is_headless: bool,
             report_back_to_session_id: Option<String>,
@@ -249,6 +272,7 @@ pub(super) async fn handle_comm_list(
                             files,
                             status: member.status.clone(),
                             detail: member.detail.clone(),
+                            task_label: member.task_label.clone(),
                             role: member.role.clone(),
                             is_headless: member.is_headless,
                             report_back_to_session_id: member.report_back_to_session_id.clone(),
@@ -277,12 +301,14 @@ pub(super) async fn handle_comm_list(
                 files_touched: m.files,
                 status: Some(m.status),
                 detail: m.detail,
+                task_label: m.task_label,
                 role: Some(m.role),
                 is_headless: Some(m.is_headless),
                 report_back_to_session_id: m.report_back_to_session_id,
                 latest_completion_report: m.latest_completion_report,
                 live_attachments: Some(m.live_attachments),
                 status_age_secs: Some(m.status_age_secs),
+                last_activity_age_secs: extras.last_activity_age_secs,
                 activity: extras.activity,
                 provider_name: extras.provider_name,
                 provider_model: extras.provider_model,

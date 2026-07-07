@@ -26,7 +26,7 @@ struct MarkdownText: View {
                         Text(code)
                             .font(Theme.mono(12))
                             .foregroundStyle(Theme.textSecondary)
-                            .padding(10)
+                            .padding(12)
                             .textSelection(.enabled)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)

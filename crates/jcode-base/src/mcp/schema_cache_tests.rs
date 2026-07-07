@@ -11,6 +11,10 @@ fn cfg(command: &str, args: &[&str]) -> McpServerConfig {
         args: args.iter().map(|s| s.to_string()).collect(),
         env: HashMap::new(),
         shared: true,
+        transport: None,
+        url: None,
+        enabled: None,
+        disabled: None,
     }
 }
 

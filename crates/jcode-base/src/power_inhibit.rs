@@ -31,12 +31,33 @@ const INHIBIT_TTL: Duration = Duration::from_secs(150);
 /// below `INHIBIT_TTL` so coverage never lapses between reconcile ticks.
 const INHIBIT_REFRESH_AFTER: Duration = Duration::from_secs(90);
 
+/// A freshly-spawned helper that exits sooner than this never actually held the
+/// lock: the OS denied the inhibitor (e.g. polkit "Access denied") or the helper
+/// binary is missing/broken. Real helpers live for `INHIBIT_TTL` (150s), so this
+/// grace window cleanly separates "died on startup" from "exited normally".
+const MIN_HEALTHY_LIFETIME: Duration = Duration::from_secs(2);
+
+/// After this many consecutive rapid failures, stop retrying and mark the
+/// inhibitor unavailable. Otherwise a denied helper would be re-spawned on every
+/// reconcile tick forever, hammering logind/polkit (observed: a denied
+/// systemd-inhibit retried in a loop pinned polkitd/logind/dbus to multiple
+/// cores). One retry tolerates a transient hiccup; a persistent denial gives up.
+const MAX_RAPID_FAILURES: u32 = 2;
+
+
 /// Best-effort inhibitor that keeps the machine awake while jcode is actively
 /// streaming/processing.
 pub struct PowerInhibitor {
     child: Option<Child>,
     acquired_at: Option<Instant>,
     available: bool,
+    /// Consecutive times a freshly-spawned helper died almost immediately (see
+    /// `MIN_HEALTHY_LIFETIME`). A helper that exits right away is not holding the
+    /// lock — typically the environment denies the inhibitor (polkit "Access
+    /// denied") or the tool is missing. Retrying such a helper every reconcile
+    /// tick hammers logind/polkit for nothing, so after `MAX_RAPID_FAILURES` in
+    /// a row we give up and mark the inhibitor unavailable.
+    rapid_failures: u32,
 }
 
 impl Default for PowerInhibitor {
@@ -60,6 +81,7 @@ impl PowerInhibitor {
                 std::env::var_os(DISABLE_ENV).is_some(),
                 current_platform(),
             ),
+            rapid_failures: 0,
         }
     }
 
@@ -90,6 +112,38 @@ impl PowerInhibitor {
             .is_some_and(|at| !should_refresh(at, now, INHIBIT_REFRESH_AFTER));
         if healthy && fresh {
             return;
+        }
+
+        // A helper that has been alive past the startup grace window proved the
+        // inhibitor works here; clear the failure streak so a later transient
+        // refresh hiccup doesn't accumulate toward the give-up threshold.
+        if healthy
+            && self
+                .acquired_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= MIN_HEALTHY_LIFETIME)
+        {
+            self.rapid_failures = 0;
+        }
+
+        // If we had a helper that has already exited, decide whether it died so
+        // fast it never held the lock (denied/unsupported) vs. exited normally.
+        // A rapid death that we did NOT initiate means the environment is
+        // rejecting the inhibitor; counting these lets us stop the retry storm.
+        if !healthy && self.child.is_some() {
+            let died_immediately = self
+                .acquired_at
+                .is_some_and(|at| now.saturating_duration_since(at) < MIN_HEALTHY_LIFETIME);
+            if died_immediately {
+                self.rapid_failures = self.rapid_failures.saturating_add(1);
+                if self.rapid_failures >= MAX_RAPID_FAILURES {
+                    self.release();
+                    self.available = false;
+                    crate::logging::warn(
+                        "power_inhibit: helper exits immediately (inhibitor denied or unavailable in this environment); disabling to avoid hammering logind/polkit",
+                    );
+                    return;
+                }
+            }
         }
 
         // Either there is no helper, it exited, or its TTL is close to expiring:
@@ -291,5 +345,57 @@ mod tests {
             acquired + Duration::from_secs(120),
             refresh_after
         ));
+    }
+
+    // A helper that dies immediately (stand-in for a denied/unsupported
+    // inhibitor) must make the PowerInhibitor give up after MAX_RAPID_FAILURES
+    // instead of respawning forever. Uses the real spawn path with a command
+    // that exits at once, so it exercises the same rapid-death detection that
+    // stops the logind/polkit retry storm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rapid_helper_death_disables_after_threshold() {
+        use super::{MAX_RAPID_FAILURES, MIN_HEALTHY_LIFETIME, PowerInhibitor};
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let mut inhibitor = PowerInhibitor {
+            child: None,
+            acquired_at: None,
+            available: true,
+            rapid_failures: 0,
+        };
+
+        // Drive acquire() manually with a helper that exits instantly. We mimic
+        // acquire()'s bookkeeping so the rapid-death detector sees a child that
+        // died within MIN_HEALTHY_LIFETIME on each pass.
+        for pass in 1..=MAX_RAPID_FAILURES {
+            // Spawn a command that returns immediately (`true`), let it exit.
+            let child = Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn true");
+            inhibitor.child = Some(child);
+            // Backdate acquisition so it reads as "died immediately".
+            inhibitor.acquired_at =
+                Some(Instant::now() - (MIN_HEALTHY_LIFETIME / 2));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            inhibitor.set_active(true);
+
+            if pass < MAX_RAPID_FAILURES {
+                assert!(
+                    inhibitor.is_available(),
+                    "should still be trying before the threshold (pass {pass})"
+                );
+            }
+        }
+
+        assert!(
+            !inhibitor.is_available(),
+            "inhibitor must disable itself after {MAX_RAPID_FAILURES} rapid failures"
+        );
     }
 }

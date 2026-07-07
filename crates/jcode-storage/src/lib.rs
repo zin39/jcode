@@ -84,6 +84,26 @@ pub fn logs_dir() -> Result<PathBuf> {
     Ok(jcode_dir()?.join("logs"))
 }
 
+/// Durable state directory for state that must survive reboots.
+///
+/// [`runtime_dir`] typically resolves to a tmpfs (for example
+/// `/run/user/<uid>` on Linux) that is wiped on reboot, so it must only hold
+/// sockets and truly ephemeral state. State that has to outlive a reboot,
+/// such as swarm plans and member records, belongs here instead: it resolves
+/// to `~/.jcode/state` (respecting `JCODE_HOME`).
+///
+/// When `JCODE_RUNTIME_DIR` is set (tests and sandboxed temp servers), it
+/// takes precedence so isolated runs never touch the real jcode home.
+pub fn durable_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("JCODE_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("durable-state");
+    }
+    match jcode_dir() {
+        Ok(dir) => dir.join("state"),
+        Err(_) => runtime_dir().join("durable-state"),
+    }
+}
+
 /// Resolve jcode's app-owned config directory.
 ///
 /// Default location is the platform config dir + `jcode` (for example
@@ -253,6 +273,13 @@ pub fn write_json_fast<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<
     write_json_inner(path, value, false)
 }
 
+/// Atomically write raw bytes to `path` (temp file + rename), fsync'd for
+/// durability. Used for editing user config files where a torn write would be
+/// catastrophic.
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_bytes_inner(path, bytes, true)
+}
+
 fn write_json_inner<T: Serialize + ?Sized>(path: &Path, value: &T, durable: bool) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     write_bytes_inner(path, &bytes, durable)
@@ -385,17 +412,24 @@ where
 
 /// Fast append of a single JSON value followed by a newline.
 /// Intended for append-only journals where per-write fsync is not required.
+///
+/// The entire line (value + trailing newline) is serialized into one buffer
+/// and appended with a single `write_all`. Streaming the serializer straight
+/// into the file issued many small writes, so a concurrent reader (or a
+/// process killed mid-append) could observe a torn half-line, and two
+/// concurrent appenders could interleave fragments. A single `O_APPEND` write
+/// of the complete line keeps each journal line intact.
 pub fn append_json_line_fast<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
 
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
+    file.write_all(&line)?;
     Ok(())
 }

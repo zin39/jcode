@@ -12,8 +12,8 @@
 //! Controls:
 //!   q / Esc      quit
 //!   + / -        more / fewer agents
-//!   [ / ]        shrink / grow the gallery band (the max_pct knob)
-//!   space        pause / resume the animation
+//!     [ / ]        shrink / grow the gallery band (the max_pct knob)
+//!     space        pause / resume the animation
 
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -21,12 +21,12 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use jcode_tui_render::swarm_gallery::{humanize_age, render_gallery, GalleryMember};
+use jcode_tui_render::swarm_gallery::{GalleryMember, humanize_age, render_gallery};
 
 /// A simulated worker, mirroring the fields the real adapter reads from a
 /// `SwarmMemberStatus` (name, role, status, streamed output tail).
@@ -79,7 +79,8 @@ impl MockWorker {
         } else {
             "running".to_string()
         };
-        self.transcript.push(line.trim_start_matches("! ").to_string());
+        self.transcript
+            .push(line.trim_start_matches("! ").to_string());
         self.next_line += 1;
         self.cooldown = 2 + (self.next_line as u16 % 3);
     }
@@ -97,10 +98,14 @@ fn workers_to_members(workers: &[MockWorker]) -> Vec<GalleryMember> {
             body.push(format!("· {} ago", humanize_age(w.age_secs())));
             GalleryMember {
                 label: w.name.clone(),
+                icon: None,
                 status: w.status.clone(),
+                task: None,
                 role: w.role.map(str::to_string),
                 body,
                 sort_key: w.name.clone(),
+                todo: None,
+                todo_items: Vec::new(),
             }
         })
         .collect()
@@ -172,7 +177,7 @@ fn make_workers(n: usize) -> Vec<MockWorker> {
         ),
         (
             "packager",
-            Some("worktree_manager"),
+            None,
             vec![
                 "Preparing the release worktree.",
                 "Bumping version.",
@@ -208,18 +213,17 @@ fn make_workers(n: usize) -> Vec<MockWorker> {
         .collect()
 }
 
-fn render_gallery_lines(workers: &[MockWorker], width: usize, max_height: usize) -> Vec<Line<'static>> {
+fn render_gallery_lines(
+    workers: &[MockWorker],
+    width: usize,
+    max_height: usize,
+) -> Vec<Line<'static>> {
     // Delegate to the exact same shared renderer the live TUI uses; only the
     // member data (built from mock workers) differs.
     render_gallery(&workers_to_members(workers), width, max_height)
 }
 
-fn draw(
-    f: &mut Frame,
-    workers: &[MockWorker],
-    max_pct: usize,
-    paused: bool,
-) {
+fn draw(f: &mut Frame, workers: &[MockWorker], max_pct: usize, paused: bool) {
     let area = f.area();
 
     // Reserve a top band like the real TUI does: a configurable share of the
@@ -237,7 +241,12 @@ fn draw(
         ((lines.len() as u16) + 1).min(area.height / 2)
     };
 
-    let band = Rect { x: area.x, y: area.y, width: area.width, height: band_h };
+    let band = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: band_h,
+    };
     let chat = Rect {
         x: area.x,
         y: area.y + band_h,
@@ -254,7 +263,9 @@ fn draw(
     let help = vec![
         Line::from(vec![Span::styled(
             "  inline swarm gallery — live demo (no real agents touched)",
-            Style::default().fg(Color::Rgb(200, 200, 210)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(200, 200, 210))
+                .add_modifier(Modifier::BOLD),
         )]),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -267,12 +278,18 @@ fn draw(
         )]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  band size: ", Style::default().fg(Color::Rgb(150, 150, 160))),
+            Span::styled(
+                "  band size: ",
+                Style::default().fg(Color::Rgb(150, 150, 160)),
+            ),
             Span::styled(
                 format!("{max_pct}% "),
                 Style::default().fg(Color::Rgb(255, 200, 100)),
             ),
-            Span::styled("(agents.swarm_gallery_max_pct)", Style::default().fg(Color::Rgb(110, 110, 120))),
+            Span::styled(
+                "(agents.swarm_gallery_max_pct)",
+                Style::default().fg(Color::Rgb(110, 110, 120)),
+            ),
             Span::styled(
                 if paused { "   [PAUSED]" } else { "" },
                 Style::default().fg(Color::Rgb(255, 170, 80)),
@@ -307,7 +324,10 @@ fn main() -> io::Result<()> {
     let res = run(&mut terminal);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut() as &mut CrosstermBackend<Stdout>, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut() as &mut CrosstermBackend<Stdout>,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     res
 }
@@ -324,29 +344,29 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         terminal.draw(|f| draw(f, &workers, max_pct, paused))?;
 
         let timeout = tick.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                let ctrl_c =
-                    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    _ if ctrl_c => break,
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        n_agents = (n_agents + 1).min(8);
-                        workers = make_workers(n_agents);
-                    }
-                    KeyCode::Char('-') | KeyCode::Char('_') => {
-                        n_agents = n_agents.saturating_sub(1).max(1);
-                        workers = make_workers(n_agents);
-                    }
-                    KeyCode::Char(']') => max_pct = (max_pct + 5).min(90),
-                    KeyCode::Char('[') => max_pct = max_pct.saturating_sub(5).max(5),
-                    KeyCode::Char(' ') => paused = !paused,
-                    KeyCode::Char('r') => {
-                        workers = make_workers(n_agents);
-                    }
-                    _ => {}
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+        {
+            let ctrl_c =
+                key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                _ if ctrl_c => break,
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    n_agents = (n_agents + 1).min(8);
+                    workers = make_workers(n_agents);
                 }
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    n_agents = n_agents.saturating_sub(1).max(1);
+                    workers = make_workers(n_agents);
+                }
+                KeyCode::Char(']') => max_pct = (max_pct + 5).min(90),
+                KeyCode::Char('[') => max_pct = max_pct.saturating_sub(5).max(5),
+                KeyCode::Char(' ') => paused = !paused,
+                KeyCode::Char('r') => {
+                    workers = make_workers(n_agents);
+                }
+                _ => {}
             }
         }
 
@@ -356,11 +376,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
                     w.tick();
                 }
                 // When everything is done, loop the demo after a short beat.
-                if workers.iter().all(|w| w.status == "completed") {
-                    if workers.iter().all(|w| w.age_secs() > 1) {
-                        // restart so the demo keeps streaming
-                        workers = make_workers(n_agents);
-                    }
+                if workers.iter().all(|w| w.status == "completed")
+                    && workers.iter().all(|w| w.age_secs() > 1)
+                {
+                    // restart so the demo keeps streaming
+                    workers = make_workers(n_agents);
                 }
             }
             last_tick = Instant::now();

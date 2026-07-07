@@ -89,8 +89,11 @@ fn apply_confidence_updates_batches_boost_and_decay() {
         let keep_before = conf_before(&keep);
         let stale_before = conf_before(&stale);
 
-        let (boosted, decayed) =
-            apply_confidence_updates(&manager, &[keep.clone()], &[stale.clone()]);
+        let (boosted, decayed) = apply_confidence_updates(
+            &manager,
+            std::slice::from_ref(&keep),
+            std::slice::from_ref(&stale),
+        );
         assert_eq!(boosted, 1, "one verified memory boosted");
         assert_eq!(decayed, 1, "one rejected memory decayed");
 

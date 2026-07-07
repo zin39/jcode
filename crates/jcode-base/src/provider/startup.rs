@@ -105,7 +105,7 @@ impl MultiProvider {
             .assessment_for_provider(crate::provider_catalog::CURSOR_LOGIN_PROVIDER)
             .is_available();
         let has_bedrock_creds = bedrock::BedrockProvider::has_credentials();
-        let has_openrouter_creds = openrouter::OpenRouterProvider::has_credentials();
+        let has_openrouter_creds = openrouter::has_credentials();
 
         let use_claude_cli = std::env::var("JCODE_USE_CLAUDE_CLI")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -120,71 +120,56 @@ impl MultiProvider {
             crate::logging::info(
                 "Using deprecated Claude CLI provider (forced by JCODE_USE_CLAUDE_CLI=1)",
             );
-            Some(Arc::new(claude::ClaudeProvider::new()))
+            external::instantiate_expected_external_provider(external::CLAUDE_CLI_RUNTIME)
         } else {
             None
         };
 
         let anthropic = if has_claude_creds && !use_claude_cli {
-            Some(Arc::new(anthropic::AnthropicProvider::new()))
+            external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME)
         } else {
             None
         };
 
         let openai = if has_openai_creds {
-            auth::codex::load_credentials()
-                .ok()
-                .map(openai::OpenAIProvider::new)
-                .map(Arc::new)
+            external::instantiate_expected_external_provider(external::OPENAI_RUNTIME)
         } else {
             None
         };
 
         let copilot_api = if has_copilot_api {
+            // The composition-root factory handles construction, tier-detection
+            // scheduling (eager vs non-interactive deferral), and init-done
+            // signaling; None means credentials were missing or invalid.
             let copilot_init_start = std::time::Instant::now();
-            match copilot::CopilotApiProvider::new() {
-                Ok(p) => {
-                    crate::logging::info(&format!(
-                        "Copilot API provider initialized (direct API) in {}ms",
-                        copilot_init_start.elapsed().as_millis()
-                    ));
-                    let provider = Arc::new(p);
-                    if should_eager_detect_copilot_tier() {
-                        let p_clone = provider.clone();
-                        tokio::spawn(async move {
-                            p_clone.detect_tier_and_set_default().await;
-                        });
-                    } else {
-                        crate::logging::info(
-                            "Deferring Copilot tier detection during non-interactive startup",
-                        );
-                        provider.complete_init_without_tier_detection();
-                    }
-                    Some(provider)
-                }
-                Err(e) => {
-                    crate::logging::info(&format!("Failed to initialize Copilot API: {}", e));
-                    None
-                }
+            let provider =
+                external::instantiate_expected_external_provider(external::COPILOT_RUNTIME);
+            match &provider {
+                Some(_) => crate::logging::info(&format!(
+                    "Copilot API provider initialized (direct API) in {}ms",
+                    copilot_init_start.elapsed().as_millis()
+                )),
+                None => crate::logging::info("Failed to initialize Copilot API (no credentials)"),
             }
+            provider
         } else {
             None
         };
 
         let antigravity_provider = if has_antigravity_creds {
-            Some(Arc::new(antigravity::AntigravityProvider::new()))
+            external::instantiate_expected_external_provider(external::ANTIGRAVITY_RUNTIME)
         } else {
             None
         };
 
         let gemini_provider = if has_gemini_creds {
-            Some(Arc::new(gemini::GeminiProvider::new()))
+            external::instantiate_expected_external_provider(external::GEMINI_RUNTIME)
         } else {
             None
         };
 
         let cursor_provider = if has_cursor_creds {
-            Some(Arc::new(cursor::CursorCliProvider::new()))
+            external::instantiate_expected_external_provider(external::CURSOR_RUNTIME)
         } else {
             None
         };
@@ -199,20 +184,19 @@ impl MultiProvider {
             let named_profile = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
                 .ok()
                 .or_else(|| default_named_provider_profile.clone());
-            let provider_result = if let Some(profile_name) = named_profile.as_deref() {
-                if let Some(profile) = cfg.providers.get(profile_name) {
-                    openrouter::OpenRouterProvider::new_named_openai_compatible(
-                        profile_name,
-                        profile,
-                    )
-                } else {
-                    openrouter::OpenRouterProvider::new()
-                }
-            } else {
-                openrouter::OpenRouterProvider::new()
-            };
-            match provider_result {
-                Ok(p) => Some(Arc::new(p)),
+            let spec = named_profile
+                .as_deref()
+                .and_then(|profile_name| {
+                    cfg.providers.get(profile_name).map(|profile| {
+                        external::OpenRouterRuntimeSpec::NamedProfile {
+                            name: profile_name.to_string(),
+                            config: profile.clone(),
+                        }
+                    })
+                })
+                .unwrap_or(external::OpenRouterRuntimeSpec::Default);
+            match external::instantiate_openrouter_runtime(spec) {
+                Ok(p) => Some(p),
                 Err(e) => {
                     crate::logging::info(&format!("Failed to initialize OpenRouter: {}", e));
                     None
@@ -311,6 +295,7 @@ impl MultiProvider {
             use_claude_cli,
             startup_notices: RwLock::new(Vec::new()),
             forced_provider,
+            routes_memo: Mutex::new(None),
         };
 
         if let Some(model) = provider_state.default_model() {

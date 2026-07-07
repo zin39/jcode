@@ -245,6 +245,69 @@ impl App {
         self.rate_limit_reset = None;
     }
 
+    /// Track a failed turn for the credential-failure circuit breaker.
+    ///
+    /// Returns `true` when the error classifies as a credential/auth failure
+    /// AND the consecutive-failure count has reached the breaker threshold,
+    /// meaning the caller must stop all automatic resend paths. Non-credential
+    /// errors reset the streak (the breaker only guards against retrying a
+    /// dead credential, not mixed transient failures).
+    pub(super) fn note_error_for_credential_breaker(&mut self, message: &str) -> bool {
+        if crate::provider::error_looks_like_credential_failure(message) {
+            self.consecutive_credential_failures =
+                self.consecutive_credential_failures.saturating_add(1);
+            self.consecutive_credential_failures >= Self::CREDENTIAL_FAILURE_BREAKER_THRESHOLD
+        } else {
+            self.consecutive_credential_failures = 0;
+            false
+        }
+    }
+
+    /// Reset the credential-failure streak. Called when a turn completes
+    /// successfully or the user changes auth (login, provider/model switch),
+    /// so a fixed credential gets a fresh retry budget.
+    pub(super) fn reset_credential_failure_breaker(&mut self) {
+        self.consecutive_credential_failures = 0;
+    }
+
+    /// Hard-stop every automatic resend path because the session has hit
+    /// repeated credential/auth failures. Retrying the identical request
+    /// against a dead credential can never succeed; before this breaker,
+    /// auto-poke/queued-retry loops logged thousands of 401s in a single
+    /// session (one failed turn per resend) until the user noticed.
+    pub(super) fn trip_credential_failure_breaker(&mut self, message: &str) {
+        let failures = self.consecutive_credential_failures;
+        self.clear_pending_remote_retry();
+        let cleared_pokes = if self.auto_poke_incomplete_todos {
+            super::commands::disable_auto_poke(self)
+        } else {
+            0
+        };
+        self.overnight_auto_poke = None;
+
+        // Surface the streak in telemetry as an explicit auth_failed event so
+        // the dashboard can distinguish "breaker tripped on a dead credential"
+        // from one-off auth blips.
+        let reason = crate::auth::login_diagnostics::classify_auth_failure_message(message);
+        let provider = self.provider_name().to_string();
+        crate::telemetry::record_auth_failed_reason(&provider, "session", reason.label());
+
+        self.push_display_message(DisplayMessage::error(format!(
+            "🛑 Stopped automatic retries: {failures} consecutive credential/auth failures. \
+             The current login or API key for {provider} is not working, so resending the same \
+             request cannot succeed.{} Run /login to re-authenticate (or /model to switch to a \
+             working route), then send again.",
+            if cleared_pokes == 0 {
+                String::new()
+            } else {
+                format!(" Cleared {cleared_pokes} queued auto-poke follow-up(s).")
+            }
+        )));
+        self.set_status_notice("Stopped: repeated auth failures");
+        self.restore_failed_input_to_box();
+        self.consecutive_credential_failures = 0;
+    }
+
     pub(super) fn new_minimal_with_session(
         provider: Arc<dyn Provider>,
         registry: Registry,
@@ -349,6 +412,9 @@ impl App {
             auto_poke_incomplete_todos: true,
             overnight_auto_poke: None,
             pending_provider_failover: None,
+            pending_fallback_offer: None,
+            pending_fallback_resend: None,
+            pending_merge_offer: None,
             session_save_pending: false,
             streaming_tool_calls: Vec::new(),
             attempt_committed_assistant_messages: 0,
@@ -358,6 +424,7 @@ impl App {
             quit_pending: None,
             last_resize_redraw: None,
             mcp_server_names: Vec::new(),
+            connection_phase_started: None,
             stream_buffer: StreamBuffer::new(),
             thinking_start: None,
             thought_line_inserted: false,
@@ -380,6 +447,7 @@ impl App {
             submit_input_on_startup: false,
             startup_submit_deferred_reason: None,
             onboarding_preview_mode: false,
+            onboarding_sim: None,
             onboarding_flow: None,
             onboarding_startup_checked: false,
             onboarding_import_in_progress: None,
@@ -457,6 +525,8 @@ impl App {
             last_injected_memory_signature: None,
             swarm_enabled: features.swarm,
             debug_force_inline_gallery: false,
+            swarm_panel_selected: 0,
+            swarm_panel_focused: false,
             diff_mode: display.diff_mode,
             centered: display.centered,
             diagram_mode: display.diagram_mode,
@@ -515,6 +585,7 @@ impl App {
             model_picker_load_request_id: 0,
             pending_model_switch: None,
             pending_route_selection: None,
+            pending_reasoning_effort: None,
             remote_model_switch_in_flight: false,
             pending_prompt_after_model_switch: None,
             pending_prompt_before_history: None,
@@ -527,6 +598,7 @@ impl App {
             dictation_key: keybind::load_dictation_key(),
             new_terminal_key: keybind::load_new_terminal_key(),
             open_resume_key: keybind::load_open_resume_key(),
+            fallback_switch_key: keybind::load_fallback_switch_key(),
             scroll_keys: keybind::load_scroll_keys(),
             dictation_session: None,
             dictation_in_flight: false,
@@ -537,6 +609,15 @@ impl App {
             stashed_input: None,
             input_undo_stack: Vec::new(),
             status_notice: None,
+            learn_hint: None,
+            learn_hint_shown_this_session: false,
+            swarm_hint_shown_this_session: false,
+            sponsor_disclosure_shown_this_session: false,
+            hotkey_feedback: None,
+            hotkey_usage: None,
+            unknown_hotkey_seen: std::collections::HashMap::new(),
+            last_unknown_hotkey_notice: None,
+            pending_startup_notice: None,
             experimental_feature_warnings_seen: HashSet::new(),
             active_experimental_feature_notice: None,
             interleave_message: None,
@@ -562,12 +643,14 @@ impl App {
             app_started: Instant::now(),
             client_focused: true,
             runtime_memory_log,
+            idle_heap_release: Default::default(),
             client_binary_mtime: std::env::current_exe()
                 .ok()
                 .and_then(|p| std::fs::metadata(&p).ok())
                 .and_then(|m| m.modified().ok()),
             rate_limit_reset: None,
             rate_limit_pending_message: None,
+            consecutive_credential_failures: 0,
             last_stream_error: None,
             last_submitted_input: None,
             reload_info: Vec::new(),
@@ -578,6 +661,7 @@ impl App {
             pending_account_input: None,
             pending_ssh_remote_name: None,
             force_full_redraw: false,
+            force_full_repaint: false,
             last_mouse_scroll: None,
             mouse_scroll_target: None,
             mouse_scroll_queue: 0,
@@ -740,6 +824,9 @@ impl App {
             auto_poke_incomplete_todos: true,
             overnight_auto_poke: None,
             pending_provider_failover: None,
+            pending_fallback_offer: None,
+            pending_fallback_resend: None,
+            pending_merge_offer: None,
             session_save_pending: false,
             streaming_tool_calls: Vec::new(),
             attempt_committed_assistant_messages: 0,
@@ -749,6 +836,7 @@ impl App {
             quit_pending: None,
             last_resize_redraw: None,
             mcp_server_names: Vec::new(), // Vec<(name, tool_count)>
+            connection_phase_started: None,
             stream_buffer: StreamBuffer::new(),
             thinking_start: None,
             thought_line_inserted: false,
@@ -771,6 +859,7 @@ impl App {
             submit_input_on_startup: false,
             startup_submit_deferred_reason: None,
             onboarding_preview_mode: false,
+            onboarding_sim: None,
             onboarding_flow: None,
             onboarding_startup_checked: false,
             onboarding_import_in_progress: None,
@@ -848,6 +937,8 @@ impl App {
             last_injected_memory_signature: None,
             swarm_enabled: features.swarm,
             debug_force_inline_gallery: false,
+            swarm_panel_selected: 0,
+            swarm_panel_focused: false,
             diff_mode: display.diff_mode,
             centered: display.centered,
             diagram_mode: display.diagram_mode,
@@ -906,6 +997,7 @@ impl App {
             model_picker_load_request_id: 0,
             pending_model_switch: None,
             pending_route_selection: None,
+            pending_reasoning_effort: None,
             remote_model_switch_in_flight: false,
             pending_prompt_after_model_switch: None,
             pending_prompt_before_history: None,
@@ -918,6 +1010,7 @@ impl App {
             dictation_key: keybind::load_dictation_key(),
             new_terminal_key: keybind::load_new_terminal_key(),
             open_resume_key: keybind::load_open_resume_key(),
+            fallback_switch_key: keybind::load_fallback_switch_key(),
             scroll_keys: keybind::load_scroll_keys(),
             dictation_session: None,
             dictation_in_flight: false,
@@ -928,6 +1021,15 @@ impl App {
             stashed_input: None,
             input_undo_stack: Vec::new(),
             status_notice: None,
+            learn_hint: None,
+            learn_hint_shown_this_session: false,
+            swarm_hint_shown_this_session: false,
+            sponsor_disclosure_shown_this_session: false,
+            hotkey_feedback: None,
+            hotkey_usage: None,
+            unknown_hotkey_seen: std::collections::HashMap::new(),
+            last_unknown_hotkey_notice: None,
+            pending_startup_notice: None,
             experimental_feature_warnings_seen: HashSet::new(),
             active_experimental_feature_notice: None,
             interleave_message: None,
@@ -953,12 +1055,14 @@ impl App {
             app_started: Instant::now(),
             client_focused: true,
             runtime_memory_log,
+            idle_heap_release: Default::default(),
             client_binary_mtime: std::env::current_exe()
                 .ok()
                 .and_then(|p| std::fs::metadata(&p).ok())
                 .and_then(|m| m.modified().ok()),
             rate_limit_reset: None,
             rate_limit_pending_message: None,
+            consecutive_credential_failures: 0,
             last_stream_error: None,
             last_submitted_input: None,
             reload_info: Vec::new(),
@@ -969,6 +1073,7 @@ impl App {
             pending_account_input: None,
             pending_ssh_remote_name: None,
             force_full_redraw: false,
+            force_full_repaint: false,
             last_mouse_scroll: None,
             mouse_scroll_target: None,
             mouse_scroll_queue: 0,
@@ -1038,21 +1143,35 @@ impl App {
         };
 
         let render_start = Instant::now();
-        let (rendered_messages, rendered_images) =
-            crate::session::render_messages_and_images(&session);
-        let display_messages =
-            jcode_tui_messages::display_messages_from_rendered_messages(rendered_messages);
-        self.replace_display_messages(display_messages);
+        // Narrow scope so render intermediates (rendered messages, display
+        // message buffers) drop before we strip and retain the session.
+        {
+            let (rendered_messages, rendered_images) =
+                crate::session::render_messages_and_images(&session);
+            let display_messages =
+                jcode_tui_messages::display_messages_from_rendered_messages(rendered_messages);
+            self.replace_display_messages(display_messages);
+            self.remote_side_pane_images = rendered_images;
+        }
         let render_ms = render_start.elapsed().as_millis();
 
-        self.remote_side_pane_images = rendered_images;
         let image_ms = 0;
         self.set_side_panel_snapshot(
             crate::side_panel::snapshot_for_session(session_id).unwrap_or_default(),
         );
         self.remote_session_id = Some(session_id.to_string());
         session.strip_transcript_for_remote_client();
+        // The strip above clears the large transcript vectors but keeps their
+        // capacity; free the backing buffers before retaining the session.
+        session.messages.shrink_to_fit();
+        session.env_snapshots.shrink_to_fit();
+        session.memory_injections.shrink_to_fit();
+        session.replay_events.shrink_to_fit();
         self.session = session;
+        // The full deserialized transcript (raw file + Session structs) was a
+        // large transient; return the freed arena pages to the OS now instead
+        // of waiting for the post-connect client_history_loaded release.
+        crate::process_memory::release_retained_heap("remote_startup_history_stripped");
         self.autoreview_enabled = self
             .session
             .autoreview_enabled

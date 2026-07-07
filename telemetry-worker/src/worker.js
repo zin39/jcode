@@ -1,56 +1,353 @@
 let cachedEventColumns = null;
 let cachedSessionDetailColumns = null;
 let cachedTurnDetailColumns = null;
+let cachedWebDetailColumns = null;
+
+// Website beacon events (anonymous visitor_id minted in localStorage). Their
+// web-only fields live in the web_details table (see migration 0016): the
+// events table sits one column shy of D1's 100-column cap, so wide event
+// shapes go in detail tables per the session_details / turn_details pattern.
+const WEB_EVENTS = ["web_pageview", "web_cta_click"];
+
+// Token subscription plan lifecycle events, plus account_linked, the
+// analytics<->account join anchor (telemetry_id + account_id).
+const SUBSCRIPTION_EVENTS = [
+  "subscription_login",
+  "subscription_activated",
+  "subscription_budget_exhausted",
+  "subscription_router_error",
+  "account_linked",
+];
+
+const CLI_EVENTS = [
+  "install",
+  "upgrade",
+  "auth_success",
+  "onboarding_step",
+  "feedback",
+  "session_start",
+  "turn_end",
+  "session_end",
+  "session_crash",
+];
+
+const KNOWN_EVENTS = [...CLI_EVENTS, ...WEB_EVENTS, ...SUBSCRIPTION_EVENTS];
+
+// Origins the website beacon posts from. The default CORS policy stays the
+// permissive ALLOWED_ORIGIN var ("*", telemetry is anonymous and unauthed);
+// allowlisted origins are echoed back explicitly so the policy keeps working
+// if ALLOWED_ORIGIN is ever narrowed.
+const WEB_ALLOWED_ORIGINS = new Set([
+  "https://solosystems.dev",
+  "https://solosystems.pages.dev",
+]);
+
+// ---------------------------------------------------------------------------
+// Self-defense against the D1 size cap.
+//
+// D1 hard-caps database size (500 MB class on the free plan). When the cap is
+// hit, every insert fails and telemetry silently stops being recorded (this
+// happened in June 2026; ~3 days of events were lost and the file was left at
+// its ~491.5 MB high-water mark). SQLite files never shrink on DELETE - the
+// nightly prune frees pages *inside* the file and the day's inserts recycle
+// them - so the steady state is "file at high-water mark, internal free-page
+// pool cycling". Two triggers defend the pool:
+//
+// 1. Size growth: every D1 result carries `meta.size_after`. If the file
+//    grows past the soft limit (just above the high-water mark), the free
+//    pool is exhausted and real growth has resumed; run an emergency prune.
+// 2. Full-error: if an insert fails with a full/limit error, prune
+//    immediately. This bounds a June-style outage to minutes instead of days.
+//
+// Emergency prunes use halved retention windows and are rate-limited per
+// isolate.
+// ---------------------------------------------------------------------------
+const D1_SOFT_LIMIT_BYTES = 493_000_000;
+const EMERGENCY_PRUNE_COOLDOWN_MS = 10 * 60 * 1000;
+// Best-effort per-isolate state (resets on isolate recycle, which is fine:
+// the next request re-observes the size from its own insert result).
+let lastObservedDbSizeBytes = 0;
+let lastEmergencyPruneAtMs = 0;
+
+// ---------------------------------------------------------------------------
+// Workers Analytics Engine firehose.
+//
+// Every event is written to the FIREHOSE dataset before the D1 insert. AE is
+// a time-series store with no database size cap (~90-day retention, adaptive
+// sampling on reads), so it is the primary store for high-volume raw analysis
+// (turn_end / session_start / onboarding_step), while D1 remains the durable
+// relational store for identity anchors, lifecycle rows, and the
+// daily_active_users rollup. Because the firehose write happens first,
+// telemetry keeps recording even if D1 hits its size cap.
+//
+// AE columns are positional (blob1..blob20, double1..double20, index1). This
+// schema defines the mapping; treat it as append-only (never reorder or
+// repurpose a position, or historical queries silently read the wrong field).
+// ---------------------------------------------------------------------------
+const FIREHOSE_SCHEMA = {
+  // blob1..blob20 (strings)
+  blobs: [
+    "event",
+    "version",
+    "os",
+    "arch",
+    "build_channel",
+    "event_id",
+    "session_id",
+    "step",
+    "auth_provider",
+    "auth_method",
+    "auth_failure_reason",
+    "provider_start",
+    "provider_end",
+    "model_start",
+    "model_end",
+    "agent_role",
+    "session_stop_reason",
+    "end_reason",
+    "turn_end_reason",
+    "from_version",
+  ],
+  // double1..double20 (numbers)
+  doubles: [
+    "is_ci",
+    "is_git_checkout",
+    "ran_from_cargo",
+    "turn_index",
+    "duration_secs",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "tool_calls",
+    "executed_tool_calls",
+    "tool_failures",
+    "file_write_calls",
+    "tests_run",
+    "tests_passed",
+    "error_auth_failed",
+    "error_rate_limited",
+    "error_provider_timeout",
+    "turn_success",
+    "turns",
+    "milestone_elapsed_ms",
+  ],
+  // index1 (sampling key): telemetry_id, so adaptive sampling stays accurate
+  // per user rather than per event shape.
+  indexes: ["telemetry_id"],
+};
+
+// ---------------------------------------------------------------------------
+// Web/subscription firehose (`jcode_web_firehose` dataset).
+//
+// FIREHOSE_SCHEMA above is append-only AND full: Analytics Engine caps a data
+// point at 20 blobs + 20 doubles, and both arrays are at capacity. The new
+// web/subscription fields therefore live in a second dataset with its own
+// positional schema instead of repurposing existing positions (which would
+// silently corrupt historical queries). Same append-only contract applies
+// here: never reorder or repurpose a position.
+// ---------------------------------------------------------------------------
+const FIREHOSE_WEB_SCHEMA = {
+  // blob1..blob20 (strings); 17 used, 3 free for future appends.
+  blobs: [
+    "event",
+    "version",
+    "os",
+    "arch",
+    "build_channel",
+    "event_id",
+    "session_id",
+    "path",
+    "referrer",
+    "visitor_id",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "cta",
+    "account_id",
+    "tier",
+    "model",
+  ],
+  // double1..double20 (numbers); 1 used, 19 free.
+  doubles: ["is_ci"],
+  // index1 (sampling key): visitor_id for web events, telemetry_id otherwise.
+  indexes: ["visitor_id_or_telemetry_id"],
+};
+
+function writeFirehose(env, body) {
+  if (WEB_EVENTS.includes(body.event) || SUBSCRIPTION_EVENTS.includes(body.event)) {
+    return writeWebFirehose(env, body);
+  }
+  if (!env.FIREHOSE || typeof env.FIREHOSE.writeDataPoint !== "function") {
+    return false;
+  }
+  const errors = body.errors || {};
+  const boolFields = new Set([
+    "is_ci",
+    "is_git_checkout",
+    "ran_from_cargo",
+    "turn_success",
+  ]);
+  const errorFields = {
+    error_auth_failed: "auth_failed",
+    error_rate_limited: "rate_limited",
+    error_provider_timeout: "provider_timeout",
+  };
+  try {
+    env.FIREHOSE.writeDataPoint({
+      indexes: [String(body.id || "").slice(0, 96)],
+      blobs: FIREHOSE_SCHEMA.blobs.map((name) => {
+        const value = body[name];
+        // Cap each blob defensively: AE limits total blob bytes per point.
+        return value == null ? "" : String(value).slice(0, 200);
+      }),
+      doubles: FIREHOSE_SCHEMA.doubles.map((name) => {
+        if (boolFields.has(name)) {
+          return boolToInt(body[name]);
+        }
+        if (name in errorFields) {
+          const value = errors[errorFields[name]] ?? body[name];
+          return Number(value) || 0;
+        }
+        return Number(body[name]) || 0;
+      }),
+    });
+    return true;
+  } catch (err) {
+    console.warn("firehose write failed", err?.message || err);
+    return false;
+  }
+}
+
+function writeWebFirehose(env, body) {
+  const sink = env.FIREHOSE_WEB;
+  if (!sink || typeof sink.writeDataPoint !== "function") {
+    return false;
+  }
+  try {
+    sink.writeDataPoint({
+      indexes: [String(body.visitor_id || body.id || "").slice(0, 96)],
+      blobs: FIREHOSE_WEB_SCHEMA.blobs.map((name) => {
+        const value = body[name];
+        return value == null ? "" : String(value).slice(0, 200);
+      }),
+      doubles: FIREHOSE_WEB_SCHEMA.doubles.map((name) => {
+        if (name === "is_ci") {
+          return boolToInt(body.is_ci);
+        }
+        return Number(body[name]) || 0;
+      }),
+    });
+    return true;
+  } catch (err) {
+    console.warn("web firehose write failed", err?.message || err);
+    return false;
+  }
+}
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    const cors = corsHeaders(request, env);
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        headers: corsHeaders(),
+        headers: cors,
       });
     }
 
-    if (request.method !== "POST") {
-      return jsonResponse({ error: "Method not allowed" }, 405);
+    const url = new URL(request.url);
+
+    // Monitoring endpoint: database size vs the soft limit, so cap pressure
+    // is observable before inserts start failing.
+    if (request.method === "GET" && url.pathname === "/v1/health") {
+      try {
+        const probe = await env.DB.prepare("SELECT 1").run();
+        observeDbSize(probe);
+      } catch (err) {
+        return jsonResponse(
+          { ok: false, error: "d1 probe failed", detail: String(err?.message || err) },
+          500,
+          cors,
+        );
+      }
+      return jsonResponse({
+        ok: true,
+        db_size_bytes: lastObservedDbSizeBytes,
+        db_soft_limit_bytes: D1_SOFT_LIMIT_BYTES,
+        over_soft_limit: lastObservedDbSizeBytes >= D1_SOFT_LIMIT_BYTES,
+        last_emergency_prune_at_ms: lastEmergencyPruneAtMs || null,
+      }, 200, cors);
     }
 
-    const url = new URL(request.url);
+    if (request.method !== "POST") {
+      return jsonResponse({ error: "Method not allowed" }, 405, cors);
+    }
+
     if (url.pathname !== "/v1/event") {
-      return jsonResponse({ error: "Not found" }, 404);
+      return jsonResponse({ error: "Not found" }, 404, cors);
     }
 
     let body;
     try {
       body = await request.json();
     } catch {
-      return jsonResponse({ error: "Invalid JSON" }, 400);
+      return jsonResponse({ error: "Invalid JSON" }, 400, cors);
+    }
+
+    // Web beacon events are normalized before the generic required-field
+    // check: the browser has no version/os/arch, so sensible defaults are
+    // filled in, and the anonymous visitor_id doubles as the telemetry id.
+    if (typeof body.event === "string" && WEB_EVENTS.includes(body.event)) {
+      const problem = normalizeWebEvent(body);
+      if (problem) {
+        return jsonResponse({ error: problem }, 400, cors);
+      }
     }
 
     if (!body.id || !body.event || !body.version || !body.os || !body.arch) {
-      return jsonResponse({ error: "Missing required fields" }, 400);
+      return jsonResponse({ error: "Missing required fields" }, 400, cors);
     }
 
-    if (![
-      "install",
-      "upgrade",
-      "auth_success",
-      "onboarding_step",
-      "feedback",
-      "session_start",
-      "turn_end",
-      "session_end",
-      "session_crash",
-    ].includes(body.event)) {
-      return jsonResponse({ error: "Unknown event type" }, 400);
+    if (!KNOWN_EVENTS.includes(body.event)) {
+      return jsonResponse({ error: "Unknown event type" }, 400, cors);
     }
 
+    if (SUBSCRIPTION_EVENTS.includes(body.event)) {
+      const problem = normalizeSubscriptionEvent(body);
+      if (problem) {
+        return jsonResponse({ error: problem }, 400, cors);
+      }
+    }
+
+    // Firehose first: even if D1 is at its size cap, the raw event is
+    // recorded in Analytics Engine and the day is reconstructable.
+    const firehoseOk = writeFirehose(env, body);
+
+    let durableOk = true;
     try {
       await insertEvent(env, body);
-
-      return jsonResponse({ ok: true });
     } catch (err) {
-      return jsonResponse({ error: "Internal error" }, 500);
+      durableOk = false;
+      console.error(
+        `d1 insert failed for ${body.event} (db_size=${lastObservedDbSizeBytes})`,
+        err?.message || err,
+      );
+      // A full/limit failure means the internal free-page pool is exhausted
+      // (June 2026 failure mode). Prune NOW so telemetry recovers within
+      // minutes instead of staying dead until someone notices.
+      if (isDbFullError(err) && ctx && typeof ctx.waitUntil === "function") {
+        const now = Date.now();
+        if (now - lastEmergencyPruneAtMs >= EMERGENCY_PRUNE_COOLDOWN_MS) {
+          lastEmergencyPruneAtMs = now;
+          ctx.waitUntil(emergencyPrune(env));
+        }
+      }
     }
+
+    maybeScheduleEmergencyPrune(env, ctx);
+
+    if (!durableOk && !firehoseOk) {
+      return jsonResponse({ error: "Internal error" }, 500, cors);
+    }
+    return jsonResponse({ ok: true, durable: durableOk, firehose: firehoseOk }, 200, cors);
   },
 
   // Nightly retention pruning. D1 hard-caps databases at 500 MB; without this
@@ -59,9 +356,69 @@ export default {
   // are pruned on a schedule while aggregate signal is preserved in the
   // daily_active_users rollup and in long-retention lifecycle events.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(pruneOldEvents(env));
+    ctx.waitUntil(
+      (async () => {
+        await pruneOldEvents(env);
+        // If the normal prune did not free enough headroom, escalate with the
+        // emergency (halved) retention windows instead of waiting for inserts
+        // to start failing mid-day.
+        try {
+          const probe = await env.DB.prepare("SELECT 1").run();
+          observeDbSize(probe);
+        } catch {
+          // ignore: size stays at last observation
+        }
+        if (lastObservedDbSizeBytes >= D1_SOFT_LIMIT_BYTES) {
+          await emergencyPrune(env);
+        }
+      })(),
+    );
   },
 };
+
+function observeDbSize(result) {
+  const size = result?.meta?.size_after;
+  if (typeof size === "number" && size > 0) {
+    lastObservedDbSizeBytes = size;
+  }
+  return lastObservedDbSizeBytes;
+}
+
+function isDbFullError(err) {
+  const message = String(err?.message || err || "").toLowerCase();
+  // D1 surfaces the cap as SQLITE_FULL ("database or disk is full") or an
+  // explicit size-limit message. Keep this narrow: a false positive triggers
+  // an unnecessary (rate-limited) prune, but matching e.g. "LIMIT" in SQL
+  // syntax errors would prune on every malformed query.
+  return (
+    message.includes("sqlite_full")
+    || message.includes("disk is full")
+    || message.includes("database is full")
+    || message.includes("exceeds the maximum size")
+    || message.includes("maximum database size")
+  );
+}
+
+function maybeScheduleEmergencyPrune(env, ctx) {
+  if (lastObservedDbSizeBytes < D1_SOFT_LIMIT_BYTES) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastEmergencyPruneAtMs < EMERGENCY_PRUNE_COOLDOWN_MS) {
+    return;
+  }
+  lastEmergencyPruneAtMs = now;
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(emergencyPrune(env));
+  }
+}
+
+async function emergencyPrune(env) {
+  console.error(
+    `EMERGENCY PRUNE: db size ${lastObservedDbSizeBytes} bytes >= soft limit ${D1_SOFT_LIMIT_BYTES}; pruning with halved retention windows`,
+  );
+  await pruneOldEvents(env, { retentionScale: 0.5, maxBatches: 24 });
+}
 
 // Retention windows, in days, per event type. Children (turn_details /
 // session_details) are deleted before their parent events rows to satisfy the
@@ -75,6 +432,11 @@ export default {
 //   metrics; keep them for 12 months per the documented retention policy.
 // - install and feedback rows are tiny and act as identity/product anchors;
 //   they are never pruned here.
+// - web_pageview is the high-volume website row; keep a 90-day raw tail in D1
+//   (matching firehose retention) and prune beyond it. web_cta_click is the
+//   low-volume conversion anchor; keep 12 months.
+// - subscription_activated and account_linked are identity/revenue anchors and
+//   are never pruned (like install / feedback).
 const RETENTION_DAYS = {
   turn_end: 30,
   session_start: 30,
@@ -83,17 +445,40 @@ const RETENTION_DAYS = {
   auth_success: 180,
   session_end: 365,
   session_crash: 365,
+  web_pageview: 90,
+  web_cta_click: 365,
+  subscription_login: 180,
+  subscription_router_error: 90,
+  subscription_budget_exhausted: 365,
 };
 
 const PRUNE_BATCH_LIMIT = 10000;
 const PRUNE_MAX_BATCHES_PER_RUN = 12;
 
-async function pruneOldEvents(env) {
+async function pruneOldEvents(env, options = {}) {
+  const retentionScale = options.retentionScale ?? 1;
+  const maxBatches = options.maxBatches ?? PRUNE_MAX_BATCHES_PER_RUN;
   let batchesUsed = 0;
   for (const [eventType, days] of Object.entries(RETENTION_DAYS)) {
-    const cutoff = `-${days} days`;
-    while (batchesUsed < PRUNE_MAX_BATCHES_PER_RUN) {
+    const scaledDays = Math.max(1, Math.round(days * retentionScale));
+    const cutoff = `-${scaledDays} days`;
+    while (batchesUsed < maxBatches) {
       batchesUsed += 1;
+      // Delete web_details children first (own try/catch: databases that
+      // predate migration 0016 have no web_details table, and that must not
+      // abort pruning of the event rows themselves).
+      if (WEB_EVENTS.includes(eventType)) {
+        try {
+          await env.DB.prepare(
+            `DELETE FROM web_details WHERE event_id IN (
+               SELECT event_id FROM events
+               WHERE event = ? AND created_at < datetime('now', ?) AND event_id IS NOT NULL
+               LIMIT ?)`
+          ).bind(eventType, cutoff, PRUNE_BATCH_LIMIT).run();
+        } catch (err) {
+          console.warn(`web_details prune failed for ${eventType}`, err?.message || err);
+        }
+      }
       try {
         // Delete detail children first so the events FK never blocks the prune.
         await env.DB.prepare(
@@ -114,6 +499,7 @@ async function pruneOldEvents(env) {
              WHERE event = ? AND created_at < datetime('now', ?)
              LIMIT ?)`
         ).bind(eventType, cutoff, PRUNE_BATCH_LIMIT).run();
+        observeDbSize(result);
         const changes = result?.meta?.changes ?? result?.changes ?? 0;
         if (changes < PRUNE_BATCH_LIMIT) {
           break;
@@ -131,6 +517,38 @@ async function insertEvent(env, body) {
   const sessionDetailColumns = await getSessionDetailColumns(env);
   const turnDetailColumns = await getTurnDetailColumns(env);
   const common = commonEventEntries(body, columns);
+
+  if (WEB_EVENTS.includes(body.event)) {
+    const values = [
+      ["telemetry_id", body.id],
+      ["event", body.event],
+      ["version", body.version],
+      ["os", body.os],
+      ["arch", body.arch],
+      ...common,
+    ].filter(([name]) => columns.has(name));
+    const inserted = await insertEventRow(env, body, values);
+    if (inserted) {
+      await insertWebDetails(env, body, await getWebDetailColumns(env));
+    }
+    return;
+  }
+
+  if (SUBSCRIPTION_EVENTS.includes(body.event)) {
+    return insertEventRow(env, body, [
+      ["telemetry_id", body.id],
+      ["event", body.event],
+      ["version", body.version],
+      ["os", body.os],
+      ["arch", body.arch],
+      ["account_id", body.account_id || null],
+      ["tier", body.tier || null],
+      // Subscription events reuse the generic model_start column for the
+      // routed model (new event types; no historical rows are re-read).
+      ["model_start", body.model || null],
+      ...common,
+    ].filter(([name]) => columns.has(name)));
+  }
 
   if (body.event === "install") {
     return insertEventRow(env, body, [
@@ -178,6 +596,7 @@ async function insertEvent(env, body) {
       ["step", body.step || null],
       ["auth_provider", body.auth_provider || null],
       ["auth_method", body.auth_method || null],
+      ["auth_failure_reason", body.auth_failure_reason || null],
       ["milestone_elapsed_ms", body.milestone_elapsed_ms || null],
       ...common,
     ].filter(([name]) => columns.has(name)));
@@ -665,32 +1084,121 @@ async function getTurnDetailColumns(env) {
   return cachedTurnDetailColumns;
 }
 
+async function getWebDetailColumns(env) {
+  if (cachedWebDetailColumns) {
+    return cachedWebDetailColumns;
+  }
+  try {
+    const result = await env.DB.prepare("PRAGMA table_info(web_details)").all();
+    cachedWebDetailColumns = new Set((result.results || []).map((row) => row.name));
+  } catch {
+    cachedWebDetailColumns = new Set();
+  }
+  return cachedWebDetailColumns;
+}
+
+async function insertWebDetails(env, body, columns) {
+  if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
+    return;
+  }
+  const values = [
+    ["event_id", body.event_id],
+    ["path", body.path || null],
+    ["referrer", body.referrer || null],
+    ["visitor_id", body.visitor_id || null],
+    ["utm_source", body.utm_source || null],
+    ["utm_medium", body.utm_medium || null],
+    ["utm_campaign", body.utm_campaign || null],
+    ["cta", body.cta || null],
+  ].filter(([name]) => columns.has(name));
+  if (values.length > 1) {
+    await insertDynamic(env, "web_details", values);
+  }
+}
+
+// Normalize a website beacon event in place. Browsers do not send
+// version/os/arch and mint an anonymous visitor_id in localStorage, so the
+// visitor_id doubles as the telemetry id and free-text fields are
+// length-capped (same defensive posture as the firehose blob caps).
+// Returns an error string when the event is invalid, otherwise null.
+function normalizeWebEvent(body) {
+  if (typeof body.visitor_id !== "string" || body.visitor_id.length === 0) {
+    return "Missing visitor_id";
+  }
+  if (typeof body.path !== "string" || body.path.length === 0) {
+    return "Missing path";
+  }
+  if (body.event === "web_cta_click" && (typeof body.cta !== "string" || body.cta.length === 0)) {
+    return "Missing cta";
+  }
+  body.visitor_id = body.visitor_id.slice(0, 96);
+  body.id = body.id || body.visitor_id;
+  body.version = body.version || "web";
+  body.os = body.os || "web";
+  body.arch = body.arch || "web";
+  for (const field of ["path", "referrer", "utm_source", "utm_medium", "utm_campaign", "cta"]) {
+    if (body[field] != null) {
+      body[field] = String(body[field]).slice(0, 200);
+    }
+  }
+  return null;
+}
+
+// Normalize a token-subscription event in place. account_id is required for
+// all of them; account_linked is the analytics<->account join event and also
+// requires the telemetry id. Returns an error string or null.
+function normalizeSubscriptionEvent(body) {
+  if (typeof body.account_id !== "string" || body.account_id.length === 0) {
+    return "Missing account_id";
+  }
+  body.account_id = body.account_id.slice(0, 96);
+  for (const field of ["tier", "model"]) {
+    if (body[field] != null) {
+      body[field] = String(body[field]).slice(0, 200);
+    }
+  }
+  return null;
+}
+
 async function insertDynamic(env, table, entries) {
   const columns = entries.map(([name]) => name);
   const placeholders = columns.map(() => "?").join(", ");
   const sql = `INSERT OR IGNORE INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})`;
   const values = entries.map(([, value]) => value);
-  return env.DB.prepare(sql).bind(...values).run();
+  const result = await env.DB.prepare(sql).bind(...values).run();
+  observeDbSize(result);
+  return result;
 }
 
 function boolToInt(value) {
   return value ? 1 : 0;
 }
 
-function jsonResponse(data, status = 200) {
+function jsonResponse(data, status = 200, cors = null) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json",
-      ...corsHeaders(),
+      ...(cors || corsHeaders()),
     },
   });
 }
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
+function corsHeaders(request = null, env = null) {
+  // Default policy: ALLOWED_ORIGIN var (currently "*"; telemetry is anonymous
+  // and unauthenticated). Website beacon origins are additionally echoed back
+  // explicitly, so browser preflights keep passing even if ALLOWED_ORIGIN is
+  // ever narrowed away from "*".
+  let allowOrigin = env?.ALLOWED_ORIGIN || "*";
+  const origin = request?.headers?.get?.("Origin");
+  const headers = {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
   };
+  if (origin && WEB_ALLOWED_ORIGINS.has(origin)) {
+    allowOrigin = origin;
+    headers["Vary"] = "Origin";
+  }
+  headers["Access-Control-Allow-Origin"] = allowOrigin;
+  return headers;
 }

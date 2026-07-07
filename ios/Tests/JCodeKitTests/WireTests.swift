@@ -82,6 +82,17 @@ private func encodedObject(_ request: Request) throws -> [String: Any] {
     #expect(rename["title"] as? String == "My session")
 }
 
+@Test func encodesReasoningEffortAndCompact() throws {
+    let effort = try encodedObject(.setReasoningEffort(id: 13, effort: "high"))
+    #expect(effort["type"] as? String == "set_reasoning_effort")
+    #expect(effort["id"] as? UInt64 == 13)
+    #expect(effort["effort"] as? String == "high")
+
+    let compact = try encodedObject(.compact(id: 14))
+    #expect(compact["type"] as? String == "compact")
+    #expect(compact["id"] as? UInt64 == 14)
+}
+
 // MARK: - ServerEvent decoding (fixtures mirror real server output)
 
 @Test func decodesStreamingEvents() throws {
@@ -187,6 +198,68 @@ private func encodedObject(_ request: Request) throws -> [String: Any] {
     let event = try ServerEvent.decode(
         line: #"{"type":"some_future_event","payload":{"x":1}}"#)
     #expect(event == .unknown(type: "some_future_event"))
+}
+
+@Test func decodesTurnLifecycleSignals() throws {
+    #expect(
+        try ServerEvent.decode(line: #"{"type":"connection_phase","phase":"authenticating"}"#)
+            == .connectionPhase(phase: "authenticating"))
+    #expect(
+        try ServerEvent.decode(line: #"{"type":"retry_rollback","attempt":2,"max":5}"#)
+            == .retryRollback(attempt: 2, max: 5))
+    #expect(
+        try ServerEvent.decode(
+            line:
+                #"{"type":"soft_interrupt_injected","content":"also fix y","point":"C","tools_skipped":1}"#
+        )
+            == .softInterruptInjected(
+                content: "also fix y", displayRole: nil, point: "C", toolsSkipped: 1))
+    #expect(
+        try ServerEvent.decode(
+            line:
+                #"{"type":"soft_interrupt_injected","content":"note","display_role":"system","point":"A"}"#
+        )
+            == .softInterruptInjected(
+                content: "note", displayRole: "system", point: "A", toolsSkipped: nil))
+}
+
+@Test func decodesEffortAndCompactResponses() throws {
+    #expect(
+        try ServerEvent.decode(
+            line: #"{"type":"reasoning_effort_changed","id":3,"effort":"high"}"#)
+            == .reasoningEffortChanged(id: 3, effort: "high", error: nil))
+    #expect(
+        try ServerEvent.decode(
+            line: #"{"type":"reasoning_effort_changed","id":4,"error":"unsupported"}"#)
+            == .reasoningEffortChanged(id: 4, effort: nil, error: "unsupported"))
+    #expect(
+        try ServerEvent.decode(
+            line: #"{"type":"compact_result","id":5,"message":"Compaction started","success":true}"#
+        )
+            == .compactResult(id: 5, message: "Compaction started", success: true))
+}
+
+@Test func decodesServerLifecycleEvents() throws {
+    #expect(
+        try ServerEvent.decode(line: #"{"type":"reloading"}"#)
+            == .reloading(newSocket: nil))
+    #expect(
+        try ServerEvent.decode(line: #"{"type":"reloading","new_socket":"/tmp/jcode.sock"}"#)
+            == .reloading(newSocket: "/tmp/jcode.sock"))
+    #expect(
+        try ServerEvent.decode(
+            line: #"{"type":"session_close_requested","reason":"taken over"}"#)
+            == .sessionCloseRequested(reason: "taken over"))
+}
+
+@Test func historyCarriesReasoningEffort() throws {
+    let line =
+        #"{"type":"history","id":1,"session_id":"s","messages":[],"reasoning_effort":"medium"}"#
+    guard case let .history(payload) = try ServerEvent.decode(line: line) else {
+        Issue.record("expected history event")
+        return
+    }
+    #expect(payload.reasoningEffort == "medium")
 }
 
 @Test func malformedLinesThrow() {

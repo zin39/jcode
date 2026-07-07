@@ -15,6 +15,8 @@ public enum Request: Equatable, Sendable {
     case getHistory(id: UInt64)
     case resumeSession(id: UInt64, sessionID: String)
     case setModel(id: UInt64, model: String)
+    case setReasoningEffort(id: UInt64, effort: String)
+    case compact(id: UInt64)
     case renameSession(id: UInt64, title: String?)
     case clear(id: UInt64)
 
@@ -23,7 +25,8 @@ public enum Request: Equatable, Sendable {
         case let .subscribe(id, _), let .message(id, _), let .cancel(id),
             let .softInterrupt(id, _, _), let .cancelSoftInterrupts(id),
             let .ping(id), let .getHistory(id), let .resumeSession(id, _),
-            let .setModel(id, _), let .renameSession(id, _), let .clear(id):
+            let .setModel(id, _), let .setReasoningEffort(id, _), let .compact(id),
+            let .renameSession(id, _), let .clear(id):
             return id
         }
     }
@@ -58,6 +61,11 @@ public enum Request: Equatable, Sendable {
         case let .setModel(_, model):
             object["type"] = "set_model"
             object["model"] = model
+        case let .setReasoningEffort(_, effort):
+            object["type"] = "set_reasoning_effort"
+            object["effort"] = effort
+        case .compact:
+            object["type"] = "compact"
         case let .renameSession(_, title):
             object["type"] = "rename_session"
             if let title {
@@ -122,6 +130,9 @@ public enum ServerEvent: Equatable, Sendable {
     case toolDone(id: String, name: String, output: String, error: String?)
     case tokenUsage(input: UInt64, output: UInt64)
     case statusDetail(detail: String)
+    case connectionPhase(phase: String)
+    case softInterruptInjected(content: String, displayRole: String?, point: String, toolsSkipped: Int?)
+    case retryRollback(attempt: Int, max: Int)
     case messageEnd
     case interrupted
     case done(id: UInt64)
@@ -132,9 +143,13 @@ public enum ServerEvent: Equatable, Sendable {
     case sessionRenamed(sessionID: String, displayTitle: String)
     case history(HistoryPayload)
     case modelChanged(id: UInt64, model: String, error: String?)
+    case reasoningEffortChanged(id: UInt64, effort: String?, error: String?)
+    case compactResult(id: UInt64, message: String, success: Bool)
     case availableModelsUpdated(models: [String], providerModel: String?)
     case compaction(trigger: String, tokensSaved: UInt64?)
     case notification(fromName: String?, message: String)
+    case reloading(newSocket: String?)
+    case sessionCloseRequested(reason: String)
     case unknown(type: String)
 
     public struct HistoryPayload: Equatable, Sendable {
@@ -148,6 +163,7 @@ public enum ServerEvent: Equatable, Sendable {
         public var allSessions: [String]
         public var serverVersion: String?
         public var displayTitle: String?
+        public var reasoningEffort: String?
 
         public struct TokenTotals: Equatable, Sendable {
             public var input: UInt64
@@ -169,7 +185,8 @@ public enum ServerEvent: Equatable, Sendable {
             totalTokens: TokenTotals? = nil,
             allSessions: [String] = [],
             serverVersion: String? = nil,
-            displayTitle: String? = nil
+            displayTitle: String? = nil,
+            reasoningEffort: String? = nil
         ) {
             self.id = id
             self.sessionID = sessionID
@@ -181,6 +198,7 @@ public enum ServerEvent: Equatable, Sendable {
             self.allSessions = allSessions
             self.serverVersion = serverVersion
             self.displayTitle = displayTitle
+            self.reasoningEffort = reasoningEffort
         }
     }
 
@@ -224,6 +242,17 @@ public enum ServerEvent: Equatable, Sendable {
             return .tokenUsage(input: json.uint64("input"), output: json.uint64("output"))
         case "status_detail":
             return .statusDetail(detail: json.string("detail"))
+        case "connection_phase":
+            return .connectionPhase(phase: json.string("phase"))
+        case "soft_interrupt_injected":
+            return .softInterruptInjected(
+                content: json.string("content"),
+                displayRole: json.optionalString("display_role"),
+                point: json.string("point"),
+                toolsSkipped: json.optionalInt("tools_skipped")
+            )
+        case "retry_rollback":
+            return .retryRollback(attempt: json.int("attempt"), max: json.int("max"))
         case "message_end":
             return .messageEnd
         case "interrupted":
@@ -260,6 +289,18 @@ public enum ServerEvent: Equatable, Sendable {
                 model: json.string("model"),
                 error: json.optionalString("error")
             )
+        case "reasoning_effort_changed":
+            return .reasoningEffortChanged(
+                id: json.uint64("id"),
+                effort: json.optionalString("effort"),
+                error: json.optionalString("error")
+            )
+        case "compact_result":
+            return .compactResult(
+                id: json.uint64("id"),
+                message: json.string("message"),
+                success: json.bool("success")
+            )
         case "available_models_updated":
             return .availableModelsUpdated(
                 models: json.stringArray("available_models"),
@@ -275,6 +316,10 @@ public enum ServerEvent: Equatable, Sendable {
                 fromName: json.optionalString("from_name"),
                 message: json.string("message")
             )
+        case "reloading":
+            return .reloading(newSocket: json.optionalString("new_socket"))
+        case "session_close_requested":
+            return .sessionCloseRequested(reason: json.string("reason"))
         default:
             return .unknown(type: type)
         }
@@ -316,7 +361,8 @@ public enum ServerEvent: Equatable, Sendable {
             totalTokens: totals,
             allSessions: json.stringArray("all_sessions"),
             serverVersion: json.optionalString("server_version"),
-            displayTitle: json.optionalString("display_title")
+            displayTitle: json.optionalString("display_title"),
+            reasoningEffort: json.optionalString("reasoning_effort")
         )
     }
 }
@@ -350,6 +396,10 @@ struct JSONObject {
 
     func int(_ key: String) -> Int {
         (raw[key] as? NSNumber)?.intValue ?? 0
+    }
+
+    func optionalInt(_ key: String) -> Int? {
+        (raw[key] as? NSNumber)?.intValue
     }
 
     func uint64(_ key: String) -> UInt64 {
