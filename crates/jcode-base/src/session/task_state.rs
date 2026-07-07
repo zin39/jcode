@@ -88,7 +88,7 @@ mod tests {
         let big = "x".repeat(MAX_TASK_STATE_CHARS + 100);
         write_task_state_in_dir(dir.path(), "s2", &big).unwrap();
         let read = read_task_state_in_dir(dir.path(), "s2").unwrap();
-        assert!(read.chars().count() <= MAX_TASK_STATE_CHARS + TRUNCATION_MARKER.chars().count());
+        assert_eq!(read.chars().count(), MAX_TASK_STATE_CHARS + TRUNCATION_MARKER.chars().count());
         assert!(read.ends_with(TRUNCATION_MARKER));
     }
 
