@@ -48,14 +48,15 @@ impl Tool for UpdateTaskStateTool {
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params: UpdateTaskStateInput = serde_json::from_value(input)?;
-        let cleared = params.content.trim().is_empty();
-        jcode_base::session::task_state::write_task_state(&ctx.session_id, &params.content)?;
+        let content = params.content.trim();
+        let cleared = content.is_empty();
+        jcode_base::session::task_state::write_task_state(&ctx.session_id, content)?;
         let msg = if cleared {
             "Task state cleared.".to_string()
         } else {
             format!(
                 "Task state updated ({} chars). It will be re-injected every turn and survives compaction.",
-                params.content.chars().count()
+                content.chars().count()
             )
         };
         Ok(ToolOutput::new(msg).with_title("update_task_state"))

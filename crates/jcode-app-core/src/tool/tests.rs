@@ -700,10 +700,21 @@ async fn gemini_build_tools_from_registry_definitions_omits_const_keywords() {
 
 #[tokio::test]
 async fn update_task_state_tool_writes_and_clears() {
+    /// Removes the task-state file on drop so a mid-test assertion failure
+    /// never leaves an artifact behind in the real jcode dir.
+    struct TaskStateCleanup(String);
+    impl Drop for TaskStateCleanup {
+        fn drop(&mut self) {
+            let _ = jcode_base::session::task_state::write_task_state(&self.0, "");
+        }
+    }
+
     let _guard = crate::storage::lock_test_env();
+    let sid = format!("task-state-test-{}", std::process::id());
+    let _cleanup = TaskStateCleanup(sid.clone());
     let tool = super::task_state::UpdateTaskStateTool::new();
     let ctx = ToolContext {
-        session_id: "task-state-test-session".to_string(),
+        session_id: sid.clone(),
         message_id: "msg-123".to_string(),
         tool_call_id: "call-456".to_string(),
         working_dir: None,
@@ -719,7 +730,7 @@ async fn update_task_state_tool_writes_and_clears() {
         .unwrap();
     assert!(out.output.contains("Task state updated"));
     assert_eq!(
-        jcode_base::session::task_state::read_task_state("task-state-test-session").as_deref(),
+        jcode_base::session::task_state::read_task_state(&sid).as_deref(),
         Some("## Plan\n- do thing")
     );
 
@@ -730,7 +741,7 @@ async fn update_task_state_tool_writes_and_clears() {
         .unwrap();
     assert!(out.output.contains("cleared"));
     assert_eq!(
-        jcode_base::session::task_state::read_task_state("task-state-test-session"),
+        jcode_base::session::task_state::read_task_state(&sid),
         None
     );
 }
