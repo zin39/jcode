@@ -1450,9 +1450,14 @@ impl CompactionManager {
             .saturating_add(offset)
             .min(result.len());
         if view_watermark > offset {
+            // Slice starts at `offset` so the prepended summary block is
+            // structurally outside the clearing range (it is
+            // Text/OpenAICompaction, never ToolResult, but keep it out of
+            // reach regardless).
+            let clear_len = view_watermark - offset;
             jcode_compaction_core::clear_tool_results_up_to(
-                &mut result[..view_watermark],
-                view_watermark,
+                &mut result[offset..view_watermark],
+                clear_len,
             );
         }
 
