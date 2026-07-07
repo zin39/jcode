@@ -697,3 +697,40 @@ async fn gemini_build_tools_from_registry_definitions_omits_const_keywords() {
         "const"
     ));
 }
+
+#[tokio::test]
+async fn update_task_state_tool_writes_and_clears() {
+    let _guard = crate::storage::lock_test_env();
+    let tool = super::task_state::UpdateTaskStateTool::new();
+    let ctx = ToolContext {
+        session_id: "task-state-test-session".to_string(),
+        message_id: "msg-123".to_string(),
+        tool_call_id: "call-456".to_string(),
+        working_dir: None,
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    // Test writing task state
+    let out = tool
+        .execute(serde_json::json!({"content": "## Plan\n- do thing"}), ctx.clone())
+        .await
+        .unwrap();
+    assert!(out.output.contains("Task state updated"));
+    assert_eq!(
+        jcode_base::session::task_state::read_task_state("task-state-test-session").as_deref(),
+        Some("## Plan\n- do thing")
+    );
+
+    // Test clearing task state
+    let out = tool
+        .execute(serde_json::json!({"content": ""}), ctx)
+        .await
+        .unwrap();
+    assert!(out.output.contains("cleared"));
+    assert_eq!(
+        jcode_base::session::task_state::read_task_state("task-state-test-session"),
+        None
+    );
+}

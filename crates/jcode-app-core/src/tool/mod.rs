@@ -30,6 +30,7 @@ pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
 mod task;
+mod task_state;
 mod todo;
 mod tournament;
 mod webfetch;
@@ -57,7 +58,7 @@ pub(crate) use session_search::spawn_recent_index_warmup;
 /// never expand anything.
 pub const CORE_FULL_SCHEMA_TOOLS: &[&str] = &[
     "bash", "read", "write", "edit", "multiedit", "ls", "glob", "grep",
-    "todo", "subagent", "load_tools",
+    "todo", "subagent", "load_tools", "update_task_state",
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -337,6 +338,11 @@ impl Registry {
             &mut tools_map,
             "load_tools",
             load_tools::LoadToolsTool::new(registry.clone()),
+        );
+        Self::insert_tool(
+            &mut tools_map,
+            "update_task_state",
+            task_state::UpdateTaskStateTool::new(),
         );
         // Sponsored discovery is on by default (opt-out); when disabled the
         // tool is never registered and no discovery endpoint is ever
