@@ -1341,6 +1341,11 @@ fn clearing_applies_in_api_view_but_not_history() {
 
 #[tokio::test]
 async fn stage1_clearing_skips_summarization_when_it_frees_enough() {
+    // Serialize against env_kill_switch_disables_stage1: this test relies on
+    // JCODE_DISABLE_TOOL_RESULT_CLEARING being unset, and that test sets it
+    // under the same lock.
+    let _env_lock = crate::storage::lock_test_env();
+
     // Small budget so 3 big (but individually clearable) tool results push
     // usage above 80%, but the cleared marker text is small enough to bring
     // it back down once stage-1 clears them.
@@ -1389,6 +1394,10 @@ async fn stage1_clearing_skips_summarization_when_it_frees_enough() {
 
 #[tokio::test]
 async fn stage1_falls_through_to_summarization_when_not_enough() {
+    // Serialize against env_kill_switch_disables_stage1 (see
+    // stage1_clearing_skips_summarization_when_it_frees_enough).
+    let _env_lock = crate::storage::lock_test_env();
+
     // Big plain-text messages (no tool results at all) push usage above 80%.
     // Stage-1 clearing has nothing to clear, so it must fall through to
     // background summarization instead of silently doing nothing.
