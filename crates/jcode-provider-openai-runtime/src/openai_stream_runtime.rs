@@ -98,7 +98,7 @@ pub(super) async fn stream_response(
     emit_connection_phase(&tx, ConnectionPhase::Authenticating).await;
     let access_token = openai_access_token(&credentials).await?;
     let creds = credentials.read().await;
-    let is_chatgpt_mode = !creds.refresh_token.is_empty() || creds.id_token.is_some();
+    let is_chatgpt_mode = OpenAIProvider::is_chatgpt_mode(&creds);
     let url = OpenAIProvider::responses_url(&creds);
     let account_id = creds.account_id.clone();
     drop(creds);
@@ -1006,7 +1006,7 @@ pub(super) async fn stream_response_websocket_persistent(
     ));
     emit_status_detail(&tx, "opening websocket").await;
     let creds = credentials.read().await;
-    let is_chatgpt_mode = !creds.refresh_token.is_empty() || creds.id_token.is_some();
+    let is_chatgpt_mode = OpenAIProvider::is_chatgpt_mode(&creds);
     let ws_url = OpenAIProvider::responses_ws_url(&creds);
     let mut ws_request = ws_url.into_client_request().map_err(|err| {
         OpenAIStreamFailure::Other(anyhow::anyhow!(

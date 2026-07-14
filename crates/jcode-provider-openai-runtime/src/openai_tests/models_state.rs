@@ -262,6 +262,24 @@ fn openai_catalog_and_chat_endpoints_agree_on_credential_shape() {
         OpenAIProvider::is_chatgpt_mode(&id_token_creds),
         "credential with an id token must be treated as ChatGPT/Codex mode"
     );
+
+    // An access-token-only ChatGPT session (no refresh, no id token) still
+    // carries the chatgpt_account_id, which routes to the Codex backend.
+    let account_id_only_creds = CodexCredentials {
+        access_token: "oauth-access".to_string(),
+        refresh_token: String::new(),
+        id_token: None,
+        account_id: Some("acct_123".to_string()),
+        expires_at: None,
+    };
+    assert!(
+        OpenAIProvider::is_chatgpt_mode(&account_id_only_creds),
+        "credential with only a chatgpt account id must be treated as ChatGPT/Codex mode"
+    );
+    assert!(
+        OpenAIProvider::responses_url(&account_id_only_creds).starts_with(CHATGPT_API_BASE),
+        "account-id-only ChatGPT session must use the Codex API base"
+    );
 }
 
 /// Issue #343: the native `openai-api` (Responses API) base URL must be

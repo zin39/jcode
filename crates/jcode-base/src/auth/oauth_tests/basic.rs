@@ -111,6 +111,62 @@ fn save_openai_tokens_uses_jcode_home_sandbox() -> Result<()> {
 }
 
 #[test]
+fn login_openai_with_access_token_bootstraps_chatgpt_account() -> Result<()> {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+
+    // Build a ChatGPT/Codex-shaped access token JWT: aud openai, an exp claim
+    // far in the future, plus the chatgpt_account_id + email claims jcode reads
+    // for routing and account metadata.
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let exp = chrono::Utc::now().timestamp() + 86_400;
+    let payload_json = serde_json::json!({
+        "aud": ["https://api.openai.com/v1"],
+        "exp": exp,
+        "email": "sandbox@example.com",
+        "https://api.openai.com/auth": { "chatgpt_account_id": "acct_sandbox_123" },
+    })
+    .to_string();
+    let payload = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+    let access_token = format!("{header}.{payload}.sig");
+
+    let tokens = login_openai_with_access_token(&access_token, "openai-1")?;
+    assert_eq!(tokens.access_token, access_token);
+    assert!(tokens.refresh_token.is_empty());
+    assert_eq!(tokens.expires_at, exp * 1000);
+
+    let auth_path = temp.path().join("openai-auth.json");
+    assert!(auth_path.exists(), "expected {}", auth_path.display());
+
+    let account = crate::auth::codex::list_accounts()?
+        .into_iter()
+        .find(|account| account.label == "openai-1")
+        .expect("openai account should exist after access-token bootstrap");
+    assert_eq!(account.access_token, access_token);
+    assert!(account.refresh_token.is_empty());
+    assert_eq!(account.account_id.as_deref(), Some("acct_sandbox_123"));
+    assert_eq!(account.email.as_deref(), Some("sandbox@example.com"));
+
+    // The loaded credential must route to the ChatGPT/Codex backend: it has an
+    // account id even though there is no refresh or id token.
+    let creds = crate::auth::codex::load_credentials()?;
+    assert_eq!(creds.account_id.as_deref(), Some("acct_sandbox_123"));
+    assert!(creds.refresh_token.is_empty());
+    Ok(())
+}
+
+#[test]
+fn login_openai_with_access_token_rejects_empty_input() {
+    let err = login_openai_with_access_token("   ", "openai-1")
+        .expect_err("empty access token should be rejected");
+    assert!(
+        err.to_string().contains("access token is empty"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn save_claude_tokens_preserves_existing_account_metadata() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;

@@ -150,6 +150,31 @@ Notes:
 - `--refresh-token` is only valid for `--provider openai` and cannot be combined
   with `--print-auth-url`, `--callback-url`, `--auth-code`, or `--complete`.
 
+### Access-token-only login (no browser, no refresh)
+If you only have a ChatGPT/Codex **access token** (the JWT with
+`aud: https://api.openai.com/v1`), you can store it directly:
+
+```bash
+jcode login --provider openai --access-token '<access-token-jwt>'
+# or from stdin:
+printf '%s' "$OPENAI_ACCESS_TOKEN" | jcode login --provider openai --access-token -
+```
+
+jcode decodes the JWT locally for its `chatgpt_account_id`, email, and `exp`
+expiry, then stores the account in `~/.jcode/openai-auth.json`. The stored
+`account_id` routes requests to the ChatGPT/Codex backend
+(`https://chatgpt.com/backend-api/codex/responses`), exactly like a browser
+login.
+
+Notes:
+- There is **no refresh token**, so jcode cannot renew this credential. When the
+  access token expires (its `exp`) or OpenAI revokes it, requests fail with a
+  401 and you must log in again.
+- `--access-token` is only valid for `--provider openai` and conflicts with the
+  scriptable flags and with `--refresh-token`.
+- Prefer `--refresh-token` or a full browser login when you can, so jcode can
+  keep the session alive automatically.
+
 ### Request details
 J-Code uses the Responses API. If you have a ChatGPT subscription (refresh
 token or id_token present), requests go to:

@@ -31,6 +31,8 @@ pub struct LoginOptions {
     pub openai_compatible_default_model: Option<String>,
     /// Refresh token for the "refresh-token only" OpenAI/Codex login bootstrap.
     pub refresh_token: Option<String>,
+    /// Access token for the "access-token only" OpenAI/Codex login bootstrap.
+    pub access_token: Option<String>,
 }
 
 impl LoginOptions {
@@ -248,6 +250,9 @@ pub async fn run_login_provider(
     let login_result = if let Some(refresh_token) = options.refresh_token.as_deref() {
         login_openai_refresh_token_flow(provider, account_label, refresh_token)
             .await
+            .map(|_| LoginFlowOutcome::Completed)
+    } else if let Some(access_token) = options.access_token.as_deref() {
+        login_openai_access_token_flow(provider, account_label, access_token)
             .map(|_| LoginFlowOutcome::Completed)
     } else if explicit_scriptable_flow {
         run_scriptable_login_provider(provider, account_label, &options).await
@@ -649,6 +654,49 @@ async fn login_openai_refresh_token_flow(
     if let Some(email) = email {
         eprintln!("Account: {}", email);
     }
+    crate::telemetry::record_auth_success("openai", "oauth");
+    Ok(())
+}
+
+fn login_openai_access_token_flow(
+    provider: LoginProviderDescriptor,
+    requested_label: Option<&str>,
+    access_token: &str,
+) -> Result<()> {
+    if !matches!(provider.target, LoginProviderTarget::OpenAi) {
+        anyhow::bail!(
+            "--access-token login is only supported for `--provider openai` (ChatGPT/Codex OAuth). Provider '{}' uses a different auth method.",
+            provider.id
+        );
+    }
+
+    let access_token = resolve_auth_input(access_token)?;
+    let label = auth::codex::login_target_label(requested_label)?;
+    eprintln!(
+        "Logging in to OpenAI/Codex from an access token (account: {})...",
+        label
+    );
+    let tokens = auth::oauth::login_openai_with_access_token(&access_token, &label)?;
+    let email = auth::codex::extract_email(&access_token);
+    eprintln!(
+        "Successfully saved OpenAI access token! Account '{}' saved to {}",
+        label,
+        crate::storage::jcode_dir()?
+            .join("openai-auth.json")
+            .display()
+    );
+    if let Some(email) = email {
+        eprintln!("Account: {}", email);
+    }
+    if tokens.expires_at > 0 {
+        let expires = chrono::DateTime::from_timestamp_millis(tokens.expires_at)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| tokens.expires_at.to_string());
+        eprintln!("Token expires: {}", expires);
+    }
+    eprintln!(
+        "Note: this is an access-token-only login with no refresh token, so jcode cannot renew it. Re-run login when it expires."
+    );
     crate::telemetry::record_auth_success("openai", "oauth");
     Ok(())
 }

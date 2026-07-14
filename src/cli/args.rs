@@ -210,6 +210,11 @@ pub(crate) enum Command {
         /// jcode exchanges it once to bootstrap the account, then keeps it alive.
         #[arg(long, conflicts_with_all = ["print_auth_url", "callback_url", "auth_code", "complete"])]
         refresh_token: Option<String>,
+
+        /// Log in to OpenAI/Codex using only a ChatGPT/Codex access token (no browser flow).
+        /// Stored as-is; jcode cannot refresh it, so it stops working when the token expires.
+        #[arg(long, conflicts_with_all = ["print_auth_url", "callback_url", "auth_code", "complete", "refresh_token"])]
+        access_token: Option<String>,
     },
 
     /// Run in simple REPL mode (no TUI)

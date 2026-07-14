@@ -513,7 +513,8 @@ fn enqueue_openai_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<ProviderUs
         Ok(creds) => creds,
         Err(_) => return 0,
     };
-    let is_chatgpt = !creds.refresh_token.is_empty() || creds.id_token.is_some();
+    let is_chatgpt =
+        !creds.refresh_token.is_empty() || creds.id_token.is_some() || creds.account_id.is_some();
     if !is_chatgpt || creds.access_token.is_empty() {
         return 0;
     }

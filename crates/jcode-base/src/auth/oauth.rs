@@ -1343,6 +1343,50 @@ async fn login_openai_with_refresh_token_at_url(
     Ok(tokens)
 }
 
+/// Bootstrap an OpenAI/Codex OAuth account from an access token alone.
+///
+/// Some ChatGPT/Codex access tokens are long-lived JWTs (`aud:
+/// https://api.openai.com/v1`) that already embed `chatgpt_account_id`, the
+/// account email, and an `exp` expiry. When a user only has such an access
+/// token (and no refresh token), jcode can still store a usable ChatGPT/Codex
+/// account: the stored `account_id` routes requests to the Codex backend, and
+/// the recovered `expires_at` lets jcode surface expiry honestly.
+///
+/// The token is NOT verified against OpenAI here; it is decoded locally for
+/// metadata and persisted. Because there is no refresh token, jcode cannot
+/// renew it: once the access token expires (or is revoked), requests will fail
+/// and the user must log in again.
+pub fn login_openai_with_access_token(access_token: &str, label: &str) -> Result<OAuthTokens> {
+    let access_token = access_token.trim();
+    if access_token.is_empty() {
+        anyhow::bail!("OpenAI access token is empty");
+    }
+
+    let account_id = crate::auth::codex::extract_account_id(access_token);
+    let expires_at = crate::auth::codex::expires_at_from_access_token(access_token);
+
+    // Persist directly (no refresh token). We store it as an account with an
+    // id_token slot left empty; `account_id` alone is enough to route to the
+    // Codex backend.
+    crate::auth::codex::upsert_account(crate::auth::codex::OpenAiAccount {
+        label: label.to_string(),
+        access_token: access_token.to_string(),
+        refresh_token: String::new(),
+        id_token: None,
+        account_id: account_id.clone(),
+        expires_at,
+        email: crate::auth::codex::extract_email(access_token),
+    })?;
+
+    Ok(OAuthTokens {
+        access_token: access_token.to_string(),
+        refresh_token: String::new(),
+        expires_at: expires_at.unwrap_or(0),
+        id_token: None,
+        scopes: Vec::new(),
+    })
+}
+
 async fn refresh_openai_tokens_inner(
     refresh_token: &str,
     label: Option<&str>,

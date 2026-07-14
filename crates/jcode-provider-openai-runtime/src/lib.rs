@@ -717,7 +717,9 @@ impl OpenAIProvider {
     }
 
     fn is_chatgpt_mode(credentials: &CodexCredentials) -> bool {
-        !credentials.refresh_token.is_empty() || credentials.id_token.is_some()
+        !credentials.refresh_token.is_empty()
+            || credentials.id_token.is_some()
+            || credentials.account_id.is_some()
     }
 
     fn should_prefer_websocket(model: &str) -> bool {
