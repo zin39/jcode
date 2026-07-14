@@ -297,6 +297,7 @@ fn login_no_browser_flag_parses() {
             api_key,
             api_key_env,
             no_validate,
+            refresh_token,
         }) => {
             assert!(provider.is_none());
             assert!(account.is_none());
@@ -311,6 +312,7 @@ fn login_no_browser_flag_parses() {
             assert!(api_key.is_none());
             assert!(api_key_env.is_none());
             assert!(!no_validate);
+            assert!(refresh_token.is_none());
         }
         other => panic!("unexpected command: {:?}", other),
     }

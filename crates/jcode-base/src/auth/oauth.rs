@@ -1262,46 +1262,93 @@ pub async fn refresh_openai_tokens_for_account(
     .await
 }
 
+/// Exchange an OpenAI/Codex refresh token for a fresh set of OAuth tokens.
+///
+/// This is the raw `grant_type=refresh_token` call against OpenAI's token
+/// endpoint. It performs no persistence and no single-flight coordination, so
+/// callers that want to store the result must do so themselves. Used both by
+/// the background token-refresh path and by the "refresh-token only" login
+/// bootstrap (`login_openai_with_refresh_token`).
+pub async fn exchange_openai_refresh_token(refresh_token: &str) -> Result<OAuthTokens> {
+    exchange_openai_refresh_token_at_url(openai::TOKEN_URL, refresh_token).await
+}
+
+async fn exchange_openai_refresh_token_at_url(
+    token_url: &str,
+    refresh_token: &str,
+) -> Result<OAuthTokens> {
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        anyhow::bail!("OpenAI refresh token is empty");
+    }
+
+    let client = crate::provider::shared_http_client();
+    let resp = client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "grant_type=refresh_token&client_id={}&refresh_token={}",
+            openai::CLIENT_ID,
+            urlencoding::encode(refresh_token)
+        ))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await?;
+        anyhow::bail!("OpenAI token refresh failed: {}", text);
+    }
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        refresh_token: String,
+        expires_in: i64,
+        id_token: Option<String>,
+    }
+
+    let tokens: TokenResponse = resp.json().await?;
+    let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
+
+    Ok(OAuthTokens {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at,
+        id_token: tokens.id_token,
+        scopes: Vec::new(),
+    })
+}
+
+/// Bootstrap an OpenAI/Codex OAuth account from a refresh token alone.
+///
+/// Mirrors the Anthropic "import a refresh token and let jcode keep it alive"
+/// path: given only a long-lived refresh token, exchange it once to obtain a
+/// current access token (plus id token for account/email metadata) and persist
+/// the whole account under `label` in `~/.jcode/openai-auth.json`. Subsequent
+/// requests refresh normally through the coordinator.
+pub async fn login_openai_with_refresh_token(
+    refresh_token: &str,
+    label: &str,
+) -> Result<OAuthTokens> {
+    login_openai_with_refresh_token_at_url(openai::TOKEN_URL, refresh_token, label).await
+}
+
+async fn login_openai_with_refresh_token_at_url(
+    token_url: &str,
+    refresh_token: &str,
+    label: &str,
+) -> Result<OAuthTokens> {
+    let tokens = exchange_openai_refresh_token_at_url(token_url, refresh_token).await?;
+    save_openai_tokens_for_account(&tokens, label)?;
+    Ok(tokens)
+}
+
 async fn refresh_openai_tokens_inner(
     refresh_token: &str,
     label: Option<&str>,
 ) -> Result<OAuthTokens> {
     let result: Result<OAuthTokens> = async {
-        let client = crate::provider::shared_http_client();
-        let resp = client
-            .post(openai::TOKEN_URL)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!(
-                "grant_type=refresh_token&client_id={}&refresh_token={}",
-                openai::CLIENT_ID,
-                urlencoding::encode(refresh_token)
-            ))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await?;
-            anyhow::bail!("OpenAI token refresh failed: {}", text);
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: String,
-            refresh_token: String,
-            expires_in: i64,
-            id_token: Option<String>,
-        }
-
-        let tokens: TokenResponse = resp.json().await?;
-        let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
-
-        let oauth_tokens = OAuthTokens {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at,
-            id_token: tokens.id_token,
-            scopes: Vec::new(),
-        };
+        let oauth_tokens = exchange_openai_refresh_token(refresh_token).await?;
 
         if let Some(label) = label {
             save_openai_tokens_for_account(&oauth_tokens, label)?;

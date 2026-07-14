@@ -230,6 +230,114 @@ fn openai_refresh_request_targets_correct_url() -> Result<()> {
 }
 
 // ========================
+// Mock server integration: OpenAI refresh-token bootstrap login
+// ========================
+
+#[tokio::test]
+async fn openai_refresh_token_exchange_mock_server_form_encoded() -> Result<()> {
+    let success_body = serde_json::json!({
+        "access_token": "at_openai_refreshed",
+        "refresh_token": "rt_openai_rotated",
+        "expires_in": 3600,
+        "id_token": "idt_openai"
+    })
+    .to_string();
+    let (port, handle) = mock_token_server(200, &success_body).await;
+
+    let url = format!("http://127.0.0.1:{}/oauth/token", port);
+    let result = exchange_openai_refresh_token_at_url(&url, "  rt_openai_input  ").await?;
+
+    assert_eq!(result.access_token, "at_openai_refreshed");
+    assert_eq!(result.refresh_token, "rt_openai_rotated");
+    assert_eq!(result.id_token, Some("idt_openai".to_string()));
+    assert!(result.expires_at > chrono::Utc::now().timestamp_millis());
+
+    let (method, _path, headers, body) = handle.await.map_err(|e| anyhow!(e))?;
+    assert_eq!(method, "POST");
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert!(body.contains("grant_type=refresh_token"));
+    assert!(body.contains(&format!("client_id={}", openai::CLIENT_ID)));
+    // Whitespace around the pasted refresh token is trimmed before sending.
+    assert!(body.contains("refresh_token=rt_openai_input"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn openai_refresh_token_exchange_rejects_empty_input() {
+    let err = exchange_openai_refresh_token("   ")
+        .await
+        .expect_err("empty refresh token should be rejected before any network call");
+    assert!(
+        err.to_string().contains("refresh token is empty"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn openai_refresh_token_exchange_error_propagates() -> Result<()> {
+    let error_body = r#"{"error":"invalid_grant"}"#;
+    let (port, _handle) = mock_token_server(400, error_body).await;
+
+    let url = format!("http://127.0.0.1:{}/oauth/token", port);
+    let err = exchange_openai_refresh_token_at_url(&url, "expired_rt")
+        .await
+        .expect_err("HTTP 400 should surface as an error");
+    assert!(
+        err.to_string().contains("OpenAI token refresh failed"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn openai_refresh_token_login_bootstraps_and_persists_account() -> Result<()> {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
+    let _home = super::EnvVarGuard::set("JCODE_HOME", temp.path());
+
+    // id_token carries email + chatgpt_account_id so the bootstrap can populate
+    // account metadata, mirroring the real ChatGPT/Codex token shape.
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload_json = serde_json::json!({
+        "email": "sandbox@example.com",
+        "https://api.openai.com/auth": { "chatgpt_account_id": "acct_sandbox_123" }
+    })
+    .to_string();
+    let payload = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+    let id_token = format!("{header}.{payload}.sig");
+
+    let success_body = serde_json::json!({
+        "access_token": "at_sandbox_new",
+        "refresh_token": "rt_sandbox_rotated",
+        "expires_in": 3600,
+        "id_token": id_token,
+    })
+    .to_string();
+    let (port, _handle) = mock_token_server(200, &success_body).await;
+    let url = format!("http://127.0.0.1:{}/oauth/token", port);
+
+    let tokens = login_openai_with_refresh_token_at_url(&url, "rt_input", "openai-1").await?;
+    assert_eq!(tokens.access_token, "at_sandbox_new");
+    assert_eq!(tokens.refresh_token, "rt_sandbox_rotated");
+
+    let auth_path = temp.path().join("openai-auth.json");
+    assert!(auth_path.exists(), "expected {}", auth_path.display());
+
+    let account = crate::auth::codex::list_accounts()?
+        .into_iter()
+        .find(|account| account.label == "openai-1")
+        .expect("openai account should exist after bootstrap");
+    assert_eq!(account.access_token, "at_sandbox_new");
+    assert_eq!(account.refresh_token, "rt_sandbox_rotated");
+    assert_eq!(account.account_id.as_deref(), Some("acct_sandbox_123"));
+    assert_eq!(account.email.as_deref(), Some("sandbox@example.com"));
+    Ok(())
+}
+
+// ========================
 // Auth URL construction
 // ========================
 

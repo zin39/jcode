@@ -126,6 +126,30 @@ If jcode finds existing credentials in `~/.codex/auth.json`, it asks before
 reading them. When approved, it remembers that trust decision for future jcode
 sessions and still does not move, delete, or rewrite the Codex file.
 
+### Refresh-token-only login (no browser)
+If you already have an OpenAI/Codex OAuth **refresh token** (for example exported
+from another machine or CLI), you can bootstrap a jcode account without running
+the browser/callback flow:
+
+```bash
+jcode login --provider openai --refresh-token '<refresh-token>'
+# or read it from stdin (avoids leaking the token in shell history):
+printf '%s' "$OPENAI_REFRESH_TOKEN" | jcode login --provider openai --refresh-token -
+```
+
+jcode exchanges the refresh token once against `https://auth.openai.com/oauth/token`
+(`grant_type=refresh_token`) to mint a current access token plus the id token
+(used for account id / email), then stores the whole account in
+`~/.jcode/openai-auth.json`. From then on jcode keeps it alive by refreshing
+normally, exactly like the browser login.
+
+Notes:
+- This requires the long-lived **refresh token**, not the short-lived access
+  token (JWT with `aud: https://api.openai.com/v1`). A pasted access token is
+  rejected by the endpoint with `token_expired`.
+- `--refresh-token` is only valid for `--provider openai` and cannot be combined
+  with `--print-auth-url`, `--callback-url`, `--auth-code`, or `--complete`.
+
 ### Request details
 J-Code uses the Responses API. If you have a ChatGPT subscription (refresh
 token or id_token present), requests go to:

@@ -205,6 +205,11 @@ pub(crate) enum Command {
         /// Environment variable name to store/use for an OpenAI-compatible API key.
         #[arg(long)]
         api_key_env: Option<String>,
+
+        /// Log in to OpenAI/Codex using only a refresh token (no browser flow).
+        /// jcode exchanges it once to bootstrap the account, then keeps it alive.
+        #[arg(long, conflicts_with_all = ["print_auth_url", "callback_url", "auth_code", "complete"])]
+        refresh_token: Option<String>,
     },
 
     /// Run in simple REPL mode (no TUI)
