@@ -126,10 +126,11 @@ fn create_hotkey_shortcut(use_alacritty: bool) -> Result<()> {
             (
                 alacritty_path,
                 Box::new(move |hk: &WindowsHotkey| {
+                    let hotkey = hk.chord.canonical();
                     if hk.self_dev {
-                        format!("-e \"{exe}\" self-dev")
+                        format!("-e \"{exe}\" --spawn-hotkey \"{hotkey}\" self-dev")
                     } else {
-                        format!("-e \"{exe}\"")
+                        format!("-e \"{exe}\" --spawn-hotkey \"{hotkey}\"")
                     }
                 }),
             )
@@ -138,10 +139,13 @@ fn create_hotkey_shortcut(use_alacritty: bool) -> Result<()> {
             (
                 "wt.exe".to_string(),
                 Box::new(move |hk: &WindowsHotkey| {
+                    let hotkey = hk.chord.canonical();
                     if hk.self_dev {
-                        format!("-p \"Command Prompt\" \"{exe}\" self-dev")
+                        format!(
+                            "-p \"Command Prompt\" \"{exe}\" --spawn-hotkey \"{hotkey}\" self-dev"
+                        )
                     } else {
-                        format!("-p \"Command Prompt\" \"{exe}\"")
+                        format!("-p \"Command Prompt\" \"{exe}\" --spawn-hotkey \"{hotkey}\"")
                     }
                 }),
             )
@@ -298,13 +302,17 @@ pub(super) fn reinstall_windows_launch_hotkeys() {
     if !state.hotkey_configured {
         return;
     }
-    let use_alacritty = detect_terminal() == "alacritty" || is_alacritty_installed();
-    match create_hotkey_shortcut(use_alacritty) {
+    match refresh_windows_launch_hotkeys() {
         Ok(()) => jcode_logging::info("Reinstalled Windows launch hotkeys after config change"),
         Err(err) => jcode_logging::warn(&format!(
             "failed to reinstall Windows launch hotkeys: {err}"
         )),
     }
+}
+
+pub(super) fn refresh_windows_launch_hotkeys() -> Result<()> {
+    let use_alacritty = detect_terminal() == "alacritty" || is_alacritty_installed();
+    create_hotkey_shortcut(use_alacritty)
 }
 
 fn install_alacritty() -> Result<()> {
@@ -370,6 +378,7 @@ fn nudge_hotkey(state: &mut SetupHintsState) -> bool {
             match create_hotkey_shortcut(using_alacritty) {
                 Ok(()) => {
                     state.hotkey_configured = true;
+                    state.launch_hotkey_tracking_version = super::LAUNCH_HOTKEY_TRACKING_VERSION;
                     let _ = state.save();
                     eprintln!(
                         "  \x1b[32m✓\x1b[0m Created hotkey (\x1b[1mAlt+;\x1b[0m) → {} + jcode",
@@ -631,6 +640,7 @@ pub(super) fn run_setup_hotkey_windows() -> Result<()> {
     match create_hotkey_shortcut(use_alacritty) {
         Ok(()) => {
             state.hotkey_configured = true;
+            state.launch_hotkey_tracking_version = super::LAUNCH_HOTKEY_TRACKING_VERSION;
             let _ = state.save();
             eprintln!("  \x1b[32m✓\x1b[0m Created launch hotkeys");
             eprintln!();

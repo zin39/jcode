@@ -86,6 +86,11 @@ pub struct SetupHintsState {
     /// the hotkey actually fire). `0` = legacy/unknown.
     #[serde(default)]
     pub hotkey_listener_version: u32,
+    /// Version of the cross-platform launch command metadata. Bumped when
+    /// generated macOS/Linux/Windows launchers need refreshing so successful
+    /// shortcut use continues feeding the learned-keybinding state.
+    #[serde(default)]
+    pub launch_hotkey_tracking_version: u32,
     /// Canonical signature of the keybinding conflicts we last warned the user
     /// about (sorted, joined chord+field pairs). Empty means "no conflicts known
     /// / never warned". We only re-show the startup conflict notice when this
@@ -136,6 +141,7 @@ impl Default for SetupHintsState {
             mac_ghostty_dismissed: false,
             terminal_nudge_count: 0,
             hotkey_listener_version: 0,
+            launch_hotkey_tracking_version: 0,
             keymap_conflict_signature: String::new(),
             glyph_safe_notice_shown: false,
             launch_hotkey_usage: HashMap::new(),
@@ -168,8 +174,13 @@ impl Default for SetupHintsState {
 /// - 5: the listener launches configured repos directly through
 ///   `jcode-terminal-launch`, avoiding the generated shell-script hop on hotkey
 ///   press. Scripts/plan are still written for compatibility and diagnostics.
+/// - 6: direct launches pass `--spawn-hotkey` into the new Jcode process so
+///   global shortcut proficiency is recorded by the same cross-platform path.
 #[cfg(any(test, target_os = "macos"))]
-pub const HOTKEY_LISTENER_VERSION: u32 = 5;
+pub const HOTKEY_LISTENER_VERSION: u32 = 6;
+
+/// Current version of generated launch commands carrying learning metadata.
+const LAUNCH_HOTKEY_TRACKING_VERSION: u32 = 1;
 
 /// Maximum number of times we will ever show the terminal/setup nudge prompt
 /// to a user (across all launches and platforms). After this many nudges we stop
@@ -673,6 +684,7 @@ pub fn run_setup_hotkey(_listen_macos_hotkey: bool, notify_cli_launch: Option<&s
                 state.hotkey_configured = true;
                 state.hotkey_dismissed = true;
                 state.hotkey_listener_version = HOTKEY_LISTENER_VERSION;
+                state.launch_hotkey_tracking_version = LAUNCH_HOTKEY_TRACKING_VERSION;
                 let _ = state.save();
                 eprintln!(
                     "  \x1b[32m✓\x1b[0m Created launch hotkeys → {} + jcode",
@@ -697,6 +709,7 @@ pub fn run_setup_hotkey(_listen_macos_hotkey: bool, notify_cli_launch: Option<&s
 
     #[cfg(target_os = "linux")]
     {
+        let mut state = SetupHintsState::load();
         eprintln!("\x1b[1mjcode setup-hotkey\x1b[0m");
         eprintln!();
         if let Some(comp) = detect_linux_compositor() {
@@ -714,6 +727,10 @@ pub fn run_setup_hotkey(_listen_macos_hotkey: bool, notify_cli_launch: Option<&s
                             comp.name()
                         );
                     }
+                    state.hotkey_configured = true;
+                    state.hotkey_dismissed = true;
+                    state.launch_hotkey_tracking_version = LAUNCH_HOTKEY_TRACKING_VERSION;
+                    let _ = state.save();
                     eprintln!();
                     eprintln!("  Press these anywhere, system-wide:");
                     for hk in &hotkeys {
@@ -1024,14 +1041,15 @@ fn run_macos_hotkey_listener() -> Result<()> {
                 launch.resolved_cwd().display()
             ));
             let cwd = launch.resolved_cwd();
-            let command = TerminalCommand::new(&exe_path, launch.args.clone())
+            let mut args = vec!["--spawn-hotkey".to_string(), launch.chord.clone()];
+            args.extend(launch.args.clone());
+            let command = TerminalCommand::new(&exe_path, args)
                 .fresh_spawn()
                 .kind("hotkey")
-                .spawn_env("JCODE_SPAWN_HOTKEY", launch.chord.clone())
                 .spawn_env("JCODE_SPAWN_LABEL", launch.label.clone());
             match spawn_command_in_new_terminal_with(&command, &cwd, |cmd| cmd.spawn().map(|_| ()))
             {
-                Ok(true) => record_launch_hotkey_use(&launch.chord),
+                Ok(true) => {}
                 Ok(false) => {
                     macos_hotkey_log("failed to launch jcode: no terminal candidate worked")
                 }
@@ -1099,15 +1117,24 @@ fn load_direct_hotkey_launches() -> Vec<DirectHotkeyLaunch> {
         .collect()
 }
 
-#[cfg(target_os = "macos")]
-fn record_launch_hotkey_use(chord: &str) {
+/// Record one successful global launch-hotkey use. Launchers pass the canonical
+/// chord through the hidden `--spawn-hotkey` argument; canonicalizing again here
+/// keeps persisted learning state stable even if an older launcher passes a
+/// differently ordered spelling.
+pub fn record_launch_hotkey_use(chord: &str) {
+    let Some(chord) = keymap::KeyChord::parse(chord).map(|chord| chord.canonical()) else {
+        jcode_logging::warn(&format!(
+            "ignored invalid launch hotkey usage chord: {chord}"
+        ));
+        return;
+    };
     let mut state = SetupHintsState::load();
-    *state
-        .launch_hotkey_usage
-        .entry(chord.to_string())
-        .or_insert(0) += 1;
+    let uses = state.launch_hotkey_usage.entry(chord.clone()).or_insert(0);
+    *uses = uses.saturating_add(1);
     if let Err(err) = state.save() {
-        macos_hotkey_log(&format!("failed to record hotkey usage for {chord}: {err}"));
+        jcode_logging::warn(&format!(
+            "failed to record launch hotkey usage for {chord}: {err}"
+        ));
     }
 }
 
@@ -1192,6 +1219,48 @@ pub fn maybe_show_setup_hints() -> Option<StartupHints> {
                 }
             }
             MacHotkeyAction::None => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if state.launch_hotkey_tracking_version < LAUNCH_HOTKEY_TRACKING_VERSION
+            && let Some(comp) = detect_linux_compositor()
+            && linux_hotkeys_installed(comp)
+        {
+            match install_linux_launch_hotkeys(comp) {
+                Ok(_) => {
+                    state.launch_hotkey_tracking_version = LAUNCH_HOTKEY_TRACKING_VERSION;
+                    let _ = state.save();
+                    jcode_logging::info(&format!(
+                        "Migrated {} launch hotkeys to usage tracking v{}",
+                        comp.name(),
+                        LAUNCH_HOTKEY_TRACKING_VERSION
+                    ));
+                }
+                Err(err) => jcode_logging::warn(&format!(
+                    "failed to migrate {} launch hotkeys to usage tracking: {err}",
+                    comp.name()
+                )),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if state.hotkey_configured
+            && state.launch_hotkey_tracking_version < LAUNCH_HOTKEY_TRACKING_VERSION
+        {
+            match windows_setup::refresh_windows_launch_hotkeys() {
+                Ok(()) => {
+                    state.launch_hotkey_tracking_version = LAUNCH_HOTKEY_TRACKING_VERSION;
+                    let _ = state.save();
+                    jcode_logging::info("Migrated Windows launch hotkeys to usage tracking");
+                }
+                Err(err) => jcode_logging::warn(&format!(
+                    "failed to migrate Windows launch hotkeys to usage tracking: {err}"
+                )),
+            }
         }
     }
 
@@ -1966,7 +2035,7 @@ fn write_linux_launch_scripts() -> Result<Vec<linux_env::ScriptBind>> {
             continue;
         };
         let self_dev = entry.args.iter().any(|a| a == "self-dev");
-        let exec = linux_env::terminal_exec_command(&terminal, &exe_path, self_dev);
+        let exec = linux_env::terminal_exec_command(&terminal, &exe_path, &entry.chord, self_dev);
         let script_body = format!(
             "#!/bin/sh\n# Auto-generated by jcode setup-hotkey; re-run it to refresh.\n{cd}exec {exec}\n",
             cd = entry.cd_prefix,
@@ -2388,6 +2457,7 @@ fn auto_install_macos_hotkey_listener(state: &mut SetupHintsState) -> Result<()>
     state.hotkey_configured = true;
     state.hotkey_dismissed = true;
     state.hotkey_listener_version = HOTKEY_LISTENER_VERSION;
+    state.launch_hotkey_tracking_version = LAUNCH_HOTKEY_TRACKING_VERSION;
     state.save()?;
     jcode_logging::info(&format!(
         "Installed macOS Cmd+; hotkey listener for {}",
@@ -2409,6 +2479,7 @@ fn migrate_macos_hotkey_listener(state: &mut SetupHintsState) -> Result<()> {
     let preferred = load_preferred_macos_terminal();
     let terminal = install_macos_hotkey_listener(preferred)?;
     state.hotkey_listener_version = HOTKEY_LISTENER_VERSION;
+    state.launch_hotkey_tracking_version = LAUNCH_HOTKEY_TRACKING_VERSION;
     state.save()?;
     jcode_logging::info(&format!(
         "Migrated macOS Cmd+; hotkey listener to v{} for {}",

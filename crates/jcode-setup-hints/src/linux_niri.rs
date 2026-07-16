@@ -140,17 +140,25 @@ fn sh_single_quote(input: &str) -> String {
 /// We `cd` into the directory (falling back to `$HOME` if it has since been
 /// removed), then launch jcode via the user's terminal. The terminal is chosen
 /// by `terminal` (e.g. `kitty`); we pass it the jcode executable directly.
-fn launch_shell_command(exe_path: &str, terminal: &str, dir: &str, self_dev: bool) -> String {
+fn launch_shell_command(
+    exe_path: &str,
+    terminal: &str,
+    dir: &str,
+    chord: &str,
+    self_dev: bool,
+) -> String {
     let dir_q = sh_single_quote(dir);
     let exe_q = sh_single_quote(exe_path);
     let term_q = sh_single_quote(terminal);
+    let chord_q = sh_single_quote(chord);
     let subcmd = if self_dev { " self-dev" } else { "" };
     // cd with $HOME fallback, then exec the terminal running jcode.
     format!(
-        "if [ -d {dir_q} ]; then cd {dir_q}; else cd \"$HOME\"; fi; exec {term_q} {exe_q}{subcmd}",
+        "if [ -d {dir_q} ]; then cd {dir_q}; else cd \"$HOME\"; fi; exec {term_q} {exe_q} --spawn-hotkey {chord_q}{subcmd}",
         dir_q = dir_q,
         term_q = term_q,
         exe_q = exe_q,
+        chord_q = chord_q,
         subcmd = subcmd,
     )
 }
@@ -169,7 +177,13 @@ pub(crate) fn render_niri_bind_line(
     } else {
         format!("jcode: {}", hotkey.label)
     };
-    let shell = launch_shell_command(exe_path, terminal, &hotkey.dir, hotkey.self_dev);
+    let shell = launch_shell_command(
+        exe_path,
+        terminal,
+        &hotkey.dir,
+        &hotkey.chord.canonical(),
+        hotkey.self_dev,
+    );
     Some(format!(
         "{indent}{bind} hotkey-overlay-title=\"{title}\" {{ spawn \"sh\" \"-c\" \"{shell}\"; }}",
         indent = indent,
@@ -413,7 +427,7 @@ mod tests {
                 .trim_end()
                 .ends_with("// <<< jcode launch hotkeys (managed) <<<")
         );
-        assert_eq!(block.matches("spawn").count(), 2);
+        assert_eq!(block.matches("spawn \"sh\"").count(), 2);
     }
 
     #[test]
@@ -498,9 +512,10 @@ mod tests {
 
     #[test]
     fn shell_command_cds_and_self_devs() {
-        let s = launch_shell_command("/bin/jcode", "kitty", "/home/u/proj", true);
+        let s = launch_shell_command("/bin/jcode", "kitty", "/home/u/proj", "cmd+shift+'", true);
         assert!(s.contains("cd '/home/u/proj'"));
-        assert!(s.contains("exec 'kitty' '/bin/jcode' self-dev"));
+        assert!(s.contains("exec 'kitty' '/bin/jcode' --spawn-hotkey"));
+        assert!(s.contains("'cmd+shift+'\\''' self-dev"));
         assert!(s.contains("\"$HOME\""));
     }
 }

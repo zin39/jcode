@@ -283,10 +283,11 @@ mod tests {
     }
 
     fn args_for(entry: &WindowsHotkey) -> String {
+        let hotkey = entry.chord.canonical();
         if entry.self_dev {
-            r#"-e "C:\jcode.exe" self-dev"#.to_string()
+            format!(r#"-e "C:\jcode.exe" --spawn-hotkey "{hotkey}" self-dev"#)
         } else {
-            r#"-e "C:\jcode.exe""#.to_string()
+            format!(r#"-e "C:\jcode.exe" --spawn-hotkey "{hotkey}""#)
         }
     }
 
@@ -350,6 +351,7 @@ mod tests {
 
         // Self-dev entry passes the subcommand; others do not.
         assert_eq!(script.matches("self-dev").count(), 2); // label + args
+        assert_eq!(script.matches("--spawn-hotkey").count(), 3);
         assert!(script.contains("Start-Process 'wt.exe'"));
         assert!(script.contains("-WorkingDirectory"));
 

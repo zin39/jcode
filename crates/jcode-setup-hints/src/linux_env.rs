@@ -625,7 +625,12 @@ fn find_flat_managed_region(config: &str) -> Option<(usize, usize)> {
 /// Build the shell command a launch script uses to open jcode in the user's
 /// terminal, as a `argv`-quoted string (e.g. `'kitty' '/bin/jcode' 'self-dev'`).
 /// Terminals differ in how they accept a command to run.
-pub(crate) fn terminal_exec_command(terminal: &str, exe_path: &str, self_dev: bool) -> String {
+pub(crate) fn terminal_exec_command(
+    terminal: &str,
+    exe_path: &str,
+    spawn_hotkey: &str,
+    self_dev: bool,
+) -> String {
     let base = std::path::Path::new(terminal)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -639,6 +644,8 @@ pub(crate) fn terminal_exec_command(terminal: &str, exe_path: &str, self_dev: bo
         _ => vec![terminal.to_string()],
     };
     argv.push(exe_path.to_string());
+    argv.push("--spawn-hotkey".to_string());
+    argv.push(spawn_hotkey.to_string());
     if self_dev {
         argv.push("self-dev".to_string());
     }
@@ -1011,25 +1018,25 @@ mod tests {
     #[test]
     fn terminal_exec_command_varies_by_terminal() {
         assert_eq!(
-            terminal_exec_command("kitty", "/bin/jcode", false),
-            "'kitty' '/bin/jcode'"
+            terminal_exec_command("kitty", "/bin/jcode", "cmd+;", false),
+            "'kitty' '/bin/jcode' '--spawn-hotkey' 'cmd+;'"
         );
         assert_eq!(
-            terminal_exec_command("alacritty", "/bin/jcode", true),
-            "'alacritty' '-e' '/bin/jcode' 'self-dev'"
+            terminal_exec_command("alacritty", "/bin/jcode", "cmd+shift+'", true),
+            r#"'alacritty' '-e' '/bin/jcode' '--spawn-hotkey' 'cmd+shift+'\''' 'self-dev'"#
         );
         assert_eq!(
-            terminal_exec_command("wezterm", "/bin/jcode", false),
-            "'wezterm' 'start' '--' '/bin/jcode'"
+            terminal_exec_command("wezterm", "/bin/jcode", "cmd+;", false),
+            "'wezterm' 'start' '--' '/bin/jcode' '--spawn-hotkey' 'cmd+;'"
         );
         assert_eq!(
-            terminal_exec_command("foot", "/bin/jcode", false),
-            "'foot' '/bin/jcode'"
+            terminal_exec_command("foot", "/bin/jcode", "cmd+;", false),
+            "'foot' '/bin/jcode' '--spawn-hotkey' 'cmd+;'"
         );
         // Full paths keep the path but dispatch on the basename.
         assert_eq!(
-            terminal_exec_command("/usr/bin/ghostty", "/bin/jcode", false),
-            "'/usr/bin/ghostty' '-e' '/bin/jcode'"
+            terminal_exec_command("/usr/bin/ghostty", "/bin/jcode", "cmd+;", false),
+            "'/usr/bin/ghostty' '-e' '/bin/jcode' '--spawn-hotkey' 'cmd+;'"
         );
     }
 }
