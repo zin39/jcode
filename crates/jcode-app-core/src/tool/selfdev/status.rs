@@ -8,7 +8,7 @@ pub fn selfdev_status_output() -> Result<ToolOutput> {
     status.push_str("## Current Version\n\n");
     status.push_str(&format!(
         "**Running:** jcode {}\n",
-        jcode_build_meta::VERSION
+        jcode_build_meta::version()
     ));
 
     if let Some(repo_dir) = build::get_repo_dir() {

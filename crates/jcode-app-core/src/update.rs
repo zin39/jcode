@@ -79,7 +79,7 @@ pub fn is_release_build() -> bool {
 }
 
 fn current_update_semver() -> &'static str {
-    jcode_build_meta::UPDATE_SEMVER
+    jcode_build_meta::update_semver()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,7 +349,7 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
 }
 
 fn prepare_stable_update_blocking() -> Result<PreparedUpdate> {
-    let current_version = jcode_build_meta::VERSION;
+    let current_version = jcode_build_meta::version();
     let current_update_version = current_update_semver();
     let release = fetch_latest_release_blocking()?;
     let release_version = release.tag_name.trim_start_matches('v');
@@ -393,11 +393,11 @@ fn prepare_stable_update_blocking() -> Result<PreparedUpdate> {
 }
 
 fn prepare_main_update_blocking() -> Result<PreparedUpdate> {
-    let current_hash = jcode_build_meta::GIT_HASH;
+    let current_hash = jcode_build_meta::git_hash();
     if current_hash.is_empty() || current_hash == "unknown" {
         crate::logging::info("Main channel: no git hash in binary, skipping update check");
         return Ok(PreparedUpdate::None {
-            current: jcode_build_meta::VERSION.to_string(),
+            current: jcode_build_meta::version().to_string(),
         });
     }
 
@@ -603,7 +603,7 @@ fn check_for_stable_update_blocking() -> Result<Option<GitHubRelease>> {
 ///   - Tries to build from source if cargo is available
 ///   - Falls back to latest GitHub Release if not
 fn check_for_main_update_blocking() -> Result<Option<GitHubRelease>> {
-    let current_hash = jcode_build_meta::GIT_HASH;
+    let current_hash = jcode_build_meta::git_hash();
     if current_hash.is_empty() || current_hash == "unknown" {
         crate::logging::info("Main channel: no git hash in binary, skipping update check");
         return Ok(None);
@@ -1128,7 +1128,7 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
 
     match check_for_update_blocking() {
         Ok(Some(release)) => {
-            let current = jcode_build_meta::VERSION.to_string();
+            let current = jcode_build_meta::version().to_string();
             let latest = release.tag_name.clone();
 
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Available {

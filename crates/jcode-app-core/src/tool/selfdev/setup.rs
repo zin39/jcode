@@ -290,7 +290,7 @@ impl SelfDevTool {
             ));
         }
 
-        let hash = jcode_build_meta::GIT_HASH.to_string();
+        let hash = jcode_build_meta::git_hash().to_string();
         let request_id = server::send_reload_signal(hash.clone(), None, false);
         let timeout = std::time::Duration::from_secs(SelfDevTool::reload_timeout_secs());
 

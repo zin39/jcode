@@ -81,7 +81,7 @@ pub(super) fn install_macos_app_launcher() -> Result<(PathBuf, MacTerminalKind)>
 </dict>
 </plist>
 "#,
-        version = jcode_build_meta::VERSION,
+        version = jcode_build_meta::version(),
         icon_file = MACOS_APP_ICON_FILE_NAME,
     );
     std::fs::write(contents_dir.join("Info.plist"), info_plist)?;

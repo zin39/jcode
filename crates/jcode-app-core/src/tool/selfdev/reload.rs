@@ -282,7 +282,7 @@ impl SelfDevTool {
             build::current_source_state(&repo_dir)?
         };
         let hash = source.version_label.clone();
-        let version_before = jcode_build_meta::VERSION.to_string();
+        let version_before = jcode_build_meta::version().to_string();
         let published = if SelfDevTool::is_test_session() {
             None
         } else {
