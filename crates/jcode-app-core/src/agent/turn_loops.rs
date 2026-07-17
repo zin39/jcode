@@ -841,11 +841,31 @@ impl Agent {
                         "PROVIDER_GUARDRAIL: turn ended with no visible output (stop_reason={:?})",
                         stop_reason
                     ));
+                    // An empty/guardrail turn is itself a collapse; keep the
+                    // streak coherent for the next turn.
+                    self.consecutive_tiny_outputs =
+                        self.consecutive_tiny_outputs.saturating_add(1);
                     if print_output {
                         println!("\n[provider guardrail] {}", notice);
                     }
                     if text_content.trim().is_empty() {
                         text_content = format!("[provider guardrail] {}", notice);
+                    }
+                } else if let Some(notice) = self.note_turn_output_collapse(
+                    stop_reason.as_deref(),
+                    usage_output.unwrap_or(0),
+                    text_content.trim().chars().count(),
+                    false,
+                    !reasoning_content.trim().is_empty(),
+                ) {
+                    // Tiny-but-non-empty reply with a normal stop, repeated:
+                    // treat as a silent safety truncation and tell the user.
+                    logging::warn(&format!(
+                        "PROVIDER_GUARDRAIL: repeated tiny-output collapse (stop_reason={:?})",
+                        stop_reason
+                    ));
+                    if print_output {
+                        println!("\n[provider guardrail] {}", notice);
                     }
                 }
                 logging::info("Turn complete - no tool calls, returning");
@@ -911,6 +931,10 @@ impl Agent {
                 "Turn has {} tool calls to execute",
                 tool_calls.len()
             ));
+
+            // Any real tool work clears the silent-collapse streak: the model is
+            // making progress, not being silently truncated.
+            self.consecutive_tiny_outputs = 0;
 
             // If provider handles tools internally (like Claude Code CLI), only run native tools locally
             if self.provider.handles_tools_internally() {

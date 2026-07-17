@@ -265,6 +265,14 @@ pub struct Agent {
     turn_made_edits: bool,
     /// Verification fix-cycles consumed this turn.
     verify_attempts: u32,
+    /// Number of consecutive no-tool-call turns whose visible output collapsed
+    /// to a suspiciously tiny size (see `is_suspicious_tiny_output`). Providers
+    /// sometimes silently truncate an answer to a few tokens under a safety
+    /// guardrail instead of returning an explicit `refusal` stop reason; a
+    /// single terse answer is legitimate, but a repeated collapse is the signal
+    /// we surface. Reset to 0 whenever a turn does real work (tool calls or a
+    /// substantive answer).
+    consecutive_tiny_outputs: u32,
     /// Rolling activity tail (text + tool markers) for the inline output tap.
     /// Persists across turns so the coordinator's viewport never blanks at
     /// turn boundaries or freezes during long tool calls.
@@ -328,6 +336,7 @@ impl Agent {
             allow_auto_reroute: false,
             turn_made_edits: false,
             verify_attempts: 0,
+            consecutive_tiny_outputs: 0,
             inline_tail: inline_tail::InlineTailBuffer::default(),
         };
         crate::tool::set_session_tool_policy(

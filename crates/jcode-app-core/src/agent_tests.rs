@@ -1244,3 +1244,97 @@ fn guardrail_notice_absent_for_normal_turns() {
     assert!(Agent::provider_guardrail_notice(Some("end_turn"), false, false).is_none());
     assert!(Agent::provider_guardrail_notice(None, false, true).is_none());
 }
+
+#[test]
+fn suspicious_tiny_output_detection() {
+    // The live-observed silent collapse: end_turn, 2 output tokens, no text,
+    // no tool calls, no reasoning.
+    assert!(Agent::is_suspicious_tiny_output(
+        Some("end_turn"),
+        2,
+        0,
+        false,
+        false
+    ));
+    assert!(Agent::is_suspicious_tiny_output(Some("end_turn"), 9, 0, false, false));
+    // Empty stop reason is a carrier too.
+    assert!(Agent::is_suspicious_tiny_output(None, 4, 0, false, false));
+
+    // Not a collapse: zero tokens is handled by the empty-output notice.
+    assert!(!Agent::is_suspicious_tiny_output(Some("end_turn"), 0, 0, false, false));
+    // Not a collapse: a real (if short) answer above the token ceiling.
+    assert!(!Agent::is_suspicious_tiny_output(
+        Some("end_turn"),
+        40,
+        0,
+        false,
+        false
+    ));
+    // Not a collapse: a readable terse answer ("Yes, it exists.") — visible
+    // chars exceed the char ceiling even though tokens are tiny.
+    assert!(!Agent::is_suspicious_tiny_output(
+        Some("end_turn"),
+        6,
+        16,
+        false,
+        false
+    ));
+    // Not a collapse: the turn made tool calls (progress).
+    assert!(!Agent::is_suspicious_tiny_output(Some("end_turn"), 3, 0, true, false));
+    // Not a collapse: reasoning-only turns are handled separately.
+    assert!(!Agent::is_suspicious_tiny_output(Some("end_turn"), 3, 0, false, true));
+    // Not a collapse: truncation/length stops have their own continuation path.
+    assert!(!Agent::is_suspicious_tiny_output(
+        Some("max_tokens"),
+        3,
+        0,
+        false,
+        false
+    ));
+    // Not a collapse: explicit guardrails are handled by the guardrail notice.
+    assert!(!Agent::is_suspicious_tiny_output(Some("refusal"), 3, 0, false, false));
+}
+
+#[test]
+fn silent_collapse_notice_mentions_tokens_and_streak() {
+    let notice = Agent::silent_collapse_notice(3, 2);
+    assert!(notice.contains("2 tokens"), "{notice}");
+    assert!(notice.contains("3 times"), "{notice}");
+    assert!(notice.to_lowercase().contains("guardrail"), "{notice}");
+}
+
+#[tokio::test]
+async fn note_turn_output_collapse_escalates_after_streak() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // First collapse: streak = 1, below threshold, no notice yet.
+    assert!(
+        agent
+            .note_turn_output_collapse(Some("end_turn"), 3, 0, false, false)
+            .is_none(),
+        "first collapse should not escalate"
+    );
+    // Second consecutive collapse: streak = 2 == threshold, escalate.
+    let notice = agent
+        .note_turn_output_collapse(Some("end_turn"), 2, 0, false, false)
+        .expect("second consecutive collapse must escalate");
+    assert!(notice.contains("2 times"), "{notice}");
+
+    // A healthy turn (real answer) resets the streak.
+    assert!(
+        agent
+            .note_turn_output_collapse(Some("end_turn"), 200, 500, false, false)
+            .is_none(),
+        "healthy turn resets streak"
+    );
+    // After reset, a single collapse should again be below threshold.
+    assert!(
+        agent
+            .note_turn_output_collapse(Some("end_turn"), 3, 0, false, false)
+            .is_none(),
+        "streak should have reset, so one collapse is below threshold"
+    );
+}

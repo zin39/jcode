@@ -165,6 +165,130 @@ impl Agent {
             reasoning_hint, reason_label
         ))
     }
+
+    /// Number of consecutive collapsed turns (tiny visible output, no tool
+    /// calls, non-guardrail stop) before we treat the collapse as a silent
+    /// guardrail and surface a notice. A single terse answer ("Yes.", "Done.")
+    /// is legitimate; a repeated collapse to a few tokens is the signal that the
+    /// provider is silently truncating under a safety filter (observed live on
+    /// `claude-opus-4-8` for credential-scanning content: three turns in a row
+    /// returned 2-9 output tokens with a normal `end_turn` stop and no answer
+    /// the user could see).
+    pub(crate) const TINY_OUTPUT_COLLAPSE_THRESHOLD: u32 = 2;
+
+    /// Upper bound (in provider-reported output tokens) below which a no-tool
+    /// turn is considered "collapsed". Chosen well under any real answer: even
+    /// a one-sentence reply runs 15-40 tokens, while the silent-guardrail
+    /// collapses we observed were 2-9 tokens.
+    pub(crate) const TINY_OUTPUT_TOKEN_CEILING: u64 = 12;
+
+    /// Upper bound (in trimmed visible characters) for a turn to still count as
+    /// collapsed. A genuinely useful terse answer the user can act on ("Yes,
+    /// the file exists.") stays under the token ceiling but carries real text;
+    /// requiring near-empty visible output keeps legitimate short replies from
+    /// tripping the streak. The silent collapses we observed rendered nothing
+    /// the user could see.
+    pub(crate) const TINY_OUTPUT_CHAR_CEILING: usize = 8;
+
+    /// True when a completed no-tool-call turn produced a suspiciously tiny
+    /// visible answer: the provider reported an output-token count at or below
+    /// [`Self::TINY_OUTPUT_TOKEN_CEILING`], the visible text is near-empty
+    /// (at most [`Self::TINY_OUTPUT_CHAR_CEILING`] chars after trimming), and
+    /// the stop reason was a normal end-of-turn (not truncation, not an
+    /// explicit guardrail; those are handled elsewhere). `output_tokens == 0`
+    /// is excluded because a truly empty answer is already caught by
+    /// [`Self::provider_guardrail_notice`].
+    pub(crate) fn is_suspicious_tiny_output(
+        stop_reason: Option<&str>,
+        output_tokens: u64,
+        visible_chars: usize,
+        has_tool_calls: bool,
+        has_reasoning: bool,
+    ) -> bool {
+        if has_tool_calls {
+            return false;
+        }
+        // Reasoning-only turns (thinking but no answer) are a different failure
+        // mode already surfaced by the empty-output notice; don't double-count.
+        if has_reasoning {
+            return false;
+        }
+        if output_tokens == 0 || output_tokens > Self::TINY_OUTPUT_TOKEN_CEILING {
+            return false;
+        }
+        // A readable answer, however short, is not a collapse.
+        if visible_chars > Self::TINY_OUTPUT_CHAR_CEILING {
+            return false;
+        }
+        // Explicit guardrails and truncation/length stops have their own
+        // handling and messaging; only a "normal" stop collapses silently.
+        if Self::is_guardrail_stop_reason(stop_reason) {
+            return false;
+        }
+        let reason = stop_reason.map(str::trim).unwrap_or("").to_ascii_lowercase();
+        if Self::should_continue_after_stop_reason(&reason) {
+            return false;
+        }
+        // Empty / end_turn / stop are the silent-collapse carriers.
+        reason.is_empty() || matches!(reason.as_str(), "end_turn" | "stop" | "tool_use")
+    }
+
+    /// User-facing notice for a run of consecutive collapsed turns, once the
+    /// streak reaches [`Self::TINY_OUTPUT_COLLAPSE_THRESHOLD`]. Distinct wording
+    /// from [`Self::provider_guardrail_notice`] because the stop reason looked
+    /// normal, so we frame it as a likely silent guardrail rather than an
+    /// explicit refusal.
+    pub(crate) fn silent_collapse_notice(streak: u32, output_tokens: u64) -> String {
+        format!(
+            "The model returned an unusually short response ({output_tokens} tokens) with no visible answer {streak} times in a row. This is usually a provider-side safety guardrail silently truncating the reply rather than returning an explicit refusal. Rephrasing or narrowing the request, or switching to a stronger model, often resolves it."
+        )
+    }
+
+    /// Update the consecutive-tiny-output streak for a completed no-tool-call
+    /// turn and, once the streak reaches [`Self::TINY_OUTPUT_COLLAPSE_THRESHOLD`],
+    /// return the user-facing notice to surface. Turns that are NOT a suspicious
+    /// collapse reset the streak to 0. Returns `None` while the streak is still
+    /// below the threshold (or on a healthy turn).
+    ///
+    /// This complements [`Self::provider_guardrail_notice`], which only covers
+    /// *empty* output and explicit guardrail stops. The gap this closes is a
+    /// tiny-but-non-empty reply (a few output tokens the user cannot act on)
+    /// with a normal `end_turn` stop, which is how some providers surface a
+    /// silent safety truncation.
+    pub(crate) fn note_turn_output_collapse(
+        &mut self,
+        stop_reason: Option<&str>,
+        output_tokens: u64,
+        visible_chars: usize,
+        has_tool_calls: bool,
+        has_reasoning: bool,
+    ) -> Option<String> {
+        let collapsed = Self::is_suspicious_tiny_output(
+            stop_reason,
+            output_tokens,
+            visible_chars,
+            has_tool_calls,
+            has_reasoning,
+        );
+        if !collapsed {
+            self.consecutive_tiny_outputs = 0;
+            return None;
+        }
+        self.consecutive_tiny_outputs = self.consecutive_tiny_outputs.saturating_add(1);
+        logging::warn(&format!(
+            "SILENT_COLLAPSE: no-tool turn with tiny output (output_tokens={}, stop_reason={:?}, streak={})",
+            output_tokens, stop_reason, self.consecutive_tiny_outputs
+        ));
+        if self.consecutive_tiny_outputs >= Self::TINY_OUTPUT_COLLAPSE_THRESHOLD {
+            Some(Self::silent_collapse_notice(
+                self.consecutive_tiny_outputs,
+                output_tokens,
+            ))
+        } else {
+            None
+        }
+    }
+
     fn continuation_prompt_for_stop_reason(stop_reason: &str) -> String {
         format!(
             "[System reminder: your previous response ended before completion (stop_reason: {}). Continue exactly where you left off, do not repeat completed content, and if the next step is a tool call, emit the tool call now.]",

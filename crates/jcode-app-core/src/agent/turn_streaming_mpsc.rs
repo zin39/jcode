@@ -1221,23 +1221,42 @@ impl Agent {
                         // Only when the provider actually finished the message
                         // (saw_message_end) and the user did not cancel, so
                         // interrupted turns never show a spurious notice.
-                        if saw_message_end
-                            && !self.is_graceful_shutdown()
-                            && let Some(notice) = Self::provider_guardrail_notice(
+                        if saw_message_end && !self.is_graceful_shutdown() {
+                            let empty_text = text_content.trim().is_empty();
+                            if let Some(notice) = Self::provider_guardrail_notice(
                                 stop_reason.as_deref(),
-                                text_content.trim().is_empty(),
+                                empty_text,
                                 !reasoning_content.trim().is_empty(),
-                            )
-                        {
-                            logging::warn(&format!(
-                                "PROVIDER_GUARDRAIL: turn ended with no visible output (stop_reason={:?}, reasoning_chars={})",
-                                stop_reason,
-                                reasoning_content.len()
-                            ));
-                            let _ = event_tx.send(ServerEvent::ProviderGuardrail {
-                                stop_reason: stop_reason.clone(),
-                                message: notice,
-                            });
+                            ) {
+                                logging::warn(&format!(
+                                    "PROVIDER_GUARDRAIL: turn ended with no visible output (stop_reason={:?}, reasoning_chars={})",
+                                    stop_reason,
+                                    reasoning_content.len()
+                                ));
+                                // An empty/guardrail turn is itself a collapse;
+                                // keep the streak coherent for the next turn.
+                                self.consecutive_tiny_outputs =
+                                    self.consecutive_tiny_outputs.saturating_add(1);
+                                let _ = event_tx.send(ServerEvent::ProviderGuardrail {
+                                    stop_reason: stop_reason.clone(),
+                                    message: notice,
+                                });
+                            } else if let Some(notice) = self.note_turn_output_collapse(
+                                stop_reason.as_deref(),
+                                usage_output.unwrap_or(0),
+                                text_content.trim().chars().count(),
+                                false,
+                                !reasoning_content.trim().is_empty(),
+                            ) {
+                                // Tiny-but-non-empty reply with a normal stop:
+                                // repeated collapses look like a silent safety
+                                // truncation. Surface the same guardrail event so
+                                // the TUI arms the one-key reroute offer.
+                                let _ = event_tx.send(ServerEvent::ProviderGuardrail {
+                                    stop_reason: stop_reason.clone(),
+                                    message: notice,
+                                });
+                            }
                         }
                         break;
                     }
@@ -1277,6 +1296,10 @@ impl Agent {
                 "Turn has {} tool calls to execute",
                 tool_calls.len()
             ));
+
+            // Any real tool work clears the silent-collapse streak: the model is
+            // making progress, not being silently truncated.
+            self.consecutive_tiny_outputs = 0;
 
             if self.provider.handles_tools_internally() {
                 self.persist_provider_handled_tool_results(&tool_calls, &mut sdk_tool_results);
