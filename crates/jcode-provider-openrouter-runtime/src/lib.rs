@@ -62,6 +62,14 @@ const OPENROUTER_TRANSPORT_STATE_ENV: &str = "JCODE_OPENROUTER_TRANSPORT_STATE";
 const KIMI_CODING_USER_AGENT: &str = "claude-cli/1.0.0";
 const KIMI_CODING_X_APP: &str = "cli";
 
+/// The Grok CLI inference proxy (`cli-chat-proxy.grok.com`) rejects requests
+/// that do not advertise a recent official Grok CLI client build with HTTP 426.
+/// These constants track the official npm `@xai-official/grok` release; the
+/// version floor can be lifted at runtime with `JCODE_XAI_OAUTH_CLIENT_VERSION`
+/// if xAI raises it again.
+const GROK_CLI_CLIENT_IDENTIFIER: &str = "xai-grok-cli";
+const GROK_CLI_CLIENT_VERSION_DEFAULT: &str = "0.1.220";
+
 /// Default model (Claude Sonnet via OpenRouter)
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4";
 
@@ -432,6 +440,50 @@ fn apply_kimi_coding_agent_headers(
     }
 }
 
+/// Whether this api_base is the Grok CLI inference proxy, which serves Grok
+/// subscription (OAuth access token) traffic instead of `api.x.ai` API keys.
+fn is_grok_cli_proxy_api_base(api_base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(api_base) else {
+        return false;
+    };
+    matches!(url.host_str(), Some("cli-chat-proxy.grok.com"))
+}
+
+fn grok_cli_client_version() -> String {
+    std::env::var("JCODE_XAI_OAUTH_CLIENT_VERSION")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| GROK_CLI_CLIENT_VERSION_DEFAULT.to_string())
+}
+
+/// The Grok CLI proxy replies HTTP 426 ("client outdated") unless the request
+/// advertises an official Grok CLI build via these headers.
+fn apply_grok_cli_proxy_headers(
+    req: reqwest::RequestBuilder,
+    api_base: &str,
+) -> reqwest::RequestBuilder {
+    if is_grok_cli_proxy_api_base(api_base) {
+        req.header("x-grok-client-identifier", GROK_CLI_CLIENT_IDENTIFIER)
+            .header("x-grok-client-version", grok_cli_client_version())
+    } else {
+        req
+    }
+}
+
+/// Apply every provider-specific transport header required by the resolved
+/// api_base (Kimi coding-agent headers, Grok CLI proxy headers, ...). All
+/// OpenAI-compatible HTTP calls (model catalog + chat) go through this so a
+/// new provider only needs one `apply_*` helper wired here.
+fn apply_profile_transport_headers(
+    req: reqwest::RequestBuilder,
+    api_base: &str,
+    model: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let req = apply_kimi_coding_agent_headers(req, api_base, model);
+    apply_grok_cli_proxy_headers(req, api_base)
+}
+
 #[derive(Debug, Clone)]
 enum ProviderAuth {
     AuthorizationBearer {
@@ -516,7 +568,7 @@ async fn fetch_models_from_api(
 ) -> Result<Vec<ModelInfo>> {
     let url = format!("{}/models", api_base);
     let response =
-        apply_kimi_coding_agent_headers(auth.apply(client.get(&url)).await?, &api_base, None)
+        apply_profile_transport_headers(auth.apply(client.get(&url)).await?, &api_base, None)
             .send()
             .await
             .with_context(|| {
@@ -621,6 +673,9 @@ fn parse_model_info_value(value: &Value) -> Option<ModelInfo> {
             &[
                 "context_length",
                 "contextLength",
+                // Grok CLI proxy (`cli-chat-proxy.grok.com`) reports the window
+                // as `context_window`.
+                "context_window",
                 "max_context_length",
                 "maxModelLength",
                 "max_model_len",

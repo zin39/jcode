@@ -26,6 +26,12 @@ fn test_provider_choice_aliases_parse() {
     let args = Args::try_parse_from(["jcode", "--provider", "grok", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Xai);
 
+    let args = Args::try_parse_from(["jcode", "--provider", "grok-oauth", "run", "smoke"]).unwrap();
+    assert_eq!(args.provider, ProviderChoice::XaiOauth);
+
+    let args = Args::try_parse_from(["jcode", "--provider", "xai-oauth", "run", "smoke"]).unwrap();
+    assert_eq!(args.provider, ProviderChoice::XaiOauth);
+
     let args = Args::try_parse_from(["jcode", "--provider", "cgc", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Comtegra);
 }

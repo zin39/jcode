@@ -339,6 +339,11 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
     };
 
     match profile.id {
+        // The Grok CLI proxy only lists the current Grok Build model; keep it
+        // selectable before the live catalog is fetched.
+        "xai-oauth" => {
+            push("grok-4.5");
+        }
         "opencode" => {
             push("minimax-m2.7");
             push("kimi-k2.5");
@@ -550,6 +555,9 @@ pub fn openai_compatible_profile_context_limit(profile_id: &str, model: &str) ->
         // direct profile runs through the OpenRouter/OpenAI-compatible provider
         // implementation, whose live catalog can be unavailable during startup.
         "deepseek" if model.starts_with("deepseek-v4-") => Some(1_000_000),
+        // The Grok CLI proxy advertises a 500K window for grok-4.5; keep it as
+        // the static fallback for grok-4.x before the live catalog loads.
+        "xai-oauth" if model.starts_with("grok-4") => Some(500_000),
         // Fall back to the shared open-weight family classifier. Many bundled
         // OpenAI-compatible gateways (Z.AI/GLM, Moonshot/Kimi, MiniMax, Qwen,
         // etc.) serve `/v1/models` entries without a `context_length`, so this

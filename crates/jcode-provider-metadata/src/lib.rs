@@ -582,6 +582,14 @@ mod tests {
             Some("xai")
         );
         assert_eq!(
+            resolve_login_provider("grok-oauth").map(|provider| provider.id),
+            Some("xai-oauth")
+        );
+        assert_eq!(
+            resolve_login_provider("xai-oauth").map(|provider| provider.id),
+            Some("xai-oauth")
+        );
+        assert_eq!(
             resolve_login_provider("lm-studio").map(|provider| provider.id),
             Some("lmstudio")
         );

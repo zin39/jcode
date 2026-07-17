@@ -118,6 +118,9 @@ pub fn models_dev_provider_id(jcode_provider: &str) -> Option<&'static str> {
         "groq" => "groq",
         "mistral" => "mistral",
         "xai" => "xai",
+        // Grok subscription OAuth traffic serves the same Grok models; reuse
+        // the xai pricing catalog entries.
+        "xai-oauth" => "xai",
         "minimax" => "minimax",
         "togetherai" => "togetherai",
         "fireworks" => "fireworks-ai",

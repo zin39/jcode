@@ -327,6 +327,23 @@ pub const XAI_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     requires_api_key: true,
 };
 
+/// xAI Grok subscription access via an OAuth access token (the credential the
+/// official Grok CLI mints at auth.x.ai). Unlike `XAI_PROFILE` (an `xai-...`
+/// API key against `api.x.ai`), this profile talks to the Grok CLI inference
+/// proxy, which accepts `Authorization: Bearer <oauth-access-token>` and also
+/// requires `x-grok-client-identifier` / `x-grok-client-version` headers (sent
+/// by the OpenAI-compatible runtime for this api_base).
+pub const XAI_OAUTH_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "xai-oauth",
+    display_name: "xAI (Grok OAuth)",
+    api_base: "https://cli-chat-proxy.grok.com/v1",
+    api_key_env: "XAI_OAUTH_TOKEN",
+    env_file: "xai-oauth.env",
+    setup_url: "https://docs.x.ai/",
+    default_model: Some("grok-4.5"),
+    requires_api_key: true,
+};
+
 pub const LMSTUDIO_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     id: "lmstudio",
     display_name: "LM Studio",
@@ -419,7 +436,7 @@ pub const OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfi
     requires_api_key: true,
 };
 
-pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 36] = [
+pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 37] = [
     OPENCODE_PROFILE,
     OPENCODE_GO_PROFILE,
     ZAI_PROFILE,
@@ -451,6 +468,7 @@ pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 36] = [
     FIREWORKS_PROFILE,
     MINIMAX_PROFILE,
     XAI_PROFILE,
+    XAI_OAUTH_PROFILE,
     NVIDIA_NIM_PROFILE,
     XIAOMI_MIMO_PROFILE,
     LMSTUDIO_PROFILE,
@@ -937,6 +955,19 @@ pub const XAI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor 
     order: LoginProviderSurfaceOrder::new(Some(33), Some(33), Some(33), Some(33), Some(33)),
 };
 
+pub const XAI_OAUTH_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "xai-oauth",
+    display_name: "xAI (Grok OAuth)",
+    auth_kind: LoginProviderAuthKind::ApiKey,
+    auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
+    auth_status_method: "OAuth access token",
+    aliases: &["grok-oauth", "xai-token", "grok-cli"],
+    menu_detail: "Grok subscription OAuth access token",
+    recommended: false,
+    target: LoginProviderTarget::OpenAiCompatible(XAI_OAUTH_PROFILE),
+    order: LoginProviderSurfaceOrder::new(Some(33), Some(33), Some(33), Some(33), Some(33)),
+};
+
 pub const NVIDIA_NIM_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
     id: "nvidia-nim",
     display_name: "NVIDIA NIM",
@@ -1085,7 +1116,7 @@ pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(13), None, None, None, None),
 };
 
-pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 47] = [
+pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 48] = [
     AUTO_IMPORT_LOGIN_PROVIDER,
     CLAUDE_LOGIN_PROVIDER,
     ANTHROPIC_API_LOGIN_PROVIDER,
@@ -1122,6 +1153,7 @@ pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 47] = [
     FIREWORKS_LOGIN_PROVIDER,
     MINIMAX_LOGIN_PROVIDER,
     XAI_LOGIN_PROVIDER,
+    XAI_OAUTH_LOGIN_PROVIDER,
     NVIDIA_NIM_LOGIN_PROVIDER,
     XIAOMI_MIMO_LOGIN_PROVIDER,
     LMSTUDIO_LOGIN_PROVIDER,

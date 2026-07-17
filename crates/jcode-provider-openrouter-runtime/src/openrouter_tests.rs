@@ -2025,6 +2025,58 @@ fn test_openrouter_kimi_chat_request_includes_compat_user_agent() {
 }
 
 #[test]
+fn test_grok_cli_proxy_api_base_detection() {
+    assert!(is_grok_cli_proxy_api_base(
+        "https://cli-chat-proxy.grok.com/v1"
+    ));
+    assert!(!is_grok_cli_proxy_api_base("https://api.x.ai/v1"));
+    assert!(!is_grok_cli_proxy_api_base("https://openrouter.ai/api/v1"));
+    assert!(!is_grok_cli_proxy_api_base("not a url"));
+}
+
+#[test]
+fn test_grok_cli_proxy_request_includes_client_headers() {
+    let request = apply_profile_transport_headers(
+        Client::new().post("https://cli-chat-proxy.grok.com/v1/chat/completions"),
+        "https://cli-chat-proxy.grok.com/v1",
+        Some("grok-4.5"),
+    )
+    .build()
+    .expect("build request");
+    assert_eq!(
+        request
+            .headers()
+            .get("x-grok-client-identifier")
+            .and_then(|value| value.to_str().ok()),
+        Some(GROK_CLI_CLIENT_IDENTIFIER),
+        "Grok CLI proxy request should identify as the official CLI"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("x-grok-client-version")
+            .and_then(|value| value.to_str().ok()),
+        Some(GROK_CLI_CLIENT_VERSION_DEFAULT),
+        "Grok CLI proxy request should advertise the tracked client version"
+    );
+}
+
+#[test]
+fn test_non_grok_endpoints_do_not_send_grok_client_headers() {
+    let request = apply_profile_transport_headers(
+        Client::new().post("https://api.x.ai/v1/chat/completions"),
+        "https://api.x.ai/v1",
+        Some("grok-code-fast-1"),
+    )
+    .build()
+    .expect("build request");
+    assert!(
+        request.headers().get("x-grok-client-identifier").is_none(),
+        "direct api.x.ai requests must not carry Grok CLI proxy headers"
+    );
+}
+
+#[test]
 fn test_parse_next_event_accepts_compact_sse_data_and_reasoning_content() {
     let bytes = Bytes::from_static(
         b"data:{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",

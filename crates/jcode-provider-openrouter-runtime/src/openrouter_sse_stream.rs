@@ -166,7 +166,7 @@ async fn stream_response(
     let connect_start = std::time::Instant::now();
 
     let url = format!("{}/chat/completions", api_base);
-    let mut req = apply_kimi_coding_agent_headers(
+    let mut req = apply_profile_transport_headers(
         auth.apply(
             client
                 .post(&url)
