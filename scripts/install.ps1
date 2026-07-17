@@ -71,6 +71,44 @@ function Write-Info($msg) { Write-Host $msg -ForegroundColor Blue }
 function Write-Err($msg) { throw "error: $msg" }
 function Write-Warn($msg) { Write-Host "warning: $msg" -ForegroundColor Yellow }
 
+function Resolve-JcodeReleaseTagFromUri([string]$Uri) {
+    if (-not $Uri) { return $null }
+    if ($Uri -match '/releases/tag/([^/?#]+)') {
+        return [Uri]::UnescapeDataString($Matches[1])
+    }
+    return $null
+}
+
+function Get-LatestJcodeReleaseTag {
+    # Avoid api.github.com here. Its unauthenticated limit is only 60 requests
+    # per public IP per hour, so installs are unreliable behind shared NAT/VPNs.
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Method Head -Uri "https://github.com/$Repo/releases/latest"
+        $baseResponse = $response.BaseResponse
+        $resolvedUri = $null
+
+        if ($baseResponse) {
+            $responseUriProperty = $baseResponse.PSObject.Properties['ResponseUri']
+            if ($responseUriProperty -and $responseUriProperty.Value) {
+                $resolvedUri = [string]$responseUriProperty.Value
+            }
+
+            if (-not $resolvedUri) {
+                $requestMessageProperty = $baseResponse.PSObject.Properties['RequestMessage']
+                if ($requestMessageProperty -and $requestMessageProperty.Value) {
+                    $resolvedUri = [string]$requestMessageProperty.Value.RequestUri
+                }
+            }
+        }
+
+        $tag = Resolve-JcodeReleaseTagFromUri $resolvedUri
+        if ($tag) { return $tag }
+        Write-Err "GitHub did not redirect releases/latest to a version tag"
+    } catch {
+        Write-Err "Failed to determine latest version: $_"
+    }
+}
+
 function Get-JcodeSha256FromManifest {
     param(
         [Parameter(Mandatory = $true)][string]$ManifestText,
@@ -808,12 +846,7 @@ if (-not $Version) {
         Write-Err "-Version is required when using -ArtifactTgzPath"
     } else {
         Write-Info "Fetching latest release..."
-        try {
-            $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
-            $Version = $Release.tag_name
-        } catch {
-            Write-Err "Failed to determine latest version: $_"
-        }
+        $Version = Get-LatestJcodeReleaseTag
     }
 }
 

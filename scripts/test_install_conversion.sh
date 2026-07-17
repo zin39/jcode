@@ -31,9 +31,9 @@ done
 [ -z "${DOWNLOAD_URL_LOG:-}" ] || printf '%s\n' "$url" >> "$DOWNLOAD_URL_LOG"
 case "$url" in
   *telemetry.jcode.sh*) printf '%s\n' "$payload" >> "$INSTALL_TELEMETRY_LOG" ;;
-  *api.github.com*)
+  *github.com*/releases/latest)
     [ "${FAIL_RELEASE:-0}" != "1" ] || exit 22
-    printf '{"tag_name":"v1.2.3"}\n'
+    printf 'https://github.com/1jehuang/jcode/releases/tag/v1.2.3'
     ;;
   *github.com*/releases/download/*)
     [ -n "$output" ] || exit 2
@@ -116,6 +116,11 @@ if PATH="$tmp/bin:$PATH" \
   exit 1
 fi
 grep -q '"stage":"installer_finish".*"outcome":"failure".*"failure_stage":"release_lookup"' "$failure_log"
+
+if grep -q 'api.github.com' "$windows_url_log"; then
+  echo "installer must not depend on the rate-limited unauthenticated GitHub API" >&2
+  exit 1
+fi
 
 privacy_log="$tmp/privacy.jsonl"
 PATH="$tmp/bin:$PATH" \

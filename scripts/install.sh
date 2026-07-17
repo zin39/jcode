@@ -130,11 +130,15 @@ else
   INSTALL_DIR="${JCODE_INSTALL_DIR:-$HOME/.local/bin}"
 fi
 
-# Extract the tag_name value, working for both pretty-printed (multi-line) and
-# compact (single-line) GitHub API JSON. `grep -o` isolates just the tag_name
-# field so `cut` no longer matches an unrelated string like the release url.
+# Resolve GitHub's stable `releases/latest` redirect instead of using the
+# unauthenticated GitHub API. The API only permits 60 requests per public IP
+# per hour, which makes installs fail with HTTP 403 on shared networks/VPNs.
 INSTALL_STAGE="release_lookup"
-VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep -o '"tag_name" *: *"[^"]*"' | head -1 | cut -d'"' -f4)
+LATEST_RELEASE_URL=$(curl -fsSIL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")
+case "$LATEST_RELEASE_URL" in
+  */releases/tag/*) VERSION="${LATEST_RELEASE_URL##*/}" ;;
+  *) VERSION="" ;;
+esac
 [ -n "$VERSION" ] || err "Failed to determine latest version"
 INSTALL_VERSION="${VERSION#v}"
 

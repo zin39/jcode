@@ -151,6 +151,13 @@ try {
     $env:JCODE_INSTALL_SKIP_BINARY_VALIDATION = '1'
     . $installScript -SkipAlacrittySetup -SkipHotkeySetup
 
+    Invoke-Case 'release_lookup_avoids_unauthenticated_github_api' {
+        Assert-Equal 'v1.2.3' (Resolve-JcodeReleaseTagFromUri 'https://github.com/1jehuang/jcode/releases/tag/v1.2.3') 'release redirect parser should extract the stable tag'
+        Assert-Equal 'v1.2.3-rc.1' (Resolve-JcodeReleaseTagFromUri 'https://github.com/1jehuang/jcode/releases/tag/v1.2.3-rc.1?source=latest') 'release redirect parser should stop before query parameters'
+        $scriptText = Get-Content -LiteralPath $installScript -Raw
+        Assert-NotContains $scriptText 'api.github.com/repos/$Repo/releases/latest' 'installer should not use the rate-limited unauthenticated GitHub API'
+    }
+
     Invoke-Case 'path_persistence_and_deduplication' {
         $profile = New-IsolatedWindowsProfile 'path-dedupe'
         $installVariant = ($profile.InstallDir.ToUpperInvariant() + '\')
