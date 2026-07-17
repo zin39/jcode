@@ -298,6 +298,15 @@ fn is_retryable_error(error_str: &str) -> bool {
         return false;
     }
 
+    // A 429 that reports an exhausted usage quota (e.g. the Grok CLI proxy's
+    // `subscription:free-usage-exhausted`, which resets over a rolling 24h
+    // window) will not recover within a retry loop. Retrying it only hides the
+    // actionable error behind a generic "provider did not respond" timeout.
+    // Momentary rate limits (plain 429 without a quota marker) stay retryable.
+    if quota_exhausted_error(error_str) {
+        return false;
+    }
+
     jcode_provider_core::is_transient_transport_error(error_str)
         || error_str.contains("stream error")
         || error_str.contains("eof")
@@ -308,6 +317,19 @@ fn is_retryable_error(error_str: &str) -> bool {
                 || error_str.contains("504")
                 || error_str.contains("internal server error"))
         || error_str.contains("overloaded")
+}
+
+/// Whether an error body reports a hard usage-quota exhaustion (spending
+/// limit / included-usage cap) rather than a momentary rate limit.
+fn quota_exhausted_error(error_str: &str) -> bool {
+    let lower = error_str.to_ascii_lowercase();
+    lower.contains("usage-exhausted")
+        || lower.contains("usage_exhausted")
+        || lower.contains("spending-limit")
+        || lower.contains("spending_limit")
+        || lower.contains("run out of credits")
+        || lower.contains("insufficient credits")
+        || lower.contains("insufficient_quota")
 }
 
 #[cfg(test)]
@@ -361,6 +383,27 @@ mod tests {
                 "status {status} should not be retryable"
             );
         }
+    }
+
+    #[test]
+    fn quota_exhausted_429_is_not_retryable() {
+        let err = "OpenAI-compatible chat request failed\n  endpoint: \
+            https://cli-chat-proxy.grok.com/v1/chat/completions\n  model: grok-4.5\n  \
+            auth: XAI_OAUTH_TOKEN\n  status: 429 Too Many Requests\n  response: \
+            {\"code\":\"subscription:free-usage-exhausted\",\"error\":\"You've used all \
+            the included free usage for model grok-4.5-build-free for now.\"}";
+        assert!(
+            !is_retryable_error(err),
+            "quota-exhausted 429 must surface immediately instead of retrying into a timeout"
+        );
+    }
+
+    #[test]
+    fn plain_rate_limit_429_stays_retryable() {
+        let err = "chat request failed\n  status: 429 Too Many Requests\n  response: \
+            {\"error\":\"rate limited, slow down\"}\ntimeout";
+        // Plain momentary rate limits should keep the existing retry behavior.
+        assert!(!quota_exhausted_error(err));
     }
 
     #[test]
