@@ -428,15 +428,12 @@ impl Agent {
                     agent.session.provider_key.as_deref(),
                     agent.session.route_api_method.as_deref(),
                 );
-            if let Err(e) = crate::provider::set_model_with_auth_refresh(
+            let restored = crate::provider::restore_session_model_best_effort(
                 agent.provider.as_ref(),
+                &model,
                 &model_request,
-            ) {
-                logging::error(&format!(
-                    "Failed to restore session model '{}' via '{}': {}",
-                    model, model_request, e
-                ));
-            }
+            );
+            agent.session.model = Some(restored);
         } else {
             agent.session.model = Some(agent.provider.model());
         }

@@ -715,3 +715,81 @@ fn test_on_auth_changed_hot_initializes_cursor_and_marks_routes_available() {
         })
     });
 }
+
+/// Provider that only accepts a fixed allowlist of models, used to model a
+/// session whose saved provider_key routes to the wrong backend.
+#[derive(Clone)]
+struct RestoreMockProvider {
+    allowed: Vec<&'static str>,
+    selected_model: Arc<std::sync::Mutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for RestoreMockProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unimplemented!("RestoreMockProvider")
+    }
+
+    fn name(&self) -> &str {
+        "restore-mock"
+    }
+
+    fn model(&self) -> String {
+        self.selected_model.lock().unwrap().clone()
+    }
+
+    fn set_model(&self, model: &str) -> Result<()> {
+        if !self.allowed.contains(&model) {
+            anyhow::bail!("Model {} not supported", model);
+        }
+        *self.selected_model.lock().unwrap() = model.to_string();
+        Ok(())
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+#[test]
+fn test_restore_session_model_falls_back_to_bare_model_when_route_is_stale() {
+    let provider = RestoreMockProvider {
+        allowed: vec!["deepseek-v4-pro"],
+        selected_model: Arc::new(std::sync::Mutex::new("default-model".to_string())),
+    };
+    // Saved provider_key was wrong ("claude") so the routed request fails,
+    // but the bare model is available.
+    let restored = restore_session_model_best_effort(
+        &provider,
+        "deepseek-v4-pro",
+        "claude-oauth:deepseek-v4-pro",
+    );
+    assert_eq!(restored, "deepseek-v4-pro");
+}
+
+#[test]
+fn test_restore_session_model_keeps_default_when_model_unavailable() {
+    let provider = RestoreMockProvider {
+        allowed: vec![],
+        selected_model: Arc::new(std::sync::Mutex::new("default-model".to_string())),
+    };
+    let restored = restore_session_model_best_effort(
+        &provider,
+        "deepseek-v4-flash",
+        "claude-oauth:deepseek-v4-flash",
+    );
+    assert_eq!(restored, "default-model");
+    // Second call must also not panic and stays on default (one-time warn path).
+    let restored = restore_session_model_best_effort(
+        &provider,
+        "deepseek-v4-flash",
+        "claude-oauth:deepseek-v4-flash",
+    );
+    assert_eq!(restored, "default-model");
+}

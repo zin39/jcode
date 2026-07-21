@@ -260,6 +260,57 @@ fn configured_standard_openrouter_profile_routes() -> Vec<ModelRoute> {
         .collect()
 }
 
+/// Restore a session's saved model onto `provider`, tolerating a stale or
+/// wrong saved route.
+///
+/// Sessions can persist a `provider_key` that does not actually serve the
+/// saved model (e.g. an OpenRouter/dashscope model saved with provider_key
+/// "claude" builds a `claude-oauth:<model>` request the Anthropic provider
+/// rejects). Restoring must not fail hard or spam the error log on every
+/// resume:
+/// 1. Try the routed `model_request` first (preserves auth route when valid).
+/// 2. If that fails and the bare model differs, try the bare model so the
+///    provider's own routing heuristics can find the right backend.
+/// 3. If both fail, keep the provider's default model and emit a one-time
+///    warning per (model, route) instead of an error on every restore.
+///
+/// Returns the model string actually in effect after the attempt.
+pub fn restore_session_model_best_effort(
+    provider: &dyn Provider,
+    model: &str,
+    model_request: &str,
+) -> String {
+    let routed_err = match set_model_with_auth_refresh(provider, model_request) {
+        Ok(()) => return provider.model(),
+        Err(err) => err,
+    };
+    if model_request != model
+        && set_model_with_auth_refresh(provider, model).is_ok()
+    {
+        return provider.model();
+    }
+
+    // One-time warn per (model, route): repeated resumes of stale sessions
+    // must not flood the log with errors.
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let key = format!("{model_request}|{model}");
+    let should_warn = WARNED
+        .lock()
+        .map(|mut guard| guard.get_or_insert_with(Default::default).insert(key))
+        .unwrap_or(true);
+    if should_warn {
+        crate::logging::warn(&format!(
+            "Could not restore session model '{}' via '{}' ({}); keeping default model '{}'",
+            model,
+            model_request,
+            routed_err,
+            provider.model()
+        ));
+    }
+    provider.model()
+}
+
 pub fn set_model_with_auth_refresh(provider: &dyn Provider, model: &str) -> Result<()> {
     match provider.set_model(model) {
         Ok(()) => Ok(()),

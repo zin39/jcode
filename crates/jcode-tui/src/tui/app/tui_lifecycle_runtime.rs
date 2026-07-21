@@ -327,23 +327,25 @@ impl App {
                         self.session.provider_key.as_deref(),
                         self.session.route_api_method.as_deref(),
                     );
-                if let Err(e) = crate::provider::set_model_with_auth_refresh(
+                let restored = crate::provider::restore_session_model_best_effort(
                     self.provider.as_ref(),
+                    &model,
                     &model_request,
-                ) {
+                );
+                if restored == model {
+                    restored_model = true;
+                } else {
                     self.push_display_message(DisplayMessage {
                         role: "system".to_string(),
                         content: format!(
-                            "⚠ Failed to restore model '{}' via '{}': {}",
-                            model, model_request, e
+                            "⚠ Session model '{}' is unavailable; continuing with '{}'",
+                            model, restored
                         ),
                         tool_calls: vec![],
                         duration_secs: None,
                         title: None,
                         tool_data: None,
                     });
-                } else {
-                    restored_model = true;
                 }
             }
 
