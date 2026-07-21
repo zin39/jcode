@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Fast/cheap OpenAI model used when Codex credentials are available.
 pub const SIDECAR_OPENAI_MODEL: &str = "gpt-5.3-codex-spark";
 const SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL: &str = "gpt-5.4";
+/// Model used on the public API-key path, where the ChatGPT-only
+/// `gpt-5.3-codex-spark` does not exist. Cheapest current mini-tier model.
+const SIDECAR_OPENAI_API_KEY_MODEL: &str = "gpt-5-mini";
 const SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING: &str = "low";
 
 /// Fast/cheap Claude model used when only Claude credentials are available.
@@ -681,7 +684,20 @@ fn resolve_openai_request_model(
     preferred_model: &str,
     is_chatgpt_mode: bool,
 ) -> (&str, Option<&'static str>) {
-    if !is_chatgpt_mode || preferred_model != SIDECAR_OPENAI_MODEL {
+    if !is_chatgpt_mode {
+        // `gpt-5.3-codex-spark` only exists on the ChatGPT OAuth backend; the
+        // public API rejects it with 400 "model does not exist", which silently
+        // killed memory extraction for API-key accounts. Substitute a real,
+        // cheap public-API model with minimal reasoning.
+        if preferred_model == SIDECAR_OPENAI_MODEL {
+            return (
+                SIDECAR_OPENAI_API_KEY_MODEL,
+                Some(SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING),
+            );
+        }
+        return (preferred_model, None);
+    }
+    if preferred_model != SIDECAR_OPENAI_MODEL {
         return (preferred_model, None);
     }
 
