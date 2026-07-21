@@ -5,8 +5,13 @@ use std::hash::{Hash, Hasher};
 /// Default token budget (200k tokens - matches Claude's actual context limit)
 pub const DEFAULT_TOKEN_BUDGET: usize = 200_000;
 
-/// Trigger compaction at this percentage of budget
-pub const COMPACTION_THRESHOLD: f32 = 0.80;
+/// Trigger compaction at this percentage of budget.
+///
+/// Lowering from 0.80 to 0.75: late compaction forces the model to write
+/// a summary under context-anxiety pressure, producing low-quality
+/// summaries that omit important details. Starting at ~75% leaves enough
+/// room for a calm, thorough summary.
+pub const COMPACTION_THRESHOLD: f32 = 0.75;
 
 /// If context is above this threshold when compaction starts, do a synchronous
 /// hard-compact (drop old messages) so the API call doesn't fail.
@@ -181,13 +186,18 @@ pub const SEMANTIC_EMBED_CACHE_CAPACITY: usize = 256;
 
 pub const SUMMARY_PROMPT: &str = r#"Summarize our conversation so you can continue this work later.
 
-Write in natural language with these sections:
-- **Context:** What we're working on and why (1-2 sentences)
-- **What we did:** Key actions taken, files changed, problems solved
-- **Current state:** What works, what's broken, what's next
-- **User preferences:** Specific requirements or decisions they made
+Fill in EVERY section below. If a section has nothing, write 'None.' explicitly — never silently omit a section.
 
-Be concise but preserve important details. You can search the full conversation later if you need exact error messages or code snippets."#;
+- **Original goal (verbatim):** The user's initial task request, quoted as close to verbatim as practical
+- **Session intent:** What we're working on now and why (1-2 sentences)
+- **Files modified:** Full paths of every file created/edited/deleted, with one line on what changed in each
+- **Key decisions:** Choices made and the reasoning behind them
+- **Approaches tried and rejected:** What failed or was abandoned, and why (so we never retry them blindly)
+- **Current state:** What works, what's broken
+- **Next steps:** Concrete remaining work items
+- **User preferences:** Specific requirements, constraints, or style decisions the user stated
+
+Preserve exact technical details: file paths, error messages, command lines, model/version identifiers. You can search the full conversation later for anything else."#;
 
 /// A completed summary covering turns up to a certain point
 #[derive(Debug, Clone)]
@@ -872,6 +882,7 @@ pub fn tail_str_boundary(value: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    mod probe_eval_tests;
     use super::*;
 
     #[test]
