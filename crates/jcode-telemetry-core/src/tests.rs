@@ -472,3 +472,49 @@ fn test_install_marker_tracks_current_telemetry_id() {
         jcode_core::env::remove_var("JCODE_HOME");
     }
 }
+
+#[test]
+fn test_circuit_breaker_trips_after_five_rejections_and_stays_tripped() {
+    let _guard = lock_test_env();
+    let tmp = std::env::temp_dir().join(format!("jcode_breaker_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    jcode_core::env::set_var("JCODE_HOME", tmp.to_str().unwrap());
+
+    // Reset breaker state.
+    TELEMETRY_DISABLED.store(false, Ordering::Relaxed);
+    TELEMETRY_REJECTION_COUNT.store(0, Ordering::Relaxed);
+    clear_persisted_breaker_trip();
+
+    // Five consecutive 4xx rejections (e.g. a 404 endpoint) trip the breaker.
+    for _ in 0..4 {
+        note_endpoint_rejection();
+        assert!(!TELEMETRY_DISABLED.load(Ordering::Relaxed));
+    }
+    note_endpoint_rejection();
+    assert!(TELEMETRY_DISABLED.load(Ordering::Relaxed), "breaker should trip on 5th 4xx");
+
+    // The trip is persisted, so a fresh process (simulated by clearing the
+    // in-memory flag) still honors the open breaker for the next hour.
+    TELEMETRY_DISABLED.store(false, Ordering::Relaxed);
+    assert!(breaker_open_on_disk(), "persisted breaker must stay tripped across processes");
+
+    // A stale trip (>1h old) allows retries again.
+    let path = breaker_state_path().unwrap();
+    let stale = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - BREAKER_OPEN_DURATION.as_secs()
+        - 10;
+    std::fs::write(&path, stale.to_string()).unwrap();
+    assert!(!breaker_open_on_disk(), "stale trip should expire");
+    assert!(!path.exists(), "stale marker should be removed");
+
+    // A successful send clears any persisted trip.
+    persist_breaker_trip();
+    note_endpoint_success();
+    assert!(!breaker_open_on_disk());
+
+    jcode_core::env::remove_var("JCODE_HOME");
+    let _ = std::fs::remove_dir_all(&tmp);
+}

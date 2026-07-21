@@ -30,8 +30,82 @@ const TELEMETRY_SCHEMA_VERSION: u32 = 5;
 
 // Circuit breaker: after 5 consecutive 4xx rejections, stop sending telemetry
 // for the rest of the process lifetime. Reset on any successful send.
+//
+// The in-process atomics alone are not enough: jcode spawns many short-lived
+// processes (subagents, blocking lifecycle sends), and each fresh process
+// started its counter at zero, so a permanently dead endpoint still received
+// a steady drip of 4xx requests. Once tripped, the breaker is therefore also
+// persisted to `~/.jcode/telemetry_breaker_open` and honored across processes
+// for `BREAKER_OPEN_DURATION` (see `breaker_open_on_disk`).
 static TELEMETRY_REJECTION_COUNT: AtomicU32 = AtomicU32::new(0);
 static TELEMETRY_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// How long a tripped breaker stays open across processes.
+const BREAKER_OPEN_DURATION: Duration = Duration::from_secs(60 * 60);
+
+fn breaker_state_path() -> Option<std::path::PathBuf> {
+    storage::jcode_dir()
+        .ok()
+        .map(|d| d.join("telemetry_breaker_open"))
+}
+
+/// Returns true if a previously persisted breaker trip is still in effect.
+fn breaker_open_on_disk() -> bool {
+    let Some(path) = breaker_state_path() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let tripped_at = contents.trim().parse::<u64>().unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(tripped_at) < BREAKER_OPEN_DURATION.as_secs() {
+        true
+    } else {
+        // Stale trip: allow a retry and clear the marker.
+        let _ = std::fs::remove_file(&path);
+        false
+    }
+}
+
+fn persist_breaker_trip() {
+    if let Some(path) = breaker_state_path() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, now.to_string());
+    }
+}
+
+fn clear_persisted_breaker_trip() {
+    if let Some(path) = breaker_state_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Record one endpoint rejection (4xx). Trips the breaker after 5 in a row.
+fn note_endpoint_rejection() {
+    let count = TELEMETRY_REJECTION_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count >= 5 {
+        TELEMETRY_DISABLED.store(true, Ordering::Relaxed);
+        persist_breaker_trip();
+        logging::info(
+            "telemetry disabled: 5 consecutive endpoint rejections (breaker persisted for 1h)",
+        );
+    }
+}
+
+fn note_endpoint_success() {
+    TELEMETRY_REJECTION_COUNT.store(0, Ordering::Relaxed);
+    clear_persisted_breaker_trip();
+}
 
 /// Returns the telemetry endpoint, preferring the `JCODE_TELEMETRY_ENDPOINT`
 /// env var (read once, lazily) over the compiled-in default.
@@ -873,8 +947,13 @@ pub fn record_command_family(command: &str) {
 }
 
 fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
-    // Circuit breaker: skip if permanently disabled
+    // Circuit breaker: skip if disabled in this process or tripped on disk
+    // by any recent process (dead endpoint backoff).
     if TELEMETRY_DISABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+    if breaker_open_on_disk() {
+        TELEMETRY_DISABLED.store(true, Ordering::Relaxed);
         return false;
     }
 
@@ -893,18 +972,12 @@ fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
         Ok(response) => match response.error_for_status() {
             Ok(_) => {
                 // Successful send resets the rejection counter
-                TELEMETRY_REJECTION_COUNT.store(0, Ordering::Relaxed);
+                note_endpoint_success();
                 true
             }
             Err(err) => {
                 logging::warn(&format!("telemetry endpoint rejected payload: {err}"));
-                let count = TELEMETRY_REJECTION_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if count >= 5 {
-                    TELEMETRY_DISABLED.store(true, Ordering::Relaxed);
-                    logging::info(
-                        "telemetry disabled for this process lifetime: 5 consecutive endpoint rejections",
-                    );
-                }
+                note_endpoint_rejection();
                 false
             }
         },
