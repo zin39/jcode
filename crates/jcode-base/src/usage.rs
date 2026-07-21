@@ -23,7 +23,7 @@ use display::{format_token_count, humanize_key, provider_usage_cache_is_fresh};
 use openai_helpers::{parse_openai_usage_payload, usage_percent_to_ratio};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -36,11 +36,17 @@ const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// Cache duration (refresh every 5 minutes - usage data is slow-changing)
 const CACHE_DURATION: Duration = Duration::from_secs(300);
 
-/// Error backoff duration (wait 5 minutes before retrying after auth/credential errors)
-const ERROR_BACKOFF: Duration = Duration::from_secs(300);
-
 /// Rate limit backoff duration (wait 15 minutes before retrying after 429 errors)
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(900);
+
+/// Maximum backoff cap for usage polling (30 minutes).
+const MAX_BACKOFF_SECS: u64 = 1800;
+
+/// Consecutive Anthropic usage fetch failures for exponential backoff.
+static CONSECUTIVE_ANTHROPIC_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// Consecutive OpenAI usage fetch failures for exponential backoff.
+pub(super) static CONSECUTIVE_OPENAI_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 /// Minimum interval between /usage command fetches (per provider).
 const PROVIDER_USAGE_CACHE_TTL: Duration = Duration::from_secs(120);
@@ -640,6 +646,24 @@ fn active_openai_usage_report(results: &[ProviderUsage]) -> Option<&ProviderUsag
                 .iter()
                 .find(|report| report.provider_name.starts_with("OpenAI"))
         })
+}
+
+/// Compute exponential backoff duration from consecutive failure count.
+/// Doubles each consecutive failure, capped at `MAX_BACKOFF_SECS` (30 min).
+/// A fresh `consecutive_failures` of 0 returns Duration::ZERO (no extra delay).
+pub(super) fn usage_poller_backoff(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::ZERO;
+    }
+    let base: u64 = 60; // 1 minute initial backoff
+    let exponent = consecutive_failures.saturating_sub(1);
+    // Compute 2^exponent * base, clamped to MAX_BACKOFF_SECS
+    let secs = if exponent >= 31 {
+        MAX_BACKOFF_SECS
+    } else {
+        (base << exponent).min(MAX_BACKOFF_SECS)
+    };
+    Duration::from_secs(secs)
 }
 
 #[cfg(test)]
