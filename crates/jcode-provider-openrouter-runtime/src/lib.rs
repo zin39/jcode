@@ -2620,11 +2620,18 @@ impl OpenRouterProvider {
     }
 
     async fn model_pricing(&self, model_id: &str) -> Option<ModelPricing> {
-        let cache = self.models_cache.read().await;
-        if cache.fetched
-            && let Some(model) = cache.models.iter().find(|m| m.id == model_id)
+        // Scope the read guard so it is dropped before `fetch_models` below,
+        // which acquires a WRITE lock on the same `models_cache`. Holding the
+        // read guard across that call deadlocked every completion whose model
+        // was missing from both the memory and disk caches: the stream never
+        // opened and the outer 45s stream-open timeout fired with no logs.
         {
-            return Some(model.pricing.clone());
+            let cache = self.models_cache.read().await;
+            if cache.fetched
+                && let Some(model) = cache.models.iter().find(|m| m.id == model_id)
+            {
+                return Some(model.pricing.clone());
+            }
         }
 
         if let Some(cache_entry) = self.load_usable_model_disk_cache_entry() {
