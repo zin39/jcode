@@ -143,20 +143,22 @@ pub(super) fn infer_protocol_from_env(
     let term_program = term_program.unwrap_or("").to_ascii_lowercase();
     let lc_terminal = lc_terminal.unwrap_or("").to_ascii_lowercase();
 
+    // WezTerm implements the base Kitty graphics protocol (classic
+    // placements), which is what ratatui-image's Kitty backend emits, so it
+    // belongs in the Kitty family here. What WezTerm does NOT implement is
+    // Kitty *Unicode placeholders* (virtual placement) - that path is gated
+    // separately in `can_use_kitty_virtual_viewport`, so WezTerm renders
+    // through the classic-placement fallback instead of tofu boxes.
     if term.contains("kitty")
         || term_program.contains("kitty")
+        || term_program.contains("wezterm")
         || term_program.contains("ghostty")
     {
         return Some(ProtocolType::Kitty);
     }
 
-    // WezTerm advertises the base Kitty graphics protocol, but its
-    // implementation is incomplete (no Unicode placeholders; repositioned
-    // classic placements can even crash it - wezterm/wezterm#986, #7953).
-    // Its iTerm2 protocol support is complete and stable, so prefer that.
     if term_program.contains("iterm")
         || term.contains("iterm")
-        || term_program.contains("wezterm")
         || lc_terminal.contains("iterm")
         || lc_terminal.contains("wezterm")
     {
@@ -494,11 +496,11 @@ mod tests {
             infer_protocol_from_env(None, Some("ghostty"), None, None),
             Some(ProtocolType::Kitty)
         );
-        // WezTerm's Kitty graphics implementation is incomplete (no Unicode
-        // placeholders), so it routes to its fully-supported iTerm2 protocol.
+        // WezTerm supports classic Kitty placements (Unicode placeholders are
+        // gated separately in can_use_kitty_virtual_viewport).
         assert_eq!(
             infer_protocol_from_env(None, Some("WezTerm"), None, None),
-            Some(ProtocolType::Iterm2)
+            Some(ProtocolType::Kitty)
         );
         // KITTY_WINDOW_ID present is sufficient.
         assert_eq!(

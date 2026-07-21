@@ -746,7 +746,9 @@ pub fn inline_fit_readiness(
         Some(picker) => picker,
         None => return InlineFitReadiness::Unsupported,
     };
-    if picker.protocol_type() != ProtocolType::Kitty {
+    if picker.protocol_type() != ProtocolType::Kitty
+        || !terminal_supports_unicode_placeholders()
+    {
         return InlineFitReadiness::Unsupported;
     }
     // Hot path: runs on the UI thread for every visible and prefetched image,
@@ -787,7 +789,9 @@ pub fn prewarm_inline_fit_state(
         Some(picker) => picker,
         None => return false,
     };
-    if picker.protocol_type() != ProtocolType::Kitty {
+    if picker.protocol_type() != ProtocolType::Kitty
+        || !terminal_supports_unicode_placeholders()
+    {
         return false;
     }
     let Some(cached) = get_cached_diagram(hash, None) else {
@@ -880,7 +884,9 @@ pub fn render_image_widget_fit_stable(
         Some(picker) => picker,
         None => return false,
     };
-    if picker.protocol_type() != ProtocolType::Kitty {
+    if picker.protocol_type() != ProtocolType::Kitty
+        || !terminal_supports_unicode_placeholders()
+    {
         return false;
     }
 
