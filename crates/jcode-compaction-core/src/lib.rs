@@ -331,6 +331,29 @@ Fill in EVERY section below. If a section has nothing, write 'None.' explicitly 
 
 Preserve exact technical details: file paths, error messages, command lines, model/version identifiers. You can search the full conversation later for anything else."#;
 
+/// Anchored-merge variant of [`SUMMARY_PROMPT`], used when a previous summary
+/// already exists. Instead of regenerating a fresh summary of everything (which
+/// causes compaction-chain degradation: details drift and disappear across
+/// cycles), the model UPDATES the existing summary by merging in only the new
+/// conversation span. Durable sections are explicitly append-only.
+pub const SUMMARY_MERGE_PROMPT: &str = r#"Below is the EXISTING session summary followed by NEW conversation since it was written. UPDATE the existing summary by merging in the new information.
+
+Rules:
+- NEVER delete existing entries in 'Original goal (verbatim)', 'Files modified', 'Key decisions', or 'Approaches tried and rejected' — only append new entries or refine wording without losing specifics.
+- 'Session intent', 'Current state', and 'Next steps' should be rewritten to reflect the latest situation.
+- Keep the same section structure. Fill in EVERY section below. If a section has nothing, write 'None.' explicitly — never silently omit a section.
+
+- **Original goal (verbatim):** The user's initial task request, quoted as close to verbatim as practical
+- **Session intent:** What we're working on now and why (1-2 sentences)
+- **Files modified:** Full paths of every file created/edited/deleted, with one line on what changed in each
+- **Key decisions:** Choices made and the reasoning behind them
+- **Approaches tried and rejected:** What failed or was abandoned, and why (so we never retry them blindly)
+- **Current state:** What works, what's broken
+- **Next steps:** Concrete remaining work items
+- **User preferences:** Specific requirements, constraints, or style decisions the user stated
+
+Preserve exact technical details: file paths, error messages, command lines, model/version identifiers. You can search the full conversation later for anything else."#;
+
 /// A completed summary covering turns up to a certain point
 #[derive(Debug, Clone)]
 pub struct Summary {
@@ -387,15 +410,43 @@ pub fn build_compaction_prompt(
     existing_summary: Option<&Summary>,
     max_prompt_chars: usize,
 ) -> String {
-    let mut conversation_text = build_compaction_conversation_text(messages, existing_summary);
-    let overhead = SUMMARY_PROMPT.len() + 50;
-    if conversation_text.len() + overhead > max_prompt_chars && max_prompt_chars > overhead {
+    // Keep the previous-summary block and the NEWEST messages when the prompt
+    // must shrink: the oldest raw messages are the part already (partially)
+    // covered by the previous summary, while the newest ones exist nowhere
+    // else — dropping them would lose the freshest context permanently.
+    let summary_prefix = existing_summary
+        .map(|summary| {
+            format!(
+                "## Previous Summary\n\n{}\n\n## New Conversation\n\n",
+                summary.text
+            )
+        })
+        .unwrap_or_default();
+    // Anchored iterative merge: with an existing summary, instruct the model
+    // to UPDATE it (append-only for durable sections) instead of regenerating
+    // from scratch — regeneration causes compaction-chain degradation where
+    // details drift and disappear across cycles.
+    let instruction_prompt = if existing_summary.is_some() {
+        SUMMARY_MERGE_PROMPT
+    } else {
+        SUMMARY_PROMPT
+    };
+    let messages_text = build_compaction_conversation_text(messages, None);
+    let marker = "... [oldest messages truncated to fit context window]\n\n";
+    let overhead = instruction_prompt.len() + summary_prefix.len() + marker.len() + 50;
+    let conversation_text = if messages_text.len() + overhead > max_prompt_chars
+        && max_prompt_chars > overhead
+    {
         let budget = max_prompt_chars - overhead;
-        conversation_text = truncate_str_boundary(&conversation_text, budget).to_string();
-        conversation_text
-            .push_str("\n\n... [earlier conversation truncated to fit context window]\n");
-    }
-    format!("{}\n\n---\n\n{}", conversation_text, SUMMARY_PROMPT)
+        let mut start = messages_text.len() - budget;
+        while start < messages_text.len() && !messages_text.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("{}{}{}", summary_prefix, marker, &messages_text[start..])
+    } else {
+        format!("{}{}", summary_prefix, messages_text)
+    };
+    format!("{}\n\n---\n\n{}", conversation_text, instruction_prompt)
 }
 
 pub fn build_compaction_conversation_text(
@@ -1368,6 +1419,50 @@ mod tests {
     }
 
     #[test]
+    fn merge_prompt_contract_preserves_durable_sections() {
+        // The anchored-merge prompt must forbid deleting durable sections and
+        // keep the full section checklist so structure keeps forcing
+        // preservation across compaction cycles.
+        assert!(SUMMARY_MERGE_PROMPT.contains("NEVER delete existing entries"));
+        for section in [
+            "Original goal (verbatim)",
+            "Session intent",
+            "Files modified",
+            "Key decisions",
+            "Approaches tried and rejected",
+            "Current state",
+            "Next steps",
+            "User preferences",
+        ] {
+            assert!(
+                SUMMARY_MERGE_PROMPT.contains(section),
+                "merge prompt missing section: {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_prompt_uses_merge_instructions_when_summary_exists() {
+        let messages = vec![Message::user("new work after the first compaction")];
+        let existing = Summary {
+            text: "- **Original goal (verbatim):** fix the auth bug".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 10,
+            original_turn_count: 20,
+        };
+
+        let fresh = build_compaction_prompt(&messages, None, usize::MAX / 4);
+        assert!(fresh.contains("Summarize our conversation"));
+        assert!(!fresh.contains("UPDATE the existing summary"));
+
+        let merged = build_compaction_prompt(&messages, Some(&existing), usize::MAX / 4);
+        assert!(merged.contains("## Previous Summary"));
+        assert!(merged.contains("fix the auth bug"));
+        assert!(merged.contains("UPDATE the existing summary"));
+        assert!(merged.contains("NEVER delete existing entries"));
+    }
+
+    #[test]
     fn cleared_content_preserves_spill_pointer() {
         let original = "first 10KB head...\n[Tool output truncated by jcode: tool `bash` produced 80000 chars; kept first 10000 inline. FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt — use the read tool with start_line/limit for targeted sections.]";
         let cleared = cleared_tool_result_content(original);
@@ -1421,161 +1516,5 @@ mod tests {
         assert_eq!(clear_tool_results_up_to(&mut messages, 2), 0);
     }
 
-    // ── dedup_repeated_tool_reads tests ────────────────────────────────────
-
-
-    #[test]
-    fn dedup_skips_short_results() {
-        let short = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS - 1);
-        let mut messages = vec![
-            tool_result_message("t1", &short),
-            tool_result_message("t2", &short),
-        ];
-        let count = dedup_repeated_tool_reads(&mut messages);
-        assert_eq!(count, 0, "short results should not be deduped");
-        assert_eq!(tool_result_text(&messages[0]), &short);
-        assert_eq!(tool_result_text(&messages[1]), &short);
-    }
-
-    #[test]
-    fn dedup_skips_already_cleared_markers() {
-        let big = "x".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
-        let cleared = format!("{}foo]", CLEARED_MARKER_PREFIX);
-        let mut messages = vec![
-            tool_result_message("t1", &cleared),
-            tool_result_message("t2", &big),
-        ];
-        let count = dedup_repeated_tool_reads(&mut messages);
-        assert_eq!(count, 0, "already-cleared markers should not be counted");
-        // The cleared content and big are different => no dedup.
-        // Now test with duplicate cleared content.
-        let mut messages2 = vec![
-            tool_result_message("t1", &cleared),
-            tool_result_message("t2", &cleared),
-        ];
-        let count2 = dedup_repeated_tool_reads(&mut messages2);
-        assert_eq!(count2, 0, "duplicate cleared markers should not be deduped");
-    }
-
-    #[test]
-    fn dedup_respects_recent_tail() {
-        let big = "y".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
-        // Create RECENT_TURNS_TO_KEEP messages in the tail.
-        let mut messages: Vec<Message> = (0..RECENT_TURNS_TO_KEEP)
-            .map(|i| tool_result_message(&format!("t{}", i), &big))
-            .collect();
-        // All messages are in the tail zone => nothing should be deduped.
-        let count = dedup_repeated_tool_reads(&mut messages);
-        assert_eq!(count, 0, "tail messages should not be touched");
-        for msg in &messages {
-            assert_eq!(tool_result_text(msg), &big);
-        }
-    }
-
-
-    #[test]
-    fn dedup_unique_content_not_affected() {
-        let big = "w".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
-        let mut messages = vec![
-            tool_result_message("t1", &format!("{}a", &big)),
-            tool_result_message("t2", &format!("{}b", &big)),
-            tool_result_message("t3", &format!("{}c", &big)),
-        ];
-        let count = dedup_repeated_tool_reads(&mut messages);
-        assert_eq!(count, 0, "all unique content should be untouched");
-    }
-
-    // ── purge_resolved_error_results tests ─────────────────────────────────
-
-    fn tool_use_msg(id: &str, name: &str) -> Message {
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: id.to_string(),
-                name: name.to_string(),
-                input: serde_json::json!({}),
-                thought_signature: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }
-    }
-
-    fn error_result_msg(id: &str, content: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                content: content.to_string(),
-                is_error: Some(true),
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }
-    }
-
-
-
-
-    #[test]
-    fn purge_respects_recent_tail() {
-        let mut messages: Vec<Message> = Vec::new();
-        // Add RECENT_TURNS_TO_KEEP messages in the tail.
-        for i in 0..RECENT_TURNS_TO_KEEP {
-            messages.push(tool_use_msg(&format!("call_read_{}", i), "read"));
-            messages.push(error_result_msg(&format!("call_read_{}", i), "error!"));
-        }
-        let count = purge_resolved_error_results(&mut messages);
-        assert_eq!(count, 0, "tail messages should not be touched");
-        for msg in &messages {
-            if let ContentBlock::ToolResult { content, is_error, .. } = &msg.content[0] {
-                if *is_error == Some(true) {
-                    assert_eq!(content, "error!", "tail error content should be preserved");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn last_error_kept_when_no_success_follows() {
-        // Two errors for the same tool, no success after either.
-        let mut messages = vec![
-            tool_use_msg("call_read_1", "read"),
-            error_result_msg("call_read_1", "error1"),
-            tool_use_msg("call_read_2", "read"),
-            error_result_msg("call_read_2", "error2"),
-        ];
-        let count = purge_resolved_error_results(&mut messages);
-        assert_eq!(count, 0, "no success after either error, so none purged");
-        // Both errors should be preserved.
-        let err1 = match &messages[1].content[0] {
-            ContentBlock::ToolResult { content, .. } => content.as_str(),
-            other => panic!("expected ToolResult, got {other:?}"),
-        };
-        let err2 = match &messages[3].content[0] {
-            ContentBlock::ToolResult { content, .. } => content.as_str(),
-            other => panic!("expected ToolResult, got {other:?}"),
-        };
-        assert!(err1.contains("error1"));
-        assert!(err2.contains("error2"));
-    }
-
-    #[test]
-    fn error_after_success_not_purged() {
-        // Error comes AFTER a success for the same tool name — should not be purged.
-        let mut messages = vec![
-            tool_use_msg("call_read_1", "read"),
-            Message::tool_result("call_read_1", "ok", false),
-            tool_use_msg("call_read_2", "read"),
-            error_result_msg("call_read_2", "error after success"),
-        ];
-        let count = purge_resolved_error_results(&mut messages);
-        assert_eq!(count, 0, "error after success should not be purged");
-        let err_content = match &messages[3].content[0] {
-            ContentBlock::ToolResult { content, .. } => content.as_str(),
-            other => panic!("expected ToolResult, got {other:?}"),
-        };
-        assert!(err_content.contains("error after success"));
-    }
-
+    include!("probe_eval_tests.rs");
 }
