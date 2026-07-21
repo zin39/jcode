@@ -1470,6 +1470,15 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    /// Isolate test from user's ~/.jcode/config.toml by setting JCODE_HOME to a temp dir.
+    /// Returns the temp dir (must be kept alive for the test duration).
+    fn isolate_config() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        unsafe { std::env::set_var("JCODE_HOME", temp.path()) };
+        jcode_base::config::invalidate_config_cache();
+        temp
+    }
+
     #[test]
     fn debate_summary_formats() {
         assert_eq!(debate_summary(3, 42, 0.0234), "gold from 3 models in 42s · $0.02");
@@ -1586,6 +1595,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_cheap_route_decomposes_recommends_spawns_and_reviews() {
+        let _temp = isolate_config();
         let decompose = r#"[
             {"description":"edit auth","prompt":"edit it","difficulty":2},
             {"description":"write tests","prompt":"test it","difficulty":3}
@@ -1811,6 +1821,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_cheap_route_falls_back_when_cheapest_model_errors() {
+        let _temp = isolate_config();
         // Menu: cheapo (cheapest, DEAD) + pricey (works). Recommend -> cheapo.
         let backend = FallbackBackend {
             parent_responses: Mutex::new(VecDeque::from(vec![
@@ -1975,6 +1986,7 @@ mod tests {
 
     #[tokio::test]
     async fn difficulty_routes_hard_subtask_to_strong_model() {
+        let _temp = isolate_config();
         // Default threshold is 3: difficulty<=3 -> cheapest, >3 -> strong model
         // (here the parent's current model, since cheap_route_strong_model unset).
         let backend = FallbackBackend {
@@ -2005,6 +2017,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_cheap_route_tries_one_model_per_provider() {
+        let _temp = isolate_config();
         fn route(model: &str, provider: &str, micros: u64) -> ModelRoute {
             ModelRoute {
                 model: model.to_string(),
@@ -2102,6 +2115,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_backend_delegates_ask_parent_and_routes() {
+        let _temp = isolate_config();
         let provider: std::sync::Arc<dyn crate::provider::Provider> =
             std::sync::Arc::new(ParentMock {
                 reply: "PARENT_REPLY".to_string(),
@@ -2122,6 +2136,7 @@ mod tests {
 
     #[test]
     fn cheapest_available_model_returns_cheapest_route() {
+        let _temp = isolate_config();
         let provider = ParentMock {
             reply: String::new(),
             routes: vec![
