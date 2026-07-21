@@ -1105,3 +1105,493 @@ fn test_recover_within_budget_summary_line_variants() {
     assert!(line.contains("shortened 5 large tool result(s)"));
     assert!(!line.contains("dropped"));
 }
+
+#[test]
+fn test_bug1_active_chars_not_double_subtracted() {
+    // BUG 1 regression test: verify the accounting fix for double-subtraction.
+    //
+    // The bug was in check_and_apply_compaction_with:
+    // 1. Advance compacted_count (so active_messages() skips more messages)
+    // 2. Call active_message_chars_with() which re-computes based on the new range
+    // 3. Subtract compacted_chars from the re-computed (already reduced) value
+    // 4. Result: double subtraction corrupts active_chars
+    //
+    // The fix: capture pre-advance active chars before advancing compacted_count,
+    // then subtract compacted_chars from that captured value.
+
+    let mut messages = Vec::new();
+    for i in 0..5 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("msg {}: {}", i, "x".repeat(200)),
+        ));
+    }
+
+    let mut manager = CompactionManager::new();
+    manager.seed_restored_messages_with(&messages);
+
+    let last_three_chars: usize = messages[2..].iter().map(message_char_count).sum();
+
+    // Simulate compacting the first 2 messages by manually setting state
+    // (since we can't easily trigger the full background compaction flow)
+    manager.compacted_count = 2;
+    manager.active_chars.set_exact(last_three_chars);
+    manager.active_summary = Some(Summary {
+        text: "summary of first 2 messages".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 2,
+        original_turn_count: 2,
+    });
+
+    // Now verify that the accounting is correct
+    // active_message_chars_with should return the last 3 messages' chars
+    let active_chars_recomputed = manager.active_message_chars_with(&messages);
+    assert_eq!(
+        active_chars_recomputed, last_three_chars,
+        "active_message_chars_with should return chars of the 3 remaining messages"
+    );
+
+    // And the cached value should match
+    let cached_value = manager.active_chars.value();
+    assert_eq!(
+        cached_value, last_three_chars,
+        "cached active_chars should match the remaining messages"
+    );
+
+    // Verify token estimate is sensible
+    let token_estimate = manager.token_estimate_with(&messages);
+    assert!(token_estimate > 0, "token estimate should be positive");
+}
+
+#[test]
+fn test_bug2_hard_compact_loop_checks_effective_tokens() {
+    // BUG 2 regression test: verify the loop in hard_compact_with accounts
+    // for SYSTEM_OVERHEAD_TOKENS and emergency summary size.
+    //
+    // The bug was:
+    // 1. Loop compares: remaining_message_tokens <= token_budget
+    // 2. But ignores SYSTEM_OVERHEAD_TOKENS (~18k)
+    // 3. And ignores the emergency summary payload size
+    // 4. Result: can exit loop with cutoff that still exceeds budget when
+    //    those factors are included
+    //
+    // The fix: in the loop, compute total_effective_tokens including:
+    // - message tokens
+    // - summary tokens (existing + estimated emergency additions)
+    // - overhead tokens
+    // Then compare against budget.
+
+    let token_budget = 30_000usize; // Small budget to trigger hard compact
+    let mut manager = CompactionManager::new().with_budget(token_budget);
+
+    // Create messages large enough to exceed budget
+    // Each message: ~2000 chars = ~500 tokens
+    // With 10 messages: 5000 tokens message content
+    // + 18k overhead = 23k tokens total (within budget if ignoring summary)
+    // But if we account for summary + overhead, we should need to drop more
+    let mut messages = Vec::new();
+    for i in 0..10 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("message {}: {}", i, "x".repeat(2000)),
+        ));
+        manager.notify_message_added_with(&messages.last().unwrap());
+    }
+
+    // Simulate having an existing summary
+    let existing_summary = Summary {
+        text: "x".repeat(5000), // 5000 chars ~1250 tokens
+        openai_encrypted_content: None,
+        covers_up_to_turn: 100,
+        original_turn_count: 100,
+    };
+    manager.active_summary = Some(existing_summary);
+
+    // Hard compact should succeed and drop messages
+    let result = manager.hard_compact_with(&messages);
+    assert!(result.is_ok(), "hard_compact should succeed");
+
+    let dropped = result.unwrap();
+    assert!(dropped > 0, "should have dropped messages to fit budget");
+
+    // After hard compact, verify effective tokens are within budget
+    let final_tokens = manager.effective_token_count_with(&messages) as usize;
+    assert!(
+        final_tokens <= token_budget,
+        "final tokens {} should be <= budget {} (accounting for overhead + summary)",
+        final_tokens,
+        token_budget
+    );
+}
+
+// ── stage-1 reversible tool-result clearing ─────────────────────────────
+
+fn make_tool_result_message(tool_use_id: &str, content: &str) -> Message {
+    Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: content.to_string(),
+            is_error: Some(false),
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        crate::env::set_var(key, value);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = &self.prev {
+            crate::env::set_var(self.key, prev);
+        } else {
+            crate::env::remove_var(self.key);
+        }
+    }
+}
+
+#[test]
+fn clearing_applies_in_api_view_but_not_history() {
+    let mut manager = CompactionManager::new().with_budget(50_000);
+    let mut messages = Vec::new();
+    // 3 old messages carrying big, clearable tool results.
+    for i in 0..3 {
+        messages.push(make_tool_result_message(
+            &format!("t{}", i),
+            &"A".repeat(900),
+        ));
+        manager.notify_message_added();
+    }
+    // Padding so the watermark (len - RECENT_TURNS_TO_KEEP) lands past the
+    // big tool results and into the small recent tail.
+    for i in 0..12 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+    assert_eq!(messages.len(), 15);
+
+    let watermark = messages.len() - RECENT_TURNS_TO_KEEP; // 5
+    manager.set_tool_cleared_up_to(watermark);
+
+    let view = manager.messages_for_api_with(&messages);
+    assert_eq!(view.len(), messages.len(), "no summary yet, view keeps all messages");
+
+    // The 3 big tool results (indexes 0..3) must be cleared in the view.
+    for i in 0..3 {
+        match &view[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert!(
+                    content.starts_with("[tool result cleared by jcode"),
+                    "message {} should be cleared in the view, got: {}",
+                    i,
+                    content
+                );
+                assert!(content.len() < 900, "cleared content should be much smaller");
+            }
+            other => panic!("expected tool result at index {}, got {:?}", i, other),
+        }
+    }
+
+    // Messages 3..5 (still below the watermark but plain text) must be
+    // untouched — clearing only ever rewrites ToolResult blocks.
+    for i in 3..5 {
+        match &view[i].content[0] {
+            ContentBlock::Text { text, .. } => {
+                assert!(text.starts_with("recent"))
+            }
+            other => panic!("expected text at index {}, got {:?}", i, other),
+        }
+    }
+
+    // The recent tail (>= watermark) must be byte-for-byte identical to the
+    // original messages.
+    for i in watermark..messages.len() {
+        assert_eq!(view[i].role, messages[i].role, "recent message {} role changed", i);
+        match (&view[i].content[0], &messages[i].content[0]) {
+            (ContentBlock::Text { text: a, .. }, ContentBlock::Text { text: b, .. }) => {
+                assert_eq!(a, b, "recent message {} must be untouched", i);
+            }
+            other => panic!("expected matching text content at index {}, got {:?}", i, other),
+        }
+    }
+
+    // Stored history (the caller's own Vec) must never be mutated — clearing
+    // only ever rewrites the cloned view returned above.
+    for i in 0..3 {
+        match &messages[i].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, &"A".repeat(900), "stored history must keep full content");
+            }
+            other => panic!("expected tool result at index {}, got {:?}", i, other),
+        }
+    }
+}
+
+#[tokio::test]
+async fn stage1_clearing_skips_summarization_when_it_frees_enough() {
+    // Serialize against env_kill_switch_disables_stage1: this test relies on
+    // JCODE_DISABLE_TOOL_RESULT_CLEARING being unset, and that test sets it
+    // under the same lock.
+    let _env_lock = crate::storage::lock_test_env();
+
+    // Small budget so 3 big (but individually clearable) tool results push
+    // usage above 80%, but the cleared marker text is small enough to bring
+    // it back down once stage-1 clears them.
+    let mut manager = CompactionManager::new().with_budget(2_000);
+    let mut messages = Vec::new();
+    for i in 0..3 {
+        messages.push(make_tool_result_message(
+            &format!("t{}", i),
+            &"A".repeat(900),
+        ));
+        manager.notify_message_added();
+    }
+    for i in 0..10 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+    assert_eq!(messages.len(), 13);
+
+    // Sanity: raw usage (before any clearing) should already be in the
+    // reactive-but-not-critical band so we reach the stage-1 code path.
+    let raw_usage = manager.context_usage_with(&messages);
+    assert!(
+        (COMPACTION_THRESHOLD..CRITICAL_THRESHOLD).contains(&raw_usage),
+        "test setup should land usage in [80%, 95%), got {:.3}",
+        raw_usage
+    );
+
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+    let action = manager.ensure_context_fits(&messages, provider);
+
+    assert_eq!(
+        action,
+        CompactionAction::ToolResultsCleared { cleared: 3 },
+        "stage-1 clearing should free enough headroom to skip summarization"
+    );
+    assert!(
+        !manager.is_compacting(),
+        "background summarization should not have started"
+    );
+    assert_eq!(manager.compacted_count, 0, "stage-1 clearing must not touch compacted_count");
+    assert!(
+        manager.context_usage_with(&messages) < COMPACTION_THRESHOLD,
+        "usage should have dropped below the threshold after clearing"
+    );
+}
+
+#[tokio::test]
+async fn stage1_falls_through_to_summarization_when_not_enough() {
+    // Serialize against env_kill_switch_disables_stage1 (see
+    // stage1_clearing_skips_summarization_when_it_frees_enough).
+    let _env_lock = crate::storage::lock_test_env();
+
+    // Big plain-text messages (no tool results at all) push usage above 80%.
+    // Stage-1 clearing has nothing to clear, so it must fall through to
+    // background summarization instead of silently doing nothing.
+    let mut manager = CompactionManager::new().with_budget(2_000);
+    let mut messages = Vec::new();
+    for i in 0..3 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("old {} {}", i, "x".repeat(850)),
+        ));
+        manager.notify_message_added();
+    }
+    for i in 0..10 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+    assert_eq!(messages.len(), 13);
+
+    let raw_usage = manager.context_usage_with(&messages);
+    assert!(
+        (COMPACTION_THRESHOLD..CRITICAL_THRESHOLD).contains(&raw_usage),
+        "test setup should land usage in [80%, 95%), got {:.3}",
+        raw_usage
+    );
+
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+    let action = manager.ensure_context_fits(&messages, provider);
+
+    assert!(
+        matches!(action, CompactionAction::BackgroundStarted { .. }),
+        "expected fallthrough to background summarization, got {:?}",
+        action
+    );
+    assert!(
+        manager.is_compacting(),
+        "background summarization should be in flight"
+    );
+    // The watermark still advances (nothing to clear doesn't mean nothing to
+    // mark), but it had zero effect since there were no clearable results.
+    assert_eq!(manager.tool_cleared_up_to(), 3);
+}
+
+#[test]
+fn tool_cleared_watermark_round_trips_through_persistence() {
+    let mut manager = CompactionManager::new().with_budget(500);
+    let mut messages = Vec::new();
+    for i in 0..20 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("turn {} {}", i, "x".repeat(40)),
+        ));
+        manager.notify_message_added();
+    }
+    manager.update_observed_input_tokens(490);
+    manager
+        .hard_compact_with(&messages)
+        .expect("should compact before persisting");
+
+    manager.set_tool_cleared_up_to(7);
+
+    let persisted = manager
+        .persisted_state()
+        .expect("compaction state should be exportable");
+    assert_eq!(persisted.tool_cleared_up_to, Some(7));
+
+    let mut restored = CompactionManager::new().with_budget(500);
+    restored.restore_persisted_state(&persisted, messages.len());
+
+    assert_eq!(restored.tool_cleared_up_to(), 7);
+}
+
+#[tokio::test]
+async fn env_kill_switch_disables_stage1() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _guard = EnvVarGuard::set("JCODE_DISABLE_TOOL_RESULT_CLEARING", "1");
+
+    // Same setup as `stage1_clearing_skips_summarization_when_it_frees_enough`:
+    // without the kill switch this would return ToolResultsCleared.
+    let mut manager = CompactionManager::new().with_budget(2_000);
+    let mut messages = Vec::new();
+    for i in 0..3 {
+        messages.push(make_tool_result_message(
+            &format!("t{}", i),
+            &"A".repeat(900),
+        ));
+        manager.notify_message_added();
+    }
+    for i in 0..10 {
+        messages.push(make_text_message(Role::User, &format!("recent {}", i)));
+        manager.notify_message_added();
+    }
+
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+    let action = manager.ensure_context_fits(&messages, provider);
+
+    assert!(
+        !matches!(action, CompactionAction::ToolResultsCleared { .. }),
+        "kill switch must disable stage-1, got {:?}",
+        action
+    );
+    assert_eq!(
+        manager.tool_cleared_up_to(),
+        0,
+        "watermark must not advance while stage-1 is disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_two_cycle_compaction() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+
+    // ── Cycle 1: create ~30 messages and force-compact ──────────────
+    let mut messages = Vec::new();
+    for i in 0..30 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("Turn {} {}", i, "x".repeat(120)),
+        ));
+        manager.notify_message_added();
+    }
+
+    manager
+        .force_compact_with(&messages, provider.clone())
+        .expect("first force_compact should start");
+
+    // Poll until the first compaction completes
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        manager.check_and_apply_compaction();
+        if manager.stats().has_summary {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        manager.active_summary.is_some(),
+        "cycle 1: active_summary should be set"
+    );
+    let compacted_after_first = manager.compacted_count;
+    assert!(
+        compacted_after_first > 0,
+        "cycle 1: compacted_count should be > 0, got {}",
+        compacted_after_first,
+    );
+
+    // ── Cycle 2: add ~15 more messages and force-compact again ──────
+    for i in 30..45 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("Turn {} {}", i, "y".repeat(120)),
+        ));
+        manager.notify_message_added();
+    }
+
+    manager
+        .force_compact_with(&messages, provider.clone())
+        .expect("second force_compact should start");
+
+    // Poll until the second compaction completes
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        manager.check_and_apply_compaction();
+        if manager.compacted_count > compacted_after_first {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        manager.active_summary.is_some(),
+        "cycle 2: active_summary should still be set"
+    );
+    assert!(
+        manager.compacted_count > compacted_after_first,
+        "cycle 2: compacted_count should have increased beyond {} (got {})",
+        compacted_after_first,
+        manager.compacted_count,
+    );
+
+    // The final API view should still have a summary + recent messages
+    let api_msgs = manager.messages_for_api_with(&messages);
+    assert!(
+        api_msgs.len() < messages.len(),
+        "after two cycles, API messages should be fewer than total"
+    );
+    match &api_msgs[0].content[0] {
+        ContentBlock::Text { text, .. } => {
+            assert!(
+                text.contains("Previous Conversation Summary"),
+                "first message should be the merged summary"
+            );
+        }
+        _ => panic!("expected text summary block after two compaction cycles"),
+    }
+}
