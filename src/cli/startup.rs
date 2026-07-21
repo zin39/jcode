@@ -102,6 +102,7 @@ pub async fn run() -> Result<()> {
     startup_profile::mark("nofile_limit");
 
     storage::harden_user_config_permissions();
+    storage::migrate_stray_env_files();
     startup_profile::mark("perm_harden");
 
     perf::init_background();
