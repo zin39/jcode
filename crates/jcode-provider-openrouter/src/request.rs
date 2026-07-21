@@ -447,7 +447,26 @@ pub fn build_chat_messages(
     }
 
     if !pending_tool_results.is_empty() {
-        skipped_results += pending_tool_results.len();
+        // These outputs never found their assistant tool call (it was likely
+        // lost to compaction/truncation). Silently discarding them loses real
+        // conversation context, so rewrite them as user messages the same way
+        // the openai path does. Sort by id for deterministic ordering.
+        let mut recovered: Vec<(String, String)> = pending_tool_results.drain().collect();
+        recovered.sort_by(|a, b| a.0.cmp(&b.0));
+        let recovered_count = recovered.len();
+        for (tool_call_id, output) in recovered {
+            api_messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "[Recovered orphaned tool output: {}]\n{}",
+                    tool_call_id, output
+                )
+            }));
+        }
+        jcode_logging::info(&format!(
+            "[openrouter] Recovered {} orphaned tool output(s) as user messages",
+            recovered_count
+        ));
     }
 
     if injected_missing > 0 {
@@ -617,6 +636,7 @@ pub fn build_chat_messages(
     let mut used_outputs: HashSet<String> = HashSet::new();
     let mut injected_ordered = 0usize;
     let mut dropped_orphans = 0usize;
+    let mut recovered_orphans = 0usize;
 
     for msg in api_messages.into_iter() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -652,10 +672,26 @@ pub fn build_chat_messages(
             if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str())
                 && used_outputs.contains(id)
             {
+                // Duplicate: this output was already re-inserted directly after
+                // its assistant tool call above. Safe to skip.
                 dropped_orphans += 1;
                 continue;
             }
-            dropped_orphans += 1;
+            // Genuine orphan: no assistant tool_call references this id (its
+            // assistant message was likely lost to compaction/truncation).
+            // Strict endpoints reject dangling tool messages, but silently
+            // discarding them loses real conversation context, so rewrite the
+            // output as a user message the same way the openai path does.
+            let id = msg
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            recovered_orphans += 1;
+            reordered.push(serde_json::json!({
+                "role": "user",
+                "content": format!("[Recovered orphaned tool output: {}]\n{}", id, content)
+            }));
             continue;
         }
 
@@ -672,8 +708,14 @@ pub fn build_chat_messages(
     }
     if dropped_orphans > 0 {
         jcode_logging::info(&format!(
-            "[openrouter] Dropped {} orphaned tool output(s) during re-ordering",
+            "[openrouter] Dropped {} duplicate tool output(s) during re-ordering",
             dropped_orphans
+        ));
+    }
+    if recovered_orphans > 0 {
+        jcode_logging::info(&format!(
+            "[openrouter] Recovered {} orphaned tool output(s) as user messages",
+            recovered_orphans
         ));
     }
 
@@ -826,5 +868,40 @@ mod sanitize_schema_tests {
     fn type_arrays_including_object_are_sanitized() {
         let sanitized = sanitize_tool_parameters_schema(&json!({"type": ["object", "null"]}));
         assert_eq!(sanitized["properties"], json!({}));
+    }
+}
+
+#[cfg(test)]
+mod orphan_recovery_tests {
+    use super::build_chat_messages;
+    use jcode_message_types::Message;
+
+    /// A tool result whose assistant tool call is gone (e.g. lost to
+    /// compaction) must be recovered as a user message, not silently dropped
+    /// (silent drops lose real conversation context).
+    #[test]
+    fn genuine_orphan_tool_output_is_recovered_as_user_message() {
+        let messages = vec![
+            Message::user("run the check"),
+            // Orphan: no assistant message declares tool_use id "call_lost".
+            Message::tool_result("call_lost", "important tool output", false),
+            Message::assistant_text("done"),
+        ];
+        let api = build_chat_messages(&messages, "", false, false, false);
+
+        // No dangling role:"tool" messages may remain (strict endpoints 400).
+        assert!(
+            api.iter()
+                .all(|m| m.get("role").and_then(|r| r.as_str()) != Some("tool")),
+            "orphan tool message should not survive as role=tool: {api:?}"
+        );
+        // The output text must still be present, rewritten as a user message.
+        let recovered = api.iter().any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("important tool output"))
+        });
+        assert!(recovered, "orphan output should be recovered: {api:?}");
     }
 }
