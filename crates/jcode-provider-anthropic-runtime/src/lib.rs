@@ -227,6 +227,22 @@ async fn ensure_oauth_preflight(
         return Ok(());
     }
 
+    // Scoped-down tokens (inference-only, e.g. long-lived secondary accounts
+    // with just `user:inference`) can never pass the bootstrap/settings/grove
+    // endpoints: they 403 on the `user:profile` scope requirement every
+    // session start (3 wasted requests + warn spam). Skip preflight entirely
+    // for them; it is nonessential bootstrap traffic anyway.
+    if let Ok(creds) = jcode_base::auth::claude::load_credentials() {
+        let scopes = &creds.scopes;
+        if !scopes.is_empty() && !scopes.iter().any(|s| s == "user:profile") {
+            done_flag.store(true, Ordering::Relaxed);
+            jcode_base::logging::info(
+                "Skipping Claude OAuth preflight: token lacks user:profile scope (inference-only account)",
+            );
+            return Ok(());
+        }
+    }
+
     let official = load_official_claude_client_metadata();
     let Some(device_id) = official.device_id else {
         jcode_base::logging::warn(
