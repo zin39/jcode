@@ -194,4 +194,104 @@ mod tests {
         let content = &content_part[..end_of_content];
         assert_eq!(content, &format!("{}... [truncated]", "a".repeat(2000)));
     }
+
+    // ---- edge-case tests added for memory/compaction overhaul verification ----
+
+    #[test]
+    fn edge_seed_skips_empty_and_whitespace_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_task_state_if_empty_in_dir(dir.path(), "e1", "");
+        assert_eq!(read_task_state_in_dir(dir.path(), "e1"), None);
+        seed_task_state_if_empty_in_dir(dir.path(), "e2", "   \n\t  ");
+        assert_eq!(read_task_state_in_dir(dir.path(), "e2"), None);
+    }
+
+    #[test]
+    fn edge_seed_exactly_2000_chars_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = "b".repeat(2000);
+        seed_task_state_if_empty_in_dir(dir.path(), "e3", &msg);
+        let state = read_task_state_in_dir(dir.path(), "e3").unwrap();
+        assert!(!state.contains("... [truncated]"));
+        assert!(state.contains(&msg));
+    }
+
+    #[test]
+    fn edge_seed_2001_chars_truncated_to_2000() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg = "c".repeat(2001);
+        seed_task_state_if_empty_in_dir(dir.path(), "e4", &msg);
+        let state = read_task_state_in_dir(dir.path(), "e4").unwrap();
+        assert!(state.contains(&format!("{}... [truncated]", "c".repeat(2000))));
+        assert!(!state.contains(&"c".repeat(2001)));
+    }
+
+    #[test]
+    fn edge_seed_multibyte_near_truncation_boundary_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2500 4-byte emoji chars: byte index 2000 is NOT a char boundary,
+        // so byte-based slicing would panic. char-based must not.
+        let msg = "\u{1F600}".repeat(2500);
+        seed_task_state_if_empty_in_dir(dir.path(), "e5", &msg);
+        let state = read_task_state_in_dir(dir.path(), "e5").unwrap();
+        assert!(state.contains("... [truncated]"));
+        assert!(state.contains(&"\u{1F600}".repeat(2000)));
+        assert!(!state.contains(&"\u{1F600}".repeat(2001)));
+
+        // Mixed multibyte content straddling the boundary.
+        let mixed = format!("{}日本語テスト", "x".repeat(1997));
+        assert!(mixed.chars().count() > 2000);
+        seed_task_state_if_empty_in_dir(dir.path(), "e6", &mixed);
+        let state = read_task_state_in_dir(dir.path(), "e6").unwrap();
+        assert!(state.contains("... [truncated]"));
+    }
+
+    #[test]
+    fn edge_seed_multibyte_short_message_counted_by_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        // 19 multibyte chars (57+ bytes): must still be skipped (char count rule).
+        let msg = "\u{4E2D}".repeat(19);
+        seed_task_state_if_empty_in_dir(dir.path(), "e7", &msg);
+        assert_eq!(read_task_state_in_dir(dir.path(), "e7"), None);
+        // 20 multibyte chars accepted.
+        let msg20 = "\u{4E2D}".repeat(20);
+        seed_task_state_if_empty_in_dir(dir.path(), "e8", &msg20);
+        assert!(read_task_state_in_dir(dir.path(), "e8").is_some());
+    }
+
+    #[test]
+    fn edge_seed_system_reminder_stripping_is_caller_side() {
+        // The caller (prompting.rs) strips the leading <system-reminder> block
+        // before calling seed. Verify seed behaves sanely for both raw and
+        // pre-stripped inputs.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "<system-reminder>\n# Session Context\nstuff\n</system-reminder>please refactor the auth module for me";
+        // Simulate caller stripping (same logic as prompting.rs).
+        let cleaned = match (raw.find("</system-reminder>"), raw.contains("<system-reminder")) {
+            (Some(end), true) => raw[end + "</system-reminder>".len()..].trim(),
+            _ => raw.trim(),
+        };
+        seed_task_state_if_empty_in_dir(dir.path(), "e9", cleaned);
+        let state = read_task_state_in_dir(dir.path(), "e9").unwrap();
+        assert!(state.contains("please refactor the auth module"));
+        assert!(!state.contains("<system-reminder>"));
+
+        // A message that is ONLY a system-reminder strips to empty -> skipped.
+        let only = "<system-reminder>\nsession context only, quite long indeed\n</system-reminder>";
+        let cleaned2 = match (only.find("</system-reminder>"), only.contains("<system-reminder")) {
+            (Some(end), true) => only[end + "</system-reminder>".len()..].trim(),
+            _ => only.trim(),
+        };
+        seed_task_state_if_empty_in_dir(dir.path(), "e10", cleaned2);
+        assert_eq!(read_task_state_in_dir(dir.path(), "e10"), None);
+    }
+
+    #[test]
+    fn edge_seed_does_not_overwrite_after_first_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_task_state_if_empty_in_dir(dir.path(), "e11", "first substantial user message here");
+        let first = read_task_state_in_dir(dir.path(), "e11").unwrap();
+        seed_task_state_if_empty_in_dir(dir.path(), "e11", "second substantial user message here");
+        assert_eq!(read_task_state_in_dir(dir.path(), "e11").unwrap(), first);
+    }
 }

@@ -1574,4 +1574,148 @@ mod tests {
     }
 
     include!("probe_eval_tests.rs");
+
+    // ---- edge-case tests added for memory/compaction overhaul verification ----
+
+    #[test]
+    fn edge_dedup_zero_messages() {
+        let mut messages: Vec<Message> = Vec::new();
+        assert_eq!(dedup_repeated_tool_reads(&mut messages), 0);
+    }
+
+    #[test]
+    fn edge_purge_zero_messages() {
+        let mut messages: Vec<Message> = Vec::new();
+        assert_eq!(purge_resolved_error_results(&mut messages), 0);
+    }
+
+    #[test]
+    fn edge_dedup_single_read_untouched() {
+        let big = "z".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
+        let mut messages = vec![tool_result_message("t1", &big)];
+        for i in 0..RECENT_TURNS_TO_KEEP + 2 {
+            messages.push(Message::user(&format!("pad {i}")));
+        }
+        assert_eq!(dedup_repeated_tool_reads(&mut messages), 0);
+        assert_eq!(tool_result_text(&messages[0]), big);
+    }
+
+    #[test]
+    fn edge_dedup_different_files_not_deduped() {
+        let a = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
+        let b = "b".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
+        let mut messages = vec![
+            tool_result_message("t1", &a),
+            tool_result_message("t2", &b),
+        ];
+        for i in 0..RECENT_TURNS_TO_KEEP + 2 {
+            messages.push(Message::user(&format!("pad {i}")));
+        }
+        assert_eq!(dedup_repeated_tool_reads(&mut messages), 0);
+        assert_eq!(tool_result_text(&messages[0]), a);
+        assert_eq!(tool_result_text(&messages[1]), b);
+    }
+
+    #[test]
+    fn edge_dedup_marker_contains_prefix_and_order_preserved() {
+        let big = "q".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
+        let mut messages = vec![
+            Message::user("first user msg"),
+            tool_result_message("t1", &big),
+            Message::user("middle"),
+            tool_result_message("t2", &big),
+        ];
+        for i in 0..RECENT_TURNS_TO_KEEP + 2 {
+            messages.push(Message::user(&format!("pad {i}")));
+        }
+        let n = dedup_repeated_tool_reads(&mut messages);
+        assert_eq!(n, 1);
+        // Earlier replaced with marker, later kept, order preserved.
+        assert!(tool_result_text(&messages[1]).starts_with(DEDUP_MARKER_PREFIX));
+        assert_eq!(tool_result_text(&messages[3]), big);
+        assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
+        assert!(matches!(messages[2].content[0], ContentBlock::Text { .. }));
+        // Idempotent: second pass changes nothing.
+        assert_eq!(dedup_repeated_tool_reads(&mut messages), 0);
+    }
+
+    #[test]
+    fn edge_purge_error_with_no_later_success_kept() {
+        let err = "e".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
+        let mut messages = vec![
+            tool_use_message("c1", "bash"),
+            Message::tool_result_with_duration("c1", &err, true, None),
+        ];
+        for i in 0..RECENT_TURNS_TO_KEEP + 2 {
+            messages.push(Message::user(&format!("pad {i}")));
+        }
+        assert_eq!(purge_resolved_error_results(&mut messages), 0);
+        assert_eq!(tool_result_text(&messages[1]), err);
+    }
+
+    #[test]
+    fn edge_purge_marker_contains_prefix() {
+        let err = "e".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
+        let mut messages = vec![
+            tool_use_message("c1", "bash"),
+            Message::tool_result_with_duration("c1", &err, true, None),
+            tool_use_message("c2", "bash"),
+            Message::tool_result_with_duration("c2", "ok", false, None),
+        ];
+        for i in 0..RECENT_TURNS_TO_KEEP + 2 {
+            messages.push(Message::user(&format!("pad {i}")));
+        }
+        assert_eq!(purge_resolved_error_results(&mut messages), 1);
+        assert!(tool_result_text(&messages[1]).starts_with(RESOLVED_ERROR_MARKER_PREFIX));
+        // Successful result untouched.
+        assert_eq!(tool_result_text(&messages[3]), "ok");
+        // Idempotent.
+        assert_eq!(purge_resolved_error_results(&mut messages), 0);
+    }
+
+    #[test]
+    fn edge_purge_success_before_error_does_not_purge() {
+        let err = "e".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
+        let mut messages = vec![
+            tool_use_message("c1", "bash"),
+            Message::tool_result_with_duration("c1", "ok", false, None),
+            tool_use_message("c2", "bash"),
+            Message::tool_result_with_duration("c2", &err, true, None),
+        ];
+        for i in 0..RECENT_TURNS_TO_KEEP + 2 {
+            messages.push(Message::user(&format!("pad {i}")));
+        }
+        assert_eq!(purge_resolved_error_results(&mut messages), 0);
+        assert_eq!(tool_result_text(&messages[3]), err);
+    }
+
+    #[test]
+    fn edge_build_prompt_no_summary_uses_summary_prompt() {
+        let messages = vec![Message::user("do a thing please")];
+        let prompt = build_compaction_prompt(&messages, None, 1_000_000);
+        assert!(prompt.contains(SUMMARY_PROMPT));
+        assert!(!prompt.contains(SUMMARY_MERGE_PROMPT));
+        assert!(!prompt.contains("## Previous Summary"));
+    }
+
+    #[test]
+    fn edge_build_prompt_with_summary_uses_merge_prompt() {
+        let summary = Summary {
+            text: "prior anchored summary".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 3,
+            original_turn_count: 3,
+        };
+        let messages = vec![Message::user("new work happened")];
+        let prompt = build_compaction_prompt(&messages, Some(&summary), 1_000_000);
+        assert!(prompt.contains(SUMMARY_MERGE_PROMPT));
+        assert!(prompt.contains("## Previous Summary"));
+        assert!(prompt.contains("prior anchored summary"));
+        assert!(prompt.contains("## New Conversation"));
+    }
+
+    #[test]
+    fn edge_compaction_threshold_is_075() {
+        assert_eq!(COMPACTION_THRESHOLD, 0.75);
+    }
 }
