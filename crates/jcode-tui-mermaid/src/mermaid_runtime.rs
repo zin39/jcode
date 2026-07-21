@@ -145,14 +145,18 @@ pub(super) fn infer_protocol_from_env(
 
     if term.contains("kitty")
         || term_program.contains("kitty")
-        || term_program.contains("wezterm")
         || term_program.contains("ghostty")
     {
         return Some(ProtocolType::Kitty);
     }
 
+    // WezTerm advertises the base Kitty graphics protocol, but its
+    // implementation is incomplete (no Unicode placeholders; repositioned
+    // classic placements can even crash it - wezterm/wezterm#986, #7953).
+    // Its iTerm2 protocol support is complete and stable, so prefer that.
     if term_program.contains("iterm")
         || term.contains("iterm")
+        || term_program.contains("wezterm")
         || lc_terminal.contains("iterm")
         || lc_terminal.contains("wezterm")
     {
@@ -309,6 +313,10 @@ pub fn init_picker() {
 /// tests. No-op if the picker is already initialized. Uses a font-size-correct
 /// fast picker base so cell<->pixel math matches a real Kitty terminal.
 pub fn force_test_kitty_picker() {
+    // Also force the Unicode-placeholder capability: benchmarks/tests simulate
+    // a real Kitty terminal, which the env-based gate cannot see.
+    crate::viewport_render::FORCE_UNICODE_PLACEHOLDERS
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     PICKER.get_or_init(|| {
         let mut picker = fast_picker();
         picker.set_protocol_type(ProtocolType::Kitty);
@@ -486,9 +494,11 @@ mod tests {
             infer_protocol_from_env(None, Some("ghostty"), None, None),
             Some(ProtocolType::Kitty)
         );
+        // WezTerm's Kitty graphics implementation is incomplete (no Unicode
+        // placeholders), so it routes to its fully-supported iTerm2 protocol.
         assert_eq!(
             infer_protocol_from_env(None, Some("WezTerm"), None, None),
-            Some(ProtocolType::Kitty)
+            Some(ProtocolType::Iterm2)
         );
         // KITTY_WINDOW_ID present is sufficient.
         assert_eq!(

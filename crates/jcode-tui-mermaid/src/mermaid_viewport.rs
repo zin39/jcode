@@ -339,8 +339,44 @@ fn can_use_kitty_virtual_viewport(
     scroll_x: u16,
     scroll_y: u16,
 ) -> bool {
+    if !terminal_supports_unicode_placeholders() {
+        return false;
+    }
     let max_index = KITTY_DIACRITICS.len() as u16;
     full_cols < max_index && full_rows < max_index && scroll_x < max_index && scroll_y < max_index
+}
+
+/// Test/benchmark override: force the Unicode-placeholder path on regardless
+/// of environment (set by `force_test_kitty_picker`, which simulates a real
+/// Kitty terminal).
+pub(crate) static FORCE_UNICODE_PLACEHOLDERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the terminal actually implements Kitty *Unicode placeholders*
+/// (virtual placement, `U=1` + `U+10EEEE` cells).
+///
+/// This is a stricter capability than the base Kitty graphics protocol.
+/// WezTerm advertises Kitty graphics but does NOT implement Unicode
+/// placeholders (wezterm/wezterm#986 lists it as incomplete), so emitting
+/// them there paints the region as thousands of literal tofu boxes instead
+/// of an image. Only genuine Kitty (and Ghostty, which implements the full
+/// spec) get the virtual path; everything else falls back to classic
+/// placement/halfblocks.
+fn terminal_supports_unicode_placeholders() -> bool {
+    if FORCE_UNICODE_PLACEHOLDERS.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    if std::env::var_os("KITTY_WINDOW_ID").is_some() {
+        return true;
+    }
+    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    if term.contains("kitty") || term.contains("ghostty") {
+        return true;
+    }
+    let term_program = std::env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    term_program.contains("kitty") || term_program.contains("ghostty")
 }
 
 fn kitty_add_placeholder(buf: &mut String, x: u16, y: u16, id_extra: u8) {
