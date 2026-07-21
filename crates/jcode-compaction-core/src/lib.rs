@@ -882,7 +882,6 @@ pub fn tail_str_boundary(value: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    mod probe_eval_tests;
     use super::*;
 
     #[test]
@@ -1371,4 +1370,6 @@ mod tests {
         // Idempotent: second pass clears nothing new.
         assert_eq!(clear_tool_results_up_to(&mut messages, 2), 0);
     }
+
+    include!("probe_eval_tests.rs");
 }
