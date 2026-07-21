@@ -273,6 +273,11 @@ pub struct Agent {
     /// we surface. Reset to 0 whenever a turn does real work (tool calls or a
     /// substantive answer).
     consecutive_tiny_outputs: u32,
+    /// Consecutive stream-open failures (timeout before provider responds).
+    /// Incremented on each stream-open timeout; reset to 0 when a stream opens
+    /// successfully. Used to add exponential backoff and surface a hint when
+    /// repeated identical retries are failing.
+    consecutive_stream_open_failures: u32,
     /// Rolling activity tail (text + tool markers) for the inline output tap.
     /// Persists across turns so the coordinator's viewport never blanks at
     /// turn boundaries or freezes during long tool calls.
@@ -337,6 +342,7 @@ impl Agent {
             turn_made_edits: false,
             verify_attempts: 0,
             consecutive_tiny_outputs: 0,
+            consecutive_stream_open_failures: 0,
             inline_tail: inline_tail::InlineTailBuffer::default(),
         };
         crate::tool::set_session_tool_policy(

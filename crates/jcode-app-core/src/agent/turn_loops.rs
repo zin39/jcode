@@ -122,10 +122,7 @@ impl Agent {
                             "Subagent API stream did not open within {}s (provider may be rate-limited or unreachable) - aborting turn",
                             SUBAGENT_STREAM_OPEN_TIMEOUT.as_secs()
                         ));
-                        return Err(anyhow::anyhow!(
-                            "Provider did not respond within {}s — it may be rate-limited or unreachable. Try again or switch models with /model.",
-                            SUBAGENT_STREAM_OPEN_TIMEOUT.as_secs()
-                        ));
+                        return Err(self.note_stream_open_failure(SUBAGENT_STREAM_OPEN_TIMEOUT.as_secs()).await);
                     }
                 };
             let mut stream = match open_result {
@@ -157,8 +154,9 @@ impl Agent {
                 }
             };
 
-            // Successful API call - reset retry counter
+            // Successful API call - reset retry counters
             context_limit_retries = 0;
+            self.note_stream_open_success();
 
             logging::info(&format!(
                 "API stream opened in {:.2}s",

@@ -244,6 +244,50 @@ impl Agent {
         )
     }
 
+    // ── Stream-open failure backoff ────────────────────────────────────────
+
+    /// Record a stream-open timeout: increment the consecutive-failure counter,
+    /// sleep with exponential backoff (0s → 5s → 15s cap), and return the
+    /// user-facing error. When the counter reaches 2 the message is augmented
+    /// to call out that identical retries keep failing and suggest switching
+    /// models, so the caller (or a swarm coordinator) can route around the
+    /// problem instead of looping forever.
+    pub(crate) async fn note_stream_open_failure(
+        &mut self,
+        timeout_secs: u64,
+    ) -> anyhow::Error {
+        self.consecutive_stream_open_failures =
+            self.consecutive_stream_open_failures.saturating_add(1);
+        let n = self.consecutive_stream_open_failures;
+
+        // Exponential-ish backoff: 0s, 5s, 15s (capped).
+        let backoff = match n {
+            1 => std::time::Duration::from_secs(0),
+            2 => std::time::Duration::from_secs(5),
+            _ => std::time::Duration::from_secs(15),
+        };
+        if !backoff.is_zero() {
+            tokio::time::sleep(backoff).await;
+        }
+
+        let base = format!(
+            "Provider did not respond within {timeout_secs}s — it may be rate-limited or unreachable. Try again or switch models with /model."
+        );
+        if n >= 2 {
+            anyhow::anyhow!(
+                "{base} (Stream-open has failed {n} times in a row — repeated identical retries are unlikely to succeed. Consider switching to a different model.)"
+            )
+        } else {
+            anyhow::anyhow!("{base}")
+        }
+    }
+
+    /// Reset the consecutive stream-open-failure counter after a successful
+    /// stream open.
+    pub(crate) fn note_stream_open_success(&mut self) {
+        self.consecutive_stream_open_failures = 0;
+    }
+
     /// Update the consecutive-tiny-output streak for a completed no-tool-call
     /// turn and, once the streak reaches [`Self::TINY_OUTPUT_COLLAPSE_THRESHOLD`],
     /// return the user-facing notice to surface. Turns that are NOT a suspicious
