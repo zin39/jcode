@@ -90,6 +90,12 @@ impl Agent {
     }
 
     fn append_task_state(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        // Seed from the first user message if no task state exists yet.
+        // This implements the "recitation" pattern: the original goal is
+        // captured to disk so it survives compaction even when the agent
+        // never explicitly calls update_task_state.
+        self.seed_task_state_from_first_message();
+
         let Some(state) = jcode_base::session::task_state::read_task_state(&self.session.id) else {
             return;
         };
@@ -101,6 +107,41 @@ impl Agent {
             "# Task State\n\nYour saved working state (maintained via the `update_task_state` tool; survives compaction). Keep it current:\n\n",
         );
         split.dynamic_part.push_str(&state);
+    }
+
+    /// Extract the first user message text from the session and seed the task
+    /// state file if it is empty. No-op when state already exists or no user
+    /// message is found.
+    fn seed_task_state_from_first_message(&self) {
+        let first_user_text = self
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::message::Role::User)
+            .flat_map(|m| {
+                m.content.iter().filter_map(|block| {
+                    if let crate::message::ContentBlock::Text { text, .. } = block {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+            })
+            // Session-context reminders and tool results are injected as User
+            // messages; the real request is the first text that isn't one.
+            .find(|text| {
+                let t = text.trim_start();
+                !t.starts_with("<system-reminder") && !t.starts_with("[Recovered orphaned")
+            });
+        if let Some(text) = first_user_text {
+            // Strip a leading inline system-reminder block when the real
+            // request shares one text block with it.
+            let cleaned = match (text.find("</system-reminder>"), text.contains("<system-reminder")) {
+                (Some(end), true) => text[end + "</system-reminder>".len()..].trim(),
+                _ => text.trim(),
+            };
+            jcode_base::session::task_state::seed_task_state_if_empty(&self.session.id, cleaned);
+        }
     }
 
     fn append_current_turn_system_reminder(&self, split: &mut crate::prompt::SplitSystemPrompt) {
