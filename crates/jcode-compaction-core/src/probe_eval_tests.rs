@@ -335,6 +335,39 @@ fn summary_prompt_contract() {
 }
 
 #[test]
+fn summary_merge_prompt_contract() {
+    /// Required sections that the SUMMARY_MERGE_PROMPT must contain.
+    /// Adapt this list when the prompt evolves.
+    const REQUIRED_SECTIONS: &[&str] = &[
+        "Original goal",
+        "Session intent",
+        "Files modified",
+        "Key decisions",
+        "Approaches tried",
+        "Current state",
+        "Next steps",
+        "User preferences",
+    ];
+
+    assert!(
+        SUMMARY_MERGE_PROMPT.contains("NEVER delete"),
+        "SUMMARY_MERGE_PROMPT must instruct the model to NEVER delete existing entries"
+    );
+
+    let missing: Vec<&&str> = REQUIRED_SECTIONS
+        .iter()
+        .filter(|section| !SUMMARY_MERGE_PROMPT.contains(**section))
+        .collect();
+
+    if !missing.is_empty() {
+        panic!(
+            "SUMMARY_MERGE_PROMPT is missing these required sections: {:?}\n\nFull prompt:\n{}",
+            missing, SUMMARY_MERGE_PROMPT
+        );
+    }
+}
+
+#[test]
 fn recent_turns_preserved() {
     let session = build_synthetic_session();
     assert!(
