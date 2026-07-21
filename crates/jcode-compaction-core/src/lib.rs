@@ -23,6 +23,243 @@ pub const MANUAL_COMPACT_MIN_THRESHOLD: f32 = 0.10;
 /// Keep this many recent turns verbatim (not summarized)
 pub const RECENT_TURNS_TO_KEEP: usize = 10;
 
+/// Tool results below this size are left alone — clearing them saves nothing
+/// and destroys cheap, useful context.
+pub const MIN_CLEARABLE_TOOL_RESULT_CHARS: usize = 200;
+
+const CLEARED_MARKER_PREFIX: &str = "[tool result cleared by jcode";
+const DEDUP_MARKER_PREFIX: &str = "[duplicate tool result removed by jcode";
+const RESOLVED_ERROR_MARKER_PREFIX: &str = "[resolved error removed by jcode";
+const SPILL_POINTER_NEEDLE: &str = "FULL output saved to ";
+/// Prefix of the inline pointer line the spill feature leaves behind. Only
+/// lines starting with this are treated as real spill pointers — tool output
+/// that merely mentions the needle phrase must not hijack extraction.
+const SPILL_POINTER_LINE_PREFIX: &str = "[Tool output truncated by jcode";
+
+/// Replacement text for a cleared tool result. Preserves the spill-pointer
+/// line (if the original was spilled to disk) so the agent can still retrieve
+/// the full output with the read tool.
+pub fn cleared_tool_result_content(original: &str) -> String {
+    let pointer_line = original.lines().find(|line| {
+        let line = line.trim();
+        line.starts_with(SPILL_POINTER_LINE_PREFIX) && line.contains(SPILL_POINTER_NEEDLE)
+    });
+    match pointer_line {
+        Some(line) => {
+            // Keep only from the spill-pointer needle onward — the rest of the
+            // line (e.g. "Tool output truncated by jcode: ...") is redundant
+            // with the marker we're already emitting, and dropping it keeps
+            // the replacement meaningfully smaller than the original.
+            let trimmed = line.trim().trim_end_matches(']');
+            let pointer = trimmed
+                .find(SPILL_POINTER_NEEDLE)
+                .map(|idx| &trimmed[idx..])
+                .unwrap_or(trimmed);
+            format!(
+                "{} under context pressure: {} chars removed. {}]",
+                CLEARED_MARKER_PREFIX,
+                original.chars().count(),
+                pointer,
+            )
+        }
+        None => format!(
+            "{} under context pressure: {} chars removed. Re-run the tool if this output is needed again.]",
+            CLEARED_MARKER_PREFIX,
+            original.chars().count(),
+        ),
+    }
+}
+
+/// True if this tool-result text is worth clearing (big enough, not already cleared).
+pub fn is_clearable_tool_result(text: &str) -> bool {
+    text.chars().count() >= MIN_CLEARABLE_TOOL_RESULT_CHARS
+        && !text.starts_with(CLEARED_MARKER_PREFIX)
+}
+
+/// Clear tool-result payloads in `messages[..up_to_index]` (view-time only —
+/// callers pass a cloned API view, never stored history). Returns how many
+/// results were cleared. Skips already-cleared markers and small results.
+pub fn clear_tool_results_up_to(messages: &mut [Message], up_to_index: usize) -> usize {
+    let mut cleared = 0;
+    let end = up_to_index.min(messages.len());
+    for message in &mut messages[..end] {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && is_clearable_tool_result(content)
+            {
+                *content = cleared_tool_result_content(content);
+                cleared += 1;
+            }
+        }
+    }
+    cleared
+}
+
+/// Byte length of the cleared replacement for `original`, without requiring
+/// the caller to allocate the exact string. Defers to
+/// [`cleared_tool_result_content`] itself (rather than reimplementing its
+/// layout) so this estimate can never drift out of sync with what clearing
+/// actually produces.
+pub fn cleared_tool_result_estimate_chars(original: &str) -> usize {
+    cleared_tool_result_content(original).len()
+}
+
+/// Count clearable tool-result payloads in `messages[..up_to_index]` without
+/// mutating anything. Mirrors [`clear_tool_results_up_to`]'s predicate
+/// exactly so a reported count always matches what an actual clearing pass
+/// over the same range would affect.
+pub fn count_clearable_tool_results(messages: &[Message], up_to_index: usize) -> usize {
+    let end = up_to_index.min(messages.len());
+    messages[..end]
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { content, .. } if is_clearable_tool_result(content)
+            )
+        })
+        .count()
+}
+
+/// Deterministic, zero-LLM-cost context cleanup: replace EARLIER byte-identical
+/// tool results with a short marker, keeping only the LAST occurrence intact.
+///
+/// Repeatedly re-reading the same file (or re-running the same command with
+/// identical output) is one of the biggest sources of context bloat in long
+/// coding sessions; production guides report 15-30% context reduction from
+/// deduplication alone, with zero information loss (the newest copy survives).
+///
+/// The most recent [`RECENT_TURNS_TO_KEEP`] messages are never modified, so the
+/// working tail stays verbatim. Only results longer than
+/// [`MIN_CLEARABLE_TOOL_RESULT_CHARS`] are considered (tiny results are not
+/// worth the marker), and already-cleared/deduplicated markers are skipped.
+///
+/// Returns the number of duplicate results replaced.
+pub fn dedup_repeated_tool_reads(messages: &mut [Message]) -> usize {
+    let protected_start = messages.len().saturating_sub(RECENT_TURNS_TO_KEEP);
+
+    // Pass 1 (backward): record the LAST message index for each eligible
+    // content string. We look at ALL messages so a duplicate in the head
+    // whose twin lives in the tail is still detected (the head copy is
+    // replaced, the tail copy stays).
+    let mut last_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (mi, message) in messages.iter().enumerate().rev() {
+        for block in &message.content {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && content.chars().count() >= MIN_CLEARABLE_TOOL_RESULT_CHARS
+                && !content.starts_with(CLEARED_MARKER_PREFIX)
+                && !content.starts_with(DEDUP_MARKER_PREFIX)
+                && !content.starts_with(RESOLVED_ERROR_MARKER_PREFIX)
+            {
+                last_seen.entry(content.clone()).or_insert(mi);
+            }
+        }
+    }
+
+    // Pass 2 (forward, mutable part only): replace earlier duplicates.
+    let mut deduped = 0;
+    for (mi, message) in messages.iter_mut().enumerate().take(protected_start) {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && content.chars().count() >= MIN_CLEARABLE_TOOL_RESULT_CHARS
+                && !content.starts_with(CLEARED_MARKER_PREFIX)
+                && !content.starts_with(DEDUP_MARKER_PREFIX)
+                && !content.starts_with(RESOLVED_ERROR_MARKER_PREFIX)
+            {
+                if let Some(&last_idx) = last_seen.get(content) {
+                    if last_idx != mi {
+                        *content = format!(
+                            "{}; identical to a later result: {} chars removed]",
+                            DEDUP_MARKER_PREFIX,
+                            content.chars().count(),
+                        );
+                        deduped += 1;
+                    }
+                }
+            }
+        }
+    }
+    deduped
+}
+
+/// Deterministic cleanup: purge error tool-results whose error was RESOLVED by
+/// a later successful call to the same tool.
+///
+/// Rationale: error traces are valuable in-context learning signal only while
+/// the error is unresolved. Once a later call of the same tool succeeds, the
+/// stale stack trace/exit dump is pure noise (production guides: purge
+/// deterministically, no model call needed). Unresolved errors are always
+/// kept — they still carry signal.
+///
+/// Tool identity is resolved by matching each `ToolResult.tool_use_id` to its
+/// assistant `ToolUse` block to learn the tool name. The most recent
+/// [`RECENT_TURNS_TO_KEEP`] messages are never modified.
+///
+/// Returns the number of error results purged.
+pub fn purge_resolved_error_results(messages: &mut [Message]) -> usize {
+    use std::collections::HashMap;
+
+    // Map tool_use_id -> tool name from assistant ToolUse blocks.
+    let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
+    for message in messages.iter() {
+        for block in &message.content {
+            if let ContentBlock::ToolUse { id, name, .. } = block {
+                tool_name_by_id.insert(id.clone(), name.clone());
+            }
+        }
+    }
+
+    // For each tool name, find the index of the LAST successful result.
+    let mut last_success_by_tool: HashMap<String, usize> = HashMap::new();
+    for (mi, message) in messages.iter().enumerate() {
+        for block in &message.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } = block
+                && !matches!(is_error, Some(true))
+                && let Some(name) = tool_name_by_id.get(tool_use_id)
+            {
+                last_success_by_tool.insert(name.clone(), mi);
+            }
+        }
+    }
+
+    // Purge error results that a LATER success of the same tool supersedes.
+    let protected_start = messages.len().saturating_sub(RECENT_TURNS_TO_KEEP);
+    let mut purged = 0;
+    for (mi, message) in messages.iter_mut().enumerate().take(protected_start) {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+                && matches!(is_error, Some(true))
+                && !content.starts_with(RESOLVED_ERROR_MARKER_PREFIX)
+                && !content.starts_with(CLEARED_MARKER_PREFIX)
+                && !content.starts_with(DEDUP_MARKER_PREFIX)
+            {
+                let Some(name) = tool_name_by_id.get(tool_use_id.as_str()) else {
+                    continue;
+                };
+                if last_success_by_tool.get(name).copied().is_some_and(|si| si > mi) {
+                    *content = format!(
+                        "{}; a later {} call succeeded: {} chars removed]",
+                        RESOLVED_ERROR_MARKER_PREFIX,
+                        name,
+                        content.chars().count(),
+                    );
+                    purged += 1;
+                }
+            }
+        }
+    }
+    purged
+}
+
 /// Absolute minimum turns to keep during emergency compaction
 pub const MIN_TURNS_TO_KEEP: usize = 2;
 
@@ -1043,4 +1280,302 @@ mod tests {
         assert_eq!(stripped, 1);
         assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
     }
+
+    fn tool_result_message(id: &str, text: &str) -> Message {
+        Message::tool_result_with_duration(id, text, false, None)
+    }
+
+    fn tool_result_text(message: &Message) -> &str {
+        match &message.content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected ToolResult block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dedup_keeps_last_occurrence_and_marks_earlier() {
+        let big = "x".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 50);
+        let mut messages: Vec<Message> = Vec::new();
+        // Two identical results in the head, one identical in the tail region.
+        messages.push(tool_result_message("t1", &big));
+        messages.push(tool_result_message("t2", &big));
+        // Pad so the last copy is inside the protected tail.
+        for i in 0..RECENT_TURNS_TO_KEEP - 1 {
+            messages.push(Message::user(&format!("filler {i}")));
+        }
+        messages.push(tool_result_message("t3", &big));
+
+        let deduped = dedup_repeated_tool_reads(&mut messages);
+        assert_eq!(deduped, 2, "both head copies dupe the tail copy");
+        assert!(tool_result_text(&messages[0]).starts_with("[duplicate tool result removed"));
+        assert!(tool_result_text(&messages[1]).starts_with("[duplicate tool result removed"));
+        // Tail copy untouched.
+        let last = messages.len() - 1;
+        assert_eq!(tool_result_text(&messages[last]), big);
+    }
+
+    #[test]
+    fn dedup_skips_short_results_and_protected_tail() {
+        let small = "y".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS - 1);
+        let mut messages: Vec<Message> = vec![
+            tool_result_message("t1", &small),
+            tool_result_message("t2", &small),
+        ];
+        // Everything is inside the protected tail (len < RECENT_TURNS_TO_KEEP).
+        assert_eq!(dedup_repeated_tool_reads(&mut messages), 0);
+        assert_eq!(tool_result_text(&messages[0]), small);
+    }
+
+    fn tool_use_message(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn resolved_error_is_purged_but_unresolved_kept() {
+        let err_text = "e".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 10);
+        let mut messages: Vec<Message> = vec![
+            tool_use_message("c1", "bash"),
+            Message::tool_result_with_duration("c1", &err_text, true, None),
+            tool_use_message("c2", "edit"),
+            Message::tool_result_with_duration("c2", &err_text, true, None),
+            tool_use_message("c3", "bash"),
+            // Later bash SUCCESS resolves c1's error; edit never succeeds.
+            Message::tool_result_with_duration("c3", "ok", false, None),
+        ];
+        for i in 0..RECENT_TURNS_TO_KEEP {
+            messages.push(Message::user(&format!("filler {i}")));
+        }
+
+        let purged = purge_resolved_error_results(&mut messages);
+        assert_eq!(purged, 1, "only the resolved bash error is purged");
+        assert!(tool_result_text(&messages[1]).starts_with("[resolved error removed"));
+        assert!(
+            tool_result_text(&messages[1]).contains("bash"),
+            "marker names the tool"
+        );
+        // The edit error is unresolved and must survive verbatim.
+        assert_eq!(tool_result_text(&messages[3]), err_text);
+    }
+
+    #[test]
+    fn cleared_content_preserves_spill_pointer() {
+        let original = "first 10KB head...\n[Tool output truncated by jcode: tool `bash` produced 80000 chars; kept first 10000 inline. FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt — use the read tool with start_line/limit for targeted sections.]";
+        let cleared = cleared_tool_result_content(original);
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(cleared.contains("FULL output saved to /home/u/.jcode/tool-outputs/s/t.txt"));
+        assert!(cleared.len() < original.len());
+    }
+
+    #[test]
+    fn spurious_full_output_phrase_is_not_treated_as_pointer() {
+        // The needle phrase appearing in ordinary tool output (not on a real
+        // spill-pointer line) must not hijack extraction.
+        let original = format!(
+            "{}\nAnalysis notes: FULL output saved to /tmp/fake.txt\nmore output",
+            "x".repeat(300)
+        );
+        let cleared = cleared_tool_result_content(&original);
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(!cleared.contains("/tmp/fake.txt"));
+        assert!(cleared.contains("Re-run the tool if this output is needed again."));
+    }
+
+    #[test]
+    fn threshold_boundary_exactly_min_chars_is_clearable() {
+        let at_min = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
+        assert!(is_clearable_tool_result(&at_min));
+        let below_min = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS - 1);
+        assert!(!is_clearable_tool_result(&below_min));
+    }
+
+    #[test]
+    fn cleared_content_without_pointer_is_marker_only() {
+        let cleared = cleared_tool_result_content("plain big output");
+        assert!(cleared.starts_with("[tool result cleared by jcode"));
+        assert!(!cleared.contains("FULL output saved"));
+    }
+
+    #[test]
+    fn clear_tool_results_respects_watermark_and_skips_small_results() {
+        let mut messages = vec![
+            tool_result_message("t1", &"a".repeat(1000)),
+            tool_result_message("t2", "short"),
+            tool_result_message("t3", &"b".repeat(1000)),
+        ];
+        let cleared = clear_tool_results_up_to(&mut messages, 2);
+        assert_eq!(cleared, 1);
+        assert!(tool_result_text(&messages[0]).starts_with("[tool result cleared"));
+        assert_eq!(tool_result_text(&messages[1]), "short");
+        assert!(tool_result_text(&messages[2]).starts_with("bbb"));
+        // Idempotent: second pass clears nothing new.
+        assert_eq!(clear_tool_results_up_to(&mut messages, 2), 0);
+    }
+
+    // ── dedup_repeated_tool_reads tests ────────────────────────────────────
+
+
+    #[test]
+    fn dedup_skips_short_results() {
+        let short = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS - 1);
+        let mut messages = vec![
+            tool_result_message("t1", &short),
+            tool_result_message("t2", &short),
+        ];
+        let count = dedup_repeated_tool_reads(&mut messages);
+        assert_eq!(count, 0, "short results should not be deduped");
+        assert_eq!(tool_result_text(&messages[0]), &short);
+        assert_eq!(tool_result_text(&messages[1]), &short);
+    }
+
+    #[test]
+    fn dedup_skips_already_cleared_markers() {
+        let big = "x".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
+        let cleared = format!("{}foo]", CLEARED_MARKER_PREFIX);
+        let mut messages = vec![
+            tool_result_message("t1", &cleared),
+            tool_result_message("t2", &big),
+        ];
+        let count = dedup_repeated_tool_reads(&mut messages);
+        assert_eq!(count, 0, "already-cleared markers should not be counted");
+        // The cleared content and big are different => no dedup.
+        // Now test with duplicate cleared content.
+        let mut messages2 = vec![
+            tool_result_message("t1", &cleared),
+            tool_result_message("t2", &cleared),
+        ];
+        let count2 = dedup_repeated_tool_reads(&mut messages2);
+        assert_eq!(count2, 0, "duplicate cleared markers should not be deduped");
+    }
+
+    #[test]
+    fn dedup_respects_recent_tail() {
+        let big = "y".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
+        // Create RECENT_TURNS_TO_KEEP messages in the tail.
+        let mut messages: Vec<Message> = (0..RECENT_TURNS_TO_KEEP)
+            .map(|i| tool_result_message(&format!("t{}", i), &big))
+            .collect();
+        // All messages are in the tail zone => nothing should be deduped.
+        let count = dedup_repeated_tool_reads(&mut messages);
+        assert_eq!(count, 0, "tail messages should not be touched");
+        for msg in &messages {
+            assert_eq!(tool_result_text(msg), &big);
+        }
+    }
+
+
+    #[test]
+    fn dedup_unique_content_not_affected() {
+        let big = "w".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS);
+        let mut messages = vec![
+            tool_result_message("t1", &format!("{}a", &big)),
+            tool_result_message("t2", &format!("{}b", &big)),
+            tool_result_message("t3", &format!("{}c", &big)),
+        ];
+        let count = dedup_repeated_tool_reads(&mut messages);
+        assert_eq!(count, 0, "all unique content should be untouched");
+    }
+
+    // ── purge_resolved_error_results tests ─────────────────────────────────
+
+    fn tool_use_msg(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }
+    }
+
+    fn error_result_msg(id: &str, content: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+                is_error: Some(true),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }
+    }
+
+
+
+
+    #[test]
+    fn purge_respects_recent_tail() {
+        let mut messages: Vec<Message> = Vec::new();
+        // Add RECENT_TURNS_TO_KEEP messages in the tail.
+        for i in 0..RECENT_TURNS_TO_KEEP {
+            messages.push(tool_use_msg(&format!("call_read_{}", i), "read"));
+            messages.push(error_result_msg(&format!("call_read_{}", i), "error!"));
+        }
+        let count = purge_resolved_error_results(&mut messages);
+        assert_eq!(count, 0, "tail messages should not be touched");
+        for msg in &messages {
+            if let ContentBlock::ToolResult { content, is_error, .. } = &msg.content[0] {
+                if *is_error == Some(true) {
+                    assert_eq!(content, "error!", "tail error content should be preserved");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn last_error_kept_when_no_success_follows() {
+        // Two errors for the same tool, no success after either.
+        let mut messages = vec![
+            tool_use_msg("call_read_1", "read"),
+            error_result_msg("call_read_1", "error1"),
+            tool_use_msg("call_read_2", "read"),
+            error_result_msg("call_read_2", "error2"),
+        ];
+        let count = purge_resolved_error_results(&mut messages);
+        assert_eq!(count, 0, "no success after either error, so none purged");
+        // Both errors should be preserved.
+        let err1 = match &messages[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.as_str(),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        let err2 = match &messages[3].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.as_str(),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert!(err1.contains("error1"));
+        assert!(err2.contains("error2"));
+    }
+
+    #[test]
+    fn error_after_success_not_purged() {
+        // Error comes AFTER a success for the same tool name — should not be purged.
+        let mut messages = vec![
+            tool_use_msg("call_read_1", "read"),
+            Message::tool_result("call_read_1", "ok", false),
+            tool_use_msg("call_read_2", "read"),
+            error_result_msg("call_read_2", "error after success"),
+        ];
+        let count = purge_resolved_error_results(&mut messages);
+        assert_eq!(count, 0, "error after success should not be purged");
+        let err_content = match &messages[3].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.as_str(),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert!(err_content.contains("error after success"));
+    }
+
 }

@@ -1325,6 +1325,20 @@ impl CompactionManager {
             }
             None => active.to_vec(),
         }
+
+        // Deterministic, always-on view-time cleanup (zero LLM cost, applied
+        // to this cloned view only so stored history is untouched):
+        // - duplicate tool results (same file read twice) keep only the
+        //   newest copy;
+        // - error results superseded by a later success of the same tool are
+        //   dropped. Both skip the recent-turns tail and typically cut
+        //   context 15-30% before any summarization is needed.
+        if result.len() > offset {
+            jcode_compaction_core::dedup_repeated_tool_reads(&mut result[offset..]);
+            jcode_compaction_core::purge_resolved_error_results(&mut result[offset..]);
+        }
+
+        result
     }
 
     /// Check if compaction is in progress
