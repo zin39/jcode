@@ -397,6 +397,95 @@ fn run_windows_hardening_worker() {
     }
 }
 
+/// Migrate stray `*.env` credential files from `~/.jcode/` into the canonical
+/// app config dir (`app_config_dir()`), where the provider/env loaders
+/// actually read them.
+///
+/// Users repeatedly place key files in `~/.jcode/` by hand (it looks like the
+/// natural config location), but jcode reads env files from the platform
+/// config dir (for example `~/Library/Application Support/jcode` on macOS).
+/// Keys stranded in `~/.jcode/` were silently ignored, breaking providers and
+/// tools (tavily, siliconflow, perplexity) with no error anywhere.
+///
+/// Policy: one canonical location, automatic one-way migration.
+/// - If the file does not exist in the config dir: move it there (copy +
+///   remove; falls back to copy-only if the remove fails).
+/// - If both exist: leave both untouched and warn, so we never clobber a
+///   newer canonical credential with a stale stray file.
+///
+/// Best-effort: any I/O failure is logged and skipped, never fatal.
+/// Returns the number of files migrated.
+pub fn migrate_stray_env_files() -> usize {
+    let Ok(jcode_home) = jcode_dir() else {
+        return 0;
+    };
+    let Ok(config_dir) = app_config_dir() else {
+        return 0;
+    };
+    migrate_stray_env_files_between(&jcode_home, &config_dir)
+}
+
+/// Path-taking core of [`migrate_stray_env_files`], separated for direct
+/// testing without mutating process env vars (which races parallel tests).
+fn migrate_stray_env_files_between(jcode_home: &Path, config_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(jcode_home) else {
+        return 0;
+    };
+
+    let mut migrated = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".env") || !path.is_file() {
+            continue;
+        }
+        // Skip obvious backups.
+        if name.contains(".bak") {
+            continue;
+        }
+        let dest = config_dir.join(name);
+        if dest.exists() {
+            eprintln!(
+                "Warning: credential file {} exists in both {} and {}; using the config-dir copy. \
+                 Remove the one under ~/.jcode to silence this warning.",
+                name,
+                jcode_home.display(),
+                config_dir.display()
+            );
+            continue;
+        }
+        if std::fs::create_dir_all(&config_dir).is_err() {
+            continue;
+        }
+        match std::fs::copy(&path, &dest) {
+            Ok(_) => {
+                harden_secret_file_permissions(&dest);
+                // Move semantics: drop the stray original so there is exactly
+                // one canonical copy going forward. Non-fatal if it fails.
+                let _ = std::fs::remove_file(&path);
+                eprintln!(
+                    "Migrated credential file {} from {} to canonical config dir {}",
+                    name,
+                    jcode_home.display(),
+                    config_dir.display()
+                );
+                migrated += 1;
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to migrate credential file {} to {}: {}",
+                    path.display(),
+                    dest.display(),
+                    err
+                );
+            }
+        }
+    }
+    migrated
+}
+
 /// Validate an external auth file managed by another tool before reading it.
 ///
 /// jcode intentionally avoids mutating these files. We also reject obvious risky
@@ -766,5 +855,48 @@ mod env_file_tests {
             std::fs::read_to_string(&path).expect("unchanged env"),
             "SAFE_KEY=safe-value\n"
         );
+#[cfg(test)]
+mod migrate_stray_env_tests {
+    use super::migrate_stray_env_files_between;
+
+    #[test]
+    fn moves_stray_env_files_and_respects_existing_canonical_copies() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let home = sandbox.path();
+        let config_dir = home.join("config").join("jcode");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Stray file that should migrate.
+        std::fs::write(home.join("tavily.env"), "TAVILY_API_KEYS=abc").unwrap();
+        // Stray file with a canonical copy already present: must NOT clobber.
+        std::fs::write(home.join("zai.env"), "ZHIPU_API_KEY=stale").unwrap();
+        std::fs::write(config_dir.join("zai.env"), "ZHIPU_API_KEY=fresh").unwrap();
+        // Backup files must be ignored.
+        std::fs::write(home.join("old.env.bak"), "X=1").unwrap();
+        // Non-env files must be ignored.
+        std::fs::write(home.join("config.toml"), "[x]").unwrap();
+
+        let migrated = migrate_stray_env_files_between(home, &config_dir);
+
+        assert_eq!(migrated, 1, "only tavily.env should migrate");
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("tavily.env")).unwrap(),
+            "TAVILY_API_KEYS=abc"
+        );
+        assert!(
+            !home.join("tavily.env").exists(),
+            "stray original should be removed after migration"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("zai.env")).unwrap(),
+            "ZHIPU_API_KEY=fresh",
+            "canonical copy must not be clobbered"
+        );
+        assert!(
+            home.join("zai.env").exists(),
+            "conflicting stray file is left in place for the user to resolve"
+        );
+        assert!(home.join("old.env.bak").exists());
+        assert!(home.join("config.toml").exists());
     }
 }
