@@ -17,7 +17,9 @@ use lifecycle::emit_lifecycle_event;
 use serde_json::Value;
 use state_support::*;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const TELEMETRY_ENDPOINT: &str = "https://jcode-telemetry.jeremyhuang55555.workers.dev/v1/event";
@@ -25,6 +27,22 @@ const ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_INSTALL_TIMEOUT: Duration = Duration::from_millis(1200);
 const BLOCKING_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(800);
 const TELEMETRY_SCHEMA_VERSION: u32 = 5;
+
+// Circuit breaker: after 5 consecutive 4xx rejections, stop sending telemetry
+// for the rest of the process lifetime. Reset on any successful send.
+static TELEMETRY_REJECTION_COUNT: AtomicU32 = AtomicU32::new(0);
+static TELEMETRY_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Returns the telemetry endpoint, preferring the `JCODE_TELEMETRY_ENDPOINT`
+/// env var (read once, lazily) over the compiled-in default.
+fn telemetry_endpoint() -> &'static str {
+    static OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| std::env::var("JCODE_TELEMETRY_ENDPOINT").ok());
+    match OVERRIDE.get().unwrap() {
+        Some(v) => v.as_str(),
+        None => TELEMETRY_ENDPOINT,
+    }
+}
 
 // Error/switch counters live inside `SessionTelemetry` (guarded by
 // `SESSION_STATE`) so increments, snapshots, and resets all happen under a
@@ -855,6 +873,11 @@ pub fn record_command_family(command: &str) {
 }
 
 fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
+    // Circuit breaker: skip if permanently disabled
+    if TELEMETRY_DISABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+
     let client = match reqwest::blocking::Client::builder()
         .user_agent(jcode_provider_core::JCODE_USER_AGENT)
         .timeout(timeout)
@@ -866,11 +889,22 @@ fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
             return false;
         }
     };
-    match client.post(TELEMETRY_ENDPOINT).json(&payload).send() {
+    match client.post(telemetry_endpoint()).json(&payload).send() {
         Ok(response) => match response.error_for_status() {
-            Ok(_) => true,
+            Ok(_) => {
+                // Successful send resets the rejection counter
+                TELEMETRY_REJECTION_COUNT.store(0, Ordering::Relaxed);
+                true
+            }
             Err(err) => {
                 logging::warn(&format!("telemetry endpoint rejected payload: {err}"));
+                let count = TELEMETRY_REJECTION_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= 5 {
+                    TELEMETRY_DISABLED.store(true, Ordering::Relaxed);
+                    logging::info(
+                        "telemetry disabled for this process lifetime: 5 consecutive endpoint rejections",
+                    );
+                }
                 false
             }
         },
