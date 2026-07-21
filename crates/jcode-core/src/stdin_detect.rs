@@ -261,7 +261,7 @@ mod macos {
         pth_name: [u8; 64],
     }
 
-    const TH_STATE_WAITING: i32 = 2;
+    const TH_STATE_WAITING: i32 = 3;
 
     pub fn check(pid: u32) -> StdinState {
         // Check if fd 0 (stdin) is a pipe or pty
