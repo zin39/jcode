@@ -519,9 +519,10 @@ pub async fn run_cheap_route(
 
         let mut chosen: Option<(String, Option<String>, String)> = None; // (model, api_method, output)
         let mut errors: Vec<String> = Vec::new();
+        let attempt_timeout = subtask_attempt_timeout(subtask.difficulty, difficulty_threshold);
         for (model, api_method) in &task_candidates {
             let attempt = tokio::time::timeout(
-                SUBTASK_TIMEOUT,
+                attempt_timeout,
                 backend.run_subtask(subtask, model, api_method.as_deref()),
             )
             .await;
@@ -533,7 +534,7 @@ pub async fn run_cheap_route(
                 Ok(Err(err)) => errors.push(format!("{model}: {err}")),
                 Err(_) => errors.push(format!(
                     "{model}: timed out after {}s",
-                    SUBTASK_TIMEOUT.as_secs()
+                    attempt_timeout.as_secs()
                 )),
             }
         }
@@ -1068,6 +1069,23 @@ fn cheap_subagent_tool_allowlist(registry_tools: &std::collections::HashSet<Stri
 /// abandoned quickly: a healthy cheap model opens + answers a small subtask in a
 /// few seconds, so 30s is generous for "working" yet fast to fail on a hang.
 const SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Timeout for a HARD subtask (difficulty above the routing threshold) running
+/// on a strong reasoning model. Frontier reasoning models (Fable, Kimi K3,
+/// GPT-5.6 Sol) legitimately think for 1-3 minutes on difficulty-4/5 work;
+/// killing them at the cheap 30s budget guaranteed the strong tier could never
+/// answer and every hard subtask fell back to cheap models or failed.
+const STRONG_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Pick the per-attempt timeout for a subtask: hard subtasks get the strong
+/// (reasoning) budget, trivial ones stay on the tight cheap budget.
+fn subtask_attempt_timeout(difficulty: u8, threshold: u8) -> std::time::Duration {
+    if difficulty > threshold {
+        STRONG_SUBTASK_TIMEOUT
+    } else {
+        SUBTASK_TIMEOUT
+    }
+}
 #[allow(dead_code)]
 const DEBATE_PROPOSER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 #[allow(dead_code)]
