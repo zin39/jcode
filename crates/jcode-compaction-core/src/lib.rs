@@ -331,17 +331,9 @@ Fill in EVERY section below. If a section has nothing, write 'None.' explicitly 
 
 Preserve exact technical details: file paths, error messages, command lines, model/version identifiers. You can search the full conversation later for anything else."#;
 
-/// Anchored-merge variant of [`SUMMARY_PROMPT`], used when a previous summary
-/// already exists. Instead of regenerating a fresh summary of everything (which
-/// causes compaction-chain degradation: details drift and disappear across
-/// cycles), the model UPDATES the existing summary by merging in only the new
-/// conversation span. Durable sections are explicitly append-only.
-pub const SUMMARY_MERGE_PROMPT: &str = r#"Below is the EXISTING session summary followed by NEW conversation since it was written. UPDATE the existing summary by merging in the new information.
+pub const SUMMARY_MERGE_PROMPT: &str = r#"Below is the EXISTING session summary followed by NEW conversation since it was written. UPDATE the existing summary by merging in the new information. NEVER delete existing entries in 'Original goal', 'Files modified', 'Key decisions', or 'Approaches tried and rejected' - only append/refine. Keep the same section structure.
 
-Rules:
-- NEVER delete existing entries in 'Original goal (verbatim)', 'Files modified', 'Key decisions', or 'Approaches tried and rejected' — only append new entries or refine wording without losing specifics.
-- 'Session intent', 'Current state', and 'Next steps' should be rewritten to reflect the latest situation.
-- Keep the same section structure. Fill in EVERY section below. If a section has nothing, write 'None.' explicitly — never silently omit a section.
+Fill in EVERY section below. If a section has nothing, write 'None.' explicitly — never silently omit a section.
 
 - **Original goal (verbatim):** The user's initial task request, quoted as close to verbatim as practical
 - **Session intent:** What we're working on now and why (1-2 sentences)
@@ -414,6 +406,7 @@ pub fn build_compaction_prompt(
     // must shrink: the oldest raw messages are the part already (partially)
     // covered by the previous summary, while the newest ones exist nowhere
     // else — dropping them would lose the freshest context permanently.
+    let has_existing = existing_summary.is_some();
     let summary_prefix = existing_summary
         .map(|summary| {
             format!(
@@ -422,18 +415,14 @@ pub fn build_compaction_prompt(
             )
         })
         .unwrap_or_default();
-    // Anchored iterative merge: with an existing summary, instruct the model
-    // to UPDATE it (append-only for durable sections) instead of regenerating
-    // from scratch — regeneration causes compaction-chain degradation where
-    // details drift and disappear across cycles.
-    let instruction_prompt = if existing_summary.is_some() {
+    let messages_text = build_compaction_conversation_text(messages, None);
+    let marker = "... [oldest messages truncated to fit context window]\n\n";
+    let prompt_template = if has_existing {
         SUMMARY_MERGE_PROMPT
     } else {
         SUMMARY_PROMPT
     };
-    let messages_text = build_compaction_conversation_text(messages, None);
-    let marker = "... [oldest messages truncated to fit context window]\n\n";
-    let overhead = instruction_prompt.len() + summary_prefix.len() + marker.len() + 50;
+    let overhead = prompt_template.len() + summary_prefix.len() + marker.len() + 50;
     let conversation_text = if messages_text.len() + overhead > max_prompt_chars
         && max_prompt_chars > overhead
     {
@@ -446,7 +435,7 @@ pub fn build_compaction_prompt(
     } else {
         format!("{}{}", summary_prefix, messages_text)
     };
-    format!("{}\n\n---\n\n{}", conversation_text, instruction_prompt)
+    format!("{}\n\n---\n\n{}", conversation_text, prompt_template)
 }
 
 pub fn build_compaction_conversation_text(
@@ -1079,7 +1068,75 @@ mod tests {
         assert!(prompt.contains("## Previous Summary"));
         assert!(prompt.contains("prior work"));
         assert!(prompt.contains("**User:**"));
-        assert!(prompt.contains(SUMMARY_PROMPT));
+        assert!(prompt.contains(SUMMARY_MERGE_PROMPT));
+    }
+
+    #[test]
+    fn emergency_truncation_shrinks_oversized_tool_use_input() {
+        let mut messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "write".to_string(),
+                input: serde_json::json!({"path": "a.txt", "content": "z".repeat(50_000)}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+        let truncated = emergency_truncate_large_payloads(&mut messages, 10_000, 10_000);
+        assert_eq!(truncated, 1);
+        let ContentBlock::ToolUse { input, .. } = &messages[0].content[0] else {
+            panic!("tool use block replaced unexpectedly");
+        };
+        assert!(input.to_string().len() < 15_000, "input actually shrank");
+        assert_eq!(input["_emergency_truncated"], true);
+    }
+
+    #[test]
+    fn oversized_compaction_prompt_keeps_newest_messages_and_summary() {
+        let summary = Summary {
+            text: "prior work".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 1,
+            original_turn_count: 1,
+        };
+        let messages = vec![
+            Message::user(&format!("OLDEST-MARKER {}", "x".repeat(4000))),
+            Message::user(&format!("{} NEWEST-MARKER", "y".repeat(4000))),
+        ];
+        let max = SUMMARY_MERGE_PROMPT.len() + 3000;
+        let prompt = build_compaction_prompt(&messages, Some(&summary), max);
+        assert!(prompt.contains("## Previous Summary"), "summary block kept");
+        assert!(prompt.contains("prior work"), "summary text kept");
+        assert!(prompt.contains("NEWEST-MARKER"), "newest content kept");
+        assert!(!prompt.contains("OLDEST-MARKER"), "oldest content dropped");
+        assert!(prompt.contains("truncated to fit context window"));
+    }
+
+    #[test]
+    fn failed_tool_result_payload_excluded_from_summary() {
+        let messages = vec![Message::tool_result(
+            "t1",
+            "ERROR: secret-stacktrace-payload at line 42",
+            true,
+        )];
+        let text = build_compaction_conversation_text(&messages, None);
+        assert!(
+            !text.contains("secret-stacktrace-payload"),
+            "failed-result payload must not enter summary input"
+        );
+        assert!(
+            text.contains("[tool failed]"),
+            "a failure marker must remain so the summary knows an attempt happened"
+        );
+    }
+
+    #[test]
+    fn successful_tool_result_payload_kept() {
+        let messages = vec![Message::tool_result("t2", "build succeeded: ok-payload", false)];
+        let text = build_compaction_conversation_text(&messages, None);
+        assert!(text.contains("ok-payload"), "successful result must be kept");
     }
 
     #[test]
@@ -1514,6 +1571,61 @@ mod tests {
         assert!(tool_result_text(&messages[2]).starts_with("bbb"));
         // Idempotent: second pass clears nothing new.
         assert_eq!(clear_tool_results_up_to(&mut messages, 2), 0);
+    }
+
+    #[test]
+    fn builds_compaction_merge_prompt_when_existing_summary() {
+        let summary = Summary {
+            text: "prior work".to_string(),
+            openai_encrypted_content: None,
+            covers_up_to_turn: 5,
+            original_turn_count: 5,
+        };
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "new work".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        };
+        let prompt = build_compaction_prompt(&[message], Some(&summary), 10_000);
+        assert!(
+            prompt.contains(SUMMARY_MERGE_PROMPT),
+            "merge prompt should be used when existing summary exists"
+        );
+        assert!(
+            !prompt.contains(SUMMARY_PROMPT),
+            "fresh prompt should NOT be used when existing summary exists"
+        );
+        assert!(prompt.contains("## Previous Summary"));
+        assert!(prompt.contains("prior work"));
+        assert!(prompt.contains("## New Conversation"));
+        assert!(prompt.contains("new work"));
+    }
+
+    #[test]
+    fn builds_compaction_fresh_prompt_when_no_existing_summary() {
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "new work".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        };
+        let prompt = build_compaction_prompt(&[message], None, 10_000);
+        assert!(
+            prompt.contains(SUMMARY_PROMPT),
+            "fresh prompt should be used when no existing summary"
+        );
+        assert!(
+            !prompt.contains(SUMMARY_MERGE_PROMPT),
+            "merge prompt should NOT be used when no existing summary"
+        );
+        assert!(!prompt.contains("## Previous Summary"));
     }
 
     include!("probe_eval_tests.rs");
