@@ -31,7 +31,7 @@ pub use jcode_compaction_core::{
     CompactionStats, DEFAULT_TOKEN_BUDGET, EMBED_MAX_CHARS_PER_MSG, EMBEDDING_HISTORY_WINDOW,
     EMERGENCY_IMAGE_MAX_CHARS, EMERGENCY_TOOL_RESULT_MAX_CHARS, MANUAL_COMPACT_MIN_THRESHOLD,
     MIN_TURNS_TO_KEEP, PAYLOAD_IMAGE_CHAR_BUDGET, RECENT_TURNS_TO_KEEP,
-    SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_PROMPT, SYSTEM_OVERHEAD_TOKENS, Summary,
+    SEMANTIC_EMBED_CACHE_CAPACITY, SUMMARY_MERGE_PROMPT, SUMMARY_PROMPT, SYSTEM_OVERHEAD_TOKENS, Summary,
     TOKEN_HISTORY_WINDOW, build_compaction_prompt, build_emergency_summary_text,
     compacted_summary_text_block, content_char_count, effective_context_tokens_from_usage,
     emergency_strip_large_images, emergency_truncate_large_payloads, estimate_compaction_tokens,

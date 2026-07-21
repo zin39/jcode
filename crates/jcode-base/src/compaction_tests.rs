@@ -1504,3 +1504,94 @@ async fn env_kill_switch_disables_stage1() {
         "watermark must not advance while stage-1 is disabled"
     );
 }
+
+#[tokio::test]
+async fn test_two_cycle_compaction() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+    let provider: Arc<dyn Provider> = Arc::new(MockSummaryProvider);
+
+    // ── Cycle 1: create ~30 messages and force-compact ──────────────
+    let mut messages = Vec::new();
+    for i in 0..30 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("Turn {} {}", i, "x".repeat(120)),
+        ));
+        manager.notify_message_added();
+    }
+
+    manager
+        .force_compact_with(&messages, provider.clone())
+        .expect("first force_compact should start");
+
+    // Poll until the first compaction completes
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        manager.check_and_apply_compaction();
+        if manager.stats().has_summary {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        manager.active_summary.is_some(),
+        "cycle 1: active_summary should be set"
+    );
+    let compacted_after_first = manager.compacted_count;
+    assert!(
+        compacted_after_first > 0,
+        "cycle 1: compacted_count should be > 0, got {}",
+        compacted_after_first,
+    );
+
+    // ── Cycle 2: add ~15 more messages and force-compact again ──────
+    for i in 30..45 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("Turn {} {}", i, "y".repeat(120)),
+        ));
+        manager.notify_message_added();
+    }
+
+    manager
+        .force_compact_with(&messages, provider.clone())
+        .expect("second force_compact should start");
+
+    // Poll until the second compaction completes
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        manager.check_and_apply_compaction();
+        if manager.compacted_count > compacted_after_first {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        manager.active_summary.is_some(),
+        "cycle 2: active_summary should still be set"
+    );
+    assert!(
+        manager.compacted_count > compacted_after_first,
+        "cycle 2: compacted_count should have increased beyond {} (got {})",
+        compacted_after_first,
+        manager.compacted_count,
+    );
+
+    // The final API view should still have a summary + recent messages
+    let api_msgs = manager.messages_for_api_with(&messages);
+    assert!(
+        api_msgs.len() < messages.len(),
+        "after two cycles, API messages should be fewer than total"
+    );
+    match &api_msgs[0].content[0] {
+        ContentBlock::Text { text, .. } => {
+            assert!(
+                text.contains("Previous Conversation Summary"),
+                "first message should be the merged summary"
+            );
+        }
+        _ => panic!("expected text summary block after two compaction cycles"),
+    }
+}
