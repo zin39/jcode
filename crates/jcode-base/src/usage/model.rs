@@ -1,6 +1,10 @@
 use super::display::{format_reset_time, usage_reset_passed};
-use super::{CACHE_DURATION, ERROR_BACKOFF, RATE_LIMIT_BACKOFF};
+use super::{
+    CACHE_DURATION, CONSECUTIVE_ANTHROPIC_FAILURES, CONSECUTIVE_OPENAI_FAILURES,
+    usage_poller_backoff,
+};
 use serde::Deserialize;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub(super) fn mask_email(email: &str) -> String {
@@ -78,10 +82,9 @@ impl UsageData {
 
         match self.fetched_at {
             Some(t) => {
-                let ttl = if self.is_rate_limited() {
-                    RATE_LIMIT_BACKOFF
-                } else if self.last_error.is_some() {
-                    ERROR_BACKOFF
+                let ttl = if self.last_error.is_some() {
+                    let failures = CONSECUTIVE_ANTHROPIC_FAILURES.load(Ordering::Relaxed);
+                    usage_poller_backoff(failures)
                 } else {
                     CACHE_DURATION
                 };
@@ -89,14 +92,6 @@ impl UsageData {
             }
             None => true,
         }
-    }
-
-    /// Check if the last error was a rate limit (429)
-    fn is_rate_limited(&self) -> bool {
-        self.last_error
-            .as_ref()
-            .map(|e| e.contains("429") || e.contains("rate limit") || e.contains("Rate limited"))
-            .unwrap_or(false)
     }
 
     /// Format five-hour usage as percentage string
@@ -217,10 +212,9 @@ impl OpenAIUsageData {
 
         match self.fetched_at {
             Some(t) => {
-                let ttl = if self.is_rate_limited() {
-                    RATE_LIMIT_BACKOFF
-                } else if self.last_error.is_some() {
-                    ERROR_BACKOFF
+                let ttl = if self.last_error.is_some() {
+                    let failures = CONSECUTIVE_OPENAI_FAILURES.load(Ordering::Relaxed);
+                    usage_poller_backoff(failures)
                 } else {
                     CACHE_DURATION
                 };
@@ -228,13 +222,6 @@ impl OpenAIUsageData {
             }
             None => true,
         }
-    }
-
-    fn is_rate_limited(&self) -> bool {
-        self.last_error
-            .as_ref()
-            .map(|e| e.contains("429") || e.contains("rate limit") || e.contains("Rate limited"))
-            .unwrap_or(false)
     }
 
     pub fn has_limits(&self) -> bool {

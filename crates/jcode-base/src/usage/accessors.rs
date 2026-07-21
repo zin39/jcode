@@ -36,16 +36,23 @@ async fn fetch_usage() -> Result<UsageData> {
 async fn refresh_usage(usage: Arc<RwLock<UsageData>>) {
     match fetch_usage().await {
         Ok(new_data) => {
+            super::CONSECUTIVE_ANTHROPIC_FAILURES.store(0, Ordering::SeqCst);
             *usage.write().await = new_data;
         }
         Err(e) => {
+            let consecutive =
+                super::CONSECUTIVE_ANTHROPIC_FAILURES.fetch_add(1, Ordering::SeqCst) + 1;
             let err_msg = e.to_string();
             let mut data = usage.write().await;
-            let is_new_error = data.last_error.as_deref() != Some(&err_msg);
             data.last_error = Some(err_msg.clone());
             data.fetched_at = Some(Instant::now());
-            if is_new_error {
+            if consecutive == 1 {
                 crate::logging::error(&format!("Usage fetch error: {}", err_msg));
+            } else {
+                crate::logging::warn(&format!(
+                    "Usage fetch error (attempt {}): {}",
+                    consecutive, err_msg
+                ));
             }
         }
     }
@@ -106,6 +113,11 @@ async fn fetch_openai_usage_data() -> OpenAIUsageData {
 
 async fn refresh_openai_usage(usage: Arc<RwLock<OpenAIUsageData>>) {
     let new_data = fetch_openai_usage_data().await;
+    if new_data.last_error.is_some() {
+        super::CONSECUTIVE_OPENAI_FAILURES.fetch_add(1, Ordering::SeqCst);
+    } else {
+        super::CONSECUTIVE_OPENAI_FAILURES.store(0, Ordering::SeqCst);
+    }
     *usage.write().await = new_data;
 }
 
