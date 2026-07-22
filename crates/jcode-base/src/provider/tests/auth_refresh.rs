@@ -726,3 +726,85 @@ fn test_on_auth_changed_hot_initializes_cursor_and_marks_routes_available() {
         })
     });
 }
+
+#[derive(Clone)]
+struct RestoreMockProvider {
+    accepted_models: Vec<String>,
+    default_model: String,
+    selected_model: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for RestoreMockProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unimplemented!("RestoreMockProvider")
+    }
+
+    fn name(&self) -> &str {
+        "restore-mock"
+    }
+
+    fn model(&self) -> String {
+        self.selected_model
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.default_model.clone())
+    }
+
+    fn set_model(&self, model: &str) -> Result<()> {
+        if self.accepted_models.iter().any(|m| m == model) {
+            *self.selected_model.lock().unwrap() = Some(model.to_string());
+            Ok(())
+        } else {
+            anyhow::bail!("model '{}' not available", model)
+        }
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+#[test]
+fn test_restore_session_model_falls_back_to_bare_model_when_route_is_stale() {
+    let provider = RestoreMockProvider {
+        accepted_models: vec!["gpt-5.4".to_string()],
+        default_model: "gpt-5.4".to_string(),
+        selected_model: Arc::new(std::sync::Mutex::new(None)),
+    };
+
+    // The routed request uses "openai:gpt-5.4" which should fail,
+    // then it should fall back to bare "gpt-5.4" which succeeds.
+    let restored = restore_session_model_best_effort(
+        &provider,
+        "gpt-5.4",
+        "openai:gpt-5.4",
+    );
+    assert_eq!(restored, "gpt-5.4");
+    assert_eq!(provider.model(), "gpt-5.4");
+}
+
+#[test]
+fn test_restore_session_model_keeps_default_when_model_unavailable() {
+    let provider = RestoreMockProvider {
+        accepted_models: vec!["gpt-5.4".to_string()],
+        default_model: "gpt-5.4".to_string(),
+        selected_model: Arc::new(std::sync::Mutex::new(None)),
+    };
+
+    // Neither the routed request nor the bare model should succeed.
+    let restored = restore_session_model_best_effort(
+        &provider,
+        "gpt-99.99",
+        "openai:gpt-99.99",
+    );
+    assert_eq!(restored, "gpt-5.4", "should keep the provider's default model");
+    assert_eq!(provider.model(), "gpt-5.4");
+}
