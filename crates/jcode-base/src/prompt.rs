@@ -607,10 +607,11 @@ pub fn build_system_prompt_split_with_capabilities(
     }
 
     // Add sponsored discovery categories (static; on by default, opt-out)
-    if let Some(section) = crate::sponsors::build_discovery_prompt_section() {
-        info.sponsored_discovery_chars = section.len();
-        static_parts.push(section);
-    }
+    // TODO: implement build_discovery_prompt_section in sponsors module
+    // if let Some(section) = crate::sponsors::build_discovery_prompt_section() {
+    //     info.sponsored_discovery_chars = section.len();
+    //     static_parts.push(section);
+    // }
 
     // Add available skills list (progressive disclosure, 4000-char budget)
     if !available_skills.is_empty() {
