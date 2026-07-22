@@ -281,6 +281,42 @@ fn configured_standard_openrouter_profile_routes() -> Vec<ModelRoute> {
         .collect()
 }
 
+pub fn restore_session_model_best_effort(
+    provider: &dyn Provider,
+    model: &str,
+    model_request: &str,
+) -> String {
+    let routed_err = match set_model_with_auth_refresh(provider, model_request) {
+        Ok(()) => return provider.model(),
+        Err(err) => err,
+    };
+    if model_request != model
+        && set_model_with_auth_refresh(provider, model).is_ok()
+    {
+        return provider.model();
+    }
+
+    // One-time warn per (model, route): repeated resumes of stale sessions
+    // must not flood the log with errors.
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let key = format!("{model_request}|{model}");
+    let should_warn = WARNED
+        .lock()
+        .map(|mut guard| guard.get_or_insert_with(Default::default).insert(key))
+        .unwrap_or(true);
+    if should_warn {
+        crate::logging::warn(&format!(
+            "Could not restore session model '{}' via '{}' ({}); keeping default model '{}'",
+            model,
+            model_request,
+            routed_err,
+            provider.model()
+        ));
+    }
+    provider.model()
+}
+
 pub fn set_model_with_auth_refresh(provider: &dyn Provider, model: &str) -> Result<()> {
     match provider.set_model(model) {
         Ok(()) => Ok(()),
