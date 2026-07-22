@@ -203,6 +203,53 @@ pub struct SkillInfo {
     pub description: String,
 }
 
+/// Build the "Available Skills" section with progressive disclosure.
+///
+/// Each description is truncated to its first sentence (capped at 80 chars).
+/// When the total section exceeds `max_chars`, remaining skills are listed as
+/// names only to stay within budget.
+fn build_skills_section(available_skills: &[SkillInfo], max_chars: usize) -> String {
+    const DESC_CAP: usize = 80;
+    let header = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n";
+    let footer = "\n\nWhen a user asks about available skills or capabilities, mention these skills.";
+    
+    let mut section = String::from(header);
+    let mut overflow_names: Vec<&str> = Vec::new();
+    
+    for skill in available_skills {
+        // Truncate to first sentence, capped at DESC_CAP chars
+        let desc = skill.description
+            .split(|c| c == '.' || c == '!' || c == '?')
+            .next()
+            .unwrap_or(&skill.description);
+        let desc = if desc.len() > DESC_CAP {
+            // Truncate on char boundary to avoid panicking on multi-byte UTF-8.
+            let end = desc.floor_char_boundary(DESC_CAP);
+            &desc[..end]
+        } else {
+            desc
+        };
+        
+        let line = format!("\n- `/{} ` - {}", skill.name, desc);
+        
+        // Check if adding this line would exceed budget (accounting for footer)
+        if section.len() + line.len() + footer.len() > max_chars {
+            overflow_names.push(&skill.name);
+        } else {
+            section.push_str(&line);
+        }
+    }
+    
+    // If we have overflow, add them as names-only line
+    if !overflow_names.is_empty() {
+        let names_line = format!("\n\nMore skills (names only): {}", overflow_names.join(", "));
+        section.push_str(&names_line);
+    }
+    
+    section.push_str(footer);
+    section
+}
+
 /// Information about what's loaded in the context window
 #[derive(Debug, Clone, Default)]
 pub struct ContextInfo {
@@ -424,15 +471,9 @@ pub fn build_system_prompt_full_with_capabilities(
         parts.push(memory.to_string());
     }
 
-    // Add available skills list
+    // Add available skills list (progressive disclosure, 4000-char budget)
     if !available_skills.is_empty() {
-        let mut skills_section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
-        for skill in available_skills {
-            skills_section.push_str(&format!("\n- `/{} ` - {}", skill.name, skill.description));
-        }
-        skills_section.push_str(
-            "\n\nWhen a user asks about available skills or capabilities, mention these skills.",
-        );
+        let skills_section = build_skills_section(available_skills, 4000);
         info.skills_chars = skills_section.len();
         parts.push(skills_section);
     }
@@ -517,15 +558,19 @@ pub fn build_system_prompt_split_with_capabilities(
         static_parts.push(content);
     }
 
+<<<<<<< HEAD
     // Add available skills list (fairly static)
+=======
+    // Add sponsored discovery categories (static; on by default, opt-out)
+    if let Some(section) = crate::sponsors::build_discovery_prompt_section() {
+        info.sponsored_discovery_chars = section.len();
+        static_parts.push(section);
+    }
+
+    // Add available skills list (progressive disclosure, 4000-char budget)
+>>>>>>> 0df559cb (feat(prompt): progressive disclosure for skills list with 4K char budget)
     if !available_skills.is_empty() {
-        let mut skills_section = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n".to_string();
-        for skill in available_skills {
-            skills_section.push_str(&format!("\n- `/{} ` - {}", skill.name, skill.description));
-        }
-        skills_section.push_str(
-            "\n\nWhen a user asks about available skills or capabilities, mention these skills.",
-        );
+        let skills_section = build_skills_section(available_skills, 4000);
         info.skills_chars = skills_section.len();
         static_parts.push(skills_section);
     }

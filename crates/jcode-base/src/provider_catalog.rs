@@ -666,7 +666,12 @@ pub fn apply_named_provider_profile_env_from_config(
     crate::env::remove_var("JCODE_PROVIDER_PROFILE_NAME");
     crate::env::remove_var("JCODE_NAMED_PROVIDER_PROFILE");
     apply_openai_compatible_profile_env(None);
+    // Mirror key env vars into the JCODE_OPENAI_COMPAT_* family so that
+    // `resolve_openai_compatible_profile` for the generic openai-compatible
+    // profile picks up the named profile's base URL, key env, env file, and
+    // default model.
     crate::env::set_var("JCODE_OPENROUTER_API_BASE", &api_base);
+    crate::env::set_var("JCODE_OPENAI_COMPAT_API_BASE", &api_base);
     crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", profile_name);
     crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", profile_name);
     let provider_is_openrouter = matches!(
@@ -701,6 +706,7 @@ pub fn apply_named_provider_profile_env_from_config(
         .filter(|v| !v.is_empty())
     {
         crate::env::set_var("JCODE_OPENROUTER_MODEL", model);
+        crate::env::set_var("JCODE_OPENAI_COMPAT_DEFAULT_MODEL", model);
     }
 
     let static_models = profile
@@ -746,6 +752,7 @@ pub fn apply_named_provider_profile_env_from_config(
                     );
                 }
                 crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", &key_env);
+                crate::env::set_var("JCODE_OPENAI_COMPAT_API_KEY_NAME", &key_env);
             }
 
             if let Some(env_file) = profile
@@ -762,6 +769,7 @@ pub fn apply_named_provider_profile_env_from_config(
                     );
                 }
                 crate::env::set_var("JCODE_OPENROUTER_ENV_FILE", env_file);
+                crate::env::set_var("JCODE_OPENAI_COMPAT_ENV_FILE", env_file);
             }
 
             let requires_key = profile
