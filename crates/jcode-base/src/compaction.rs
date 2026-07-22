@@ -1296,7 +1296,7 @@ impl CompactionManager {
 
         let active = self.active_messages(all_messages);
 
-        match &self.active_summary {
+        let mut result = match &self.active_summary {
             Some(summary) => {
                 let summary_block = summary
                     .openai_encrypted_content
@@ -1309,9 +1309,9 @@ impl CompactionManager {
                         cache_control: None,
                     });
 
-                let mut result = Vec::with_capacity(active.len() + 1);
+                let mut out = Vec::with_capacity(active.len() + 1);
 
-                result.push(Message {
+                out.push(Message {
                     role: Role::User,
                     content: vec![summary_block],
                     timestamp: None,
@@ -1319,12 +1319,12 @@ impl CompactionManager {
                 });
 
                 // Clone only the active (non-compacted) messages
-                result.extend(active.iter().cloned());
+                out.extend(active.iter().cloned());
 
-                result
+                out
             }
             None => active.to_vec(),
-        }
+        };
 
         // Deterministic, always-on view-time cleanup (zero LLM cost, applied
         // to this cloned view only so stored history is untouched):
@@ -1333,6 +1333,8 @@ impl CompactionManager {
         // - error results superseded by a later success of the same tool are
         //   dropped. Both skip the recent-turns tail and typically cut
         //   context 15-30% before any summarization is needed.
+        // Skip the summary prefix (index 0 when a summary is present).
+        let offset = if self.active_summary.is_some() { 1 } else { 0 };
         if result.len() > offset {
             jcode_compaction_core::dedup_repeated_tool_reads(&mut result[offset..]);
             jcode_compaction_core::purge_resolved_error_results(&mut result[offset..]);
