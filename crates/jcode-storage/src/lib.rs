@@ -855,6 +855,9 @@ mod env_file_tests {
             std::fs::read_to_string(&path).expect("unchanged env"),
             "SAFE_KEY=safe-value\n"
         );
+    }
+}
+
 #[cfg(test)]
 mod migrate_stray_env_tests {
     use super::migrate_stray_env_files_between;
