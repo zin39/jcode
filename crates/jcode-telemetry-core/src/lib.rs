@@ -17,10 +17,10 @@ use lifecycle::emit_lifecycle_event;
 use serde_json::Value;
 use state_support::*;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const TELEMETRY_ENDPOINT: &str = "https://telemetry.jcode.sh/v1/event";
 const ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,6 +30,83 @@ const BLOCKING_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(800);
 const TELEMETRY_SCHEMA_VERSION: u32 = 6;
 const DEFAULT_DISCOVERY_ENDPOINT: &str = "https://api.jcode.sh/v1/discovery";
 static TELEMETRY_PERMANENTLY_REJECTED: AtomicBool = AtomicBool::new(false);
+
+// Circuit breaker: after 5 consecutive rejections, persist to disk for 1 hour
+static TELEMETRY_CONSECUTIVE_REJECTIONS: AtomicU32 = AtomicU32::new(0);
+const BREAKER_OPEN_DURATION: Duration = Duration::from_secs(60 * 60);
+
+fn breaker_state_path() -> Option<std::path::PathBuf> {
+    storage::jcode_dir()
+        .ok()
+        .map(|d| d.join("telemetry_breaker_open"))
+}
+
+fn breaker_open_on_disk() -> bool {
+    let Some(path) = breaker_state_path() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let tripped_at = contents.trim().parse::<u64>().unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(tripped_at) < BREAKER_OPEN_DURATION.as_secs() {
+        true
+    } else {
+        // Stale trip: allow a retry and clear the marker.
+        let _ = std::fs::remove_file(&path);
+        false
+    }
+}
+
+fn persist_breaker_trip() {
+    if let Some(path) = breaker_state_path() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, now.to_string());
+    }
+}
+
+fn clear_persisted_breaker_trip() {
+    if let Some(path) = breaker_state_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn note_endpoint_rejection() {
+    let count = TELEMETRY_CONSECUTIVE_REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count >= 5 {
+        TELEMETRY_PERMANENTLY_REJECTED.store(true, Ordering::Relaxed);
+        persist_breaker_trip();
+        logging::info(
+            "telemetry disabled: 5 consecutive endpoint rejections (breaker persisted for 1h)",
+        );
+    }
+}
+
+fn note_endpoint_success() {
+    TELEMETRY_CONSECUTIVE_REJECTIONS.store(0, Ordering::Relaxed);
+    clear_persisted_breaker_trip();
+}
+
+/// Returns the telemetry endpoint, preferring the `JCODE_TELEMETRY_ENDPOINT`
+/// env var (read once, lazily) over the compiled-in default.
+fn telemetry_endpoint() -> &'static str {
+    static OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| std::env::var("JCODE_TELEMETRY_ENDPOINT").ok());
+    match OVERRIDE.get().unwrap() {
+        Some(v) => v.as_str(),
+        None => TELEMETRY_ENDPOINT,
+    }
+}
 static TELEMETRY_QUEUE_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
 static TELEMETRY_BACKGROUND_SENDER: OnceLock<SyncSender<Value>> = OnceLock::new();
 static TELEMETRY_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
@@ -982,6 +1059,12 @@ fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
     if TELEMETRY_PERMANENTLY_REJECTED.load(Ordering::Relaxed) {
         return false;
     }
+    // Check if breaker is tripped on disk from a previous process
+    if breaker_open_on_disk() {
+        TELEMETRY_PERMANENTLY_REJECTED.store(true, Ordering::Relaxed);
+        return false;
+    }
+    
     let client = TELEMETRY_HTTP_CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .user_agent(jcode_provider_core::JCODE_USER_AGENT)
@@ -989,16 +1072,19 @@ fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
             .expect("telemetry HTTP client should build")
     });
     match client
-        .post(TELEMETRY_ENDPOINT)
+        .post(telemetry_endpoint())
         .timeout(timeout)
         .json(&payload)
         .send()
     {
-        Ok(response) if response.status().is_success() => true,
+        Ok(response) if response.status().is_success() => {
+            note_endpoint_success();
+            true
+        }
         Ok(response) => {
             let status = response.status();
             if telemetry_status_is_permanent(status.as_u16()) {
-                TELEMETRY_PERMANENTLY_REJECTED.store(true, Ordering::Relaxed);
+                note_endpoint_rejection();
                 logging::warn(&format!(
                     "telemetry endpoint permanently rejected payload with HTTP {status}; suppressing telemetry delivery for this process"
                 ));
