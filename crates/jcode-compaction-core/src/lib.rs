@@ -464,13 +464,20 @@ pub fn build_compaction_conversation_text(
                 ContentBlock::ToolUse { name, input, .. } => {
                     conversation_text.push_str(&format!("[Tool: {} - {}]\n", name, input));
                 }
-                ContentBlock::ToolResult { content, .. } => {
-                    let truncated = if content.len() > 500 {
-                        format!("{}... (truncated)", truncate_str_boundary(content, 500))
+                ContentBlock::ToolResult { content, is_error, .. } => {
+                    if *is_error == Some(true) {
+                        // Failed tool results carry noisy stack traces that pollute the
+                        // summary. Keep only a marker so the model knows an attempt
+                        // happened but the payload does not leak into the summary.
+                        conversation_text.push_str("[tool failed]\n");
                     } else {
-                        content.clone()
-                    };
-                    conversation_text.push_str(&format!("[Result: {}]\n", truncated));
+                        let truncated = if content.len() > 500 {
+                            format!("{}... (truncated)", truncate_str_boundary(content, 500))
+                        } else {
+                            content.clone()
+                        };
+                        conversation_text.push_str(&format!("[Result: {}]\n", truncated));
+                    }
                 }
                 ContentBlock::Reasoning { .. }
                 | ContentBlock::ReasoningTrace { .. }
@@ -871,6 +878,21 @@ pub fn emergency_truncate_large_payloads(
                         cache_control: None,
                     };
                     truncated += 1;
+                }
+                ContentBlock::ToolUse { input, .. } => {
+                    // Oversized tool INPUTS (e.g. a Write call carrying a huge
+                    // file body) blow the budget just like oversized results.
+                    let serialized = input.to_string();
+                    if serialized.len() > max_tool_result_chars {
+                        let preview =
+                            truncate_str_boundary(&serialized, max_tool_result_chars.min(2000));
+                        *input = serde_json::json!({
+                            "_emergency_truncated": true,
+                            "original_chars": serialized.len(),
+                            "preview": preview,
+                        });
+                        truncated += 1;
+                    }
                 }
                 _ => {}
             }
