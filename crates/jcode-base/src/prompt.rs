@@ -208,42 +208,90 @@ pub struct SkillInfo {
 /// Each description is truncated to its first sentence (capped at 80 chars).
 /// When the total section exceeds `max_chars`, remaining skills are listed as
 /// names only to stay within budget.
-fn build_skills_section(available_skills: &[SkillInfo], max_chars: usize) -> String {
+pub(crate) fn build_skills_section(available_skills: &[SkillInfo], max_chars: usize) -> String {
     const DESC_CAP: usize = 80;
     let header = "# Available Skills\n\nYou have access to the following skills that the user can invoke with `/skillname`:\n";
     let footer = "\n\nWhen a user asks about available skills or capabilities, mention these skills.";
+    let overflow_prefix = "\n\nMore skills (names only): ";
     
     let mut section = String::from(header);
-    let mut overflow_names: Vec<&str> = Vec::new();
     
-    for skill in available_skills {
-        // Truncate to first sentence, capped at DESC_CAP chars
-        let desc = skill.description
-            .split(|c| c == '.' || c == '!' || c == '?')
-            .next()
-            .unwrap_or(&skill.description);
-        let desc = if desc.len() > DESC_CAP {
-            // Truncate on char boundary to avoid panicking on multi-byte UTF-8.
-            let end = desc.floor_char_boundary(DESC_CAP);
-            &desc[..end]
+    // Truncate each skill description to its first sentence, capped at DESC_CAP.
+    let truncated: Vec<&str> = available_skills
+        .iter()
+        .map(|s| {
+            let desc = s.description
+                .split(|c| c == '.' || c == '!' || c == '?')
+                .next()
+                .unwrap_or(&s.description);
+            if desc.len() > DESC_CAP {
+                let end = desc.floor_char_boundary(DESC_CAP);
+                &desc[..end]
+            } else {
+                desc
+            }
+        })
+        .collect();
+    
+    // Precompute names-only overflow line cost (all skill names).
+    let all_names: String = available_skills
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let full_overflow_cost = overflow_prefix.len() + all_names.len() + footer.len();
+    
+    // Greedily add skill lines while they fit (with footer reserved).
+    let mut included = 0usize;
+    for (idx, (skill, desc)) in available_skills.iter().zip(truncated.iter()).enumerate() {
+        let line = format!("\n- `/{} ` - {}", skill.name, desc);
+        let remaining = available_skills.len() - idx - 1;
+        let overflow_cost = if remaining > 0 {
+            // Names of skills AFTER this one
+            let names: String = available_skills[idx + 1..]
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            overflow_prefix.len() + names.len() + footer.len()
         } else {
-            desc
+            footer.len()
         };
         
-        let line = format!("\n- `/{} ` - {}", skill.name, desc);
-        
-        // Check if adding this line would exceed budget (accounting for footer)
-        if section.len() + line.len() + footer.len() > max_chars {
-            overflow_names.push(&skill.name);
-        } else {
-            section.push_str(&line);
+        if section.len() + line.len() + overflow_cost > max_chars {
+            break;
         }
+        section.push_str(&line);
+        included += 1;
     }
     
-    // If we have overflow, add them as names-only line
-    if !overflow_names.is_empty() {
-        let names_line = format!("\n\nMore skills (names only): {}", overflow_names.join(", "));
-        section.push_str(&names_line);
+    // Overflow: skills that didn't fit get listed as names only.
+    if included < available_skills.len() {
+        let overflow_names: Vec<&str> = available_skills[included..]
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let names_str = overflow_names.join(", ");
+        let overflow_line_len = overflow_prefix.len() + names_str.len() + footer.len();
+        
+        if section.len() + overflow_line_len <= max_chars {
+            section.push_str(overflow_prefix);
+            section.push_str(&names_str);
+        } else {
+            // Even names-only overflows budget. Truncate to fit.
+            section.push_str(overflow_prefix);
+            let avail = max_chars.saturating_sub(section.len() + footer.len());
+            let mut len = 0;
+            for (i, name) in overflow_names.iter().enumerate() {
+                let piece = if i == 0 { name.to_string() } else { format!(", {}", name) };
+                if len + piece.len() + 5 > avail { // +5 for ", ..."
+                    section.push_str(", ...");
+                    break;
+                }
+                section.push_str(&piece);
+                len += piece.len();
+            }
+        }
     }
     
     section.push_str(footer);
@@ -558,9 +606,6 @@ pub fn build_system_prompt_split_with_capabilities(
         static_parts.push(content);
     }
 
-<<<<<<< HEAD
-    // Add available skills list (fairly static)
-=======
     // Add sponsored discovery categories (static; on by default, opt-out)
     if let Some(section) = crate::sponsors::build_discovery_prompt_section() {
         info.sponsored_discovery_chars = section.len();
@@ -568,7 +613,6 @@ pub fn build_system_prompt_split_with_capabilities(
     }
 
     // Add available skills list (progressive disclosure, 4000-char budget)
->>>>>>> 0df559cb (feat(prompt): progressive disclosure for skills list with 4K char budget)
     if !available_skills.is_empty() {
         let skills_section = build_skills_section(available_skills, 4000);
         info.skills_chars = skills_section.len();

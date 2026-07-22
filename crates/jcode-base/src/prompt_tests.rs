@@ -418,3 +418,75 @@ fn classify_effort_distinguishes_reasoning_from_swarm_modes() {
     assert!(EffortKind::SwarmDeep.is_swarm_mode());
     assert!(!EffortKind::Reasoning.is_swarm_mode());
 }
+
+#[test]
+fn test_skills_section_truncates_description_to_first_sentence_and_cap() {
+    use crate::prompt::{SkillInfo, build_skills_section};
+
+    let skills = vec![SkillInfo {
+        name: "long-skill".to_string(),
+        description: "This is the first sentence. Then more detail follows which should be dropped. And more.".to_string(),
+    }];
+    let section = build_skills_section(&skills, 4000);
+    assert!(
+        section.contains("- `/long-skill ` - This is the first sentence"),
+        "first sentence must be preserved; got: {section}"
+    );
+    assert!(
+        !section.contains("Then more detail follows"),
+        "later sentences must be stripped"
+    );
+
+    let long = "A".repeat(200);
+    let skills = vec![SkillInfo {
+        name: "capped".to_string(),
+        description: long.clone(),
+    }];
+    let section = build_skills_section(&skills, 4000);
+    let needle = "- `/capped ` - ";
+    let line_start = section.find(needle).unwrap() + needle.len();
+    let desc_len = section[line_start..].lines().next().unwrap().len();
+    assert!(
+        desc_len <= 80,
+        "description must be capped at 80 chars, got {desc_len}"
+    );
+}
+
+#[test]
+fn test_skills_section_honors_total_budget_with_overflow_names_only() {
+    use crate::prompt::{SkillInfo, build_skills_section};
+
+    let skills: Vec<SkillInfo> = (0..143)
+        .map(|i| SkillInfo {
+            name: format!("skill-{i:03}"),
+            description: format!("Short description for skill {i} with some padding text here."),
+        })
+        .collect();
+
+    let section = build_skills_section(&skills, 4000);
+    assert!(
+        section.len() <= 4000,
+        "skills section must be within budget, got {} chars",
+        section.len()
+    );
+    assert!(
+        section.contains("More skills (names only):"),
+        "overflow names-only line must appear when budget is hit; got: {section}"
+    );
+    assert!(section.contains("# Available Skills"), "header must still be present");
+    assert!(section.contains("mention these skills"), "footer must still be present");
+}
+
+#[test]
+fn test_skills_section_handles_multibyte_utf8_without_panic() {
+    use crate::prompt::{SkillInfo, build_skills_section};
+
+    let description = "🚀".repeat(50);
+    let skills = vec![SkillInfo {
+        name: "rocket".to_string(),
+        description,
+    }];
+    let section = build_skills_section(&skills, 4000);
+    assert!(section.contains("rocket"));
+    assert!(section.len() <= 4000);
+}
