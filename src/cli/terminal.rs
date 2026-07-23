@@ -450,18 +450,21 @@ fn cleanup_tui_runtime(state: &TuiRuntimeState, restore_terminal: bool) {
     }
 
     if restore_terminal {
+        // Emit the mode-disable escapes UNCONDITIONALLY, not gated on the
+        // tracked `state.*` flags. If enable/disable state ever drifts (e.g. a
+        // client/server split where one process enabled mouse capture and a
+        // differently-initialized cleanup runs), gating on stale state leaves
+        // mouse tracking on and the shell fills with `<35;47;34M` reports after
+        // exit. All of these are idempotent DEC-mode resets, so disabling a
+        // mode that was never set is a harmless no-op.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-        if state.focus_change {
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
+        if let Err(error) = sync_windows_vt_mouse_capture(false) {
+            crate::logging::warn(&format!(
+                "failed to disable Windows VT mouse capture: {error}"
+            ));
         }
-        if state.mouse_capture {
-            if let Err(error) = sync_windows_vt_mouse_capture(false) {
-                crate::logging::warn(&format!(
-                    "failed to disable Windows VT mouse capture: {error}"
-                ));
-            }
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
-        }
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         if state.keyboard_enhanced {
             tui::disable_keyboard_enhancement();
         }
