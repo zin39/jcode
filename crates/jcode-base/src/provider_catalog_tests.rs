@@ -196,8 +196,13 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
 #[test]
 fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_international_default() {
     let _lock = crate::storage::lock_test_env();
-    let _guard = EnvGuard::save(&["OPENAI_API_KEY"]);
+    let _guard = EnvGuard::save(&["OPENAI_API_KEY", "JCODE_HOME"]);
     crate::env::remove_var("OPENAI_API_KEY");
+    // Isolate from the developer's real config dir: a genuine minimax.env
+    // holding an sk-cp- (China plan) key would flip the "international
+    // default" half of this test through the config-file fallback.
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    crate::env::set_var("JCODE_HOME", temp_home.path().to_string_lossy().to_string());
 
     let international = resolve_openai_compatible_profile(MINIMAX_PROFILE);
     assert_eq!(international.api_base, "https://api.minimax.io/v1");
