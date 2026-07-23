@@ -668,6 +668,27 @@ fn append_batch_progress_spans(
 }
 
 pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pending_count: usize) {
+    let line = build_status_line(app, area.width, pending_count);
+
+    crate::memory::check_staleness();
+
+    if app.centered_mode() {
+        frame.render_widget(Paragraph::new(line.alignment(Alignment::Center)), area);
+        return;
+    }
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Build the status-line content without rendering it. Split out of
+/// `draw_status` so the run loop can patch ONLY the status row into the
+/// previous frame during tool execution (the RunningTool animation), instead
+/// of triggering a full-transcript redraw every animation tick. See
+/// `StatusSpinnerRenderer::draw_status_line_only`.
+pub(super) fn build_status_line(
+    app: &dyn TuiState,
+    area_width: u16,
+    pending_count: usize,
+) -> Line<'static> {
     let elapsed = app.elapsed().map(|d| d.as_secs_f32()).unwrap_or(0.0);
     let stale_secs = app.time_since_activity().map(|d| d.as_secs_f32());
     let (cache_read, cache_creation) = app.streaming_cache_tokens();
@@ -961,7 +982,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
             total,
             app.session_compaction_count(),
             app.context_limit(),
-            area.width as usize,
+            area_width as usize,
             app.animation_elapsed() as u64,
         ) {
             let severe_token_threshold = app
@@ -980,7 +1001,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                 Span::styled(warning, Style::default().fg(warning_color)),
             ])
         } else if let Some(tip) =
-            occasional_status_tip(area.width as usize, app.animation_elapsed() as u64)
+            occasional_status_tip(area_width as usize, app.animation_elapsed() as u64)
         {
             Line::from(vec![Span::styled(tip, Style::default().fg(dim_color()))])
         } else {
@@ -988,7 +1009,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
         }
     } else {
         if let Some(tip) =
-            occasional_status_tip(area.width as usize, app.animation_elapsed() as u64)
+            occasional_status_tip(area_width as usize, app.animation_elapsed() as u64)
         {
             Line::from(vec![Span::styled(tip, Style::default().fg(dim_color()))])
         } else {
@@ -999,10 +1020,10 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
     crate::memory::check_staleness();
 
     if app.centered_mode() {
-        frame.render_widget(Paragraph::new(line.alignment(Alignment::Center)), area);
-        return;
+        line.alignment(Alignment::Center)
+    } else {
+        line
     }
-    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Append the "+N queued" suffix span (in the queued accent color) when there

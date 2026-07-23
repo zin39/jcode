@@ -1306,6 +1306,31 @@ pub(crate) fn last_status_area() -> Option<Rect> {
     }
 }
 
+/// Render only the status line into a single row of `buffer` at `area`, reusing
+/// the exact builder `draw_status` uses. Lets the run loop patch the animated
+/// status line (RunningTool bar, countdowns) into the previous frame without a
+/// full-transcript redraw. Returns false when the area is unusable.
+pub(crate) fn patch_status_line_into_buffer(
+    buffer: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    app: &dyn crate::tui::TuiState,
+) -> bool {
+    use ratatui::widgets::Widget;
+    if area.width == 0 || area.height == 0 {
+        return false;
+    }
+    // Clear the status row first so a shorter line doesn't leave stale cells.
+    for x in area.left()..area.right() {
+        if let Some(cell) = buffer.cell_mut((x, area.y)) {
+            cell.reset();
+        }
+    }
+    let pending_count = input_ui::pending_prompt_count(app);
+    let line = input_ui::build_status_line(app, area.width, pending_count);
+    ratatui::widgets::Paragraph::new(line).render(area, buffer);
+    true
+}
+
 use frame_metrics::{
     ChatLayoutMetrics, FLICKER_NOTICE_COPY_KEY, FullPrepPhaseMetrics, ViewportMetrics,
     begin_frame_resource_sample, finalize_frame_metrics, note_body_built, note_body_cache_hit,

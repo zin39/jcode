@@ -92,6 +92,21 @@ pub(super) fn status_spinner_only_symbol(app: &App) -> Option<&'static str> {
     }
 }
 
+/// Whether a redraw currently driven by the animated status line can be served
+/// by the cheap status-line patch instead of a full-transcript redraw. True
+/// only when a tool is running (the bouncing `●··/··●` bar) with no streaming
+/// text and no queued content change: in that state nothing in the transcript
+/// moves, so re-rendering just the status row into the previous frame is
+/// visually identical to a full redraw at a fraction of the cost. Streaming,
+/// scrolling, and centered mode are excluded so real content still full-redraws.
+pub(super) fn status_line_patch_eligible(app: &App) -> bool {
+    app.is_processing
+        && app.streaming.streaming_text.is_empty()
+        && !app.centered_mode()
+        && !app.has_pending_mouse_scroll_animation()
+        && !app.remote_startup_phase_active()
+        && matches!(app.status, crate::tui::ProcessingStatus::RunningTool(_))
+}
 /// Statuses whose full status line starts with the primary green circular spinner.
 ///
 /// Keep this in sync with `ui_input::draw_status`: these statuses can be safely
@@ -252,6 +267,56 @@ impl StatusSpinnerRenderer {
         Ok(())
     }
 
+    /// Patch ONLY the status line into the previous frame and flush, without a
+    /// full-transcript redraw. Used for the RunningTool animation (bouncing bar)
+    /// and rate-limit/build countdowns: those animate several status cells the
+    /// single-cell spinner fast path can't cover, but redrawing the whole TUI
+    /// each animation tick cost 40-60ms and thousands of changed cells (this is
+    /// what drives active-session CPU). Returns false when there is no prior
+    /// frame or known status area, so the caller falls back to a full redraw.
+    pub(super) fn draw_status_line_only(
+        &mut self,
+        app: &App,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<bool> {
+        let Some(previous_frame) = self.last_frame.as_ref() else {
+            return Ok(false);
+        };
+        let Some(status_area) = crate::tui::ui::last_status_area() else {
+            return Ok(false);
+        };
+        // The status area must sit inside the previous frame's bounds (it can
+        // drift after a resize until the next full frame re-anchors it).
+        if !previous_frame.area.intersects(status_area) {
+            return Ok(false);
+        }
+
+        let next_frame = {
+            let current_buffer = terminal.current_buffer_mut();
+            current_buffer.clone_from(previous_frame);
+            if !crate::tui::ui::patch_status_line_into_buffer(current_buffer, status_area, app) {
+                return Ok(false);
+            }
+            current_buffer.clone()
+        };
+
+        crossterm::queue!(
+            terminal.backend_mut(),
+            BeginSynchronizedUpdate,
+            SavePosition
+        )?;
+        terminal.flush()?;
+        crossterm::queue!(
+            terminal.backend_mut(),
+            RestorePosition,
+            EndSynchronizedUpdate
+        )?;
+        terminal.swap_buffers();
+        terminal.backend_mut().flush()?;
+        self.last_frame = Some(next_frame);
+        Ok(true)
+    }
+
     pub(super) fn draw_status_spinner_only(
         &mut self,
         app: &App,
@@ -384,8 +449,18 @@ impl App {
             } else {
                 // Wait for input or redraw tick
                 tokio::select! {
-                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(&self) => {
-                        if !status_spinner_renderer.draw_status_spinner_only(&self, &mut terminal)? {
+                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(&self) || status_line_patch_eligible(&self) => {
+                        // Prefer the single-cell spinner patch; if unavailable
+                        // (e.g. a tool is running, which animates several status
+                        // cells) fall back to the status-LINE patch before ever
+                        // resorting to a full-transcript redraw. Only if BOTH
+                        // cheap patches decline do we request a full redraw.
+                        let patched = if status_spinner_renderer.spinner_only_available(&self) {
+                            status_spinner_renderer.draw_status_spinner_only(&self, &mut terminal)?
+                        } else {
+                            status_spinner_renderer.draw_status_line_only(&self, &mut terminal)?
+                        };
+                        if !patched {
                             needs_redraw = true;
                         }
                     }
@@ -582,8 +657,18 @@ impl App {
                 }
 
                 tokio::select! {
-                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(&self) => {
-                        if !status_spinner_renderer.draw_status_spinner_only(&self, &mut terminal)? {
+                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(&self) || status_line_patch_eligible(&self) => {
+                        // Prefer the single-cell spinner patch; if unavailable
+                        // (e.g. a tool is running, which animates several status
+                        // cells) fall back to the status-LINE patch before ever
+                        // resorting to a full-transcript redraw. Only if BOTH
+                        // cheap patches decline do we request a full redraw.
+                        let patched = if status_spinner_renderer.spinner_only_available(&self) {
+                            status_spinner_renderer.draw_status_spinner_only(&self, &mut terminal)?
+                        } else {
+                            status_spinner_renderer.draw_status_line_only(&self, &mut terminal)?
+                        };
+                        if !patched {
                             needs_redraw = true;
                         }
                     }

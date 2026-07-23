@@ -1485,12 +1485,13 @@ fn full_frame_status_animation_active_with_policy(
         return false;
     }
 
-    // These animations are rendered as part of the full status line, not by the
-    // spinner-only cell renderer in app/run_shell.rs, so they need the normal
-    // active redraw loop while visible.
-    matches!(state.status(), ProcessingStatus::RunningTool(_))
-        || rate_limit_countdown_redraw_active(state)
-        || crate::build::read_build_progress().is_some()
+    // Rate-limit countdown and build progress animate as part of the full
+    // status line and are rare, so they keep the normal active redraw loop.
+    // RunningTool used to be here too, but its bouncing bar now animates via
+    // the cheap status-LINE patch (run_shell::status_line_patch_eligible +
+    // draw_status_line_only), so it must NOT force a full-transcript redraw
+    // every animation tick -- that was the dominant active-session CPU cost.
+    rate_limit_countdown_redraw_active(state) || crate::build::read_build_progress().is_some()
 }
 
 fn primary_status_spinner_fast_path_available_with_policy(
