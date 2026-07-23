@@ -159,7 +159,14 @@ pub async fn run_tui_client(
         std::process::exit(code);
     }
 
-    execute_requested_action(&run_result)?;
+    if let Err(exec_error) = execute_requested_action(&run_result) {
+        // The guard skipped the terminal restore because an exec was supposed
+        // to replace this process. The exec failed, so the terminal is still
+        // in raw mode / alternate screen with all input modes enabled. Restore
+        // it before propagating the error, or the shell is left garbled.
+        crate::cli::terminal::emergency_terminal_restore();
+        return Err(exec_error);
+    }
 
     if !has_requested_action(&run_result)
         && let Some(ref session_id) = run_result.session_id
