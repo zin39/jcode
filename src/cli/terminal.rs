@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::{id, session, telemetry, tui};
 
@@ -8,6 +9,56 @@ pub struct TuiRuntimeState {
     mouse_capture: bool,
     keyboard_enhanced: bool,
     focus_change: bool,
+}
+
+/// Global emergency-restore state so signal handlers and the panic hook can
+/// fully restore the terminal even when the `TuiRuntimeGuard` is unreachable
+/// (e.g. `process::exit` on a signal path skips all destructors).
+///
+/// Encoding: 0 = TUI not active (nothing to restore), otherwise a bitmask of
+/// `EMERGENCY_ACTIVE | EMERGENCY_KITTY` flags.
+static EMERGENCY_RESTORE_STATE: AtomicU8 = AtomicU8::new(0);
+const EMERGENCY_ACTIVE: u8 = 1;
+const EMERGENCY_KITTY: u8 = 2;
+
+fn set_emergency_restore_state(active: bool, keyboard_enhanced: bool) {
+    let value = if active {
+        EMERGENCY_ACTIVE | if keyboard_enhanced { EMERGENCY_KITTY } else { 0 }
+    } else {
+        0
+    };
+    EMERGENCY_RESTORE_STATE.store(value, Ordering::SeqCst);
+}
+
+/// Best-effort full terminal restore for abnormal exit paths (signals, panics,
+/// failed exec handoffs). Emits every stateful mode disable jcode may have
+/// enabled: kitty keyboard pop, mouse tracking, bracketed paste, focus events,
+/// alternate screen leave, cursor show, then cooked mode. All sequences are
+/// idempotent, so double-restore (e.g. guard Drop after this) is harmless.
+///
+/// Unlike `cleanup_tui_runtime` this never allocates or logs first, so it is
+/// safe to call from a panic hook while the process is in a degraded state.
+pub fn emergency_terminal_restore() {
+    let state = EMERGENCY_RESTORE_STATE.swap(0, Ordering::SeqCst);
+    if state & EMERGENCY_ACTIVE == 0 {
+        return;
+    }
+    let mut sequence: Vec<u8> = Vec::with_capacity(64);
+    if state & EMERGENCY_KITTY != 0 {
+        // Pop the kitty keyboard-enhancement flags pushed at init.
+        sequence.extend_from_slice(b"\x1b[<u");
+    }
+    // Mouse tracking (all variants), bracketed paste, focus events.
+    sequence.extend_from_slice(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    sequence.extend_from_slice(b"\x1b[?2004l\x1b[?1004l");
+    // Leave alternate screen, show cursor.
+    sequence.extend_from_slice(b"\x1b[?1049l\x1b[?25h");
+    {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(&sequence);
+        let _ = stdout.flush();
+    }
+    let _ = crossterm::terminal::disable_raw_mode();
 }
 
 const INHERITED_MODES_ENV: &str = "JCODE_TUI_INHERITED_MODES";
@@ -128,6 +179,7 @@ thread_local! {
 
 impl TuiRuntimeGuard {
     fn new(state: TuiRuntimeState) -> Self {
+        set_emergency_restore_state(true, state.keyboard_enhanced);
         Self { state, armed: true }
     }
 
@@ -174,6 +226,12 @@ pub fn get_current_session() -> Option<String> {
 pub fn install_panic_hook() {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        // Restore the terminal before printing anything: the default hook's
+        // backtrace is unreadable in raw mode / alternate screen, and the
+        // alternate screen would erase it anyway. No-op when the TUI is not
+        // active.
+        emergency_terminal_restore();
+
         default_hook(info);
 
         if let Some(session_id) = get_current_session() {
@@ -408,6 +466,9 @@ fn cleanup_tui_runtime(state: &TuiRuntimeState, restore_terminal: bool) {
             tui::disable_keyboard_enhancement();
         }
         ratatui::restore();
+        // Terminal is back to a sane state; abnormal-exit paths no longer
+        // need to emit the emergency restore sequence.
+        set_emergency_restore_state(false, false);
     }
 }
 
@@ -516,12 +577,11 @@ fn signal_crash_reason(sig: i32) -> String {
 fn handle_termination_signal(sig: i32) -> ! {
     mark_current_session_crashed(signal_crash_reason(sig));
 
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(
-        std::io::stderr(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::cursor::Show
-    );
+    // Full restore: raw mode alone is not enough. Mouse tracking, bracketed
+    // paste, focus events, and kitty keyboard flags are stateful DEC modes
+    // that persist after exit and garble the shell (mouse reports like
+    // `[<35;12;40M`, paste wrappers `200~`).
+    emergency_terminal_restore();
 
     if let Some(session_id) = get_current_session() {
         print_session_resume_hint(&session_id);
@@ -532,32 +592,38 @@ fn handle_termination_signal(sig: i32) -> ! {
 
 #[cfg(unix)]
 pub fn spawn_session_signal_watchers() {
-    use tokio::signal::unix::{SignalKind, signal};
+    // A dedicated OS thread, not tokio tasks: when the async runtime is wedged
+    // (the classic "jcode hung, had to kill it" case), tokio signal tasks are
+    // never polled, SIGTERM appears ignored, and the user escalates to
+    // `kill -9`, after which nothing can restore the terminal. signal-hook's
+    // iterator blocks on its own self-pipe, so restore works even during a
+    // runtime hang.
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    use signal_hook::iterator::Signals;
 
-    fn spawn_one(sig: i32, kind: SignalKind) {
-        tokio::spawn(async move {
-            let mut stream = match signal(kind) {
-                Ok(s) => s,
-                Err(e) => {
-                    crate::logging::error(&format!(
-                        "Failed to install {} handler: {}",
-                        signal_name(sig),
-                        e
-                    ));
-                    return;
-                }
-            };
-            if stream.recv().await.is_some() {
-                crate::logging::info(&format!("Received {} in TUI process", signal_name(sig)));
+    let mut signals = match Signals::new([SIGHUP, SIGTERM, SIGINT, SIGQUIT]) {
+        Ok(signals) => signals,
+        Err(e) => {
+            crate::logging::error(&format!("Failed to install signal watchers: {}", e));
+            return;
+        }
+    };
+
+    std::thread::Builder::new()
+        .name("jcode-signal-watcher".to_string())
+        .spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                crate::logging::info(&format!(
+                    "Received {} in TUI process",
+                    signal_name(sig)
+                ));
                 handle_termination_signal(sig);
             }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| {
+            crate::logging::error(&format!("Failed to spawn signal watcher thread: {}", e));
         });
-    }
-
-    spawn_one(libc::SIGHUP, SignalKind::hangup());
-    spawn_one(libc::SIGTERM, SignalKind::terminate());
-    spawn_one(libc::SIGINT, SignalKind::interrupt());
-    spawn_one(libc::SIGQUIT, SignalKind::quit());
 }
 
 #[cfg(not(unix))]

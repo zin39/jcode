@@ -227,6 +227,9 @@ linux-compat-vendored-openssl = ["jcode-tui/linux-compat-vendored-openssl"]
 mmdr-size-api = ["jcode-tui/mmdr-size-api"]
 pdf = ["jcode-tui/pdf"]
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"      # Dedicated signal thread (terminal restore survives runtime hangs)
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
