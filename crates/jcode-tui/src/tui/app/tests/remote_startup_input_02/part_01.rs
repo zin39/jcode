@@ -1740,10 +1740,12 @@ fn test_model_picker_effort_variants_follow_each_route_vocabulary() {
         picker.entries.iter().any(|entry| {
             entry.name.starts_with("gpt-5.5 (")
                 && entry.effort.as_deref() == Some(effort)
+                // Rows merge every route supporting the effort into one entry
+                // (column-switchable), so match any option, not just the first.
                 && entry
                     .options
-                    .first()
-                    .is_some_and(|route| route.api_method == api_method)
+                    .iter()
+                    .any(|route| route.api_method == api_method)
         })
     };
 

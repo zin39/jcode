@@ -1809,13 +1809,28 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
         openai_text
     );
     assert!(
-        openai_text.contains("gpt-5.4")
-            && openai_text.contains("OpenAI")
-            && openai_text.contains("oauth")
-            && openai_text.contains("api key"),
-        "OpenAI OAuth and API-key routes should be separately visible, got:\n{}",
+        openai_text.contains("gpt-5.4") && openai_text.contains("OpenAI"),
+        "OpenAI routes should be visible, got:\n{}",
         openai_text
     );
+    // Merged rows carry both access methods as column-switchable options.
+    {
+        let picker = app
+            .inline_interactive_state
+            .as_ref()
+            .expect("model picker should be open");
+        let gpt54_methods: Vec<&str> = picker
+            .entries
+            .iter()
+            .filter(|entry| entry.name.starts_with("gpt-5.4 ("))
+            .flat_map(|entry| entry.options.iter().map(|route| route.api_method.as_str()))
+            .collect();
+        assert!(
+            gpt54_methods.contains(&"openai-oauth") && gpt54_methods.contains(&"openai-api-key"),
+            "OpenAI OAuth and API-key routes should both be selectable options, got {:?}",
+            gpt54_methods
+        );
+    }
     let glm_row = comtegra_text
         .lines()
         .find(|line| line.contains("glm-51-nvfp4"))

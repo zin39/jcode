@@ -1497,74 +1497,101 @@ impl App {
                     let effort_matches_current =
                         *name == current_model && current_effort.as_deref() == Some(*effort);
                     let or_created = openrouter_created_timestamp(name);
-                    for (route, route_efforts) in &effort_routes {
-                        if !route_efforts.contains(effort) {
-                            continue;
-                        }
-                        let is_this_current = effort_matches_current
+                    // One row per model+effort with every supporting route as a
+                    // switchable option (column navigation), instead of one row
+                    // per route. Models served by many OpenRouter endpoints
+                    // previously flooded the picker with duplicate rows, burying
+                    // direct provider routes ("all models showing openrouter").
+                    let routes_for_effort: Vec<_> = effort_routes
+                        .iter()
+                        .filter(|(_, route_efforts)| route_efforts.contains(effort))
+                        .map(|(route, _)| route.clone())
+                        .collect();
+                    if routes_for_effort.is_empty() {
+                        continue;
+                    }
+                    let current_option = routes_for_effort.iter().position(|route| {
+                        effort_matches_current
                             && model_picker_route_is_current(
                                 name,
                                 route,
                                 &current_model,
                                 &current_provider,
-                            );
-                        entries.push(PickerEntry {
-                            name: display_name.clone(),
-                            options: vec![route.clone()],
-                            action: PickerAction::Model,
-                            selected_option: 0,
-                            is_current: is_this_current,
-                            recommended: *effort == "high"
-                                && model_picker_route_is_recommended(name, route),
-                            recommendation_rank: model_picker_recommendation_rank(name),
-                            usage_score: model_picker_usage_score(
-                                &usage_store,
-                                name,
-                                route,
-                                Some(effort),
-                            ),
-                            old: old_threshold_secs > 0
-                                && or_created.map(|t| t < old_threshold_secs).unwrap_or(false),
-                            created_date: or_created.map(format_created),
-                            effort: Some(effort.to_string()),
-                            is_default: is_config_default(name, route),
-                            is_favorite: model_picker_is_favorite(
-                                &favorites_store,
-                                name,
-                                route,
-                                Some(effort),
-                            ),
-                        });
-                    }
+                            )
+                    });
+                    let recommended = *effort == "high"
+                        && routes_for_effort
+                            .iter()
+                            .any(|route| model_picker_route_is_recommended(name, route));
+                    let usage_score = routes_for_effort
+                        .iter()
+                        .map(|route| {
+                            model_picker_usage_score(&usage_store, name, route, Some(effort))
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let is_favorite = routes_for_effort.iter().any(|route| {
+                        model_picker_is_favorite(&favorites_store, name, route, Some(effort))
+                    });
+                    let is_default = routes_for_effort
+                        .iter()
+                        .any(|route| is_config_default(name, route));
+                    entries.push(PickerEntry {
+                        name: display_name.clone(),
+                        selected_option: current_option.unwrap_or(0),
+                        options: routes_for_effort,
+                        action: PickerAction::Model,
+                        is_current: current_option.is_some(),
+                        recommended,
+                        recommendation_rank: model_picker_recommendation_rank(name),
+                        usage_score,
+                        old: old_threshold_secs > 0
+                            && or_created.map(|t| t < old_threshold_secs).unwrap_or(false),
+                        created_date: or_created.map(format_created),
+                        effort: Some(effort.to_string()),
+                        is_default,
+                        is_favorite,
+                    });
                 }
             }
             {
                 let or_created = openrouter_created_timestamp(name);
                 let is_old = old_threshold_secs > 0
                     && or_created.map(|t| t < old_threshold_secs).unwrap_or(false);
-                for route in plain_routes {
-                    let is_recommended = model_picker_route_is_recommended(name, &route);
-                    let is_current = model_picker_route_is_current(
-                        name,
-                        &route,
-                        &current_model,
-                        &current_provider,
-                    );
-                    let is_default = is_config_default(name, &route);
+                // One row per model with all its routes as switchable options,
+                // matching the effort-expanded branch above.
+                if !plain_routes.is_empty() {
+                    let current_option = plain_routes.iter().position(|route| {
+                        model_picker_route_is_current(name, route, &current_model, &current_provider)
+                    });
+                    let is_recommended = plain_routes
+                        .iter()
+                        .any(|route| model_picker_route_is_recommended(name, route));
+                    let usage_score = plain_routes
+                        .iter()
+                        .map(|route| model_picker_usage_score(&usage_store, name, route, None))
+                        .max()
+                        .unwrap_or(0);
+                    let is_default = plain_routes
+                        .iter()
+                        .any(|route| is_config_default(name, route));
+                    let is_favorite = plain_routes
+                        .iter()
+                        .any(|route| model_picker_is_favorite(&favorites_store, name, route, None));
                     entries.push(PickerEntry {
                         name: name.clone(),
-                        options: vec![route.clone()],
+                        selected_option: current_option.unwrap_or(0),
+                        options: plain_routes,
                         action: PickerAction::Model,
-                        selected_option: 0,
-                        is_current,
+                        is_current: current_option.is_some(),
                         recommended: is_recommended,
                         recommendation_rank: model_picker_recommendation_rank(name),
-                        usage_score: model_picker_usage_score(&usage_store, name, &route, None),
+                        usage_score,
                         old: is_old,
                         created_date: or_created.map(format_created),
                         effort: None,
                         is_default,
-                        is_favorite: model_picker_is_favorite(&favorites_store, name, &route, None),
+                        is_favorite,
                     });
                 }
             }
