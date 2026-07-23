@@ -1038,10 +1038,19 @@ pub fn remote_model_routes_fallback(
         }
 
         if !added_any && remote_model_should_offer_copilot_route(model) && !model.contains("[1m]") {
+            // Availability must reflect actual Copilot credentials. Marking
+            // server-copilot-only models available without credentials made
+            // the switch fail with "GitHub Copilot credentials not available"
+            // (same class as the OpenAI OAuth route bug).
+            let copilot_available = auth.copilot == AuthState::Available;
             routes.push(build_copilot_route(
                 model,
-                auth.copilot == AuthState::Available || remote_model_is_server_copilot_only(model),
-                String::new(),
+                copilot_available,
+                if copilot_available {
+                    String::new()
+                } else {
+                    "requires GitHub Copilot login; run /login copilot".to_string()
+                },
             ));
             added_any = true;
         }
