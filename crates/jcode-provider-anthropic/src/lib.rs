@@ -104,6 +104,114 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
         ));
     }
 
+    // Repair pass: Anthropic requires each assistant tool_use to have its
+    // tool_result in the immediately-following user message. Global existence
+    // is not enough: a tool_result that drifted later in history (interrupt,
+    // cancel/resume, reordering damage) still yields a 400
+    // "tool_use ids were found without tool_result blocks" on every retry.
+    // Inject synthetic error tool_results adjacent to the tool_use so the
+    // request is always well-formed.
+    let mut repaired: Vec<ApiMessage> = Vec::with_capacity(merged.len());
+    let mut adjacency_repairs = 0usize;
+    let mut stray_removals = 0usize;
+    let mut iter = merged.into_iter().peekable();
+    let mut prev_assistant_tool_uses: std::collections::HashSet<String> = Default::default();
+    while let Some(mut msg) = iter.next() {
+        if msg.role != "assistant" {
+            // Drop stray tool_results that do not reference the immediately
+            // preceding assistant message's tool_uses. After a drifted result
+            // is replaced by an adjacent synthetic one, the stray would 400
+            // with "unexpected tool_use_id" if left in place.
+            let before = msg.content.len();
+            msg.content.retain(|b| match b {
+                ApiContentBlock::ToolResult { tool_use_id, .. } => {
+                    prev_assistant_tool_uses.contains(tool_use_id)
+                }
+                _ => true,
+            });
+            stray_removals += before - msg.content.len();
+            if !msg.content.is_empty() {
+                repaired.push(msg);
+            }
+            continue;
+        }
+        let tool_uses: Vec<String> = msg
+            .content
+            .iter()
+            .filter_map(|b| {
+                if let ApiContentBlock::ToolUse { id, .. } = b {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        prev_assistant_tool_uses = tool_uses.iter().cloned().collect();
+        repaired.push(msg);
+        if tool_uses.is_empty() {
+            continue;
+        }
+
+        let next_results: std::collections::HashSet<String> = iter
+            .peek()
+            .filter(|next| next.role == "user")
+            .map(|next| {
+                next.content
+                    .iter()
+                    .filter_map(|b| {
+                        if let ApiContentBlock::ToolResult { tool_use_id, .. } = b {
+                            Some(tool_use_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let missing: Vec<&String> = tool_uses
+            .iter()
+            .filter(|id| !next_results.contains(*id))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        adjacency_repairs += missing.len();
+
+        let synthetic: Vec<ApiContentBlock> = missing
+            .iter()
+            .map(|id| ApiContentBlock::ToolResult {
+                tool_use_id: (*id).clone(),
+                content: ToolResultContent::Text(
+                    "[Tool result unavailable: session was interrupted before the result was recorded]"
+                        .to_string(),
+                ),
+                is_error: true,
+            })
+            .collect();
+
+        if let Some(next) = iter.peek_mut()
+            && next.role == "user"
+        {
+            // Prepend so tool_results stay contiguous at the top of the reply.
+            let mut content = synthetic;
+            content.extend(std::mem::take(&mut next.content));
+            next.content = content;
+        } else {
+            repaired.push(ApiMessage {
+                role: "user".to_string(),
+                content: synthetic,
+            });
+        }
+    }
+    if adjacency_repairs > 0 || stray_removals > 0 {
+        jcode_logging::warn(&format!(
+            "[anthropic] Restored tool_use adjacency: {} synthetic tool_result(s) injected, {} stray tool_result(s) dropped",
+            adjacency_repairs, stray_removals
+        ));
+    }
+    let merged = repaired;
+
     // Validate: check each assistant message with tool_use has matching tool_result in next user message
     for (i, msg) in merged.iter().enumerate() {
         if msg.role == "assistant" {
@@ -1036,5 +1144,148 @@ mod cache_prefix_invariant_tests {
             with_cache.first().copied(),
             "cache breakpoint must be on the final tool"
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_use_adjacency_repair_tests {
+    //! The Anthropic API requires every assistant `tool_use` to be answered by
+    //! a `tool_result` in the immediately-following user message. Histories
+    //! damaged by interrupt/cancel/resume can hold the result later (or not at
+    //! all); both cases must be repaired before the request is sent, or the
+    //! API 400s with "tool_use ids were found without tool_result blocks" on
+    //! every retry (observed in session_maple, 2026-07-22).
+
+    use super::*;
+    use jcode_message_types::{ContentBlock, Message, Role};
+
+    fn msg(role: Role, content: Vec<ContentBlock>) -> Message {
+        Message {
+            role,
+            content,
+            timestamp: None,
+            tool_duration_ms: None,
+        }
+    }
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "true"}),
+            thought_signature: None,
+        }
+    }
+
+    fn tool_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+        }
+    }
+
+    fn text(role: Role, s: &str) -> Message {
+        msg(
+            role,
+            vec![ContentBlock::Text {
+                text: s.to_string(),
+                cache_control: None,
+            }],
+        )
+    }
+
+    fn assert_adjacent(api: &[ApiMessage]) {
+        for (i, m) in api.iter().enumerate() {
+            if m.role != "assistant" {
+                continue;
+            }
+            let uses: Vec<&String> = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ApiContentBlock::ToolUse { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            if uses.is_empty() {
+                continue;
+            }
+            let next = api.get(i + 1).expect("tool_use must have a next message");
+            assert_eq!(next.role, "user");
+            let results: std::collections::HashSet<&String> = next
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ApiContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+                    _ => None,
+                })
+                .collect();
+            for id in uses {
+                assert!(
+                    results.contains(id),
+                    "tool_use {id} not answered adjacently at message {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drifted_tool_result_is_replaced_with_adjacent_synthetic() {
+        // tool_use answered two messages later (a user interrupt slid in
+        // between). Global-existence repair sees nothing wrong; the API 400s.
+        let messages = vec![
+            text(Role::User, "run it"),
+            msg(Role::Assistant, vec![tool_use("toolu_drift")]),
+            text(Role::User, "[User interrupted]"),
+            text(Role::Assistant, "ok, waiting"),
+            msg(Role::User, vec![tool_result("toolu_drift")]),
+        ];
+        let api = format_messages(&messages, false);
+        assert_adjacent(&api);
+    }
+
+    #[test]
+    fn fully_missing_tool_result_gets_synthetic_injected() {
+        let messages = vec![
+            text(Role::User, "run it"),
+            msg(Role::Assistant, vec![tool_use("toolu_gone")]),
+            text(Role::User, "next question"),
+        ];
+        let api = format_messages(&messages, false);
+        assert_adjacent(&api);
+    }
+
+    #[test]
+    fn healthy_history_is_untouched() {
+        let messages = vec![
+            text(Role::User, "run it"),
+            msg(Role::Assistant, vec![tool_use("toolu_ok")]),
+            msg(Role::User, vec![tool_result("toolu_ok")]),
+            text(Role::Assistant, "done"),
+        ];
+        let api = format_messages(&messages, false);
+        assert_adjacent(&api);
+        // No synthetic blocks were added.
+        let total_results: usize = api
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ApiContentBlock::ToolResult { .. }))
+            .count();
+        assert_eq!(total_results, 1);
+    }
+
+    #[test]
+    fn parallel_tool_uses_with_partial_results_are_completed() {
+        let messages = vec![
+            text(Role::User, "run both"),
+            msg(
+                Role::Assistant,
+                vec![tool_use("toolu_a"), tool_use("toolu_b")],
+            ),
+            msg(Role::User, vec![tool_result("toolu_a")]),
+        ];
+        let api = format_messages(&messages, false);
+        assert_adjacent(&api);
     }
 }
