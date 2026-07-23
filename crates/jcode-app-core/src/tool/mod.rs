@@ -5,6 +5,7 @@ mod bash;
 mod batch;
 mod bg;
 mod browser;
+mod cheap_route_tool;
 mod communicate;
 #[cfg(target_os = "macos")]
 mod computer;
@@ -255,7 +256,7 @@ impl Registry {
         tools
     }
 
-    pub async fn new(_provider: Arc<dyn Provider>) -> Self {
+    pub async fn new(provider: Arc<dyn Provider>) -> Self {
         let start = std::time::Instant::now();
         let skills_start = std::time::Instant::now();
         let skills = Self::shared_skills_registry();
@@ -281,6 +282,11 @@ impl Registry {
             &mut tools_map,
             "batch",
             batch::BatchTool::new(registry.clone()),
+        );
+        Self::insert_tool(
+            &mut tools_map,
+            "cheap_route",
+            cheap_route_tool::CheapRouteTool::new(provider.clone(), registry.clone()),
         );
         Self::insert_tool(
             &mut tools_map,

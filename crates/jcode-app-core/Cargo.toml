@@ -126,6 +126,9 @@ test-support = ["jcode-base/test-support"]
 [dev-dependencies]
 # Used by async streaming tests (ambient/runner_tests, server/client_actions_tests).
 async-stream = "0.3"
+# test-util enables tokio's paused-clock control (start_paused) for time-based
+# cheap_route tests (subtask timeouts, debate deadlines).
+tokio = { version = "1", features = ["test-util"] }
 # Enables jcode-base's test-support helpers (storage::lock_test_env,
 # auth::test_sandbox, bus::reset_models_updated_publish_state_for_tests) for
 # *this* crate's own test target. Feature unification applies this only to

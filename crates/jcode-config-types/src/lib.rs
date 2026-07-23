@@ -409,7 +409,10 @@ pub enum NamedProviderAuth {
     None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// Not `Eq`: the optional `f64` price hints below are only `PartialEq`. The
+// parent `NamedProviderConfig` is `PartialEq`-only too, and nothing keys on this
+// struct, so dropping `Eq` is safe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct NamedProviderModelConfig {
     pub id: String,
@@ -424,6 +427,15 @@ pub struct NamedProviderModelConfig {
     pub context_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    /// Price hint: USD per million INPUT tokens. Lets a provider whose pricing
+    /// isn't in the models.dev catalog (e.g. modelscope, dashscope) be
+    /// cost-ranked by cheap-routing. Both input and output must be set to take
+    /// effect; unset = the model stays unpriced (ranked last).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_input_per_mtok: Option<f64>,
+    /// Price hint: USD per million OUTPUT tokens. See `price_input_per_mtok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_output_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -514,6 +526,59 @@ pub struct AgentsConfig {
     /// string only when you deliberately want every swarm worker pinned to a
     /// specific model regardless of which model spawned them.
     pub swarm_model: Option<String>,
+    /// Models/providers to PREFER for cheap-routing and `"cheapest"` spawns —
+    /// tried before others even when marginally pricier. Each entry is matched
+    /// case-insensitively as a substring against a route's model id, provider,
+    /// api_method, or `"provider/model"` (e.g. `"deepseek/deepseek-chat"`).
+    #[serde(default)]
+    pub cheap_route_prefer: Vec<String>,
+    /// Models/providers to NEVER use for cheap-routing and `"cheapest"` spawns
+    /// (e.g. `"deepseek-v4-flash"` or `"openrouter"`). Same matching as
+    /// `cheap_route_prefer`.
+    #[serde(default)]
+    pub cheap_route_ban: Vec<String>,
+    /// Tool names a cheap-routed subagent is allowed to use. Empty = a built-in
+    /// default (core file/shell tools + websearch/webfetch). Keeping this small
+    /// matters: sending the full ~31-tool registry bloats the prompt and stalls
+    /// cheap models. Add e.g. `"browser"` here if cheap subtasks need it.
+    #[serde(default)]
+    pub cheap_route_tools: Vec<String>,
+    /// Optional shell command run after each cheap subtask to verify its edits
+    /// (e.g. `"cargo check -q"`, `"npm test -s"`). Runs in the working
+    /// directory. If it exits non-zero, the subtask is retried once with the
+    /// failure output fed back, then re-verified. Unset = no verification (the
+    /// cheap output is accepted as-is, preserving prior behavior).
+    #[serde(default)]
+    pub cheap_route_verify_cmd: Option<String>,
+    /// Difficulty-tiered routing: cheap-route subtasks at or below this
+    /// difficulty (1-5) go to the cheapest model; subtasks ABOVE it go to the
+    /// stronger model (`cheap_route_strong_model`, or the parent's own model),
+    /// so the expensive model only spends on complex subtasks. Default 3
+    /// (1-3 cheap, 4-5 strong). Set to 5 to keep nearly everything on cheap
+    /// models, or 0 to route every subtask to the strong model.
+    #[serde(default = "default_cheap_route_difficulty_threshold")]
+    pub cheap_route_difficulty_threshold: u8,
+    /// Model used for hard subtasks (difficulty above
+    /// `cheap_route_difficulty_threshold`). Unset = the parent's own current
+    /// (main) model, so complex work runs on the strong model you're chatting
+    /// with. Set to a strong-but-cheaper model (e.g. "glm-5.1", "qwen3-max") to
+    /// keep even hard subtasks off the most expensive model.
+    #[serde(default)]
+    pub cheap_route_strong_model: Option<String>,
+    /// When true, a coordinator (an agent that can spawn subagents) is instructed
+    /// to delegate ALL hands-on execution (bash, edits, search, investigation) to
+    /// cheap subagents and reserve itself for planning + review — so the expensive
+    /// model stops doing cheap grunt work. Off by default. Spawned subagents (which
+    /// cannot delegate further) never get this directive.
+    #[serde(default)]
+    pub auto_delegate: bool,
+    /// Master enable for gold mode (multi-model debate on hard subtasks). The
+    /// per-session `/gold` flag only takes effect when this is also true. Off by default.
+    #[serde(default)]
+    pub cheap_route_gold_mode: bool,
+    /// Number of distinct cheap-model proposers in a debate. Default 3.
+    #[serde(default = "default_cheap_route_gold_k")]
+    pub cheap_route_gold_k: usize,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -599,6 +664,14 @@ fn default_memory_sidecar_enabled() -> bool {
     true
 }
 
+fn default_cheap_route_difficulty_threshold() -> u8 {
+    3
+}
+
+fn default_cheap_route_gold_k() -> usize {
+    3
+}
+
 fn default_memory_rerank_cadence() -> usize {
     3
 }
@@ -615,6 +688,15 @@ impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
             swarm_model: None,
+            cheap_route_prefer: Vec::new(),
+            cheap_route_ban: Vec::new(),
+            cheap_route_tools: Vec::new(),
+            cheap_route_verify_cmd: None,
+            cheap_route_difficulty_threshold: default_cheap_route_difficulty_threshold(),
+            cheap_route_strong_model: None,
+            auto_delegate: false,
+            cheap_route_gold_mode: false,
+            cheap_route_gold_k: default_cheap_route_gold_k(),
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             swarm_strip_layout: SwarmStripLayout::default(),
@@ -1549,6 +1631,18 @@ impl Default for GatewayConfig {
             port: 7643,
             bind_addr: "0.0.0.0".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agents_config_gold_defaults() {
+        let c = AgentsConfig::default();
+        assert!(!c.cheap_route_gold_mode);
+        assert_eq!(c.cheap_route_gold_k, 3);
     }
 }
 
