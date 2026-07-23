@@ -400,6 +400,13 @@ pub async fn run_cheap_route(
     // 1. Parent decomposes the task.
     let decompose = backend.ask_parent(&build_decompose_prompt(task)).await?;
     let subtasks = parse_subtasks(&decompose)?;
+    // Publish the plan so the user can watch progress (side panel page).
+    backend.reporter().plan(
+        &subtasks
+            .iter()
+            .map(|s| (s.description.clone(), s.difficulty))
+            .collect::<Vec<_>>(),
+    );
 
     // 2. Rank ALL available routes cheapest-first. The top slice is the recommend
     //    menu; the FULL ranked list is the fallback candidate order, so a working
@@ -500,7 +507,7 @@ pub async fn run_cheap_route(
 
     // 5. Run each subtask (with fallback) and have the parent review each result.
     let mut results = Vec::with_capacity(subtasks.len());
-    for subtask in &subtasks {
+    for (subtask_index, subtask) in subtasks.iter().enumerate() {
         // Gold mode: run a multi-model debate on a HARD REASONING subtask
         // (code subtasks use strong + verify+repair instead — execution-grounded).
         if backend.gold_mode()
@@ -547,6 +554,11 @@ pub async fn run_cheap_route(
         let mut errors: Vec<String> = Vec::new();
         let attempt_timeout = subtask_attempt_timeout(subtask.difficulty, difficulty_threshold);
         for (model, api_method) in &task_candidates {
+            backend.reporter().subtask(
+                subtask_index,
+                DebatePhase::Running,
+                &format!("running on {model}"),
+            );
             let attempt = tokio::time::timeout(
                 attempt_timeout,
                 backend.run_subtask(subtask, model, api_method.as_deref()),
@@ -564,14 +576,25 @@ pub async fn run_cheap_route(
                 )),
             }
         }
-        let (model_used, api_method_used, mut output) = chosen.ok_or_else(|| {
-            anyhow!(
-                "all {} candidate model(s) failed for subtask '{}': {}",
-                task_candidates.len(),
-                subtask.description,
-                errors.join("; ")
-            )
-        })?;
+        let (model_used, api_method_used, mut output) = match chosen {
+            Some(chosen) => chosen,
+            None => {
+                backend.reporter().subtask(
+                    subtask_index,
+                    DebatePhase::Failed,
+                    "all candidates failed",
+                );
+                return Err(anyhow!(
+                    "all {} candidate model(s) failed for subtask '{}': {}",
+                    task_candidates.len(),
+                    subtask.description,
+                    errors.join("; ")
+                ));
+            }
+        };
+        backend
+            .reporter()
+            .subtask(subtask_index, DebatePhase::Done, &model_used);
 
         // Execution-grounded verification: if a verify command is configured,
         // run it after the subtask's edits, retrying the subtask once on failure
@@ -1250,6 +1273,9 @@ impl CheapRouteBackend for ProviderCheapBackend {
         // Cheap workers may auto-switch to the next-cheapest healthy model if
         // their pinned model rate-limits/quota-fails mid-run, instead of failing.
         agent.set_allow_auto_reroute(true);
+        // Stream the worker's live output tail to the bus so the coordinator's
+        // inline gallery can show what the cheap model is doing while it runs.
+        agent.set_inline_output_tap(true);
         agent.run_once_capture(&subtask.prompt).await
     }
 
