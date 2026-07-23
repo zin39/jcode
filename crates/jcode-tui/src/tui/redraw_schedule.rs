@@ -334,7 +334,30 @@ pub(crate) fn redraw_interval_with_policy(
 
 pub(crate) fn redraw_interval(state: &dyn TuiState) -> Duration {
     let policy = crate::perf::tui_policy();
-    redraw_interval_with_policy(state, &policy)
+    let requested = redraw_interval_with_policy(state, &policy);
+    govern_redraw_interval_by_draw_cost(requested)
+}
+
+/// Adaptive redraw governor: never schedule frames meaningfully faster than
+/// the terminal can draw them. When each full draw costs 45-70ms (large
+/// transcript + side panel), a 16ms (60fps) cadence just renders back-to-back
+/// and pins a core at 60-70% CPU while showing at most ~15 real fps anyway.
+/// Cap the effective rate so the loop spends most of each period idle. The
+/// cap only ever slows the cadence; cheap frames keep the configured rate,
+/// and the cost estimate refreshes every frame so the cadence recovers as
+/// soon as drawing gets cheap again (e.g. side panel closed).
+pub(crate) fn govern_redraw_interval_by_draw_cost(requested: Duration) -> Duration {
+    const GOVERNOR_WINDOW: usize = 12;
+    /// Target duty cycle: drawing should take at most ~40% of each period.
+    const DUTY_FACTOR: f64 = 2.5;
+    /// Don't throttle below this even for pathological frame costs.
+    const GOVERNOR_MAX_INTERVAL: Duration = Duration::from_millis(250);
+
+    let Some(avg_ms) = ui::recent_average_draw_cost_ms(GOVERNOR_WINDOW) else {
+        return requested;
+    };
+    let floor = Duration::from_millis((avg_ms * DUTY_FACTOR) as u64).min(GOVERNOR_MAX_INTERVAL);
+    requested.max(floor)
 }
 
 pub(crate) fn periodic_redraw_required(state: &dyn TuiState) -> bool {

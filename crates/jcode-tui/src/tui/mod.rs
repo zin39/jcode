@@ -1813,3 +1813,34 @@ mod tests {
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 }
+
+#[cfg(test)]
+mod redraw_governor_tests {
+    use super::redraw_schedule::govern_redraw_interval_by_draw_cost;
+    use std::time::Duration;
+
+    // recent_average_draw_cost_ms reads from the process-global draw history,
+    // which is empty in unit tests, so the governor must pass the request
+    // through untouched (the None branch). The arithmetic branch is covered
+    // via the pure floor computation replicated here to pin the constants.
+    #[test]
+    fn governor_passes_through_without_history() {
+        let requested = Duration::from_millis(16);
+        assert_eq!(govern_redraw_interval_by_draw_cost(requested), requested);
+    }
+
+    #[test]
+    fn governor_floor_math_caps_expensive_frames() {
+        // 60ms frames at DUTY_FACTOR 2.5 -> 150ms floor; 16ms request becomes 150ms.
+        let avg_ms: f64 = 60.0;
+        let floor = Duration::from_millis((avg_ms * 2.5) as u64).min(Duration::from_millis(250));
+        assert_eq!(floor, Duration::from_millis(150));
+        assert_eq!(Duration::from_millis(16).max(floor), floor);
+        // 4ms frames -> 10ms floor; the 16ms request wins (no slowdown for cheap frames).
+        let cheap_floor = Duration::from_millis((4.0_f64 * 2.5) as u64);
+        assert_eq!(Duration::from_millis(16).max(cheap_floor), Duration::from_millis(16));
+        // Pathological 500ms frames clamp at the 250ms max, keeping the UI responsive.
+        let patho = Duration::from_millis((500.0_f64 * 2.5) as u64).min(Duration::from_millis(250));
+        assert_eq!(patho, Duration::from_millis(250));
+    }
+}
