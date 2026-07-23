@@ -175,6 +175,22 @@ fn draw_call_history() -> &'static Mutex<VecDeque<DrawCallAttribution>> {
     DRAW_CALL_HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+/// Average wall-clock cost of the most recent full draws, in milliseconds.
+/// Used by the adaptive redraw governor: scheduling frames faster than they
+/// can be produced just runs the render loop back-to-back and saturates a
+/// core (observed 60-70% CPU with 45-70ms frames at a 60fps cadence).
+pub(crate) fn recent_average_draw_cost_ms(window: usize) -> Option<f64> {
+    let history = draw_call_history()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if history.is_empty() || window == 0 {
+        return None;
+    }
+    let n = history.len().min(window);
+    let sum: f64 = history.iter().rev().take(n).map(|s| s.total_ms).sum();
+    Some(sum / n as f64)
+}
+
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;

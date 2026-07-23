@@ -1316,7 +1316,8 @@ use frame_metrics::{
 };
 pub(crate) use frame_metrics::{
     DrawCallAttribution, FrameInputAttribution, frame_input_attribution_snapshot,
-    record_draw_call_attribution, set_frame_input_attribution, wall_clock_ms,
+    recent_average_draw_cost_ms, record_draw_call_attribution, set_frame_input_attribution,
+    wall_clock_ms,
 };
 pub(crate) use frame_metrics::{
     debug_draw_call_history, debug_flicker_frame_history, debug_slow_frame_history,
