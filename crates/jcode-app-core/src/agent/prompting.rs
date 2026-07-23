@@ -2,6 +2,48 @@ use super::Agent;
 use crate::logging;
 use crate::message::{Message, ToolDefinition};
 
+/// Injected into a coordinator's system prompt when `agents.auto_delegate` is on.
+/// Pushes execution onto cheap subagents so the expensive coordinator model is
+/// spent on planning + review rather than grunt work.
+const AUTO_DELEGATION_DIRECTIVE: &str = "\
+# Delegation policy (cost control)
+
+You have cheap subagents available via the `subagent` tool. DELEGATE all hands-on \
+execution to them and reserve yourself for planning and review:
+
+- Spawn a subagent for every unit of real work — running shell commands, \
+  editing/writing files, searching and reading code, investigating behavior, \
+  reproducing bugs, and any repetitive or bulk task.
+- Do NOT run bash, file edits, grep/search, or file reads yourself when a \
+  subagent can do it. Each time you do cheap work directly you waste the \
+  expensive model.
+- For independent subtasks, spawn multiple subagents in the SAME turn — they run \
+  concurrently, which is faster.
+- Keep yourself for: understanding the request, decomposing it into delegable \
+  subtasks, choosing what to delegate, and reviewing/integrating subagent \
+  results before the next step.";
+
+/// Injected into a coordinator's system prompt when gold mode is on for the
+/// session (`session.gold_mode_enabled` AND `agents.cheap_route_gold_mode`).
+/// Makes the coordinator auto-route substantive reasoning work through the
+/// `cheap_route` tool, which runs the multi-model debate and folds the
+/// proposals into one "gold" answer — no explicit "use cheap_route" needed.
+const GOLD_MODE_DIRECTIVE: &str = "\
+# Gold mode (multi-model debate) is ON
+
+For any substantive reasoning task — design, architecture, analysis, research, \
+comparison, planning, debugging strategy, or any open-ended question with a \
+single best answer — offload it to the `cheap_route` tool instead of answering \
+it yourself. cheap_route runs several models in parallel as proposers and folds \
+their answers into one high-quality \"gold\" result.
+
+- Pass the user's full task text as the `task` argument.
+- Do this automatically; the user does NOT need to say \"use cheap_route\". Gold \
+  mode being on IS the instruction to route through it.
+- You keep light coordination and presenting the gold result back to the user.
+- Skip cheap_route ONLY for trivial chat, simple factual replies, or pure \
+  mechanical edits where a debate adds no value.";
+
 impl Agent {
     pub(super) fn log_prompt_prefix_accounting(
         &self,
@@ -172,12 +214,53 @@ impl Agent {
 
         self.append_task_state(&mut split);
         self.append_current_turn_system_reminder(&mut split);
+        self.append_auto_delegation_directive(&mut split);
+        self.append_gold_mode_directive(&mut split);
         crate::prompt::append_swarm_effort_directive(
             &mut split,
             self.provider.reasoning_effort().as_deref(),
         );
 
         split
+    }
+
+
+    /// When gold mode is on for this session and this agent can invoke
+    /// `cheap_route` (i.e. it is a coordinator, not a spawned subagent — those
+    /// have the tool removed, which also blocks recursive debates), instruct it
+    /// to auto-route substantive reasoning work through cheap_route so the user
+    /// gets gold debates without saying "use cheap_route" each time.
+    fn append_gold_mode_directive(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        let gold_on = self.session.gold_mode_enabled.unwrap_or(false)
+            && crate::config::config().agents.cheap_route_gold_mode;
+        if !gold_on {
+            return;
+        }
+        if self.validate_tool_allowed("cheap_route").is_err() {
+            return;
+        }
+        if !split.dynamic_part.is_empty() {
+            split.dynamic_part.push_str("\n\n");
+        }
+        split.dynamic_part.push_str(GOLD_MODE_DIRECTIVE);
+    }
+
+    /// When `agents.auto_delegate` is on and this agent can spawn subagents (i.e.
+    /// it is a coordinator, not a spawned subagent), instruct it to offload all
+    /// hands-on execution to cheap subagents and keep itself for planning/review.
+    fn append_auto_delegation_directive(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        if !crate::config::config().agents.auto_delegate {
+            return;
+        }
+        // Only coordinators get this. A spawned subagent has the `subagent` tool
+        // removed, so it must not be told to delegate work it cannot delegate.
+        if self.validate_tool_allowed("subagent").is_err() {
+            return;
+        }
+        if !split.dynamic_part.is_empty() {
+            split.dynamic_part.push_str("\n\n");
+        }
+        split.dynamic_part.push_str(AUTO_DELEGATION_DIRECTIVE);
     }
 
     /// Non-blocking memory prompt - takes pending result and spawns check for next turn

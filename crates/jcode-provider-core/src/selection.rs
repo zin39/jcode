@@ -262,6 +262,51 @@ fn dedupe_model_routes_reference(routes: Vec<ModelRoute>) -> Vec<ModelRoute> {
     deduped
 }
 
+/// A model route paired with its comparable metered cost. Used by cheap-routing
+/// to present a cheapest-first menu to the parent model. Capability ("can this
+/// model do the task properly") is judged by the parent, not here — this orders
+/// purely by price and drops routes that are not currently usable.
+#[derive(Debug, Clone)]
+pub struct CheapRouteCandidate {
+    pub route: ModelRoute,
+    /// Normalized reference-request cost in micros (lower = cheaper). `None` when
+    /// the route carries no pricing estimate; such routes sort after all priced
+    /// routes because an unknown cost cannot be confirmed cheap.
+    pub reference_cost_micros: Option<u64>,
+}
+
+/// Order `routes` cheapest-first by each route's normalized reference-request
+/// cost (`RouteCheapnessEstimate::estimated_reference_cost_micros`). Unavailable
+/// routes are dropped. Priced routes sort ascending; unpriced routes sort last.
+/// Ties and unpriced routes break alphabetically by model id for determinism.
+pub fn rank_routes_by_cost(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> {
+    let mut candidates: Vec<CheapRouteCandidate> = routes
+        .into_iter()
+        .filter(|route| route.available)
+        .map(|route| {
+            let reference_cost_micros = route
+                .cheapness
+                .as_ref()
+                .and_then(|estimate| estimate.estimated_reference_cost_micros);
+            CheapRouteCandidate {
+                route,
+                reference_cost_micros,
+            }
+        })
+        .collect();
+
+    candidates.sort_by(
+        |a, b| match (a.reference_cost_micros, b.reference_cost_micros) {
+            (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.route.model.cmp(&b.route.model)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.route.model.cmp(&b.route.model),
+        },
+    );
+
+    candidates
+}
+
 fn duplicate_route_api_method(existing: &str, candidate: &str) -> bool {
     existing == candidate
         || (is_generic_openai_compatible_route(existing)
@@ -675,5 +720,82 @@ mod tests {
         assert_eq!(sequence.first(), Some(&ActiveProvider::OpenRouter));
         assert!(sequence.contains(&ActiveProvider::Claude));
         assert!(sequence.contains(&ActiveProvider::Cursor));
+    }
+
+    #[test]
+    fn rank_routes_by_cost_orders_cheapest_first_and_drops_unavailable() {
+        use crate::{RouteCheapnessEstimate, RouteCostConfidence, RouteCostSource};
+
+        fn priced(model: &str, available: bool, input_micros: u64, output_micros: u64) -> ModelRoute {
+            ModelRoute {
+                model: model.to_string(),
+                provider: "p".to_string(),
+                api_method: "a".to_string(),
+                available,
+                detail: String::new(),
+                cheapness: Some(RouteCheapnessEstimate::metered(
+                    RouteCostSource::PublicApiPricing,
+                    RouteCostConfidence::Exact,
+                    input_micros,
+                    output_micros,
+                    None,
+                    None,
+                )),
+            }
+        }
+
+        fn unpriced(model: &str) -> ModelRoute {
+            ModelRoute {
+                model: model.to_string(),
+                provider: "p".to_string(),
+                api_method: "a".to_string(),
+                available: true,
+                detail: String::new(),
+                cheapness: None,
+            }
+        }
+
+        let routes = vec![
+            priced("expensive", true, 5_000_000, 15_000_000),
+            unpriced("unpriced"),
+            priced("cheap", true, 200_000, 200_000),
+            priced("gone", false, 1_000, 1_000), // unavailable -> dropped
+        ];
+
+        let ranked = rank_routes_by_cost(routes);
+        let order: Vec<&str> = ranked.iter().map(|c| c.route.model.as_str()).collect();
+
+        // cheapest priced first, expensive next, unpriced last; unavailable dropped.
+        assert_eq!(order, vec!["cheap", "expensive", "unpriced"]);
+        assert!(ranked[0].reference_cost_micros.is_some());
+        assert!(ranked.last().unwrap().reference_cost_micros.is_none());
+        assert!(ranked.iter().all(|c| c.route.model != "gone"));
+    }
+
+    #[test]
+    fn rank_routes_by_cost_breaks_ties_alphabetically_by_model() {
+        use crate::{RouteCheapnessEstimate, RouteCostConfidence, RouteCostSource};
+
+        fn same_price(model: &str) -> ModelRoute {
+            ModelRoute {
+                model: model.to_string(),
+                provider: "p".to_string(),
+                api_method: "a".to_string(),
+                available: true,
+                detail: String::new(),
+                cheapness: Some(RouteCheapnessEstimate::metered(
+                    RouteCostSource::PublicApiPricing,
+                    RouteCostConfidence::Exact,
+                    1_000_000,
+                    1_000_000,
+                    None,
+                    None,
+                )),
+            }
+        }
+
+        let ranked = rank_routes_by_cost(vec![same_price("b"), same_price("a")]);
+        let order: Vec<&str> = ranked.iter().map(|c| c.route.model.as_str()).collect();
+        assert_eq!(order, vec!["a", "b"]);
     }
 }

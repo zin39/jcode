@@ -176,6 +176,8 @@ pub(crate) fn configure_provider_profile(
         model_catalog: options.model_catalog,
         allow_provider_pinning: options.provider_routing,
         models: vec![NamedProviderModelConfig {
+            price_input_per_mtok: None,
+            price_output_per_mtok: None,
             id: model.clone(),
             context_window: options.context_window,
             input: Vec::new(),
