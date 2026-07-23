@@ -1718,6 +1718,31 @@ fn detects_anthropic_model_not_found_errors() {
 }
 
 #[test]
+fn out_of_credits_429_is_not_retryable() {
+    // The real 429 body returned when the usage-credit allowance is exhausted
+    // (e.g. Fable). It is a `rate_limit_error` but permanently non-retryable.
+    let real = "anthropic api error (429 too many requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"usage credits are required for this model.\",\"details\":{\"error_code\":\"credits_required\",\"disabled_reason\":\"out_of_credits\"}}}";
+    assert!(
+        is_out_of_credits_error(real),
+        "should detect the out-of-credits detail"
+    );
+    assert!(
+        !is_retryable_error(real),
+        "out-of-credits must not be retried despite the 429/rate_limit markers"
+    );
+
+    // Each marker on its own is sufficient (error chains vary by transport).
+    assert!(is_out_of_credits_error("... out_of_credits ..."));
+    assert!(is_out_of_credits_error("... credits_required ..."));
+    assert!(is_out_of_credits_error("you're out of usage credits"));
+
+    // A genuine transient rate limit is still retryable.
+    assert!(is_retryable_error(
+        "anthropic api error (429 too many requests): {\"type\":\"rate_limit_error\",\"message\":\"rate limit exceeded, please retry\"}"
+    ));
+}
+
+#[test]
 fn anthropic_fallback_prefers_best_available_and_skips_tried_and_retired() {
     // The fallback logic reads the process-global model catalog; lock and
     // reset it so fixture models hydrated by other tests cannot leak in.

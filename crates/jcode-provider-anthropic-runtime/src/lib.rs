@@ -1892,6 +1892,15 @@ async fn stream_response(
 
 /// Check if an error is transient and should be retried
 fn is_retryable_error(error_str: &str) -> bool {
+    // An out-of-credits / usage-credits-required rejection is returned as a
+    // 429 `rate_limit_error`, but it is *permanent*: retrying cannot succeed
+    // until the user buys credits or switches models. Short-circuit before the
+    // generic 429/rate-limit matching below so we fail fast instead of burning
+    // the retry budget hammering the Anthropic endpoint (e.g. Fable when the
+    // usage-credit allowance is exhausted).
+    if is_out_of_credits_error(error_str) {
+        return false;
+    }
     jcode_provider_core::is_transient_transport_error(error_str)
         // Server errors (5xx)
         || error_str.contains("500 internal server error")
@@ -1906,6 +1915,21 @@ fn is_retryable_error(error_str: &str) -> bool {
         // API-level server errors (SSE error events)
         || error_str.contains("api_error")
         || error_str.contains("internal server error")
+}
+
+/// Detect an Anthropic "out of usage credits" rejection.
+///
+/// When the account's usage-credit allowance is exhausted the API returns HTTP
+/// 429 with `"type":"rate_limit_error"` but a `credits_required` /
+/// `out_of_credits` detail (message: "Usage credits are required for this
+/// model."). Unlike a genuine transient rate limit this never clears on its
+/// own, so it must not be retried. `error_str` is expected to already be
+/// lowercased.
+fn is_out_of_credits_error(error_str: &str) -> bool {
+    error_str.contains("credits_required")
+        || error_str.contains("out_of_credits")
+        || error_str.contains("usage credits are required")
+        || error_str.contains("out of usage credits")
 }
 
 /// Detect an Anthropic "model not found" rejection.
