@@ -529,13 +529,20 @@ impl Agent {
     }
 
     pub(super) fn validate_tool_allowed(&self, name: &str) -> Result<()> {
+        // Providers can surface aliased tool names (e.g. Anthropic OAuth's
+        // curated `Grep` reverse-maps to `grep`) while allow/disable lists hold
+        // canonical registry names (`agentgrep`). Compare both the raw and the
+        // canonical form so an alias never trips the policy check (#104-class
+        // failures: "Tool 'grep' is not allowed" aborting subagent turns).
+        let resolved = jcode_tool_types::resolve_tool_name(name);
         if let Some(allowed) = self.allowed_tools.as_ref()
             && !allowed.contains(name)
+            && !allowed.contains(resolved)
         {
-            return Err(anyhow::anyhow!("Tool '{}' is not allowed", name));
+            return Err(anyhow::anyhow!("Tool '{}' is not allowed", resolved));
         }
-        if self.disabled_tools.contains(name) {
-            return Err(anyhow::anyhow!("Tool '{}' is disabled", name));
+        if self.disabled_tools.contains(name) || self.disabled_tools.contains(resolved) {
+            return Err(anyhow::anyhow!("Tool '{}' is disabled", resolved));
         }
         Ok(())
     }

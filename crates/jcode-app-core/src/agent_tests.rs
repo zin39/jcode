@@ -1319,3 +1319,38 @@ fn guardrail_notice_absent_for_normal_turns() {
 }
 
 include!("agent_tests/retention_readiness.rs");
+
+#[tokio::test]
+async fn validate_tool_allowed_resolves_aliases_against_canonical_allowlist() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(DelayedProvider {
+        open_delay: Duration::from_millis(1),
+        first_event_delay: Duration::from_millis(1),
+    });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    // Allowlist stores canonical names, but providers can hand back aliases
+    // (Anthropic OAuth curated `Grep` reverse-maps to `grep`). Both the alias
+    // and the canonical form must pass.
+    agent.allowed_tools = Some(
+        ["agentgrep", "bash", "skill_manage"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+    agent.disabled_tools = HashSet::new();
+
+    assert!(agent.validate_tool_allowed("agentgrep").is_ok());
+    assert!(agent.validate_tool_allowed("grep").is_ok(), "OAuth alias grep must resolve to agentgrep");
+    assert!(agent.validate_tool_allowed("Grep").is_ok(), "PascalCase OAuth alias must resolve");
+    assert!(agent.validate_tool_allowed("Bash").is_ok());
+    assert!(agent.validate_tool_allowed("skill").is_ok(), "skill alias must resolve to skill_manage");
+    assert!(agent.validate_tool_allowed("edit").is_err(), "non-allowlisted tool still rejected");
+
+    // Disabled list should also match by canonical name.
+    agent.allowed_tools = None;
+    agent.disabled_tools = ["agentgrep"].into_iter().map(String::from).collect();
+    assert!(agent.validate_tool_allowed("grep").is_err(), "alias of disabled tool must be rejected");
+    assert!(agent.validate_tool_allowed("bash").is_ok());
+}
