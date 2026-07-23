@@ -141,6 +141,7 @@ fn test_disconnected_key_handler_runs_model_picker_locally() {
     app.cursor_pos = app.input.len();
 
     remote::handle_disconnected_key(&mut app, KeyCode::Enter, KeyModifiers::empty()).unwrap();
+    app.wait_for_model_picker_routes_for_tests();
 
     assert!(app.input.is_empty());
     assert!(app.queued_messages().is_empty());

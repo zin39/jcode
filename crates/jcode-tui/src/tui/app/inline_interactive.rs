@@ -932,6 +932,21 @@ impl App {
         self.open_model_picker_inner(false);
     }
 
+    /// Test support: block until a pending async route load resolves so tests
+    /// can assert on the final picker contents. No-op when nothing is pending.
+    #[cfg(test)]
+    pub(crate) fn wait_for_model_picker_routes_for_tests(&mut self) {
+        let started = std::time::Instant::now();
+        while self.pending_model_picker_load.is_some()
+            && started.elapsed() < std::time::Duration::from_secs(5)
+        {
+            if self.poll_model_picker_load() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn open_model_picker_preserving_input(&mut self) {
         self.open_model_picker_inner(true);
     }
@@ -1196,6 +1211,44 @@ impl App {
         let build = move || {
             let routes_started = std::time::Instant::now();
             let routes = build_routes();
+            let routes_ms = routes_started.elapsed().as_millis();
+            let _ = tx.send(Ok(ModelPickerRoutesResult { routes, routes_ms }));
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(build);
+        } else {
+            std::thread::spawn(build);
+        }
+
+        self.pending_model_picker_load = Some(PendingModelPickerLoad {
+            request_id,
+            signature,
+            picker_started,
+            receiver: rx,
+        });
+    }
+
+    /// Remote-session variant of [`Self::start_model_picker_route_load`]: the
+    /// names-only fallback walks per-model disk caches (O(models × catalog))
+    /// and previously ran synchronously on the input path, freezing the UI
+    /// for seconds while `/model` was being typed.
+    fn start_remote_model_picker_route_load(
+        &mut self,
+        signature: ModelPickerCacheSignature,
+        picker_started: std::time::Instant,
+    ) {
+        self.model_picker_load_request_id = self.model_picker_load_request_id.wrapping_add(1);
+        let request_id = self.model_picker_load_request_id;
+        let remote_provider_name = self.remote_provider_name.clone();
+        let remote_available_entries = self.remote_available_entries.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let build = move || {
+            let routes_started = std::time::Instant::now();
+            let routes = crate::provider::remote_model_routes_fallback(
+                remote_provider_name.as_deref(),
+                &remote_available_entries,
+            );
             let routes_ms = routes_started.elapsed().as_millis();
             let _ = tx.send(Ok(ModelPickerRoutesResult { routes, routes_ms }));
         };

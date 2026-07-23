@@ -4,6 +4,7 @@ fn test_model_picker_copilot_selection_prefixes_model() {
     configure_test_remote_models_with_copilot(&mut app);
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -49,6 +50,7 @@ fn test_model_picker_cursor_models_have_cursor_route() {
     configure_test_remote_models_with_cursor(&mut app);
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -77,6 +79,7 @@ fn test_model_picker_cursor_selection_prefixes_model() {
     configure_test_remote_models_with_cursor(&mut app);
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -122,6 +125,7 @@ fn test_model_picker_bedrock_selection_prefixes_model() {
     }];
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -165,6 +169,7 @@ fn test_model_picker_bedrock_arn_selection_prefixes_model() {
     }];
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -274,6 +279,7 @@ fn test_remote_hydrated_catalog_restores_missing_direct_bedrock_route() {
         }];
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         match previous_enable {
             Some(value) => crate::env::set_var("JCODE_BEDROCK_ENABLE", value),
@@ -397,6 +403,7 @@ fn test_remote_cached_oauth_only_claude_route_gains_api_key_route_in_picker() {
         }];
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         let picker = app
             .inline_interactive_state
@@ -448,6 +455,7 @@ fn test_remote_jcode_subscription_catalog_is_not_augmented_with_local_auth_route
         }];
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         match previous_anthropic_key {
             Some(value) => crate::env::set_var("ANTHROPIC_API_KEY", value),
@@ -538,6 +546,7 @@ fn test_remote_mixed_catalog_keeps_jcode_subscription_separate_from_other_provid
     ];
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     assert_eq!(app.remote_model_options.len(), 5);
     let jcode_routes = app
@@ -632,6 +641,7 @@ fn test_remote_hydrated_catalog_adds_entitled_jcode_subscription_routes() {
         ];
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         match previous_key {
             Some(value) => {
@@ -717,6 +727,7 @@ fn test_remote_non_jcode_catalog_repairs_poisoned_all_jcode_routes() {
             .collect();
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         match previous_tier {
             Some(value) => crate::env::set_var(crate::subscription_catalog::JCODE_TIER_ENV, value),
@@ -773,6 +784,7 @@ fn test_model_picker_ctrl_b_bedrock_selection_saves_bedrock_default() {
         }];
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         let picker = app
             .inline_interactive_state
@@ -1707,6 +1719,7 @@ fn test_model_picker_effort_variant_selection_stages_effort_in_remote_mode() {
     configure_test_remote_models_with_openai_recommendations(&mut app);
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -1760,6 +1773,7 @@ fn test_model_picker_effort_variants_follow_each_route_vocabulary() {
     });
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     let picker = app
         .inline_interactive_state
         .as_ref()
@@ -1804,6 +1818,7 @@ fn test_model_picker_plain_selection_stages_no_effort_in_remote_mode() {
     });
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state

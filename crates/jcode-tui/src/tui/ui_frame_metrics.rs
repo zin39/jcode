@@ -161,7 +161,9 @@ pub(crate) fn record_draw_call_attribution(sample: DrawCallAttribution) {
         return;
     }
     if let Ok(payload) = serde_json::to_string(&sample) {
-        crate::logging::warn(&format!("TUI_DRAW_CALL {}", payload));
+        // Perf telemetry, not an actionable warning: INFO keeps daily logs
+        // readable (these lines were >90% of all WARNs, ~24k/day).
+        crate::logging::info(&format!("TUI_DRAW_CALL {}", payload));
     }
 }
 
@@ -1181,9 +1183,11 @@ pub(crate) fn record_slow_frame_sample(sample: SlowFrameSample) {
     if should_log {
         history.last_log_at_ms = Some(sample.timestamp_ms);
         if let Ok(payload) = serde_json::to_string(&sample) {
-            crate::logging::warn(&format!("TUI_SLOW_FRAME {}", payload));
+            // Perf telemetry, not an actionable warning: INFO keeps daily
+            // logs readable.
+            crate::logging::info(&format!("TUI_SLOW_FRAME {}", payload));
         } else {
-            crate::logging::warn(&format!(
+            crate::logging::info(&format!(
                 "TUI_SLOW_FRAME total_ms={:.2} prepare_ms={:.2} draw_ms={:.2}",
                 sample.total_ms, sample.prepare_ms, sample.draw_ms
             ));

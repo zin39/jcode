@@ -387,6 +387,7 @@ fn test_model_picker_copilot_models_have_copilot_route() {
     configure_test_remote_models_with_copilot(&mut app);
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -418,6 +419,7 @@ fn test_model_picker_remote_comtegra_model_uses_comtegra_route_not_copilot() {
     app.remote_available_entries = vec!["glm-51-nvfp4".to_string()];
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     match prev_key {
         Some(value) => crate::env::set_var("COMTEGRA_API_KEY", value),
@@ -467,6 +469,7 @@ fn test_model_picker_remote_bedrock_model_has_bedrock_route_when_configured() {
     app.remote_available_entries = vec!["us.amazon.nova-micro-v1:0".to_string()];
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     match prev_home {
         Some(value) => crate::env::set_var("JCODE_HOME", value),
@@ -508,6 +511,7 @@ fn test_model_picker_preserves_recommendation_priority_order() {
     configure_test_remote_models_with_openai_recommendations(&mut app);
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
