@@ -88,8 +88,8 @@ impl Tool for WebSearchTool {
                 },
                 "engine": {
                     "type": "string",
-                    "enum": ["hybrid", "tavily", "last30days", "duckduckgo", "bing", "searxng"],
-                    "description": "Search engine. Defaults to hybrid, which runs Tavily (fast, keyed) and the last30days skill (deep social: Reddit/HN/GitHub/etc.) concurrently, cross-verifies their results, and returns one best-first ranking (results found by both engines are marked verified). Use tavily for a fast keyed search, last30days for deep engagement-scored social research, duckduckgo/bing for keyless HTML search, or searxng for a self-hosted instance (JCODE_SEARXNG_URL)."
+                    "enum": ["hybrid", "tavily", "perplexity", "last30days", "duckduckgo", "bing", "searxng"],
+                    "description": "Search engine. Defaults to hybrid, which runs Tavily (raw keyed search), Perplexity Sonar (LLM with independent live retrieval), and the last30days skill (deep social) concurrently, cross-verifies their results, and returns one best-first ranking (results found by multiple engines are marked verified). Use tavily for fast raw search, perplexity for a synthesized cited answer, last30days for engagement-scored social research, duckduckgo/bing for keyless HTML search, or searxng for a self-hosted instance."
                 },
                 "bing_market": {
                     "type": "string",
@@ -211,6 +211,7 @@ impl WebSearchTool {
             }
             WebSearchEngine::Searxng => self.search_searxng(query, num_results).await,
             WebSearchEngine::Tavily => self.search_tavily(query, num_results).await,
+            WebSearchEngine::Perplexity => self.search_perplexity(query, num_results).await,
             WebSearchEngine::Last30days => self.search_last30days(query, num_results).await,
             WebSearchEngine::Hybrid => self.search_hybrid(query, num_results).await,
         }
@@ -530,6 +531,110 @@ impl WebSearchTool {
         Ok(parse_tavily_results(parsed, num_results))
     }
 
+    /// Query Perplexity's `sonar` model: an LLM with its own live web
+    /// retrieval. Returns the synthesized answer as the first result plus one
+    /// result per citation URL, so the hybrid engine can cross-verify those
+    /// URLs against Tavily's raw search results. Key comes from the
+    /// `perplexity` provider profile (provider-perplexity.env).
+    async fn search_perplexity(
+        &self,
+        query: &str,
+        num_results: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let Some(api_key) = jcode_provider_env::load_env_value_from_env_or_config(
+            "JCODE_PROVIDER_PERPLEXITY_API_KEY",
+            "provider-perplexity.env",
+        ) else {
+            anyhow::bail!(
+                "Perplexity engine selected but no API key found. Save one with \
+                 /login perplexity (stored as provider-perplexity.env)."
+            );
+        };
+
+        let response = self
+            .client
+            .post("https://api.perplexity.ai/chat/completions")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", api_key),
+            )
+            .json(&json!({
+                "model": "sonar",
+                "messages": [{
+                    "role": "user",
+                    "content": format!(
+                        "Web research query: {query}\n\nAnswer concisely with facts and cite sources."
+                    ),
+                }],
+                "max_tokens": 700,
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Perplexity request failed: {e}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("Perplexity API failed with status: {status}");
+        }
+        let parsed: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Perplexity response parse failed: {e}"))?;
+
+        let answer = parsed["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if answer.is_empty() {
+            anyhow::bail!("Perplexity returned an empty answer");
+        }
+        // Citations arrive either as top-level `citations` (list of URLs) or
+        // `search_results` (objects with title/url). Convert each to a result
+        // so hybrid ranking can match them against Tavily URLs.
+        let mut results: Vec<SearchResult> = Vec::new();
+        const SNIPPET_LIMIT: usize = 1200;
+        let snippet: String = answer.chars().take(SNIPPET_LIMIT).collect();
+        results.push(SearchResult {
+            title: format!("Perplexity synthesis: {query}"),
+            url: "https://www.perplexity.ai".to_string(),
+            snippet,
+            score: 0.9,
+            engines: vec!["perplexity".to_string()],
+        });
+        if let Some(items) = parsed["search_results"].as_array() {
+            for item in items.iter().take(num_results) {
+                let url = item["url"].as_str().unwrap_or_default();
+                if url.is_empty() {
+                    continue;
+                }
+                results.push(SearchResult {
+                    title: item["title"].as_str().unwrap_or(url).to_string(),
+                    url: url.to_string(),
+                    snippet: item["snippet"].as_str().unwrap_or_default().to_string(),
+                    score: 0.6,
+                    engines: vec!["perplexity".to_string()],
+                });
+            }
+        } else if let Some(citations) = parsed["citations"].as_array() {
+            for citation in citations.iter().take(num_results) {
+                let url = citation.as_str().unwrap_or_default();
+                if url.is_empty() {
+                    continue;
+                }
+                results.push(SearchResult {
+                    title: url.to_string(),
+                    url: url.to_string(),
+                    snippet: String::new(),
+                    score: 0.6,
+                    engines: vec!["perplexity".to_string()],
+                });
+            }
+        }
+        Ok(results)
+    }
+
     /// Run the installed last30days skill for a deep, engagement-scored search
     /// across Reddit/HN/GitHub/etc. Slow (tens of seconds), so callers should
     /// bound it with a timeout (the hybrid engine does). Shells out to the
@@ -600,25 +705,34 @@ impl WebSearchTool {
         Ok(parse_last30days_results(parsed, num_results))
     }
 
-    /// Hybrid engine: run the fast (Tavily) and deep (last30days) engines
-    /// concurrently, then merge, cross-verify, and rank. Results surfaced by
-    /// both independent engines are treated as higher-confidence ("verified")
-    /// and float to the top. The deep engine is bounded by a timeout so the
-    /// search always returns promptly with whatever the fast engine found.
+    /// Hybrid engine: run Tavily (raw keyed search), Perplexity Sonar (LLM
+    /// with independent live retrieval), and optionally last30days (deep
+    /// social) concurrently, then merge, cross-verify, and rank. Results
+    /// surfaced by multiple independent engines are treated as
+    /// higher-confidence ("verified") and float to the top; Perplexity's
+    /// synthesized answer always survives ranking because agreement between
+    /// Tavily URLs and Perplexity citations is itself the verification signal.
     async fn search_hybrid(&self, query: &str, num_results: usize) -> Result<Vec<SearchResult>> {
         let config = crate::config::config();
         // Ask each leg for extra results so the merged/verified set is rich.
         let leg_results = num_results.saturating_mul(2).max(num_results);
 
         let fast = self.search_tavily(query, leg_results);
+        // Perplexity is a bounded network call (single completion); give it a
+        // generous but finite timeout so hybrid always returns promptly.
+        let perplexity_timeout = std::time::Duration::from_secs(45);
+        let perplexity = tokio::time::timeout(
+            perplexity_timeout,
+            self.search_perplexity(query, leg_results),
+        );
 
         let deep_enabled =
             config.websearch.last30days_enabled && locate_last30days_script(&config.websearch).is_some();
         let timeout = std::time::Duration::from_secs(config.websearch.last30days_timeout_secs.max(1));
 
-        let (fast_res, deep_res) = if deep_enabled {
+        let (fast_res, perplexity_res, deep_res) = if deep_enabled {
             let deep = tokio::time::timeout(timeout, self.search_last30days(query, leg_results));
-            let (fast_res, deep_timed) = tokio::join!(fast, deep);
+            let (fast_res, pplx_timed, deep_timed) = tokio::join!(fast, perplexity, deep);
             let deep_res = match deep_timed {
                 Ok(inner) => inner,
                 Err(_) => Err(anyhow::anyhow!(
@@ -626,9 +740,28 @@ impl WebSearchTool {
                     timeout.as_secs()
                 )),
             };
-            (fast_res, deep_res)
+            let pplx_res = match pplx_timed {
+                Ok(inner) => inner,
+                Err(_) => Err(anyhow::anyhow!(
+                    "perplexity engine timed out after {}s",
+                    perplexity_timeout.as_secs()
+                )),
+            };
+            (fast_res, pplx_res, deep_res)
         } else {
-            (fast.await, Err(anyhow::anyhow!("last30days engine unavailable")))
+            let (fast_res, pplx_timed) = tokio::join!(fast, perplexity);
+            let pplx_res = match pplx_timed {
+                Ok(inner) => inner,
+                Err(_) => Err(anyhow::anyhow!(
+                    "perplexity engine timed out after {}s",
+                    perplexity_timeout.as_secs()
+                )),
+            };
+            (
+                fast_res,
+                pplx_res,
+                Err(anyhow::anyhow!("last30days engine unavailable")),
+            )
         };
 
         let mut legs: Vec<(String, Vec<SearchResult>)> = Vec::new();
@@ -638,6 +771,11 @@ impl WebSearchTool {
             Ok(_) => {}
             Err(e) => errors.push(format!("tavily: {e}")),
         }
+        match perplexity_res {
+            Ok(r) if !r.is_empty() => legs.push(("perplexity".to_string(), r)),
+            Ok(_) => {}
+            Err(e) => errors.push(format!("perplexity: {e}")),
+        }
         match deep_res {
             Ok(r) if !r.is_empty() => legs.push(("last30days".to_string(), r)),
             Ok(_) => {}
@@ -645,7 +783,7 @@ impl WebSearchTool {
         }
 
         if legs.is_empty() {
-            // Both hybrid legs failed; let the caller fall through to keyless
+            // Every hybrid leg failed; let the caller fall through to keyless
             // fallback engines (DuckDuckGo/Bing) configured in fallback_engines.
             return Err(anyhow::anyhow!(
                 "hybrid search found no results ({})",

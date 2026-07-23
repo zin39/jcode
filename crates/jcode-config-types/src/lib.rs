@@ -1316,6 +1316,12 @@ pub enum WebSearchEngine {
     /// cross-verifies their results (agreement between independent engines is a
     /// strong quality signal), and returns a single merged, best-first ranking.
     Hybrid,
+    /// Perplexity Sonar (keyed LLM search). Asks Perplexity's `sonar` model the
+    /// query directly; it performs its own live web retrieval and returns a
+    /// synthesized, citation-backed answer converted into search results.
+    /// Reads the API key from the `perplexity` provider profile
+    /// (`provider-perplexity.env` / `JCODE_PROVIDER_PERPLEXITY_API_KEY`).
+    Perplexity,
 }
 
 impl WebSearchEngine {
@@ -1327,6 +1333,7 @@ impl WebSearchEngine {
             Self::Tavily => "tavily",
             Self::Last30days => "last30days",
             Self::Hybrid => "hybrid",
+            Self::Perplexity => "perplexity",
         }
     }
 
@@ -1338,6 +1345,7 @@ impl WebSearchEngine {
             "tavily" => Some(Self::Tavily),
             "last30days" | "l30d" | "last30" => Some(Self::Last30days),
             "hybrid" | "verified" | "both" => Some(Self::Hybrid),
+            "perplexity" | "sonar" | "pplx" => Some(Self::Perplexity),
             _ => None,
         }
     }
