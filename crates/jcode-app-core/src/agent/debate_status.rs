@@ -18,6 +18,12 @@ pub trait DebateStatusReporter: Send + Sync {
     fn phase(&self, label: &str);
     /// The final gold result (markdown) is ready.
     fn gold(&self, markdown: &str);
+    /// A cheap-route run announced its plan: subtask descriptions in order.
+    /// Default no-op keeps existing reporters/tests source-compatible.
+    fn plan(&self, _subtasks: &[(String, u8)]) {}
+    /// A cheap-route subtask changed state. `detail` carries the model that is
+    /// running it (or the error). Default no-op.
+    fn subtask(&self, _index: usize, _phase: DebatePhase, _detail: &str) {}
 }
 
 /// Reporter that ignores everything. Used in non-TUI contexts and tests.
@@ -36,13 +42,31 @@ struct DebateState {
     phase_label: String,
     proposers: Vec<(String, DebatePhase)>,
     gold: Option<String>,
+    /// Cheap-route plan: (description, difficulty, phase, detail) per subtask.
+    subtasks: Vec<(String, u8, DebatePhase, String)>,
 }
 
 impl DebateState {
     fn render(&self) -> String {
-        let mut buf = String::from("# Gold Debate\n\n");
+        let mut buf = String::from("# Cheap Route\n\n");
         if !self.phase_label.is_empty() {
             buf.push_str(&format!("**Phase:** {}\n\n", self.phase_label));
+        }
+        if !self.subtasks.is_empty() {
+            buf.push_str("## Subtasks\n\n");
+            for (desc, difficulty, phase, detail) in &self.subtasks {
+                let icon = match phase {
+                    DebatePhase::Running => "⏳",
+                    DebatePhase::Done => "✅",
+                    DebatePhase::Failed => "❌",
+                };
+                if detail.is_empty() {
+                    buf.push_str(&format!("- {} (d{}) {}\n", icon, difficulty, desc));
+                } else {
+                    buf.push_str(&format!("- {} (d{}) {} — `{}`\n", icon, difficulty, desc, detail));
+                }
+            }
+            buf.push('\n');
         }
         if !self.proposers.is_empty() {
             buf.push_str("## Proposers\n\n");
@@ -83,6 +107,7 @@ impl SidePanelDebateReporter {
                 phase_label: String::new(),
                 proposers: Vec::new(),
                 gold: None,
+                subtasks: Vec::new(),
             }),
         }
     }
@@ -133,6 +158,27 @@ impl DebateStatusReporter for SidePanelDebateReporter {
     fn gold(&self, markdown: &str) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.gold = Some(markdown.to_string());
+        self.flush(&state);
+    }
+
+    fn plan(&self, subtasks: &[(String, u8)]) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.subtasks = subtasks
+            .iter()
+            .map(|(desc, difficulty)| {
+                (desc.clone(), *difficulty, DebatePhase::Running, String::new())
+            })
+            .collect();
+        state.phase_label = "running subtasks".to_string();
+        self.flush(&state);
+    }
+
+    fn subtask(&self, index: usize, phase: DebatePhase, detail: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = state.subtasks.get_mut(index) {
+            entry.2 = phase;
+            entry.3 = detail.to_string();
+        }
         self.flush(&state);
     }
 }
