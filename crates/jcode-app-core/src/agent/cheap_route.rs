@@ -26,6 +26,11 @@ pub struct Subtask {
     /// 1 (trivial/mechanical) .. 5 (hard, needs a strong model).
     #[serde(default = "default_difficulty")]
     pub difficulty: u8,
+    /// Runtime-only position of this subtask in the plan, used to route the
+    /// worker's live output tail to the matching side-panel row. Not part of the
+    /// model's JSON contract (skipped in (de)serialization).
+    #[serde(skip)]
+    pub index: usize,
 }
 
 /// Result of running and reviewing one subtask.
@@ -358,6 +363,7 @@ async fn verify_and_maybe_repair(
         description: subtask.description.clone(),
         prompt: build_repair_prompt(subtask, &output, verify_cmd, &fail_out),
         difficulty: subtask.difficulty,
+        index: subtask.index,
     };
     let repaired = tokio::time::timeout(
         SUBTASK_TIMEOUT,
@@ -399,7 +405,12 @@ pub async fn run_cheap_route(
 ) -> Result<CheapRouteOutcome> {
     // 1. Parent decomposes the task.
     let decompose = backend.ask_parent(&build_decompose_prompt(task)).await?;
-    let subtasks = parse_subtasks(&decompose)?;
+    let mut subtasks = parse_subtasks(&decompose)?;
+    // Stamp each subtask with its plan position so the worker's live output tail
+    // routes to the matching side-panel row.
+    for (i, st) in subtasks.iter_mut().enumerate() {
+        st.index = i;
+    }
     // Publish the plan so the user can watch progress (side panel page).
     backend.reporter().plan(
         &subtasks
@@ -630,6 +641,10 @@ pub async fn run_cheap_route(
             model_used,
         });
     }
+
+    // Mark the run complete so the side-panel phase label stops saying
+    // "running subtasks" once every subtask has finished.
+    backend.reporter().phase("complete");
 
     Ok(CheapRouteOutcome {
         recommended_model,
@@ -1273,9 +1288,16 @@ impl CheapRouteBackend for ProviderCheapBackend {
         // Cheap workers may auto-switch to the next-cheapest healthy model if
         // their pinned model rate-limits/quota-fails mid-run, instead of failing.
         agent.set_allow_auto_reroute(true);
-        // Stream the worker's live output tail to the bus so the coordinator's
-        // inline gallery can show what the cheap model is doing while it runs.
-        agent.set_inline_output_tap(true);
+        // Stream the worker's live output tail directly into the side-panel
+        // "Cheap Route" page, routed to this subtask's row, so the user can open
+        // the panel and watch exactly what the cheap model is doing (streaming
+        // text + tool markers) in real time. Cheap workers are not swarm members,
+        // so we use the direct sink rather than the global-bus route.
+        let reporter = self.reporter.clone();
+        let index = subtask.index;
+        agent.set_inline_tail_sink(std::sync::Arc::new(move |tail: &str| {
+            reporter.subtask_live(index, tail);
+        }));
         agent.run_once_capture(&subtask.prompt).await
     }
 
@@ -1400,6 +1422,7 @@ pub async fn run_gold_debate(backend: &dyn CheapRouteBackend, task: &str) -> Res
         description: task.to_string(),
         prompt: task.to_string(),
         difficulty: 5,
+        index: 0,
     };
 
     if proposers.len() >= 2 {
@@ -1754,6 +1777,7 @@ mod tests {
             description: "t".to_string(),
             prompt: "do it".to_string(),
             difficulty: 1,
+            index: 0,
         }
     }
 
@@ -2455,8 +2479,8 @@ mod tests {
 
     #[test]
     fn is_code_subtask_detects_code() {
-        let code = Subtask { description: "edit main.rs".into(), prompt: "modify src/main.rs".into(), difficulty: 4 };
-        let reason = Subtask { description: "design the api".into(), prompt: "what is the best architecture for X".into(), difficulty: 4 };
+        let code = Subtask { description: "edit main.rs".into(), prompt: "modify src/main.rs".into(), difficulty: 4, index: 0 };
+        let reason = Subtask { description: "design the api".into(), prompt: "what is the best architecture for X".into(), difficulty: 4, index: 0 };
         assert!(is_code_subtask(&code));
         assert!(!is_code_subtask(&reason));
     }
@@ -2623,6 +2647,7 @@ mod tests {
             description: "d".into(),
             prompt: "p".into(),
             difficulty: 5,
+            index: 0,
         };
         let models = vec![
             ("m1".to_string(), None),
@@ -2644,7 +2669,7 @@ mod tests {
     // --- helpers shared by run_debate exhaustive tests ---
 
     fn debate_st() -> Subtask {
-        Subtask { description: "d".into(), prompt: "p".into(), difficulty: 5 }
+        Subtask { description: "d".into(), prompt: "p".into(), difficulty: 5, index: 0 }
     }
 
     fn models3() -> Vec<(String, Option<String>)> {

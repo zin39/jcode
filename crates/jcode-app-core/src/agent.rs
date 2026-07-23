@@ -256,6 +256,12 @@ pub struct Agent {
     /// Persists across turns so the coordinator's viewport never blanks at
     /// turn boundaries or freezes during long tool calls.
     inline_tail: inline_tail::InlineTailBuffer,
+    /// Optional direct sink for the live output tail. Cheap-route workers are
+    /// NOT swarm members, so the global-bus `SwarmOutputTail` route is dead for
+    /// them; this callback lets the cheap-route orchestrator receive each
+    /// worker's rolling tail directly and surface it in the side panel.
+    #[allow(clippy::type_complexity)]
+    inline_tail_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Agent {
@@ -310,6 +316,7 @@ impl Agent {
             inline_output_tap: false,
             allow_auto_reroute: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
+            inline_tail_sink: None,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,

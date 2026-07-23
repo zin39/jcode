@@ -102,6 +102,11 @@ impl Tool for WebSearchTool {
     async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
         let params: WebSearchInput = serde_json::from_value(input)?;
         let num_results = params.num_results.unwrap_or(8).min(20);
+        let session_id = if _ctx.session_id.is_empty() {
+            None
+        } else {
+            Some(_ctx.session_id.as_str())
+        };
 
         let config = crate::config::config();
         let mut engines = Vec::new();
@@ -128,6 +133,7 @@ impl Tool for WebSearchTool {
                         api_key_env: &config.websearch.bing_api_key_env,
                     },
                     allow_bing_api,
+                    session_id,
                 )
                 .await
             {
@@ -202,6 +208,7 @@ impl WebSearchTool {
         num_results: usize,
         bing: BingSearchOptions<'_>,
         allow_bing_api: bool,
+        session_id: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         match engine {
             WebSearchEngine::Duckduckgo => self.search_duckduckgo(query, num_results).await,
@@ -213,7 +220,7 @@ impl WebSearchTool {
             WebSearchEngine::Tavily => self.search_tavily(query, num_results).await,
             WebSearchEngine::Perplexity => self.search_perplexity(query, num_results).await,
             WebSearchEngine::Last30days => self.search_last30days(query, num_results).await,
-            WebSearchEngine::Hybrid => self.search_hybrid(query, num_results).await,
+            WebSearchEngine::Hybrid => self.search_hybrid(query, num_results, session_id).await,
         }
     }
 
@@ -712,10 +719,37 @@ impl WebSearchTool {
     /// higher-confidence ("verified") and float to the top; Perplexity's
     /// synthesized answer always survives ranking because agreement between
     /// Tavily URLs and Perplexity citations is itself the verification signal.
-    async fn search_hybrid(&self, query: &str, num_results: usize) -> Result<Vec<SearchResult>> {
+    async fn search_hybrid(
+        &self,
+        query: &str,
+        num_results: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         let config = crate::config::config();
         // Ask each leg for extra results so the merged/verified set is rich.
         let leg_results = num_results.saturating_mul(2).max(num_results);
+
+        let deep_enabled =
+            config.websearch.last30days_enabled && locate_last30days_script(&config.websearch).is_some();
+        // Seed the live side-panel page so the user can open it and watch each
+        // engine leg resolve in real time.
+        write_websearch_panel(
+            session_id,
+            query,
+            &[
+                ("tavily", WebSearchLegState::Running),
+                ("perplexity", WebSearchLegState::Running),
+                (
+                    "last30days",
+                    if deep_enabled {
+                        WebSearchLegState::Running
+                    } else {
+                        WebSearchLegState::Skipped
+                    },
+                ),
+            ],
+            &[],
+        );
 
         let fast = self.search_tavily(query, leg_results);
         // Perplexity is a bounded network call (single completion); give it a
@@ -726,8 +760,6 @@ impl WebSearchTool {
             self.search_perplexity(query, leg_results),
         );
 
-        let deep_enabled =
-            config.websearch.last30days_enabled && locate_last30days_script(&config.websearch).is_some();
         let timeout = std::time::Duration::from_secs(config.websearch.last30days_timeout_secs.max(1));
 
         let (fast_res, perplexity_res, deep_res) = if deep_enabled {
@@ -766,23 +798,58 @@ impl WebSearchTool {
 
         let mut legs: Vec<(String, Vec<SearchResult>)> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        // Per-leg display state for the live side panel.
+        let mut leg_states: Vec<(&str, WebSearchLegState)> = Vec::new();
         match fast_res {
-            Ok(r) if !r.is_empty() => legs.push(("tavily".to_string(), r)),
-            Ok(_) => {}
-            Err(e) => errors.push(format!("tavily: {e}")),
+            Ok(r) if !r.is_empty() => {
+                leg_states.push(("tavily", WebSearchLegState::Done(r.len())));
+                legs.push(("tavily".to_string(), r));
+            }
+            Ok(_) => leg_states.push(("tavily", WebSearchLegState::Done(0))),
+            Err(e) => {
+                errors.push(format!("tavily: {e}"));
+                leg_states.push(("tavily", WebSearchLegState::Failed(e.to_string())));
+            }
         }
         match perplexity_res {
-            Ok(r) if !r.is_empty() => legs.push(("perplexity".to_string(), r)),
-            Ok(_) => {}
-            Err(e) => errors.push(format!("perplexity: {e}")),
+            Ok(r) if !r.is_empty() => {
+                leg_states.push(("perplexity", WebSearchLegState::Done(r.len())));
+                legs.push(("perplexity".to_string(), r));
+            }
+            Ok(_) => leg_states.push(("perplexity", WebSearchLegState::Done(0))),
+            Err(e) => {
+                errors.push(format!("perplexity: {e}"));
+                leg_states.push(("perplexity", WebSearchLegState::Failed(e.to_string())));
+            }
         }
         match deep_res {
-            Ok(r) if !r.is_empty() => legs.push(("last30days".to_string(), r)),
-            Ok(_) => {}
-            Err(e) => errors.push(format!("last30days: {e}")),
+            Ok(r) if !r.is_empty() => {
+                leg_states.push(("last30days", WebSearchLegState::Done(r.len())));
+                legs.push(("last30days".to_string(), r));
+            }
+            Ok(_) => leg_states.push((
+                "last30days",
+                if deep_enabled {
+                    WebSearchLegState::Done(0)
+                } else {
+                    WebSearchLegState::Skipped
+                },
+            )),
+            Err(e) => {
+                errors.push(format!("last30days: {e}"));
+                leg_states.push((
+                    "last30days",
+                    if deep_enabled {
+                        WebSearchLegState::Failed(e.to_string())
+                    } else {
+                        WebSearchLegState::Skipped
+                    },
+                ));
+            }
         }
 
         if legs.is_empty() {
+            write_websearch_panel(session_id, query, &leg_states, &[]);
             // Every hybrid leg failed; let the caller fall through to keyless
             // fallback engines (DuckDuckGo/Bing) configured in fallback_engines.
             return Err(anyhow::anyhow!(
@@ -795,7 +862,91 @@ impl WebSearchTool {
             ));
         }
 
-        Ok(merge_and_rank(legs, num_results))
+        let ranked = merge_and_rank(legs, num_results);
+        // Publish the final verified ranking so the side panel shows what won.
+        write_websearch_panel(session_id, query, &leg_states, &ranked);
+        Ok(ranked)
+    }
+}
+
+/// Live per-engine leg state for the "Web Search" side-panel page.
+#[derive(Debug, Clone)]
+enum WebSearchLegState {
+    Running,
+    Done(usize),
+    Failed(String),
+    Skipped,
+}
+
+/// Write/refresh the "Web Search" side-panel page for a hybrid search and
+/// publish a `SidePanelUpdated` bus event so the client shows it live. The user
+/// can open this page to watch each engine leg resolve (running -> done/failed)
+/// and see the final verified ranking. No-op when there is no session id.
+fn write_websearch_panel(
+    session_id: Option<&str>,
+    query: &str,
+    legs: &[(&str, WebSearchLegState)],
+    ranked: &[SearchResult],
+) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let mut buf = String::from("# Web Search\n\n");
+    buf.push_str(&format!("**Query:** {query}\n\n"));
+    buf.push_str("## Engines\n\n");
+    for (name, state) in legs {
+        let line = match state {
+            WebSearchLegState::Running => format!("- ⏳ {name} — searching…"),
+            WebSearchLegState::Done(0) => format!("- ✅ {name} — no results"),
+            WebSearchLegState::Done(n) => format!("- ✅ {name} — {n} results"),
+            WebSearchLegState::Failed(e) => {
+                let short: String = e.chars().take(80).collect();
+                format!("- ❌ {name} — {short}")
+            }
+            WebSearchLegState::Skipped => format!("- ⚪ {name} — skipped"),
+        };
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    buf.push('\n');
+    if !ranked.is_empty() {
+        buf.push_str("## Verified Ranking\n\n");
+        for (i, r) in ranked.iter().enumerate() {
+            let verified = r.engines.len() > 1;
+            let badge = if verified {
+                format!(" ✓ verified · {}", r.engines.join("+"))
+            } else if let Some(first) = r.engines.first() {
+                format!(" · {first}")
+            } else {
+                String::new()
+            };
+            buf.push_str(&format!("{}. **{}**{}\n", i + 1, r.title, badge));
+            if !r.url.is_empty() {
+                buf.push_str(&format!("   {}\n", r.url));
+            }
+        }
+        buf.push('\n');
+    }
+    match crate::side_panel::write_markdown_page(
+        session_id,
+        "websearch",
+        Some("Web Search"),
+        &buf,
+        false,
+    ) {
+        Ok(snapshot) => {
+            crate::bus::Bus::global().publish(crate::bus::BusEvent::SidePanelUpdated(
+                crate::bus::SidePanelUpdated {
+                    session_id: session_id.to_string(),
+                    snapshot,
+                },
+            ));
+        }
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "[websearch] failed to write side panel page: {err}"
+            ));
+        }
     }
 }
 
