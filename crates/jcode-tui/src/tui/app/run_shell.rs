@@ -449,7 +449,7 @@ impl App {
             } else {
                 // Wait for input or redraw tick
                 tokio::select! {
-                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(&self) || status_line_patch_eligible(&self) => {
+                    _ = status_spinner_interval.tick(), if self.client_focused() && (status_spinner_renderer.spinner_only_available(&self) || status_line_patch_eligible(&self)) => {
                         // Prefer the single-cell spinner patch; if unavailable
                         // (e.g. a tool is running, which animates several status
                         // cells) fall back to the status-LINE patch before ever
@@ -657,7 +657,7 @@ impl App {
                 }
 
                 tokio::select! {
-                    _ = status_spinner_interval.tick(), if status_spinner_renderer.spinner_only_available(&self) || status_line_patch_eligible(&self) => {
+                    _ = status_spinner_interval.tick(), if self.client_focused() && (status_spinner_renderer.spinner_only_available(&self) || status_line_patch_eligible(&self)) => {
                         // Prefer the single-cell spinner patch; if unavailable
                         // (e.g. a tool is running, which animates several status
                         // cells) fall back to the status-LINE patch before ever
