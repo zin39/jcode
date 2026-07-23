@@ -174,11 +174,37 @@ pub fn strip_code_fence(text: &str) -> &str {
 }
 
 /// Parse the parent's decompose response into subtasks. Accepts a raw JSON array
-/// or one wrapped in a markdown code fence.
+/// or one wrapped in a markdown code fence. Thinking models (DeepSeek/GLM style)
+/// also prepend `<think>…</think>` reasoning before the JSON; strip that and, as
+/// a last resort, extract the outermost `[…]` span so stray prose never sinks
+/// an otherwise-valid decomposition.
 pub fn parse_subtasks(text: &str) -> Result<Vec<Subtask>> {
-    let json = strip_code_fence(text);
-    let subtasks: Vec<Subtask> = serde_json::from_str(json)
-        .map_err(|e| anyhow!("failed to parse subtasks JSON: {e}; raw: {json}"))?;
+    let without_think = match (text.find("<think>"), text.rfind("</think>")) {
+        (Some(_), Some(end)) => &text[end + "</think>".len()..],
+        _ => text,
+    };
+    let json = strip_code_fence(without_think);
+    let parsed: Result<Vec<Subtask>, _> = serde_json::from_str(json);
+    let subtasks: Vec<Subtask> = match parsed {
+        Ok(subtasks) => subtasks,
+        Err(first_err) => {
+            // Fallback: extract the outermost JSON array span.
+            let start = json.find('[');
+            let end = json.rfind(']');
+            match (start, end) {
+                (Some(start), Some(end)) if start < end => {
+                    serde_json::from_str(&json[start..=end]).map_err(|e| {
+                        anyhow!("failed to parse subtasks JSON: {e}; raw: {json}")
+                    })?
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "failed to parse subtasks JSON: {first_err}; raw: {json}"
+                    ));
+                }
+            }
+        }
+    };
     if subtasks.is_empty() {
         return Err(anyhow!("decompose returned zero subtasks"));
     }
@@ -1524,6 +1550,21 @@ mod tests {
         assert_eq!(parsed2.len(), 1);
         // difficulty defaults to 3 when omitted.
         assert_eq!(parsed2[0].difficulty, 3);
+    }
+
+    #[test]
+    fn parse_subtasks_strips_think_tags_and_extracts_array() {
+        // Thinking models prepend reasoning; the JSON follows </think>.
+        let text = "<think>\nlet me plan this out...\n[not json here]\n</think>\n\n[\n  {\"description\": \"read file\", \"prompt\": \"read it\", \"difficulty\": 1}\n]";
+        let subtasks = parse_subtasks(text).unwrap();
+        assert_eq!(subtasks.len(), 1);
+        assert_eq!(subtasks[0].description, "read file");
+
+        // Prose around a bare array still parses via the span fallback.
+        let text = "Here are the subtasks:\n[\n  {\"description\": \"a\", \"prompt\": \"b\", \"difficulty\": 2}\n]\nDone!";
+        let subtasks = parse_subtasks(text).unwrap();
+        assert_eq!(subtasks.len(), 1);
+        assert_eq!(subtasks[0].difficulty, 2);
     }
 
     #[test]
