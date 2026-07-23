@@ -526,9 +526,9 @@ fn test_model_picker_preserves_recommendation_priority_order() {
         .position(|model| {
             model.name == "gpt-5.5 (high)"
                 && model
-                    .active_option()
-                    .map(|route| route.api_method == "openai-oauth" && route.provider == "OpenAI")
-                    .unwrap_or(false)
+                    .options
+                    .iter()
+                    .any(|route| route.api_method == "openai-oauth" && route.provider == "OpenAI")
         })
         .expect("gpt-5.5 should be present");
     let gpt54 = picker
@@ -547,9 +547,9 @@ fn test_model_picker_preserves_recommendation_priority_order() {
         .position(|model| {
             model.name == "claude-opus-4-8 (high)"
                 && model
-                    .active_option()
-                    .map(|route| route.api_method == "claude-oauth")
-                    .unwrap_or(false)
+                    .options
+                    .iter()
+                    .any(|route| route.api_method == "claude-oauth")
         })
         .expect("claude-opus-4-8 oauth should be present");
     let claude_api = picker
@@ -558,9 +558,9 @@ fn test_model_picker_preserves_recommendation_priority_order() {
         .position(|model| {
             model.name == "claude-opus-4-8 (high)"
                 && model
-                    .active_option()
-                    .map(|route| route.api_method == "claude-api")
-                    .unwrap_or(false)
+                    .options
+                    .iter()
+                    .any(|route| route.api_method == "claude-api")
         })
         .expect("claude-opus-4-8 api key should be present");
     let spark = picker
@@ -617,25 +617,27 @@ fn test_model_picker_preserves_recommendation_priority_order() {
         !picker.entries[codex].recommended,
         "gpt-5.3-codex should not be recommended"
     );
+    // Merged rows: each recommended model appears once, carrying all of its
+    // provider routes as column-switchable options.
     let recommended_routes: Vec<_> = picker
         .entries
         .iter()
         .filter(|entry| entry.recommended)
         .map(|entry| {
-            let route = entry.active_option().expect("recommended entry has route");
-            (
-                entry.name.as_str(),
-                route.provider.as_str(),
-                route.api_method.as_str(),
-            )
+            let mut methods: Vec<&str> = entry
+                .options
+                .iter()
+                .map(|route| route.api_method.as_str())
+                .collect();
+            methods.sort_unstable();
+            (entry.name.as_str(), methods)
         })
         .collect();
     assert_eq!(
         recommended_routes,
         vec![
-            ("gpt-5.5 (high)", "OpenAI", "openai-oauth"),
-            ("claude-opus-4-8 (high)", "Anthropic", "claude-api"),
-            ("claude-opus-4-8 (high)", "Anthropic", "claude-oauth"),
+            ("gpt-5.5 (high)", vec!["openai-oauth"]),
+            ("claude-opus-4-8 (high)", vec!["claude-api", "claude-oauth"]),
         ],
         "only the exact requested routes should be recommended; got {:?}",
         recommended_routes
