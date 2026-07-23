@@ -219,6 +219,7 @@ fn test_model_picker_preview_stays_open_and_updates_filter() {
         app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
             .unwrap();
     }
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state

@@ -707,6 +707,7 @@ fn test_model_picker_includes_copilot_models_in_remote_mode() {
         configure_test_remote_models_with_copilot(&mut app);
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         let picker = app
             .inline_interactive_state
@@ -779,6 +780,7 @@ fn test_available_models_updated_event_surfaces_authed_provider_in_remote_model_
     );
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app
         .inline_interactive_state
@@ -823,6 +825,7 @@ fn test_remote_final_catalog_replaces_post_login_loading_state_in_place() {
     }];
     app.auth_catalog_refresh_pending = true;
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
     let picker = app.inline_interactive_state.as_ref().unwrap();
     assert!(
@@ -1043,6 +1046,7 @@ fn test_model_picker_remote_falls_back_to_current_model_when_catalog_empty() {
         app.remote_model_options.clear();
 
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
 
         let picker = app
             .inline_interactive_state

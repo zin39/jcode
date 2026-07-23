@@ -417,10 +417,38 @@ pub fn load_disk_cache() -> Option<Vec<ModelInfo>> {
 }
 
 pub fn load_model_pricing_disk_cache_public(model_id: &str) -> Option<ModelPricing> {
-    load_disk_cache()?
-        .into_iter()
+    // Hot path for the model picker: called once per model while building
+    // routes. Serve the lookup from the memo without cloning the whole
+    // catalog Vec (previously O(catalog) alloc+copy per call, which froze
+    // the picker for seconds on large catalogs).
+    let path = cache_path();
+    let modified_at = disk_cache_modified_at(&path);
+    if let Ok(memo) = DISK_CACHE_MEMO.lock()
+        && let Some(entry) = memo.get(&path)
+        && entry.modified_at == modified_at
+        && let Some(cache) = entry.cache.as_ref()
+    {
+        let now = current_unix_secs()?;
+        if now.saturating_sub(cache.cached_at) < CACHE_TTL_SECS {
+            return cache
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+                .map(|model| model.pricing.clone());
+        }
+        return None;
+    }
+    drop_memo_guard_and_load(model_id)
+}
+
+// Cold path: memo miss, load from disk (populates the memo) then search.
+fn drop_memo_guard_and_load(model_id: &str) -> Option<ModelPricing> {
+    let cache = load_disk_cache_entry()?;
+    cache
+        .models
+        .iter()
         .find(|model| model.id == model_id)
-        .map(|model| model.pricing)
+        .map(|model| model.pricing.clone())
 }
 
 pub type ModelTimestampIndex = HashMap<String, u64>;

@@ -46,6 +46,7 @@ fn test_open_model_picker_without_routes_shows_actionable_guidance() {
     let mut app = create_test_app();
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     assert!(app.inline_interactive_state.is_none());
@@ -457,11 +458,13 @@ fn test_model_picker_reuses_cached_entries_until_invalidated() {
     app.diff_mode = crate::config::DiffDisplayMode::Inline;
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(app.model_picker_cache.is_some());
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -471,6 +474,7 @@ fn test_model_picker_reuses_cached_entries_until_invalidated() {
 
     app.invalidate_model_picker_cache();
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -834,6 +838,7 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
 
     set_model_requests.lock().unwrap().clear();
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
     let picker = app
         .inline_interactive_state
@@ -1110,6 +1115,7 @@ fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration
     app.recent_authenticated_provider = Some(("chutes".to_string(), Instant::now()));
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     let picker = app
@@ -1182,6 +1188,7 @@ fn test_model_picker_does_not_cache_single_model_fallback() {
     app.diff_mode = crate::config::DiffDisplayMode::Inline;
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(
@@ -1190,6 +1197,7 @@ fn test_model_picker_does_not_cache_single_model_fallback() {
     );
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -1203,6 +1211,7 @@ fn test_local_model_picker_selection_failure_keeps_picker_open_and_shows_next_st
     let mut app = create_failing_model_switch_test_app();
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
     assert!(app.inline_interactive_state.is_some());
 
@@ -1290,6 +1299,7 @@ fn test_model_picker_waits_for_async_post_login_catalog_activation() {
             message: "Imported existing logins".to_string(),
         });
         app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     }
 
     let picker = app
@@ -1364,6 +1374,7 @@ fn test_login_completed_surfaces_new_provider_models_in_local_model_picker() {
     });
 
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     let picker = app
@@ -1573,6 +1584,7 @@ fn test_azure_login_completion_switches_local_model_without_completion() {
 fn test_local_model_picker_surfaces_antigravity_models_from_multiprovider() {
     let mut app = create_antigravity_picker_test_app();
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     let picker = app
@@ -1595,6 +1607,7 @@ fn test_local_model_picker_surfaces_antigravity_models_from_multiprovider() {
 fn test_local_antigravity_model_picker_selection_preserves_antigravity_provider() {
     let mut app = create_antigravity_picker_test_app();
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     let picker = app
@@ -1626,6 +1639,7 @@ fn test_local_antigravity_model_picker_selection_preserves_antigravity_provider(
 fn test_local_model_picker_openrouter_bare_openai_route_uses_openai_catalog_prefix() {
     let (mut app, set_model_calls) = create_openrouter_spec_capture_test_app();
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     let picker = app
@@ -1693,6 +1707,7 @@ fn test_local_model_picker_render_shows_antigravity_models_exactly_as_user_sees_
     app.display_messages = vec![DisplayMessage::system("seed render state")];
     app.bump_display_messages_version();
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     let render_filtered = |app: &mut App, filter: &str| {
@@ -1759,6 +1774,7 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
     app.display_messages = vec![DisplayMessage::system("seed render state")];
     app.bump_display_messages_version();
     app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
     wait_for_model_picker_load(&mut app);
 
     let render_filtered = |app: &mut App, filter: &str| {
