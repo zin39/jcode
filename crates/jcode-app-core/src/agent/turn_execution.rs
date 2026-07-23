@@ -311,6 +311,19 @@ impl Agent {
         self.inline_output_tap = enabled;
     }
 
+    /// Attach a direct sink for the live output tail. Cheap-route workers are
+    /// not swarm members, so the global-bus route does not reach a coordinator;
+    /// this callback receives the rolling tail on every throttled update so the
+    /// cheap-route orchestrator can render it live in the side panel. Setting a
+    /// sink implicitly enables the tap.
+    pub fn set_inline_tail_sink(
+        &mut self,
+        sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        self.inline_tail_sink = Some(sink);
+        self.inline_output_tap = true;
+    }
+
     /// Allow this session's turn loop to auto-switch to the next-cheapest healthy
     /// model on a rate/quota/transient failure. Only for spawned cheap workers
     /// and swarm members — never the user's interactive session.
@@ -365,10 +378,14 @@ impl Agent {
         if !self.inline_output_tap {
             return;
         }
+        let tail = self.inline_tail.render();
+        if let Some(sink) = &self.inline_tail_sink {
+            sink(&tail);
+        }
         crate::bus::Bus::global().publish(crate::bus::BusEvent::SwarmOutputTail(
             crate::bus::SwarmOutputTail {
                 session_id: self.session.id.clone(),
-                tail: self.inline_tail.render(),
+                tail,
             },
         ));
     }

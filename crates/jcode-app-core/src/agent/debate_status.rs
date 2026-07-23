@@ -24,6 +24,10 @@ pub trait DebateStatusReporter: Send + Sync {
     /// A cheap-route subtask changed state. `detail` carries the model that is
     /// running it (or the error). Default no-op.
     fn subtask(&self, _index: usize, _phase: DebatePhase, _detail: &str) {}
+    /// Live rolling output tail for a running cheap-route subtask. Streamed on
+    /// every throttled worker update so the side panel shows what the cheap
+    /// model is doing (text + tool markers) in real time. Default no-op.
+    fn subtask_live(&self, _index: usize, _tail: &str) {}
 }
 
 /// Reporter that ignores everything. Used in non-TUI contexts and tests.
@@ -42,8 +46,8 @@ struct DebateState {
     phase_label: String,
     proposers: Vec<(String, DebatePhase)>,
     gold: Option<String>,
-    /// Cheap-route plan: (description, difficulty, phase, detail) per subtask.
-    subtasks: Vec<(String, u8, DebatePhase, String)>,
+    /// Cheap-route plan: (description, difficulty, phase, detail, live_tail) per subtask.
+    subtasks: Vec<(String, u8, DebatePhase, String, String)>,
 }
 
 impl DebateState {
@@ -54,7 +58,7 @@ impl DebateState {
         }
         if !self.subtasks.is_empty() {
             buf.push_str("## Subtasks\n\n");
-            for (desc, difficulty, phase, detail) in &self.subtasks {
+            for (desc, difficulty, phase, detail, live) in &self.subtasks {
                 let icon = match phase {
                     DebatePhase::Running => "⏳",
                     DebatePhase::Done => "✅",
@@ -64,6 +68,17 @@ impl DebateState {
                     buf.push_str(&format!("- {} (d{}) {}\n", icon, difficulty, desc));
                 } else {
                     buf.push_str(&format!("- {} (d{}) {} — `{}`\n", icon, difficulty, desc, detail));
+                }
+                // While running, show the live rolling activity tail indented so
+                // the user can open the panel and watch the cheap model work.
+                if *phase == DebatePhase::Running && !live.trim().is_empty() {
+                    buf.push_str("\n  ```\n");
+                    for line in live.lines() {
+                        buf.push_str("  ");
+                        buf.push_str(line);
+                        buf.push('\n');
+                    }
+                    buf.push_str("  ```\n");
                 }
             }
             buf.push('\n');
@@ -166,7 +181,13 @@ impl DebateStatusReporter for SidePanelDebateReporter {
         state.subtasks = subtasks
             .iter()
             .map(|(desc, difficulty)| {
-                (desc.clone(), *difficulty, DebatePhase::Running, String::new())
+                (
+                    desc.clone(),
+                    *difficulty,
+                    DebatePhase::Running,
+                    String::new(),
+                    String::new(),
+                )
             })
             .collect();
         state.phase_label = "running subtasks".to_string();
@@ -178,6 +199,27 @@ impl DebateStatusReporter for SidePanelDebateReporter {
         if let Some(entry) = state.subtasks.get_mut(index) {
             entry.2 = phase;
             entry.3 = detail.to_string();
+            // Clear the live tail once the subtask leaves the running state so a
+            // finished subtask does not keep a stale in-progress transcript.
+            if phase != DebatePhase::Running {
+                entry.4.clear();
+            }
+        }
+        self.flush(&state);
+    }
+
+    fn subtask_live(&self, index: usize, tail: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = state.subtasks.get_mut(index) {
+            if entry.2 != DebatePhase::Running {
+                return;
+            }
+            if entry.4 == tail {
+                return;
+            }
+            entry.4 = tail.to_string();
+        } else {
+            return;
         }
         self.flush(&state);
     }
