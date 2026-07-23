@@ -973,8 +973,22 @@ pub fn remote_model_routes_fallback(
                     ),
                 }
             };
-            routes.push(build_openai_oauth_route(model, available, detail));
-            added_any = true;
+            // Only advertise the route(s) the account can actually use.
+            // auth.openai is Available when either OAuth or an API key is
+            // configured; offering an OAuth route to an API-key-only account
+            // fails at switch time with "No OpenAI OAuth tokens found".
+            if auth.openai_has_oauth {
+                routes.push(build_openai_oauth_route(model, available, detail.clone()));
+                added_any = true;
+            }
+            if auth.openai_has_api_key {
+                routes.push(build_openai_api_key_route(model, available, detail.clone()));
+                added_any = true;
+            }
+            if !auth.openai_has_oauth && !auth.openai_has_api_key {
+                routes.push(build_openai_oauth_route(model, false, detail));
+                added_any = true;
+            }
         }
 
         if auth.openrouter != AuthState::NotConfigured {
