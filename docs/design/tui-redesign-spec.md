@@ -257,6 +257,91 @@ diffs). Mockup (100x30), side panel focused:
  ❯ ▍
 ```
 
+### 3.7 Transcript economy mode (scrolled-back history)
+
+In long sessions, distant history keeps its text but sheds its chrome (principle 1).
+Rule: blocks within ~1.5 screen heights of the live tail render full (§3.1); blocks
+beyond render compact. Distance is measured in laid-out rows, not block count.
+
+Compact block, exact differences from full:
+- No per-block headers: gutter bar, `N › name · time` row, and model tag omitted.
+  Plain/monochrome tier keeps the ASCII `|` role marker so identity stays labeled
+  (principles 3, 6).
+- No surface backgrounds: surface-1 behind user text dropped; text colors unchanged.
+- Tool groups always render as the folded one-line summary; expansion is suspended,
+  not lost, and returns when the block re-enters the full region.
+- Denser spacing: 0 blank lines between blocks (vs 1); tool groups lose their
+  surrounding blank lines.
+
+Transition rule (hard): instant per-block swap at layout time; no animation, no fade,
+no intermediate frame. Scroll is anchored to (block id, row-in-block); when a block
+above the anchor swaps, the scroll offset compensates by its height delta so the
+anchor's screen row never moves (principle 7; R:motion "prefer stable row heights and
+reserved status space").
+
+### 3.8 Pane focus and cycling
+
+With 2+ panes open (chat + side panel, diff, or swarm gallery):
+- Focused pane keeps the accent edge (§3.5; palette `accent` = active pane edge). When
+  the transcript is the focused pane, its left gutter column takes accent.
+- Status bar adds one hint, `ctrl+w cycle panes` in muted, in reserved trailing space
+  of the right segment, shown only while pane count ≥ 2. It never shifts the state
+  word; metrics truncate first (principle 7, §3.3).
+- Unfocused pane content shifts text-secondary → muted; every other role and all
+  backgrounds unchanged. Why: attention is unequal, so weight content, not chrome
+  (R:best "DON'T make panes visually equal when attention is unequal"); backgrounds
+  must not flicker on focus change (principle 1).
+Keyboard-first discoverability: the binding is named in the chrome whenever it is
+relevant and repeated in `?` help; no mouse-only affordance is introduced.
+
+### 3.9 First-run / empty session
+
+A new session with an empty transcript renders a quiet welcome instead of a blank void:
+- Wordmark: `❯ jcode` in accent, small, in the upper third; no logo art, no version
+  banner.
+- Mode line: when a directory mode is active, one muted line under the wordmark, e.g.
+  `learning mode · ~/learning`; omitted entirely when no mode is active.
+- Starter actions: three numbered suggestions in muted (color, not the dim attribute,
+  per §2.2): explain this codebase / fix the failing tests / `/help`.
+- Input is focused with the accent caret; the only motion on screen is the caret
+  (principle 1). No spinner, shimmer, or entrance animation.
+The screen is replaced by the normal transcript on the first message; starters are
+suggestions, never buttons that steal focus. Plain tier renders `>` per §2.2.
+Mockup (100x30):
+
+```
+
+
+
+
+
+
+
+
+ ❯ jcode
+ learning mode · ~/learning
+
+ 1  explain this codebase
+ 2  fix the failing tests
+ 3  /help for keys and commands
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ready                                     new session · fable-5 · 0% ctx
+ ❯ ▍
+```
+
 ## 4. Motion design
 
 Keep (motion that explains state): single-cell braille spinner at 12.5fps via the existing
@@ -290,6 +375,7 @@ Restraint rules (hard):
 | Spinner | ASCII 1.5fps | braille 12.5fps | braille 12.5fps |
 | Idle 3D anim | off | off | opt-in |
 | Images | off | off | opt-in Kitty (existing) |
+| Economy mode (§3.7) | compact, ASCII role marker kept | compact | compact |
 | Detection | NO_COLOR, dumb, SSH doubt, override | TERM *-256color, no COLORTERM | COLORTERM=truecolor/24bit or known TERM_PROGRAM (CS:2 order unchanged) |
 
 Every tier renders identical text content and labels; only chrome depth changes.
@@ -307,3 +393,6 @@ macOS VS Code/AppleTerminal stay forced to 256 (glyph atlas #330, CS:5).
 8. **Session picker preview**: right preview pane ≥100 cols, row glyphs, footer hints. AC: preview hidden <100 cols; selection uses reverse+accent, no bg band.
 9. **Motion restraint**: `JCODE_REDUCED_MOTION`, ASCII spinner fallback, rich-only idle anim behind config (default off). AC: with flag set, only ASCII spinner ticks; idle-anim crate not polled.
 10. **Docs**: theme/tier config keys and tier behavior in user docs. AC: every config key in §5 documented with detection order.
+11. **Transcript economy mode**: distance-based block classification (~1.5 screens from live tail), compact render path, (block id, row) scroll anchoring with height-delta compensation. AC: anchor block's screen row unchanged across compact↔full swaps in tests; swap completes in one frame, no animation; expanded tool groups render folded beyond the boundary and re-expand on return; plain tier keeps ASCII role marker.
+12. **Pane focus + cycle hint**: unfocused-pane text-secondary→muted shift, `ctrl+w` pane cycling, status-bar hint when pane count ≥ 2. AC: hint absent with one pane, present with two; state-word x-position constant when hint appears; snapshot shows muted content with unchanged backgrounds in the unfocused pane; accent edge tracks focus.
+13. **First-run state**: empty-transcript layout (accent wordmark, optional mode line, 3 muted starters, focused input). AC: shown iff transcript empty; mode line only when a directory mode is active; 100x30 snapshot matches §3.9; no animation sources active besides the caret; replaced by the transcript on first message.
