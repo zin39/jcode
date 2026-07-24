@@ -1129,17 +1129,19 @@ fn cheap_subagent_tool_allowlist(registry_tools: &std::collections::HashSet<Stri
 
 /// Hard cap on a single subtask's model call. A slow/hanging route (e.g. a
 /// stalled provider) must not block the whole run — on timeout the candidate is
-/// treated as failed and the next route is tried. Kept tight so a dead route is
-/// abandoned quickly: a healthy cheap model opens + answers a small subtask in a
-/// few seconds, so 30s is generous for "working" yet fast to fail on a hang.
-const SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// treated as failed and the next route is tried. A healthy cheap model answers
+/// a text-only subtask in seconds, but subtasks that exercise TOOLS (reading
+/// files, running scripts, writing outputs) legitimately take 1-2 minutes even
+/// on fast models; the old 30s budget made every tool-using subtask "time out"
+/// across all candidates and fail the whole run.
+const SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Timeout for a HARD subtask (difficulty above the routing threshold) running
 /// on a strong reasoning model. Frontier reasoning models (Fable, Kimi K3,
 /// GPT-5.6 Sol) legitimately think for 1-3 minutes on difficulty-4/5 work;
 /// killing them at the cheap 30s budget guaranteed the strong tier could never
 /// answer and every hard subtask fell back to cheap models or failed.
-const STRONG_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const STRONG_SUBTASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Pick the per-attempt timeout for a subtask: hard subtasks get the strong
 /// (reasoning) budget, trivial ones stay on the tight cheap budget.
