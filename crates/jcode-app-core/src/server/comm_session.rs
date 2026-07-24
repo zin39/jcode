@@ -78,6 +78,10 @@ fn create_visible_spawn_session(
 
     let mut session = Session::create(None, None);
     session.working_dir = Some(cwd.display().to_string());
+    // Visible-spawn workers are swarm agents just like headless ones; mark
+    // them debug so the session picker hides them and worker-session GC can
+    // reclaim their transcripts (see headless.rs, which does the same).
+    session.set_debug(true);
     if let Some(model) = model_override {
         session.model = Some(model.to_string());
     }
