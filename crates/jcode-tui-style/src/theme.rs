@@ -1,45 +1,46 @@
 use crate::color;
 use crate::color::rgb;
+use crate::palette::{self, Role};
 use ratatui::prelude::*;
 
 pub fn user_color() -> Color {
-    rgb(138, 180, 248)
+    palette::role_color(Role::SelfRole, palette::detect_tier())
 }
 pub fn ai_color() -> Color {
-    rgb(129, 199, 132)
+    palette::role_color(Role::Agent, palette::detect_tier())
 }
 pub fn tool_color() -> Color {
-    rgb(120, 120, 120)
+    palette::role_color(Role::Muted, palette::detect_tier())
 }
 pub fn file_link_color() -> Color {
     rgb(180, 200, 255)
 }
 pub fn dim_color() -> Color {
-    rgb(80, 80, 80)
+    palette::role_color(Role::Faint, palette::detect_tier())
 }
 pub fn accent_color() -> Color {
-    rgb(186, 139, 255)
+    palette::role_color(Role::Accent, palette::detect_tier())
 }
 pub fn system_message_color() -> Color {
     rgb(255, 170, 220)
 }
 pub fn queued_color() -> Color {
-    rgb(255, 193, 7)
+    palette::role_color(Role::Warn, palette::detect_tier())
 }
 pub fn asap_color() -> Color {
-    rgb(110, 210, 255)
+    palette::role_color(Role::Info, palette::detect_tier())
 }
 pub fn pending_color() -> Color {
     rgb(140, 140, 140)
 }
 pub fn user_text() -> Color {
-    rgb(245, 245, 255)
+    palette::role_color(Role::TextPrimary, palette::detect_tier())
 }
 pub fn user_bg() -> Color {
-    rgb(35, 40, 50)
+    palette::role_color(Role::Surface1, palette::detect_tier())
 }
 pub fn ai_text() -> Color {
-    rgb(220, 220, 215)
+    palette::role_color(Role::TextSecondary, palette::detect_tier())
 }
 pub fn header_icon_color() -> Color {
     rgb(120, 210, 230)
