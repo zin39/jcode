@@ -1038,3 +1038,26 @@ async fn restore_agent_session_if_requested_restores_resumed_session() {
 
     assert_eq!(resumed.session_id(), original_session_id);
 }
+
+#[test]
+fn cli_auto_poke_cooldown_blocks_within_60s() {
+    // last_poke was 30s ago -> should block
+    let mut last_poke =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+    assert!(should_skip_auto_poke_for_swarm("test-session", &mut last_poke));
+}
+
+#[test]
+fn cli_auto_poke_cooldown_allows_after_60s() {
+    // last_poke was 90s ago -> should allow
+    let mut last_poke =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(90));
+    assert!(!should_skip_auto_poke_for_swarm("test-session", &mut last_poke));
+}
+
+#[test]
+fn cli_auto_poke_first_poke_allowed() {
+    // no previous poke -> first poke always allowed (no swarm state check triggers)
+    let mut last_poke: Option<std::time::Instant> = None;
+    assert!(!should_skip_auto_poke_for_swarm("test-session", &mut last_poke));
+}

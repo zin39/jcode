@@ -20,6 +20,15 @@ use std::time::{Duration, Instant};
 
 const INPUT_SHELL_MAX_OUTPUT_LEN: usize = 30_000;
 
+/// Minimum wall-clock gap between two auto-pokes for the same session when
+/// no swarm workers are active. Prevents re-poking on every rapid turn.
+const AUTO_POKE_NORMAL_COOLDOWN: Duration = Duration::from_secs(60);
+/// Minimum gap between auto-pokes when swarm workers owned by this session
+/// are actively running. The coordinator is likely blocked on `await_members`;
+/// one initial poke is allowed to wake it, but we must not spam while it
+/// legitimately waits for workers to report back.
+const AUTO_POKE_SWARM_ACTIVE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
 /// Remove reasoning-marked lines from committed transcript text. Reasoning lines
 /// are wrapped in emphasis containing the invisible [`REASONING_SENTINEL`]
 /// (see `jcode_tui_markdown::reasoning_line_markup`). Trailing blank lines left
@@ -1323,6 +1332,25 @@ impl App {
         {
             return false;
         }
+
+        let now = Instant::now();
+
+        // --- Cooldown guard ---
+        if let Some(until) = self.auto_poke_cooldown_until {
+            if now < until {
+                return false;
+            }
+        }
+
+        // --- Swarm-activity skip: use longer cooldown when workers are running ---
+        let swarm_active = self.has_active_swarm_workers();
+        let cooldown = if swarm_active {
+            AUTO_POKE_SWARM_ACTIVE_COOLDOWN
+        } else {
+            AUTO_POKE_NORMAL_COOLDOWN
+        };
+        // Record when this poke fires so the next one waits for the cooldown.
+        self.auto_poke_cooldown_until = Some(now + cooldown);
 
         let todos = super::commands::poke_todos(self);
         let incomplete: Vec<_> = todos

@@ -869,6 +869,10 @@ pub struct App {
     pending_turn: bool,
     // When armed by /poke, automatically continue prompting until todos are complete.
     auto_poke_incomplete_todos: bool,
+    /// Wall-clock deadline after which the next auto-poke may fire. Skips pokes
+    /// while `Instant::now()` is before this value. Reset to `None` when
+    /// `auto_poke_incomplete_todos` is (re-)armed.
+    auto_poke_cooldown_until: Option<std::time::Instant>,
     /// Whether the current auto-poke cycle has already challenged an abrupt
     /// final confidence increase. Low or missing completion confidence keeps
     /// retrying, but a spike gets one dedicated independent-validation turn.
