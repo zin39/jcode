@@ -530,6 +530,24 @@ use theme_support::{
     system_message_color, tool_color, user_bg, user_color, user_text,
 };
 
+// ── Tool-fold state (WP4) ────────────────────────────────────────────────
+
+/// Whether consecutive tool-call rows are currently expanded.
+/// Toggled by `ctrl+o`. A static so the prepare cache can read it from any
+/// render path without threading a mutable App reference through.
+static TOOL_FOLD_EXPANDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Toggle the tool-fold expanded state and return the new value.
+pub(crate) fn toggle_tool_fold_expanded() -> bool {
+    TOOL_FOLD_EXPANDED.fetch_xor(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether tool-call rows are currently unfolded (not folded into a summary).
+pub(crate) fn tool_fold_expanded() -> bool {
+    TOOL_FOLD_EXPANDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) use jcode_tui_markdown::{CopyTargetKind, RawCopyTarget};
 pub(crate) use jcode_tui_messages::{
     CopyTarget, EditToolRange, ImageRegion, MessageBoundary, PreparedChatFrame, PreparedMessages,
@@ -889,6 +907,9 @@ struct BodyCacheKey {
     /// Live swarm-member data renders beneath the tool call that spawned each
     /// member, so status/todo/tool-intent updates must invalidate the body.
     swarm_members_signature: u64,
+    /// WP4: tool-call fold/expand state.  Toggling must invalidate the body so
+    /// the fold summary line appears or disappears immediately.
+    tool_fold_expanded: bool,
 }
 
 #[derive(Clone)]
@@ -971,6 +992,7 @@ impl BodyCacheState {
                     && entry.key.images_signature == key.images_signature
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
+                    && entry.key.tool_fold_expanded == key.tool_fold_expanded
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -992,6 +1014,7 @@ impl BodyCacheState {
                     && entry.key.images_signature == key.images_signature
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
+                    && entry.key.tool_fold_expanded == key.tool_fold_expanded
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -1032,6 +1055,7 @@ impl BodyCacheState {
                     && entry.key.images_signature == key.images_signature
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
+                    && entry.key.tool_fold_expanded == key.tool_fold_expanded
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (false, idx, entry.msg_count));
@@ -1054,6 +1078,7 @@ impl BodyCacheState {
                     && entry.key.images_signature == key.images_signature
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
+                    && entry.key.tool_fold_expanded == key.tool_fold_expanded
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (true, idx, entry.msg_count));
@@ -1161,6 +1186,8 @@ struct FullPrepCacheKey {
     expanded_images_version: u64,
     /// Signature of live swarm member cards embedded beneath spawn tool calls.
     swarm_members_signature: u64,
+    /// WP4: tool-call fold/expand state.
+    tool_fold_expanded: bool,
 }
 
 #[derive(Clone)]

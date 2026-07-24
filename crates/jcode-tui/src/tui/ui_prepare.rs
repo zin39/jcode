@@ -703,6 +703,7 @@ pub(super) fn prepare_messages(
         inline_images_visible: app.inline_images_visible(),
         expanded_images_version: app.expanded_images_version(),
         swarm_members_signature: swarm_members_signature(&app.swarm_members_for_transcript()),
+        tool_fold_expanded: ui::tool_fold_expanded(),
     };
 
     super::note_full_prep_request();
@@ -1045,6 +1046,7 @@ fn prepare_body_cached(app: &dyn TuiState, width: u16) -> Arc<PreparedMessages> 
         images_signature: app.side_pane_images_signature(),
         expanded_images_version: app.expanded_images_version(),
         swarm_members_signature: swarm_members_signature(&app.swarm_members_for_transcript()),
+        tool_fold_expanded: ui::tool_fold_expanded(),
     };
     let msg_count = app.display_messages().len();
     let cache_lookup_start = Instant::now();
@@ -1441,69 +1443,137 @@ fn render_message_into(
             acc.line_copy_offsets.push(prefix_width);
         }
         "tool" => {
-            let tool_start_line = acc.lines.len();
-            let cached = get_cached_message_lines(msg, width, app.diff_mode(), render_tool_message);
-            if let Some(target) = tool_message_copy_target(msg, cached.len()) {
-                acc.copy_targets
-                    .push(offset_copy_target(target, tool_start_line));
-            }
-            for line in cached {
-                acc.push_auto(align_if_unset(line, align));
-            }
-            if let Some(member) = spawned_member_for_tool(msg, &ctx.swarm_members) {
-                for line in crate::tui::info_widget::swarm_gallery::render_swarm_chat_card_lines(
-                    std::slice::from_ref(member),
-                    width.saturating_sub(1) as usize,
-                ) {
-                    acc.push_auto(line.alignment(ratatui::layout::Alignment::Left));
-                }
-            }
-            for line in todo_change_lines(ctx.messages, msg_global_idx, msg, width) {
-                acc.push_auto(align_if_unset(line, align));
-            }
-            if let Some(ref tc) = msg.tool_data {
-                let is_edit_tool = tools_ui::is_edit_tool_name(&tc.name);
-                if is_edit_tool {
-                    let file_path = tc
-                        .input
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            tc.input
-                                .get("patch_text")
-                                .and_then(|v| v.as_str())
-                                .and_then(|patch_text| {
-                                    match tools_ui::canonical_tool_name(&tc.name) {
-                                        "apply_patch" => {
-                                            tools_ui::extract_apply_patch_primary_file(patch_text)
-                                        }
-                                        "patch" => {
-                                            tools_ui::extract_unified_patch_primary_file(patch_text)
-                                        }
-                                        _ => None,
-                                    }
-                                })
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let expandable =
-                        messages::edit_tool_inline_diff_is_expandable(tc, &msg.content, width);
-                    acc.edit_tool_line_ranges.push((
-                        msg_global_idx,
-                        file_path,
-                        tool_start_line,
-                        acc.lines.len(),
-                        expandable,
-                    ));
-                }
-                if let Some(items) = ctx.anchored_images.by_tool.get(&tc.id) {
-                    for line in super::inline_image_ui::anchored_image_lines(
-                        items,
+            // ── WP4 tool-fold ──────────────────────────────────────────────
+            // If we are in a run of > 3 consecutive tool messages and the
+            // fold is not yet expanded, render only the first 3 and collapse
+            // the rest into a single summary line.
+            let fold_info = if ui::tool_fold_expanded() {
+                None
+            } else {
+                fold_position(ctx.messages, msg_global_idx)
+            };
+            if let Some((pos, run_len)) = fold_info {
+                // pos 0, 1, 2: render normally.
+                // pos 2: also append a fold-summary line after rendering.
+                // pos >= 3: skip rendering entirely (just record the segment).
+                if pos < 3 {
+                    let tool_start_line = acc.lines.len();
+                    let cached = get_cached_message_lines(
+                        msg,
                         width,
-                        ctx.inline_images_visible,
-                        &super::inline_image_ui::AppExpandLevels(app),
-                    ) {
-                        acc.push_auto(line);
+                        app.diff_mode(),
+                        render_tool_message,
+                    );
+                    if let Some(target) = tool_message_copy_target(msg, cached.len()) {
+                        acc.copy_targets
+                            .push(offset_copy_target(target, tool_start_line));
+                    }
+                    for line in cached {
+                        acc.push_auto(align_if_unset(line, align));
+                    }
+                    // Fold summary: after the 3rd tool (pos == 2), append summary.
+                    if pos == 2 {
+                        let remaining = run_len - 3;
+                        let tier = detect_tier();
+                        let glyph = if tier == Tier::Plain { ">>" } else { "▸" };
+                        let fold_line_text = format!(
+                            "  {} {} more tool calls · ctrl+o expand",
+                            glyph, remaining
+                        );
+                        let fold_span = Span::styled(
+                            fold_line_text,
+                            Style::default().fg(dim_color()),
+                        );
+                        acc.push_auto(Line::from(fold_span).alignment(align));
+                    }
+                }
+                // pos >= 3: skip rendering but still handle side effects.
+                if let Some(ref tc) = msg.tool_data {
+                    if let Some(_items) = ctx.anchored_images.by_tool.get(&tc.id) {
+                        // Folded tools with anchored images: drop images silently
+                        // (they are hidden behind the fold). They reappear on expand.
+                    }
+                }
+            } else {
+                // ── Normal (non-folded or expanded) path ──────────────────
+                let tool_start_line = acc.lines.len();
+                let cached = get_cached_message_lines(
+                    msg,
+                    width,
+                    app.diff_mode(),
+                    render_tool_message,
+                );
+                if let Some(target) = tool_message_copy_target(msg, cached.len()) {
+                    acc.copy_targets
+                        .push(offset_copy_target(target, tool_start_line));
+                }
+                for line in cached {
+                    acc.push_auto(align_if_unset(line, align));
+                }
+                if let Some(member) = spawned_member_for_tool(msg, &ctx.swarm_members) {
+                    for line in
+                        crate::tui::info_widget::swarm_gallery::render_swarm_chat_card_lines(
+                            std::slice::from_ref(member),
+                            width.saturating_sub(1) as usize,
+                        )
+                    {
+                        acc.push_auto(line.alignment(ratatui::layout::Alignment::Left));
+                    }
+                }
+                for line in todo_change_lines(ctx.messages, msg_global_idx, msg, width) {
+                    acc.push_auto(align_if_unset(line, align));
+                }
+                if let Some(ref tc) = msg.tool_data {
+                    let is_edit_tool = tools_ui::is_edit_tool_name(&tc.name);
+                    if is_edit_tool {
+                        let file_path = tc
+                            .input
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                            .or_else(|| {
+                                tc.input
+                                    .get("patch_text")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|patch_text| {
+                                        match tools_ui::canonical_tool_name(&tc.name) {
+                                            "apply_patch" => {
+                                                tools_ui::extract_apply_patch_primary_file(
+                                                    patch_text,
+                                                )
+                                            }
+                                            "patch" => {
+                                                tools_ui::extract_unified_patch_primary_file(
+                                                    patch_text,
+                                                )
+                                            }
+                                            _ => None,
+                                        }
+                                    })
+                            })
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let expandable = messages::edit_tool_inline_diff_is_expandable(
+                            tc,
+                            &msg.content,
+                            width,
+                        );
+                        acc.edit_tool_line_ranges.push((
+                            msg_global_idx,
+                            file_path,
+                            tool_start_line,
+                            acc.lines.len(),
+                            expandable,
+                        ));
+                    }
+                    if let Some(items) = ctx.anchored_images.by_tool.get(&tc.id) {
+                        for line in super::inline_image_ui::anchored_image_lines(
+                            items,
+                            width,
+                            ctx.inline_images_visible,
+                            &super::inline_image_ui::AppExpandLevels(app),
+                        ) {
+                            acc.push_auto(line);
+                        }
                     }
                 }
             }
@@ -1661,6 +1731,30 @@ fn render_message_into(
         acc.raw_plain_lines.len(),
         acc.user_prompt_texts.len(),
     ));
+}
+
+/// Compute the length of a consecutive tool-message run starting at `start_idx`.
+fn tool_run_len_from(messages: &[DisplayMessage], start_idx: usize) -> usize {
+    let mut end = start_idx;
+    while end < messages.len() && messages[end].effective_role() == "tool" {
+        end += 1;
+    }
+    end - start_idx
+}
+
+/// Position of `msg_idx` within its tool run, and the total run length.
+/// Returns `None` if not in a run of > 3 consecutive tools.
+fn fold_position(messages: &[DisplayMessage], msg_idx: usize) -> Option<(usize, usize)> {
+    let mut start = msg_idx;
+    while start > 0 && messages[start - 1].effective_role() == "tool" {
+        start -= 1;
+    }
+    let run_len = tool_run_len_from(messages, start);
+    if run_len > 3 {
+        Some((msg_idx - start, run_len))
+    } else {
+        None
+    }
 }
 
 pub(super) fn prepare_body_incremental(

@@ -12,6 +12,7 @@ fn test_body_cache_state_keeps_multiple_width_entries() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     };
     let key_b = BodyCacheKey {
         width: 41,
@@ -81,6 +82,7 @@ fn test_body_cache_state_does_not_reuse_a_different_mermaid_aspect_profile() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     };
     let resized_key = BodyCacheKey {
         messages_version: 2,
@@ -113,6 +115,7 @@ fn test_body_cache_state_evicts_oldest_entries() {
             images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
         };
         let prepared = Arc::new(PreparedMessages {
             wrapped_lines: vec![Line::from(format!("{idx}"))],
@@ -154,6 +157,7 @@ fn test_body_cache_state_accepts_large_single_entry_within_total_budget() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     };
     let prepared = make_prepared_messages_with_content_bytes(3 * 1024 * 1024, "body-large-");
 
@@ -183,6 +187,7 @@ fn test_body_cache_state_retains_oversized_hot_entry() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     };
     let prepared = make_oversized_prepared_messages("body-oversized-");
 
@@ -213,6 +218,7 @@ fn test_body_cache_state_keeps_two_oversized_width_entries_hot() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     };
     let key_b = BodyCacheKey {
         width: 139,
@@ -250,6 +256,7 @@ fn test_body_cache_state_uses_oversized_hot_entry_as_incremental_base() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     };
     let prepared = make_oversized_prepared_messages("body-oversized-base-");
 
@@ -503,6 +510,7 @@ fn test_full_prep_cache_state_keeps_multiple_width_entries() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     inline_images_visible: true,
     };
     let key_b = FullPrepCacheKey {
@@ -577,6 +585,7 @@ fn test_full_prep_cache_state_does_not_reuse_a_different_mermaid_aspect_profile(
         inline_images_visible: true,
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     };
     let resized_key = FullPrepCacheKey {
         mermaid_aspect_bucket: Some(2500),
@@ -610,6 +619,7 @@ fn test_full_prep_cache_state_evicts_oldest_entries() {
         inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
         inline_images_visible: true,
         };
         let prepared = make_prepared_chat_frame(Arc::new(PreparedMessages {
@@ -655,6 +665,7 @@ fn test_full_prep_cache_state_accepts_large_single_entry_within_total_budget() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     inline_images_visible: true,
     };
     let prepared = make_prepared_chat_frame_with_content_bytes(3 * 1024 * 1024, "full-large-");
@@ -687,6 +698,7 @@ fn test_full_prep_cache_state_retains_oversized_hot_entry() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     inline_images_visible: true,
     };
     let prepared = make_oversized_prepared_chat_frame("full-oversized-");
@@ -721,6 +733,7 @@ fn test_full_prep_cache_state_keeps_two_oversized_width_entries_hot() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+            tool_fold_expanded: false,
     inline_images_visible: true,
     };
     let key_b = FullPrepCacheKey {

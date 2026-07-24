@@ -8,6 +8,7 @@ use crate::message::{
 };
 pub(super) use cache_support::get_cached_message_lines;
 use cache_support::{centered_wrap_width, left_pad_lines_for_centered_mode};
+use jcode_tui_style::palette::{self, Role, Tier};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
@@ -15,6 +16,47 @@ const MAX_INLINE_DIFF_LINES: usize = 12;
 const MAX_DISCOVERY_DETAIL_LINES: usize = 2;
 const MAX_DISCOVERY_SETUP_LINES: usize = 3;
 const MAX_DISCOVERY_LISTING_ENTRIES: usize = 4;
+
+// ── Tier-aware tool glyphs (WP4) ─────────────────────────────────────────
+
+/// Return the tool-type glyph for the current colour tier.
+/// Rich/256: ⚙  Plain: [>]
+fn tool_type_glyph(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Plain => "[>]",
+        Tier::Rich | Tier::Ansi256 => "⚙",
+    }
+}
+
+/// Return the status glyph + colour for a completed tool call.
+/// (done_icon, done_color, error_icon, error_color)
+fn tool_status_glyphs(tier: Tier) -> (&'static str, Color, &'static str, Color) {
+    let agent = palette::role_color(Role::Agent, tier);
+    let error = palette::role_color(Role::Error, tier);
+    match tier {
+        Tier::Plain => ("[ok]", agent, "[x]", error),
+        Tier::Rich | Tier::Ansi256 => ("✓", agent, "✗", error),
+    }
+}
+
+/// Format a duration in seconds to a compact human-readable string.
+fn format_duration_secs(secs: f32) -> String {
+    if secs < 1.0 {
+        format!("{:.0}ms", secs * 1000.0)
+    } else if secs < 10.0 {
+        format!("{:.1}s", secs)
+    } else if secs < 60.0 {
+        format!("{:.0}s", secs)
+    } else {
+        let mins = (secs / 60.0) as u32;
+        let remain = (secs % 60.0) as u32;
+        if remain == 0 {
+            format!("{}m", mins)
+        } else {
+            format!("{}m{}s", mins, remain)
+        }
+    }
+}
 
 fn prefer_width_stable_system_glyphs() -> bool {
     std::env::var("TERM_PROGRAM")
@@ -3718,12 +3760,15 @@ pub(crate) fn render_tool_message(
         .map(|counts| counts.failed > 0 && counts.succeeded > 0)
         .unwrap_or(false);
 
+    let tier = palette::detect_tier();
+    let (done_icon, done_color, error_icon, error_color) = tool_status_glyphs(tier);
     let (icon, icon_color) = if is_partial_batch {
+        // Partial batch: use warn glyph
         ("⚠", rgb(214, 184, 92))
     } else if is_error {
-        ("✗", rgb(220, 100, 100))
+        (error_icon, error_color)
     } else {
-        ("✓", rgb(100, 180, 100))
+        (done_icon, done_color)
     };
 
     let is_edit_tool = tools_ui::is_edit_tool_name(&tc.name);
@@ -3797,8 +3842,14 @@ pub(crate) fn render_tool_message(
     };
 
     let mut tool_line = vec![
-        Span::styled(format!("  {} ", icon), Style::default().fg(icon_color)),
-        Span::styled(display_name, Style::default().fg(tool_color())),
+        Span::styled(
+            format!("  {} ", tool_type_glyph(tier)),
+            Style::default().fg(palette::role_color(Role::Muted, tier)),
+        ),
+        Span::styled(
+            display_name,
+            Style::default().fg(palette::role_color(Role::Muted, tier)),
+        ),
     ];
     if let Some(intent) = intent {
         tool_line.push(Span::styled(" · ", Style::default().fg(dim_color())));
@@ -3831,6 +3882,18 @@ pub(crate) fn render_tool_message(
             Style::default().fg(diff_del_color()),
         ));
         tool_line.push(Span::styled(")", Style::default().fg(dim_color())));
+    }
+    // Append status icon (done/error) after the summary/args.
+    // On plain tier this is "[ok]" / "[x]"; on rich it is "✓" / "✗".
+    tool_line.push(Span::styled(" ", Style::default()));
+    tool_line.push(Span::styled(icon, Style::default().fg(icon_color)));
+    // Append duration if available.
+    if let Some(d) = msg.duration_secs {
+        let dur_text = format_duration_secs(d);
+        tool_line.push(Span::styled(
+            format!(" {}", dur_text),
+            Style::default().fg(dim_color()),
+        ));
     }
     let token_suffix = Line::from(vec![
         Span::styled(" · ", Style::default().fg(dim_color())),

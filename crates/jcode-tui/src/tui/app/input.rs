@@ -2011,6 +2011,18 @@ pub(super) fn handle_pre_control_shortcuts(
         app.toggle_centered_mode();
         return true;
     }
+    // WP4: ctrl+o toggles tool-call fold/expand.
+    if code == KeyCode::Char('o') && modifiers == KeyModifiers::CONTROL {
+        let expanded = crate::tui::ui::toggle_tool_fold_expanded();
+        app.set_status_notice(if expanded {
+            "Tool calls: expanded"
+        } else {
+            "Tool calls: folded"
+        });
+        // Force a body rebuild so the fold takes effect immediately.
+        app.bump_display_messages_version();
+        return true;
+    }
 
     app.normalize_diagram_state();
     let diagram_available = app.diagram_available();

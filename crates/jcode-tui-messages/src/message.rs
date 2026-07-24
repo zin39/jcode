@@ -210,7 +210,7 @@ impl DisplayMessage {
             role: item.role,
             content: item.content,
             tool_calls: item.tool_calls,
-            duration_secs: None,
+            duration_secs: item.tool_duration_ms.map(|ms| ms as f32 / 1000.0),
             title: None,
             tool_data: item.tool_data,
         }
