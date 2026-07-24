@@ -2285,6 +2285,21 @@ impl App {
 
                 match save_result {
                     Ok(()) => {
+                        // When the user explicitly saves an API key for a dual-auth
+                        // provider (OpenAI or Anthropic), clear any stored OAuth
+                        // accounts so the Auto credential mode won't prefer a stale
+                        // OAuth token over the just-saved API key, and pin the
+                        // runtime provider so the credential mode resolves to ApiKey
+                        // when the provider is (re)initialized. This mirrors the CLI
+                        // flow that pins CredentialMode::ApiKey via
+                        // explicit_credential_mode() in provider_init.rs.
+                        if key_name == "OPENAI_API_KEY" {
+                            let _ = crate::auth::codex::clear_accounts();
+                            crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-api");
+                        } else if key_name == "ANTHROPIC_API_KEY" {
+                            let _ = crate::auth::claude::clear_accounts();
+                            crate::env::set_var("JCODE_RUNTIME_PROVIDER", "claude-api");
+                        }
                         crate::auth::AuthStatus::invalidate_cache();
                         crate::logging::event_info(
                             "login_api_key_saved",

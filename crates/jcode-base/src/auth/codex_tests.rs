@@ -433,3 +433,68 @@ fn load_auth_file_renames_existing_labels_to_numbered_scheme() {
     );
     assert_eq!(auth.active_openai_account.as_deref(), Some("openai-2"));
 }
+
+#[test]
+fn api_key_credentials_work_with_oauth_accounts_present() {
+    // load_api_key_credentials() must succeed even when OAuth accounts
+    // exist in openai-auth.json — the ApiKey credential mode bypasses
+    // OAuth entirely. This is the resolution path used when
+    // CredentialMode::ApiKey is pinned.
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _api_key = EnvVarGuard::set("OPENAI_API_KEY", "sk-from-env");
+    set_active_account_override(None);
+
+    // Write an OAuth account to openai-auth.json (still valid, not expired).
+    // This is the exact scenario that triggers the bug: a valid OAuth token
+    // sits in openai-auth.json and load_credentials() picks it even though
+    // the user just saved an API key.
+    upsert_account(OpenAiAccount {
+        label: "openai-1".to_string(),
+        access_token: "at_oauth_valid".to_string(),
+        refresh_token: "rt_oauth_valid".to_string(),
+        id_token: None,
+        account_id: Some("acct_oauth".to_string()),
+        expires_at: Some(9999999999999), // far future, not expired
+        email: Some("oauth@example.com".to_string()),
+    })
+    .unwrap();
+
+    // Auto mode prefers the non-expired OAuth (this is the bug:
+    // load_credentials() picks OAuth first even though the user
+    // explicitly saved an API key).
+    let auto_creds = load_credentials().unwrap();
+    assert_eq!(auto_creds.access_token, "at_oauth_valid");
+
+    // But ApiKey mode bypasses OAuth entirely and picks the env key.
+    let api_key_creds = load_api_key_credentials().unwrap();
+    assert_eq!(api_key_creds.access_token, "sk-from-env");
+    assert!(api_key_creds.refresh_token.is_empty());
+}
+
+#[test]
+fn oauth_credentials_still_work_when_oauth_accounts_exist() {
+    // load_oauth_credentials() must still resolve correctly when
+    // OAuth accounts are present — the OAuth credential mode must
+    // not be broken by the API-key-pinning fix.
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    set_active_account_override(None);
+
+    upsert_account(OpenAiAccount {
+        label: "openai-1".to_string(),
+        access_token: "at_oauth_valid".to_string(),
+        refresh_token: "rt_oauth_valid".to_string(),
+        id_token: None,
+        account_id: Some("acct_oauth".to_string()),
+        expires_at: Some(9999999999999), // far future
+        email: Some("oauth@example.com".to_string()),
+    })
+    .unwrap();
+
+    let creds = load_oauth_credentials().unwrap();
+    assert_eq!(creds.access_token, "at_oauth_valid");
+    assert_eq!(creds.refresh_token, "rt_oauth_valid");
+}
