@@ -305,6 +305,16 @@ impl Session {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        // Defer the first disk write until the session contains at least one
+        // real user message. Sessions with only system-displayed context
+        // messages (e.g. the initial session-context block) are skipped so
+        // throwaway sessions created by Agent::new() before restore_session()
+        // don't leave empty husk files on disk. Sessions with zero messages
+        // (visible spawn / jade relay handoff) are NOT blocked and persist
+        // normally for inter-process coordination.
+        if !self.persist_state.snapshot_exists && !self.messages.is_empty() && !self.has_any_visible_messages() {
+            return Ok(());
+        }
         self.updated_at = Utc::now();
         let path = session_path(&self.id)?;
         let journal_path = session_journal_path_from_snapshot(&path);

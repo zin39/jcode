@@ -2361,3 +2361,153 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
         "sanity: raw stored counting diverges, which is why rewind must not use it"
     );
 }
+
+#[test]
+fn test_empty_session_with_context_not_persisted() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-empty-nopersist-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let mut session = Session::create_with_id(
+        "session_empty_context_nopersist".to_string(),
+        None,
+        None,
+    );
+    // Simulate the context message added by Agent::new / App::new
+    session.ensure_initial_session_context_message();
+    assert!(!session.messages.is_empty(), "should have context message");
+    assert!(!session.has_any_visible_messages(), "context message is not a visible conversation message");
+
+    session.save()?;
+
+    // The session must NOT be on disk because it has no real user messages
+    assert!(
+        !session_path("session_empty_context_nopersist").is_ok_and(|p| p.exists()),
+        "session with only context message must not be persisted"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_session_persisted_after_first_user_message() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-first-message-persist-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let mut session = Session::create_with_id(
+        "session_first_message_persist".to_string(),
+        None,
+        None,
+    );
+    session.ensure_initial_session_context_message();
+
+    // First save should be skipped (only context message)
+    session.save()?;
+    assert!(
+        !session_path("session_first_message_persist").is_ok_and(|p| p.exists()),
+        "session with only context message must not be persisted"
+    );
+
+    // Add a real user message — now persist
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello jcode".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert!(session.has_any_visible_messages(), "should detect real user message");
+
+    session.save()?;
+
+    assert!(
+        session_path("session_first_message_persist").is_ok_and(|p| p.exists()),
+        "session must be persisted after real user message"
+    );
+
+    // Verify the persisted session can be loaded
+    let loaded = Session::load("session_first_message_persist")?;
+    assert!(loaded.has_any_visible_messages(), "loaded session should have user messages");
+    Ok(())
+}
+
+#[test]
+fn test_zero_message_session_persisted_for_handoff() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-zero-msg-handoff-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    // Visible-spawn / jade-relay pattern: session with 0 messages must still
+    // persist so a spawned terminal can load it for inter-process handoff.
+    let mut session = Session::create_with_id(
+        "session_zero_msg_handoff".to_string(),
+        None,
+        Some("visible spawn handoff".to_string()),
+    );
+    session.set_debug(true);
+    session.save()?;
+
+    assert!(
+        session_path("session_zero_msg_handoff").is_ok_and(|p| p.exists()),
+        "zero-message handoff session must be persisted"
+    );
+
+    let loaded = Session::load("session_zero_msg_handoff")?;
+    assert!(loaded.is_debug);
+    assert_eq!(loaded.title.as_deref(), Some("visible spawn handoff"));
+    Ok(())
+}
+
+#[test]
+fn test_resume_works_after_guard() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-resume-guard-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    // Simulate a full session lifecycle: create → add messages → save → load (resume)
+    let mut session = Session::create_with_id(
+        "session_resume_guard".to_string(),
+        None,
+        None,
+    );
+    session.ensure_initial_session_context_message();
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "do the thing".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "done".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    session.save()?;
+
+    // Resume: load the session, modify metadata, save again
+    let mut loaded = Session::load("session_resume_guard")?;
+    loaded.mark_active();
+    loaded.save()?;
+
+    // Load once more to verify journal replay works after guard was introduced
+    let reloaded = Session::load("session_resume_guard")?;
+    assert!(reloaded.has_any_visible_messages(), "resumed session should have user messages");
+    assert!(reloaded.messages.len() >= 3, "should have at least 3 messages");
+    Ok(())
+}
