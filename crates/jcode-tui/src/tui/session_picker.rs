@@ -968,6 +968,7 @@ impl SessionPicker {
                 &s.title,
                 s.working_dir.as_deref(),
                 s.save_label.as_deref(),
+                s.category.as_deref(),
                 &preview,
             );
             s.messages_preview = preview;
