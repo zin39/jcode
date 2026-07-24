@@ -63,13 +63,44 @@ pub enum Tier {
 
 // ── Tier detection ────────────────────────────────────────────────────
 
-/// Map the existing [`ColorCapability`] to a [`Tier`].
+/// Detect the color tier from the environment.
 ///
-/// `ColorCapability::TrueColor`  → `Tier::Rich`
-/// `ColorCapability::Color256`   → `Tier::Ansi256`
-///
-/// `Tier::Plain` is never returned here; it must be forced externally.
+/// Detection order (first match wins):
+/// 1. `JCODE_TIER` env var: `rich` | `256` | `plain` – overrides everything.
+/// 2. `NO_COLOR` env var (any non-empty value) → `Tier::Plain`.
+/// 3. `TERM=dumb` → `Tier::Plain`.
+/// 4. Terminal color capability (TrueColor → Rich, Color256 → Ansi256),
+///    which already includes the macOS #330 glyph-atlas workaround that
+///    forces 256 on fragile terminals.  `JCODE_TIER=rich` deliberately
+///    beats that workaround so users who need truecolor on a capped
+///    terminal can override.
 pub fn detect_tier() -> Tier {
+    // 1. Explicit override – beats everything.
+    if let Ok(raw) = std::env::var("JCODE_TIER") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "rich" => return Tier::Rich,
+            "256" => return Tier::Ansi256,
+            "plain" => return Tier::Plain,
+            other => {
+                eprintln!(
+                    "jcode: JCODE_TIER='{other}' is not recognised (expected rich|256|plain); ignoring"
+                );
+            }
+        }
+    }
+
+    // 2. NO_COLOR → plain tier (no-colour.org convention).
+    if std::env::var("NO_COLOR").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        return Tier::Plain;
+    }
+
+    // 3. TERM=dumb → plain tier.
+    if std::env::var("TERM").map(|v| v.trim().eq_ignore_ascii_case("dumb")).unwrap_or(false) {
+        return Tier::Plain;
+    }
+
+    // 4. Terminal capability (TrueColor may be downgraded to 256 by the
+    //    macOS glyph-atlas workaround in color.rs – see #330).
     match color_capability() {
         ColorCapability::TrueColor => Tier::Rich,
         ColorCapability::Color256  => Tier::Ansi256,
@@ -329,6 +360,50 @@ mod tests {
     #[test]
     fn faint_plain_is_dark_gray() {
         assert_eq!(role_color(Role::Faint, Tier::Plain), Color::DarkGray);
+    }
+
+    // ── Plain-tier invariants ──────────────────────────────────────
+
+    #[test]
+    fn all_plain_colors_are_named_ansi16_no_rgb_or_indexed() {
+        // Every role at Plain tier must return a named ANSI-16 colour
+        // (one of Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray,
+        // DarkGray, LightRed, LightGreen, LightYellow, LightBlue,
+        // LightMagenta, LightCyan, White) or Reset – never Rgb or Indexed.
+        for role in all_roles() {
+            let c = role_color(role, Tier::Plain);
+            assert!(
+                !matches!(c, Color::Rgb(..)),
+                "Plain tier produced Rgb for {role:?}: {c:?}"
+            );
+            assert!(
+                !matches!(c, Color::Indexed(_)),
+                "Plain tier produced Indexed for {role:?}: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_plain_colors_are_named_distinct_modulo_intentional_aliases() {
+        // Surface1/Surface2 both map to Reset (terminal default bg), and
+        // Muted/Faint both use DarkGray (Faint adds the dim attribute
+        // separately).  Every other role must resolve to a distinctive
+        // named ANSI-16 colour so that labels carry meaning.
+        let mut seen = std::collections::HashSet::new();
+        for role in all_roles() {
+            let c = role_color(role, Tier::Plain);
+            // These two pairs are intentional aliases at Plain tier.
+            if matches!(role, Role::Surface1 | Role::Surface2 | Role::Muted | Role::Faint) {
+                continue;
+            }
+            assert!(
+                seen.insert(format!("{c:?}")),
+                "Plain tier had duplicate colour {c:?} for {role:?}"
+            );
+        }
+        // 8 remaining roles (TextPrimary, TextSecondary, Accent, SelfRole,
+        // Agent, Warn, Error, Info) should all be distinct.
+        assert_eq!(seen.len(), 8, "expected 8 distinct non-aliased plain colours");
     }
 
     // ── Cross-tier invariants ───────────────────────────────────────
