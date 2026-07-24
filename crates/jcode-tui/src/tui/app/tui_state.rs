@@ -1938,6 +1938,10 @@ impl crate::tui::TuiState for App {
         App::suggestion_prompts(self)
     }
 
+    fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)> {
+        App::suggestion_prompts_for_welcome(self)
+    }
+
     fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> {
         let last_completed = self.last_api_completed?;
         let provider = self.provider_name();

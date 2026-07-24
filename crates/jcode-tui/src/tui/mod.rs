@@ -557,6 +557,10 @@ pub trait TuiState {
     /// Suggestion prompts for new users (shown in initial empty state).
     /// Returns (label, prompt_text) pairs. Empty if user is experienced or not authenticated.
     fn suggestion_prompts(&self) -> Vec<(String, String)>;
+    /// Ghost starter prompts for the first-run welcome screen.
+    /// Always exactly 3, shown only when has_completed_onboarding is false.
+    /// Returns (label, prompt) pairs. Empty if user has completed onboarding.
+    fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)>;
     /// Cache TTL status - shows whether the prompt cache is warm/cold based on idle time
     fn cache_ttl_status(&self) -> Option<CacheTtlInfo>;
     /// Whether the notification line has content to show

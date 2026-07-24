@@ -820,56 +820,157 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
 
     if is_initial_empty {
         let compose_start = Instant::now();
-        let suggestions = app.suggestion_prompts();
+        let welcome_prompts = app.suggestion_prompts_for_welcome();
+        let has_welcome = !welcome_prompts.is_empty();
         let is_centered = app.centered_mode();
-        let suggestion_align = if is_centered {
+        let align = if is_centered {
             ratatui::layout::Alignment::Center
         } else {
             ratatui::layout::Alignment::Left
         };
         let mut wrapped_lines = header_prepared.wrapped_lines.clone();
 
-        if !suggestions.is_empty() {
+        if has_welcome {
+            // Per §3.9: wordmark + optional mode line + exactly 3 ghost prompts
+            // Pad top to put wordmark in the upper third
             wrapped_lines.push(Line::from(""));
-            for (i, (label, prompt)) in suggestions.iter().enumerate() {
-                let is_login = prompt.starts_with('/');
-                let pad = if is_centered { "" } else { "  " };
-                let spans = if is_login {
-                    vec![
-                        Span::styled(
-                            format!("{}{} ", pad, label),
-                            Style::default()
-                                .fg(rgb(138, 180, 248))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("(type {})", prompt),
-                            Style::default().fg(dim_color()),
-                        ),
-                    ]
+            wrapped_lines.push(Line::from(""));
+            wrapped_lines.push(Line::from(""));
+
+            // Wordmark: "❯ jcode" in accent
+            wrapped_lines.push(
+                Line::from(Span::styled(
+                    "❯ jcode",
+                    Style::default()
+                        .fg(role_color(Role::Accent, detect_tier()))
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(align),
+            );
+
+            // Mode line: show working directory (compact)
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            if !cwd.is_empty() {
+                let home = std::env::var("HOME")
+                    .unwrap_or_default();
+                let display_path = if !home.is_empty() && cwd.starts_with(&home) {
+                    format!("~{}", &cwd[home.len()..])
                 } else {
-                    vec![
-                        Span::styled(
-                            format!("{}[{}] ", pad, i + 1),
-                            Style::default().fg(rgb(138, 180, 248)),
-                        ),
-                        Span::styled(label.clone(), Style::default().fg(rgb(200, 200, 200))),
-                    ]
+                    cwd
                 };
-                wrapped_lines.push(Line::from(spans).alignment(suggestion_align));
+                wrapped_lines.push(
+                    Line::from(Span::styled(
+                        format!("  {}", display_path),
+                        Style::default().fg(dim_color()),
+                    ))
+                    .alignment(align),
+                );
             }
-            if suggestions.len() > 1 {
+
+            // Blank line before ghost prompts
+            wrapped_lines.push(Line::from(""));
+
+            // Exactly 3 ghost prompts in muted
+            for (i, (label, _prompt)) in welcome_prompts.iter().enumerate().take(3) {
+                let prefix = if is_centered {
+                    format!("{}  ", i + 1)
+                } else {
+                    format!("  {}  ", i + 1)
+                };
+                wrapped_lines.push(
+                    Line::from(vec![
+                        Span::styled(
+                            prefix,
+                            Style::default().fg(role_color(Role::Muted, detect_tier())),
+                        ),
+                        Span::styled(
+                            label.clone(),
+                            Style::default().fg(role_color(Role::Muted, detect_tier())),
+                        ),
+                    ])
+                    .alignment(align),
+                );
+            }
+        } else {
+            // Fallback: old suggestion_prompts (login prompt or returning user)
+            // Always show at least the wordmark to avoid a blank screen
+            let suggestions = app.suggestion_prompts();
+            if !suggestions.is_empty() {
+                if suggestions.iter().any(|(_, p)| p.starts_with('/')) {
+                    // This is the login prompt case
+                    wrapped_lines.push(Line::from(""));
+                    wrapped_lines.push(Line::from(""));
+                    wrapped_lines.push(Line::from(""));
+                    wrapped_lines.push(
+                        Line::from(Span::styled(
+                            "❯ jcode",
+                            Style::default()
+                                .fg(role_color(Role::Accent, detect_tier()))
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(align),
+                    );
+                    wrapped_lines.push(Line::from(""));
+                    for (i, (label, prompt)) in suggestions.iter().enumerate() {
+                        let is_login = prompt.starts_with('/');
+                        let pad = if is_centered { "" } else { "  " };
+                        let spans = if is_login {
+                            vec![
+                                Span::styled(
+                                    format!("{}{} ", pad, label),
+                                    Style::default()
+                                        .fg(rgb(138, 180, 248))
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    format!("(type {})", prompt),
+                                    Style::default().fg(dim_color()),
+                                ),
+                            ]
+                        } else {
+                            vec![
+                                Span::styled(
+                                    format!("{}[{}] ", pad, i + 1),
+                                    Style::default().fg(rgb(138, 180, 248)),
+                                ),
+                                Span::styled(
+                                    label.clone(),
+                                    Style::default().fg(rgb(200, 200, 200)),
+                                ),
+                            ]
+                        };
+                        wrapped_lines.push(Line::from(spans).alignment(align));
+                    }
+                    if suggestions.len() > 1 {
+                        wrapped_lines.push(Line::from(""));
+                        wrapped_lines.push(
+                            Line::from(Span::styled(
+                                format!(
+                                    "{}Press 1-{} or type anything to start",
+                                    if is_centered { "" } else { "  " },
+                                    suggestions.len()
+                                ),
+                                Style::default().fg(dim_color()),
+                            ))
+                            .alignment(align),
+                        );
+                    }
+                }
+            } else {
+                // Returning user: always show minimal wordmark, no blank screen
+                wrapped_lines.push(Line::from(""));
+                wrapped_lines.push(Line::from(""));
                 wrapped_lines.push(Line::from(""));
                 wrapped_lines.push(
                     Line::from(Span::styled(
-                        format!(
-                            "{}Press 1-{} or type anything to start",
-                            if is_centered { "" } else { "  " },
-                            suggestions.len()
-                        ),
-                        Style::default().fg(dim_color()),
+                        "❯ jcode",
+                        Style::default()
+                            .fg(role_color(Role::Accent, detect_tier()))
+                            .add_modifier(Modifier::BOLD),
                     ))
-                    .alignment(suggestion_align),
+                    .alignment(align),
                 );
             }
         }

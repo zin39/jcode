@@ -1400,6 +1400,44 @@ impl App {
         prompts
     }
 
+    /// Ghost starter prompts for the first-run welcome screen.
+    /// Always exactly 3, shown only when has_completed_onboarding is false.
+    pub fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)> {
+        let cfg = crate::config::Config::load();
+        if cfg.features.has_completed_onboarding {
+            return Vec::new();
+        }
+        let auth = crate::auth::AuthStatus::check_fast();
+        if !auth.has_any_available() {
+            return Vec::new();
+        }
+        if !self.display_messages.is_empty() || self.is_processing {
+            return Vec::new();
+        }
+        let is_canary = if self.is_remote {
+            self.remote_is_canary.unwrap_or(self.session.is_canary)
+        } else {
+            self.session.is_canary
+        };
+        if is_canary {
+            return Vec::new();
+        }
+        vec![
+            (
+                "Explain this codebase".to_string(),
+                "Explain the codebase and walk me through its structure.".to_string(),
+            ),
+            (
+                "Add error handling in a recent file".to_string(),
+                "Add error handling in the most recently modified file.".to_string(),
+            ),
+            (
+                "Fix the failing tests".to_string(),
+                "Find and fix failing tests.".to_string(),
+            ),
+        ]
+    }
+
     /// Autocomplete current input - cycles through suggestions on repeated Tab
     pub fn autocomplete(&mut self) -> bool {
         // Get suggestions for current input
