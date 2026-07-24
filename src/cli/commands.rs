@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::{browser, gateway, memory, session, storage, tui};
 
@@ -2591,6 +2592,44 @@ fn run_todos(session_id: &str) -> Vec<crate::todo::TodoItem> {
     crate::todo::load_todos(session_id).unwrap_or_default()
 }
 
+/// Minimum wall-clock gap between two auto-pokes for the same session when
+/// no swarm workers are active. Prevents re-poking on every rapid turn.
+const CLI_AUTO_POKE_COOLDOWN: Duration = Duration::from_secs(60);
+/// Minimum gap between auto-pokes when background `swarm await_members` watches
+/// are active. The coordinator is legitimately blocked on workers; one initial
+/// poke is allowed, but we must not spam while waiting.
+const CLI_AUTO_POKE_SWARM_ACTIVE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// Returns true when an auto-poke should be skipped because of the cooldown
+/// or because swarm workers are actively running (coordinator blocked on
+/// `await_members` background watches).
+fn should_skip_auto_poke_for_swarm(
+    session_id: &str,
+    last_poke: &mut Option<Instant>,
+) -> bool {
+    let now = Instant::now();
+
+    // Base cooldown: 60s between any pokes
+    if let Some(last) = *last_poke {
+        if now.duration_since(last) < CLI_AUTO_POKE_COOLDOWN {
+            return true;
+        }
+    }
+
+    // Swarm activity: if background await_members watches are pending,
+    // only poke once per 5 minutes (coordinator legitimately waiting).
+    let pending = crate::server::pending_await_members_for_session(session_id);
+    if !pending.is_empty() {
+        if let Some(last) = *last_poke {
+            if now.duration_since(last) < CLI_AUTO_POKE_SWARM_ACTIVE_COOLDOWN {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn build_run_auto_poke_follow_up_from_todos(
     todos: &[crate::todo::TodoItem],
     confidence_spike_challenged: bool,
@@ -2671,13 +2710,18 @@ async fn run_single_message_command_plain_with_auto_poke(
     let max_turns = run_command_auto_poke_max_turns();
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
+    let mut last_poke: Option<Instant> = None;
     loop {
         agent.run_once(&next_message).await?;
         turns_completed += 1;
         if !run_command_auto_poke_enabled() {
             break;
         }
-        let todos = run_todos(agent.session_id());
+        let session_id = agent.session_id();
+        if should_skip_auto_poke_for_swarm(session_id, &mut last_poke) {
+            break;
+        }
+        let todos = run_todos(session_id);
         match build_run_auto_poke_follow_up_from_todos(&todos, confidence_spike_challenged) {
             Some(RunAutoPokeFollowUp::ConfidenceSummary {
                 message,
@@ -2709,6 +2753,7 @@ async fn run_single_message_command_plain_with_auto_poke(
                     }
                     break;
                 }
+                last_poke = Some(Instant::now());
                 next_message = message;
                 eprintln!(
                     "Auto-poking: {} incomplete todo(s). Set JCODE_RUN_AUTO_POKE=0 to disable.",
@@ -2730,13 +2775,18 @@ async fn run_single_message_command_capture_with_auto_poke(
     let mut outputs = Vec::new();
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
+    let mut last_poke: Option<Instant> = None;
     loop {
         outputs.push(agent.run_once_capture(&next_message).await?);
         turns_completed += 1;
         if !run_command_auto_poke_enabled() {
             break;
         }
-        let todos = run_todos(agent.session_id());
+        let session_id = agent.session_id();
+        if should_skip_auto_poke_for_swarm(session_id, &mut last_poke) {
+            break;
+        }
+        let todos = run_todos(session_id);
         match build_run_auto_poke_follow_up_from_todos(&todos, confidence_spike_challenged) {
             Some(RunAutoPokeFollowUp::ConfidenceSummary {
                 message,
@@ -2765,6 +2815,7 @@ async fn run_single_message_command_capture_with_auto_poke(
                     }
                     break;
                 }
+                last_poke = Some(Instant::now());
                 next_message = message;
             }
             None => break,
@@ -2810,6 +2861,7 @@ async fn run_single_message_command_ndjson(
     let mut result: Result<()> = Ok(());
     let mut turns_completed = 0usize;
     let mut confidence_spike_challenged = false;
+    let mut last_poke: Option<Instant> = None;
     loop {
         let turn_result = {
             let mut run_future = std::pin::pin!(agent.run_once_streaming_mpsc(
@@ -2847,6 +2899,9 @@ async fn run_single_message_command_ndjson(
         }
         turns_completed += 1;
         if !run_command_auto_poke_enabled() {
+            break;
+        }
+        if should_skip_auto_poke_for_swarm(&session_id, &mut last_poke) {
             break;
         }
         let todos = run_todos(&session_id);
@@ -2899,6 +2954,7 @@ async fn run_single_message_command_ndjson(
                     }
                     break;
                 }
+                last_poke = Some(Instant::now());
                 next_message = message;
                 write_json_line(
                     &mut stdout,

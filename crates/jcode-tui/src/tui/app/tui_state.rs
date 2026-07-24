@@ -65,6 +65,23 @@ impl App {
             .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("unknown"))
     }
 
+    /// True when this session has at least one swarm member with status
+    /// "running" whose session_id differs from this session (i.e., owned
+    /// workers, not self). Used to suppress auto-pokes while the coordinator
+    /// is legitimately blocked on background swarm workers.
+    pub(super) fn has_active_swarm_workers(&self) -> bool {
+        let session_id = if self.is_remote {
+            self.remote_session_id
+                .clone()
+                .unwrap_or_else(|| self.session.id.clone())
+        } else {
+            self.session.id.clone()
+        };
+        self.remote_swarm_members
+            .iter()
+            .any(|m| m.status == "running" && m.session_id != session_id)
+    }
+
     fn configured_remote_provider_hint(&self) -> Option<String> {
         std::env::var("JCODE_PROVIDER")
             .ok()
