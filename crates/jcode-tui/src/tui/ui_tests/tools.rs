@@ -146,7 +146,7 @@ fn test_render_tool_message_batch_flat_subcall_params_include_read_details() {
 
     assert_eq!(rendered.len(), 3, "rendered={rendered:?}");
     assert!(
-        rendered[0].contains("✓ batch 2 calls"),
+        rendered[0].contains("⚙ batch 2 calls ✓"),
         "rendered={rendered:?}"
     );
     assert!(
@@ -190,7 +190,7 @@ fn test_render_tool_message_batch_subcalls_show_individual_token_badges() {
 
     assert_eq!(rendered.len(), 3, "rendered={rendered:?}");
     assert!(
-        rendered[0].contains("✓ batch 2 calls"),
+        rendered[0].contains("⚙ batch 2 calls ✓"),
         "rendered={rendered:?}"
     );
     assert!(
@@ -311,7 +311,7 @@ Completed: 2 succeeded, 1 failed"
     let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
 
     assert!(
-        rendered[0].contains("⚠ batch · Inspect schemas · 2/3 succeeded"),
+        rendered[0].contains("⚙ batch · Inspect schemas · 2/3 succeeded ⚠"),
         "rendered={rendered:?}"
     );
     assert!(
@@ -360,7 +360,7 @@ fn test_render_tool_message_batch_all_failed_marks_all_children_failed() {
     let rendered: Vec<String> = lines.iter().map(extract_line_text).collect();
 
     assert!(
-        rendered[0].contains("✗ batch 3/3 failed"),
+        rendered[0].contains("⚙ batch 3/3 failed ✗"),
         "rendered={rendered:?}"
     );
     let failed_children = rendered
@@ -592,7 +592,7 @@ fn test_render_tool_message_batch_includes_start_end_read_details() {
 
     assert_eq!(rendered.len(), 2, "rendered={rendered:?}");
     assert!(
-        rendered[0].contains("✓ batch 1 call"),
+        rendered[0].contains("⚙ batch 1 call ✓"),
         "rendered={rendered:?}"
     );
     assert!(
