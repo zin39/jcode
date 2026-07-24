@@ -902,6 +902,17 @@ impl Session {
         })
     }
 
+    /// Returns true if the session contains at least one visible conversation
+    /// message (User or Assistant with no System display role). System-displayed
+    /// context messages (e.g. the initial session-context block created by
+    /// `ensure_initial_session_context_message`) and internal system reminders
+    /// are excluded. Machine-generated first prompts count.
+    pub fn has_any_visible_messages(&self) -> bool {
+        self.messages.iter().any(|msg| {
+            is_visible_conversation_message(msg)
+        })
+    }
+
     /// Persist an immutable session-context snapshot as the first provider-visible
     /// transcript item for new sessions. Existing non-empty sessions are left
     /// untouched so their historical context is never rewritten with newer state.
