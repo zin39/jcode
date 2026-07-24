@@ -3,8 +3,8 @@ use crate::bus::{Bus, BusEvent, TodoEvent};
 use crate::todo::{
     LOW_ALIGNMENT_SCORE, LOW_HILL_CLIMBABILITY, TODO_ALIGNMENT_CONTINUATION_MESSAGE,
     TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE, TODO_OWNERSHIP_CONTINUATION_MESSAGE, TodoGoal,
-    TodoGoalChange, TodoGoalField, TodoItem, load_goals, load_todos,
-    newly_completed_groups_have_sufficient_ownership, save_goals, save_todos,
+    TodoGoalChange, TodoGoalField, TodoItem, build_ownership_continuation_message, load_goals,
+    load_todos, newly_completed_groups_have_sufficient_ownership, save_goals, save_todos,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -468,13 +468,18 @@ impl Tool for TodoTool {
             (|| {
                 let stored_goals = load_goals(&ctx.session_id).unwrap_or_default();
                 let goals = merge_goals(&stored_goals, params.goals);
-                if !newly_completed_groups_have_sufficient_ownership(&previous, &todos, &goals) {
+                if !newly_completed_groups_have_sufficient_ownership(&previous, &todos, &goals).passed {
                     crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Ownership);
+                    let result = newly_completed_groups_have_sufficient_ownership(&previous, &todos, &goals);
+                    let message = match result.failing_score {
+                        Some(score) => build_ownership_continuation_message(score),
+                        None => TODO_OWNERSHIP_CONTINUATION_MESSAGE.to_string(),
+                    };
                     return build_todo_output(
                         previous,
                         stored_goals,
                         None,
-                        [TODO_OWNERSHIP_CONTINUATION_MESSAGE.to_string()],
+                        [message],
                     );
                 }
                 let nudges = take_reframe_nudges(&goals, &todos);
@@ -868,6 +873,15 @@ mod tests {
             output.metadata,
             Some(json!({"todos": todos, "goals": goals}))
         );
+    }
+
+    #[test]
+    fn ownership_gate_builds_message_with_concrete_numbers() {
+        let msg = build_ownership_continuation_message(93);
+        assert!(msg.contains("submitted end_to_end_ownership: 93"));
+        assert!(msg.contains("required: >= 96"));
+        // The static prefix is still present for is_auto_poke_message detection
+        assert!(msg.starts_with(TODO_OWNERSHIP_CONTINUATION_MESSAGE));
     }
 
     #[test]

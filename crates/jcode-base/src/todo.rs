@@ -22,13 +22,39 @@ pub const LOW_ALIGNMENT_SCORE: u8 = QUALITY_GATE_THRESHOLD;
 /// two representation links without disclosing the score or threshold.
 pub const TODO_ALIGNMENT_CONTINUATION_MESSAGE: &str = "Your alignment score is not high enough. Build a requirement inventory from the user's request, including outcomes, deliverables, constraints, prohibited actions, integration paths, edge cases, and necessary follow-through. Revise the objective to represent every material item. Then map each item to an explicit observation or check in the feedback loop. Generic instructions to run tests, verify, or review count only for requirements those checks actually enforce; add separate checks for non-testable requirements. Reassess the weaker link before continuing the task.";
 
+/// Prefix of the ownership continuation message, used by `is_auto_poke_message`
+/// to detect synthetic continuations. The full message appends the submitted score and
+/// threshold at the end.
+const OWNERSHIP_MSG_PREFIX: &str = "Your end-to-end ownership is not high enough to complete this goal. Take ownership of the full user outcome, not just the immediate implementation. Follow the work through every relevant integration and runtime path, resolve consequential gaps, validate the complete workflow, and finish the necessary follow-through.";
+
+/// Model-facing continuation for the private end-to-end ownership check. Names the
+/// assessment category without disclosing the score or threshold.
+pub const TODO_OWNERSHIP_CONTINUATION_MESSAGE: &str = OWNERSHIP_MSG_PREFIX;
+
+/// Prefix of the hill-climbability continuation message, used by `is_auto_poke_message`
+/// to detect synthetic continuations. The full message appends the submitted score and
+/// threshold at the end.
+const HILL_CLIMBABILITY_MSG_PREFIX: &str = "Your hill-climbability is not high enough. First, improve the goal's objective and feedback loop so progress can be measured across iterations. Then call the todo tool again with the revised goal before continuing the task. The goal is to create a strong feedback loop you can iterate against.";
+
 /// Model-facing continuation for the private hill-climbability check. Names the
 /// assessment category without disclosing the score or threshold.
-pub const TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE: &str = "Your hill-climbability is not high enough. First, improve the goal's objective and feedback loop so progress can be measured across iterations. Then call the todo tool again with the revised goal before continuing the task. The goal is to create a strong feedback loop you can iterate against.";
+pub const TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE: &str = HILL_CLIMBABILITY_MSG_PREFIX;
 
-/// Model-facing continuation for the private end-to-end ownership check. Names
-/// the assessment category without disclosing the score or threshold.
-pub const TODO_OWNERSHIP_CONTINUATION_MESSAGE: &str = "Your end-to-end ownership is not high enough to complete this goal. Take ownership of the full user outcome, not just the immediate implementation. Follow the work through every relevant integration and runtime path, resolve consequential gaps, validate the complete workflow, and finish the necessary follow-through.";
+/// Build the full ownership continuation message with concrete numbers appended.
+pub fn build_ownership_continuation_message(submitted: u8) -> String {
+    format!(
+        "{} (submitted end_to_end_ownership: {}; required: >= {})",
+        OWNERSHIP_MSG_PREFIX, submitted, QUALITY_GATE_THRESHOLD
+    )
+}
+
+/// Build the full hill-climbability continuation message with concrete numbers appended.
+pub fn build_hill_climbability_continuation_message(submitted: u8) -> String {
+    format!(
+        "{} (submitted hill_climbability: {}; required: >= {})",
+        HILL_CLIMBABILITY_MSG_PREFIX, submitted, QUALITY_GATE_THRESHOLD
+    )
+}
 
 /// Model-facing continuation for private completion-confidence checks. Names
 /// the assessment category without disclosing scores, items, or thresholds.
@@ -59,6 +85,14 @@ fn group_is_complete(todos: &[TodoItem], group: &Option<String>) -> bool {
     matching.peek().is_some() && matching.all(|todo| todo.status == "completed")
 }
 
+/// Result of the ownership quality gate check.
+pub struct OwnershipGateResult {
+    /// True if all newly completed groups have sufficient ownership.
+    pub passed: bool,
+    /// The score of the first failing group, if any.
+    pub failing_score: Option<u8>,
+}
+
 /// Whether every group newly closed by this update has a sufficient assessment
 /// of ownership over its full outcome. Groups completed before this check was
 /// introduced are intentionally grandfathered so existing sessions stay writable.
@@ -66,7 +100,7 @@ pub fn newly_completed_groups_have_sufficient_ownership(
     previous: &[TodoItem],
     incoming: &[TodoItem],
     goals: &[TodoGoal],
-) -> bool {
+) -> OwnershipGateResult {
     let mut groups: Vec<Option<String>> = Vec::new();
     for todo in incoming {
         let group = normalized_group(todo.group.as_deref());
@@ -75,16 +109,24 @@ pub fn newly_completed_groups_have_sufficient_ownership(
         }
     }
 
-    groups.into_iter().all(|group| {
+    for group in groups {
         if !group_is_complete(incoming, &group) || group_is_complete(previous, &group) {
-            return true;
+            continue;
         }
-        goals
+        if let Some(score) = goals
             .iter()
             .find(|goal| normalized_group(goal.group.as_deref()) == group)
             .and_then(|goal| goal.end_to_end_ownership)
-            .is_some_and(|score| score >= QUALITY_GATE_THRESHOLD)
-    })
+        {
+            if score < QUALITY_GATE_THRESHOLD {
+                return OwnershipGateResult { passed: false, failing_score: Some(score) };
+            }
+        } else {
+            // No ownership score set means it fails the gate
+            return OwnershipGateResult { passed: false, failing_score: None };
+        }
+    }
+    OwnershipGateResult { passed: true, failing_score: None }
 }
 
 /// Completed todos whose final confidence increase was abrupt rather than
@@ -134,9 +176,9 @@ pub fn is_auto_poke_message(message: &str) -> bool {
     (trimmed.starts_with("You have ")
         && trimmed.contains(" incomplete todo")
         && trimmed.ends_with("update the todo tool."))
-        || trimmed.starts_with(TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(HILL_CLIMBABILITY_MSG_PREFIX)
         || trimmed.starts_with(TODO_ALIGNMENT_CONTINUATION_MESSAGE)
-        || trimmed.starts_with(TODO_OWNERSHIP_CONTINUATION_MESSAGE)
+        || trimmed.starts_with(OWNERSHIP_MSG_PREFIX)
         || trimmed.starts_with(TODO_COMPLETION_CONTINUATION_MESSAGE)
         || trimmed.starts_with(TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE)
         || trimmed.starts_with(LEGACY_TODO_CONFIDENCE_SUMMARY_PREFIX)
@@ -270,6 +312,22 @@ mod tests {
             TODO_CONFIDENCE_SPIKE_CONTINUATION_MESSAGE
         ));
         assert!(is_auto_poke_message(LEGACY_TODO_CONFIDENCE_SUMMARY_PREFIX));
+        // Builder functions produce messages with numbers that are still detected
+        assert!(is_auto_poke_message(&build_ownership_continuation_message(93)));
+        assert!(is_auto_poke_message(&build_hill_climbability_continuation_message(85)));
+    }
+
+    #[test]
+    fn builder_functions_append_concrete_numbers() {
+        let ownership_msg = build_ownership_continuation_message(93);
+        assert!(ownership_msg.starts_with(OWNERSHIP_MSG_PREFIX));
+        assert!(ownership_msg.contains("submitted end_to_end_ownership: 93"));
+        assert!(ownership_msg.contains("required: >= 96"));
+
+        let hill_msg = build_hill_climbability_continuation_message(85);
+        assert!(hill_msg.starts_with(HILL_CLIMBABILITY_MSG_PREFIX));
+        assert!(hill_msg.contains("submitted hill_climbability: 85"));
+        assert!(hill_msg.contains("required: >= 96"));
     }
 
     #[test]
@@ -407,13 +465,13 @@ mod tests {
                 &previous,
                 &completed,
                 &[ownership_goal(Some("ship"), ownership)],
-            ));
+            ).passed);
         }
         assert!(newly_completed_groups_have_sufficient_ownership(
             &previous,
             &completed,
             &[ownership_goal(Some("ship"), Some(96))],
-        ));
+        ).passed);
     }
 
     #[test]
@@ -425,7 +483,7 @@ mod tests {
             &previous,
             &in_progress,
             &[],
-        ));
+        ).passed);
     }
 
     #[test]
@@ -436,7 +494,7 @@ mod tests {
             &previous,
             &completed,
             &[ownership_goal(Some(" ship"), Some(96))],
-        ));
+        ).passed);
 
         let previous = vec![todo("work", "in_progress", None)];
         let completed = vec![todo("work", "completed", None)];
@@ -444,7 +502,7 @@ mod tests {
             &previous,
             &completed,
             &[ownership_goal(None, Some(96))],
-        ));
+        ).passed);
     }
 
     #[test]
@@ -454,7 +512,7 @@ mod tests {
             &completed,
             &completed,
             &[],
-        ));
+        ).passed);
     }
 
     #[test]
