@@ -1,5 +1,6 @@
 use super::*;
 use crate::tui::ui::{self, WrappedLineMap};
+use jcode_tui_style::{Tier, detect_tier, role_color, Role};
 
 /// Auxiliary render data for an assistant message that is otherwise recomputed
 /// by re-parsing markdown on every body rebuild. Building the body misses its
@@ -169,18 +170,6 @@ fn map_display_lines_to_logical_lines(
     }
 
     Some(maps)
-}
-
-fn user_prompt_number_style(color: Color) -> Style {
-    Style::default().fg(color).bg(user_bg())
-}
-
-fn user_prompt_accent_style() -> Style {
-    Style::default().fg(user_color()).bg(user_bg())
-}
-
-fn user_prompt_text_style() -> Style {
-    Style::default().fg(user_text()).bg(user_bg())
 }
 
 fn default_message_alignment(role: &str, centered: bool) -> ratatui::layout::Alignment {
@@ -355,6 +344,24 @@ fn todo_change_lines(
     clippy::too_many_arguments,
     reason = "User prompt rendering updates the prepared-line side tables together"
 )]
+/// Extract the per-process tier, model name, and session display name from the
+/// app state so every `BodyRenderCtx` creation site gets a consistent tuple.
+fn tier_model_session(app: &dyn TuiState) -> (Tier, String, String) {
+    let tier = detect_tier();
+    let model_name = app.provider_model();
+    let session_name = app
+        .session_display_name()
+        .unwrap_or_else(|| "you".to_string());
+    (tier, model_name, session_name)
+}
+
+fn gutter_glyphs(tier: Tier) -> (&'static str, &'static str) {
+    match tier {
+        Tier::Plain => ("|", "|"),
+        Tier::Rich | Tier::Ansi256 => ("▌", "│"),
+    }
+}
+
 fn push_user_prompt_lines(
     lines: &mut Vec<Line<'static>>,
     raw_plain_lines: &mut Vec<String>,
@@ -362,49 +369,64 @@ fn push_user_prompt_lines(
     line_copy_offsets: &mut Vec<usize>,
     user_line_indices: &mut Vec<usize>,
     prompt_num: usize,
-    num_color: Color,
     content: &str,
     align: ratatui::layout::Alignment,
+    tier: Tier,
+    session_name: &str,
 ) {
-    let prefix_width = unicode_width::UnicodeWidthStr::width(prompt_num.to_string().as_str())
-        + unicode_width::UnicodeWidthStr::width("› ");
+    let (header_gutter, body_gutter) = gutter_glyphs(tier);
+    let self_color = role_color(Role::SelfRole, tier);
+    let muted_color = role_color(Role::Muted, tier);
+    let text_color = role_color(Role::TextPrimary, tier);
+    let surface_bg = role_color(Role::Surface1, tier);
+    let use_bg = !matches!(tier, Tier::Plain);
+
+    // Build the header line: " ▌N › name" in muted.
+    let header_text = format!("{prompt_num} › {session_name}");
+    let header_plain = header_text.clone();
+    let header_line = Line::from(vec![
+        Span::styled(format!("{header_gutter} "), Style::default().fg(self_color)),
+        Span::styled(header_text, Style::default().fg(muted_color)),
+    ])
+    .alignment(align);
+
+    let raw_header_idx = raw_plain_lines.len();
+    raw_plain_lines.push(header_plain);
+    lines.push(header_line);
+    line_raw_overrides.push(Some(WrappedLineMap {
+        raw_line: raw_header_idx,
+        start_col: 0,
+        end_col: 0, // header raw is not user text
+    }));
+    line_copy_offsets.push(0);
+
+    let user_line_start = lines.len();
+    user_line_indices.push(user_line_start);
+
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
-    for (line_idx, content_line) in normalized.split('\n').enumerate() {
+    for content_line in normalized.split('\n') {
         let raw_line = raw_plain_lines.len();
         raw_plain_lines.push(content_line.to_string());
         let prompt_width = unicode_width::UnicodeWidthStr::width(content_line);
-        let rendered_line_idx = lines.len();
-        let is_first_line = line_idx == 0;
-        if is_first_line {
-            user_line_indices.push(rendered_line_idx);
-        }
 
-        let prefix_spans = if is_first_line {
-            vec![
-                Span::styled(
-                    format!("{}", prompt_num),
-                    user_prompt_number_style(num_color),
-                ),
-                Span::styled("› ", user_prompt_accent_style()),
-            ]
+        let body_style = if use_bg {
+            Style::default().fg(text_color).bg(surface_bg)
         } else {
-            vec![Span::styled(
-                " ".repeat(prefix_width),
-                user_prompt_accent_style(),
-            )]
+            Style::default().fg(text_color)
         };
-        let mut spans = prefix_spans;
-        spans.push(Span::styled(
-            content_line.to_string(),
-            user_prompt_text_style(),
-        ));
-        lines.push(Line::from(spans).alignment(align));
+        let gutter_span = Span::styled(
+            format!("{body_gutter} "),
+            Style::default().fg(self_color),
+        );
+        let text_span = Span::styled(content_line.to_string(), body_style);
+
+        lines.push(Line::from(vec![gutter_span, text_span]).alignment(align));
         line_raw_overrides.push(Some(WrappedLineMap {
             raw_line,
             start_col: 0,
             end_col: prompt_width,
         }));
-        line_copy_offsets.push(prefix_width);
+        line_copy_offsets.push(2); // skip gutter "│ "
     }
 }
 
@@ -1198,6 +1220,12 @@ struct BodyRenderCtx<'a> {
     inline_images_visible: bool,
     messages: &'a [DisplayMessage],
     swarm_members: Vec<crate::protocol::SwarmMemberStatus>,
+    /// Model name for the assistant header tag ("jcode · <model>").
+    model_name: String,
+    /// Display name shown in the user-message header ("N › <name>").
+    session_name: String,
+    /// Current colour tier; drives gutter glyphs and background policy.
+    tier: Tier,
 }
 
 /// Mutable accumulator for one body build. Both `prepare_body` (full) and
@@ -1289,8 +1317,6 @@ fn render_message_into(
         "user" => {
             acc.prompt_num += 1;
             acc.user_prompt_texts.push(msg.content.clone());
-            let distance = ctx.total_prompts + ctx.pending_count + 1 - acc.prompt_num;
-            let num_color = rainbow_prompt_color(distance);
             let displayed_prompt_num = acc.prompt_num + ctx.prompt_number_offset;
             push_user_prompt_lines(
                 &mut acc.lines,
@@ -1299,9 +1325,10 @@ fn render_message_into(
                 &mut acc.line_copy_offsets,
                 &mut acc.user_line_indices,
                 displayed_prompt_num,
-                num_color,
                 &msg.content,
                 align,
+                ctx.tier,
+                &ctx.session_name,
             );
             if !crate::session::is_attached_image_label_text(&msg.content) {
                 let ordinal = acc.anchor_prompt_ordinal;
@@ -1326,6 +1353,22 @@ fn render_message_into(
                 app.diff_mode(),
                 render_assistant_message,
             );
+
+            // Prepend a "jcode · <model>" tag line at block start (spec §3.1).
+            let agent_color = role_color(Role::Agent, ctx.tier);
+            let tag_text = format!("jcode · {}", ctx.model_name);
+            acc.raw_plain_lines.push(tag_text.clone());
+            acc.lines.push(
+                Line::from(Span::styled(tag_text, Style::default().fg(agent_color)))
+                    .alignment(align),
+            );
+            acc.line_raw_overrides.push(Some(WrappedLineMap {
+                raw_line: acc.raw_plain_lines.len() - 1,
+                start_col: 0,
+                end_col: 0,
+            }));
+            acc.line_copy_offsets.push(0);
+
             let message_copy_targets = assistant_message_copy_targets(&msg.content, &cached);
             for target in message_copy_targets {
                 acc.copy_targets
@@ -1663,6 +1706,7 @@ pub(super) fn prepare_body_incremental(
             .count()
     };
 
+    let (tier, model_name, session_name) = tier_model_session(app);
     let ctx = BodyRenderCtx {
         app,
         width,
@@ -1674,6 +1718,9 @@ pub(super) fn prepare_body_incremental(
         inline_images_visible: app.inline_images_visible(),
         messages,
         swarm_members: app.swarm_members_for_transcript(),
+        model_name,
+        session_name,
+        tier,
     };
 
     let mut acc = BodyAcc {
@@ -1989,6 +2036,7 @@ pub(super) fn prepare_body_prepended(
     let centered = app.centered_mode();
     markdown::set_center_code_blocks(centered);
 
+    let (tier, model_name, session_name) = tier_model_session(app);
     let ctx = BodyRenderCtx {
         app,
         width,
@@ -2000,6 +2048,9 @@ pub(super) fn prepare_body_prepended(
         inline_images_visible: app.inline_images_visible(),
         messages,
         swarm_members: app.swarm_members_for_transcript(),
+        model_name,
+        session_name,
+        tier,
     };
 
     // The head sits at the very top of the transcript, so it starts with the
@@ -2237,6 +2288,7 @@ pub(super) fn prepare_body(
     let display_width = width.saturating_sub(4) as usize;
 
     let messages = app.display_messages();
+    let (tier, model_name, session_name) = tier_model_session(app);
     let ctx = BodyRenderCtx {
         app,
         width,
@@ -2250,6 +2302,9 @@ pub(super) fn prepare_body(
         inline_images_visible: app.inline_images_visible(),
         messages,
         swarm_members: app.swarm_members_for_transcript(),
+        model_name,
+        session_name,
+        tier,
     };
 
     let mut acc = BodyAcc::default();

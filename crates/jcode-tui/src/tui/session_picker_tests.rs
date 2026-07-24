@@ -58,6 +58,7 @@ fn make_session_with_flags(
         &title,
         working_dir.as_deref(),
         None,
+        None,
         &messages_preview,
     );
 
@@ -91,6 +92,7 @@ fn make_session_with_flags(
         search_index,
         server_name: None,
         server_icon: None,
+        category: None,
         source: SessionSource::Jcode,
         resume_target: ResumeTarget::JcodeSession {
             session_id: id.to_string(),
@@ -699,6 +701,7 @@ fn benchmark_resume_search_reports_incremental_timings() {
                 &session.short_name,
                 &session.title,
                 session.working_dir.as_deref(),
+                None,
                 None,
                 &session.messages_preview,
             );
