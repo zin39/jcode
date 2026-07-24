@@ -32,6 +32,13 @@ pub async fn run() -> Result<()> {
         .name("jcode-session-bak-prune".to_string())
         .spawn(crate::session::prune_old_session_backups)
         .ok();
+    // Garbage-collect old, unsaved, terminally-ended swarm worker transcripts
+    // (they are spawned in bulk and hidden from the picker, so they only ever
+    // accumulate). Runs on the same background-at-startup pattern.
+    std::thread::Builder::new()
+        .name("jcode-worker-session-prune".to_string())
+        .spawn(crate::session::prune_old_worker_sessions)
+        .ok();
     logging::info("jcode starting");
 
     // Wire config-reload reactions without making config depend on auth/bus:

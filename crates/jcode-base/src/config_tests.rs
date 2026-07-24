@@ -918,6 +918,7 @@ fn populate_context_limits_from_config_ref_seeds_global_cache() {
                 id: model_id.to_string(),
                 context_window: Some(1_000_000),
                 input: Vec::new(),
+                ..Default::default()
             }],
             ..Default::default()
         },
@@ -952,11 +953,13 @@ fn populate_context_limits_from_config_seeds_qualified_runtime_model_shapes() {
                     id: "issue421-qwen-128k".to_string(),
                     context_window: Some(131_072),
                     input: Vec::new(),
+                    ..Default::default()
                 },
                 NamedProviderModelConfig {
                     id: "/opt/models/issue421-ornith-35b-q4.gguf".to_string(),
                     context_window: Some(131_072),
                     input: Vec::new(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
