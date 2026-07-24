@@ -472,6 +472,97 @@ impl MultiProvider {
     }
 }
 
+/// Try to resolve a bare model name (no route prefix like "openrouter:" or
+/// "claude-api:") to a route-pinned form by matching against the available
+/// model routes. Returns the pinned form (e.g., "openrouter:glm-5") if
+/// exactly one *available* route matches the model name.
+///
+/// If zero routes match, returns an error listing the closest-matching route
+/// model names (by prefix similarity) as suggestions.
+///
+/// If multiple routes match (e.g. the same model is offered by both
+/// OpenRouter and a direct OpenAI-compatible profile), returns an error
+/// listing each matching route with its api_method prefix so the caller can
+/// disambiguate.
+///
+/// This is used by headless/visible spawn paths to turn a bare model request
+/// like "glm-5" into "openrouter:glm-5" when the coordinator's provider
+/// can't serve the model and `model_switch_request_for_session_route` returns
+/// a bare name.
+pub fn resolve_bare_model_to_route_pinned(
+    bare_model: &str,
+    model_routes: &[ModelRoute],
+) -> Result<String, anyhow::Error> {
+    // Find available routes whose model name matches exactly
+    let matches: Vec<&ModelRoute> = model_routes
+        .iter()
+        .filter(|r| r.model == bare_model && r.available)
+        .collect();
+
+    match matches.len() {
+        1 => {
+            let route = matches[0];
+            Ok(format!("{}:{}", route.api_method, bare_model))
+        }
+        0 => {
+            let suggestions = closest_route_suggestions(bare_model, model_routes, 3);
+            if suggestions.is_empty() {
+                Err(anyhow::anyhow!(
+                    "Unknown model '{}': no matching or similar model names found in available routes",
+                    bare_model
+                ))
+            } else {
+                Err(anyhow::anyhow!(
+                    "Unknown model '{}'. Did you mean one of: {}?",
+                    bare_model,
+                    suggestions.join(", ")
+                ))
+            }
+        }
+        _ => {
+            let candidates: Vec<String> = matches
+                .iter()
+                .map(|r| format!("{}:{}", r.api_method, r.model))
+                .collect();
+            Err(anyhow::anyhow!(
+                "Ambiguous model '{}'. Available routes: {}. Use a route-prefixed name to pick one.",
+                bare_model,
+                candidates.join(", ")
+            ))
+        }
+    }
+}
+
+/// Return up to `max_suggestions` distinct model names from `model_routes`
+/// that share the longest common prefix with `target`, sorted by prefix
+/// length descending. Only available routes are considered.
+fn closest_route_suggestions(
+    target: &str,
+    model_routes: &[ModelRoute],
+    max_suggestions: usize,
+) -> Vec<String> {
+    let target_lower = target.to_lowercase();
+    let mut scored: Vec<(&str, usize)> = model_routes
+        .iter()
+        .filter(|r| r.available)
+        .map(|r| {
+            let model_lower = r.model.to_lowercase();
+            let prefix_len = target_lower
+                .chars()
+                .zip(model_lower.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (r.model.as_str(), prefix_len)
+        })
+        .filter(|(_, len)| *len > 0)
+        .collect();
+
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    scored.dedup_by(|a, b| a.0 == b.0);
+    scored.truncate(max_suggestions);
+    scored.into_iter().map(|(name, _)| name.to_string()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,5 +884,118 @@ mod tests {
             Some(ActiveProvider::OpenRouter)
         );
         assert!(MultiProvider::resolve_config_provider_selection("unknown", &cfg).is_none());
+    }
+
+    // ── resolve_bare_model_to_route_pinned tests ──────────────────────────
+
+    fn make_route(model: &str, api_method: &str, available: bool) -> ModelRoute {
+        ModelRoute {
+            model: model.to_string(),
+            provider: "Test".to_string(),
+            api_method: api_method.to_string(),
+            available,
+            detail: String::new(),
+            cheapness: None,
+        }
+    }
+
+    #[test]
+    fn bare_model_resolves_to_unique_available_route() {
+        let routes = vec![
+            make_route("glm-5", "openrouter", true),
+            make_route("gpt-5.5", "openai-api", true),
+        ];
+        let result = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap();
+        assert_eq!(result, "openrouter:glm-5");
+    }
+
+    #[test]
+    fn bare_model_skips_unavailable_routes() {
+        let routes = vec![
+            make_route("glm-5", "openrouter", false),
+            make_route("glm-5", "zai", true),
+        ];
+        let result = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap();
+        assert_eq!(result, "zai:glm-5");
+    }
+
+    #[test]
+    fn bare_model_multiple_available_routes_is_ambiguous() {
+        let routes = vec![
+            make_route("glm-5", "openrouter", true),
+            make_route("glm-5", "zai", true),
+        ];
+        let err = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Ambiguous"), "expected Ambiguous error, got: {msg}");
+        assert!(msg.contains("openrouter:glm-5"), "expected openrouter candidate, got: {msg}");
+        assert!(msg.contains("zai:glm-5"), "expected zai candidate, got: {msg}");
+    }
+
+    #[test]
+    fn bare_model_unknown_returns_suggestions() {
+        let routes = vec![
+            make_route("glm-5-flash", "openrouter", true),
+            make_route("glm-5-pro", "openrouter", true),
+            make_route("gpt-5.5", "openai-api", true),
+        ];
+        let err = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown model"), "expected Unknown model error, got: {msg}");
+        assert!(
+            msg.contains("glm-5-flash") || msg.contains("glm-5-pro"),
+            "expected suggestion with prefix match, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bare_model_unknown_no_similar_routes() {
+        let routes = vec![
+            make_route("gpt-5.5", "openai-api", true),
+        ];
+        let err = resolve_bare_model_to_route_pinned("xyz-unknown", &routes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown model"), "expected Unknown model error, got: {msg}");
+        assert!(
+            msg.contains("no matching or similar"),
+            "expected no-similar message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn closest_route_suggestions_respects_max() {
+        let routes = vec![
+            make_route("glm-5-alpha", "openrouter", true),
+            make_route("glm-5-beta", "openrouter", true),
+            make_route("glm-5-gamma", "openrouter", true),
+            make_route("glm-5-delta", "openrouter", true),
+        ];
+        let suggestions = closest_route_suggestions("glm-5", &routes, 3);
+        assert_eq!(suggestions.len(), 3);
+        for s in &suggestions {
+            assert!(s.starts_with("glm-5-"), "unexpected suggestion: {s}");
+        }
+    }
+
+    #[test]
+    fn closest_route_suggestions_skips_unavailable() {
+        let routes = vec![
+            make_route("glm-5-flash", "openrouter", false),
+            make_route("glm-5-pro", "openrouter", true),
+        ];
+        let suggestions = closest_route_suggestions("glm-5", &routes, 5);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0], "glm-5-pro");
+    }
+
+    #[test]
+    fn closest_route_suggestions_deduplicates() {
+        let routes = vec![
+            make_route("glm-5-pro", "openrouter", true),
+            make_route("glm-5-pro", "zai", true),
+        ];
+        let suggestions = closest_route_suggestions("glm-5", &routes, 5);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0], "glm-5-pro");
     }
 }

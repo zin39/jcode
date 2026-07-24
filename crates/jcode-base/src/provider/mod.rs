@@ -369,6 +369,7 @@ pub use self::models::{
     should_refresh_openai_model_catalog,
 };
 pub use self::selection::DefaultModelSelection;
+pub use self::selection::resolve_bare_model_to_route_pinned;
 use self::selection::{ActiveProvider, ProviderAvailability};
 use self::state::ProviderState;
 pub use self::state::{ProviderModelSelectionSource, ProviderRuntimeState, ProviderStateEvent};

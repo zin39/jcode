@@ -102,10 +102,37 @@ pub(super) async fn create_headless_session(
             route_api_method_override.as_deref(),
         );
         if let Err(e) = new_agent.set_model(&model_request) {
-            crate::logging::warn(&format!(
-                "Failed to set headless session model override '{}' (request '{}'): {}",
-                model, model_request, e
-            ));
+            // If the model request is a bare name (no route prefix), the
+            // coordinator's provider can't serve it. Try to resolve it
+            // across available routes (e.g. "glm-5" → "openrouter:glm-5").
+            if !model_request.contains(':') {
+                let routes = provider_template.model_routes();
+                match crate::provider::resolve_bare_model_to_route_pinned(&model_request, &routes) {
+                    Ok(pinned) => {
+                        crate::logging::info(&format!(
+                            "Resolved bare spawn model '{}' to route-pinned '{}'",
+                            model_request, pinned
+                        ));
+                        if let Err(e2) = new_agent.set_model(&pinned) {
+                            return Err(anyhow::anyhow!(
+                                "Failed to set headless session model override '{}' (resolved to '{}'): {}",
+                                model, pinned, e2
+                            ));
+                        }
+                    }
+                    Err(resolve_err) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to set headless session model override '{}': {}. {}",
+                            model, e, resolve_err
+                        ));
+                    }
+                }
+            } else {
+                crate::logging::warn(&format!(
+                    "Failed to set headless session model override '{}' (request '{}'): {}",
+                    model, model_request, e
+                ));
+            }
         }
     }
 
