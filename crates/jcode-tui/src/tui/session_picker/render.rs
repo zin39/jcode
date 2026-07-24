@@ -1,4 +1,5 @@
 use super::*;
+use jcode_tui_style::palette::detect_tier;
 use ratatui::widgets::Wrap;
 
 impl SessionPicker {
@@ -164,6 +165,33 @@ impl SessionPicker {
         }
     }
 
+    /// Return the per-row status glyph and its color for the given session (§3.4).
+    /// Plain tier uses ASCII fallbacks: `*` for active, `o` for idle.
+    fn session_status_glyph(
+        &self,
+        session: &SessionInfo,
+        tier: Tier,
+        spinner_frame: usize,
+    ) -> (&'static str, Color) {
+        if self.session_is_streaming(session) {
+            let ch = jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES
+                [spinner_frame % jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES.len()];
+            // Spinner glyph is the same across tiers (braille pattern).
+            (ch, role_color(Role::Warn, tier))
+        } else if self.session_is_live(session) {
+            (if tier == Tier::Plain { "*" } else { "●" }, role_color(Role::Agent, tier))
+        } else {
+            match &session.status {
+                SessionStatus::Active => {
+                    (if tier == Tier::Plain { "*" } else { "●" }, role_color(Role::Agent, tier))
+                }
+                _ => {
+                    (if tier == Tier::Plain { "o" } else { "○" }, role_color(Role::Muted, tier))
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn render_session_item_lines(
         &self,
@@ -179,6 +207,7 @@ impl SessionPicker {
         is_selected: bool,
         spinner_frame: usize,
     ) -> Vec<Line<'static>> {
+        let tier = detect_tier();
         let dim: Color = rgb(100, 100, 100);
         let dimmer: Color = rgb(70, 70, 70);
         let user_clr: Color = rgb(138, 180, 248);
@@ -210,6 +239,23 @@ impl SessionPicker {
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(rgb(90, 90, 90))
+        };
+
+        // Per-row status glyph (§3.4): ●/○/⠋ at the row start.
+        let (row_glyph, row_glyph_color) = self.session_status_glyph(session, tier, spinner_frame);
+
+        // Selection pointer: ❯ (accent) for the focused row, spaces otherwise.
+        let pointer = if is_selected {
+            if tier == Tier::Plain { "> " } else { "❯ " }
+        } else {
+            "  "
+        };
+        let pointer_style = if is_selected {
+            Style::default()
+                .fg(role_color(Role::Accent, tier))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
         };
 
         let time_ago = format_time_ago(session.last_message_time);
@@ -259,6 +305,11 @@ impl SessionPicker {
 
         let primary_title = Self::primary_title_display(session);
         let mut line1_spans = vec![
+            Span::styled(pointer, pointer_style),
+            Span::styled(
+                format!("{} ", row_glyph),
+                Style::default().fg(row_glyph_color),
+            ),
             Span::styled(selection_marker, selection_style),
             Span::styled(
                 format!("{} ", session.icon),
@@ -673,6 +724,7 @@ impl SessionPicker {
         let show_scrollbar =
             super::super::ui::native_scrollbar_visible(true, total_item_rows, inner_height);
 
+        let tier = detect_tier();
         let list = List::new(items)
             .block(
                 Block::default()
@@ -690,8 +742,10 @@ impl SessionPicker {
                 // list selection so only one row reads as active.
                 Style::default().fg(rgb(150, 150, 160))
             } else {
+                // Selection: reverse video + Accent, no full-width bg band (§3.4).
                 Style::default()
-                    .bg(rgb(40, 44, 52))
+                    .fg(role_color(Role::Accent, tier))
+                    .add_modifier(Modifier::REVERSED)
                     .add_modifier(Modifier::BOLD)
             });
 

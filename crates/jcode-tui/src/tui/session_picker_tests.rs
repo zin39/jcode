@@ -2454,3 +2454,87 @@ fn preview_without_search_has_no_highlight_and_scrolls_to_bottom() {
         "no search means no highlight color in preview"
     );
 }
+
+// ── WP8: preview width gate ──────────────────────────────────────────
+
+#[test]
+fn preview_hidden_at_90_cols_last_preview_area_is_none() {
+    let session = make_session("abc", "test", false, SessionStatus::Closed);
+    let mut picker = SessionPicker::new(vec![session]);
+    // Render at 90 cols — preview should be hidden.
+    let _text = buffer_text(&mut picker, 90, 24);
+    assert!(
+        picker.last_preview_area.is_none(),
+        "preview must be hidden at 90 cols"
+    );
+    assert!(
+        picker.last_list_area.is_some(),
+        "list area should be present"
+    );
+}
+
+#[test]
+fn preview_shown_at_120_cols_last_preview_area_is_some() {
+    let session = make_session("abc", "test", false, SessionStatus::Closed);
+    let mut picker = SessionPicker::new(vec![session]);
+    // Render at 120 cols — preview should be visible.
+    let _text = buffer_text(&mut picker, 120, 30);
+    assert!(
+        picker.last_preview_area.is_some(),
+        "preview must be visible at 120 cols"
+    );
+    assert!(
+        picker.last_list_area.is_some(),
+        "list area should be present"
+    );
+}
+
+#[test]
+fn selection_uses_reverse_video_not_bg_band() {
+    let session = make_session("abc", "test", false, SessionStatus::Closed);
+    let mut picker = SessionPicker::new(vec![session]);
+    picker.focus = PaneFocus::Sessions;
+    // Select the first (only) session.
+    picker.list_state.select(Some(0)); // first session item
+    let _text = buffer_text(&mut picker, 120, 30);
+    // The rendered output should contain the ❯ pointer glyph for the selected row.
+    assert!(
+        _text.contains("❯"),
+        "selected row should show selection pointer (reverse+accent marker)"
+    );
+}
+
+#[test]
+fn status_glyph_rendered_for_active_session() {
+    let session = make_session("abc", "test", false, SessionStatus::Active);
+    let mut picker = SessionPicker::new(vec![session]);
+    let _text = buffer_text(&mut picker, 120, 30);
+    // Active session should show the filled circle glyph.
+    assert!(
+        _text.contains("●"),
+        "active session should render ● status glyph"
+    );
+}
+
+#[test]
+fn status_glyph_rendered_for_closed_session() {
+    let session = make_session("abc", "test", false, SessionStatus::Closed);
+    let mut picker = SessionPicker::new(vec![session]);
+    let _text = buffer_text(&mut picker, 120, 30);
+    // Closed/idle session should show the open circle glyph.
+    assert!(
+        _text.contains("○"),
+        "closed session should render ○ status glyph"
+    );
+}
+
+#[test]
+fn footer_hint_line_is_rendered() {
+    let session = make_session("abc", "test", false, SessionStatus::Closed);
+    let mut picker = SessionPicker::new(vec![session]);
+    let text = buffer_text(&mut picker, 120, 30);
+    assert!(
+        text.contains("navigate") && text.contains("open") && text.contains("filter"),
+        "footer hint line should contain navigate/open/filter hints"
+    );
+}

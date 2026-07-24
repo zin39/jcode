@@ -9,6 +9,7 @@ use crate::tui::{DisplayMessage, markdown};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use jcode_session_types::SessionStatus;
+use jcode_tui_style::palette::{Role, Tier, detect_tier, role_color};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -2254,18 +2255,69 @@ impl SessionPicker {
 
         let main_area = v_chunks[chunk_idx];
 
-        // Split main area horizontally for list and preview
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(main_area);
+        // Reserve a footer row at the bottom for key-binding hints.
+        let footer_height: u16 = 1;
+        let list_preview_height = main_area.height.saturating_sub(footer_height);
+        let list_preview_rect = Rect {
+            y: main_area.y,
+            height: list_preview_height,
+            ..main_area
+        };
+        let footer_rect = Rect {
+            y: main_area.y.saturating_add(list_preview_height),
+            height: footer_height.min(main_area.height),
+            ..main_area
+        };
 
-        self.last_list_area = Some(chunks[0]);
-        self.last_preview_area = Some(chunks[1]);
+        // Split main area horizontally for list and preview.
+        // Preview pane is shown only at width >= 100 cols (§3.4).
+        let total_width = frame.area().width;
+        let preview_visible = total_width >= 100;
+        if preview_visible {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(list_preview_rect);
+            self.last_list_area = Some(chunks[0]);
+            self.last_preview_area = Some(chunks[1]);
+            self.render_session_list(frame, chunks[0]);
+            self.render_preview(frame, chunks[1]);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(100)])
+                .split(list_preview_rect);
+            self.last_list_area = Some(chunks[0]);
+            self.last_preview_area = None;
+            self.render_session_list(frame, chunks[0]);
+        }
 
-        self.render_session_list(frame, chunks[0]);
-        self.render_preview(frame, chunks[1]);
+        // Render footer hint line.
+        self.render_footer(frame, footer_rect);
+
         self.render_claude_takeover_confirmation(frame);
+    }
+
+    /// Render the footer hint line with key bindings (§3.4).
+    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let muted = rgb(100, 100, 100);
+        let accent = rgb(186, 139, 255);
+        let footer_line = Line::from(vec![
+            Span::styled("↑↓", Style::default().fg(accent)),
+            Span::styled(" navigate · ", Style::default().fg(muted)),
+            Span::styled("⏎", Style::default().fg(accent)),
+            Span::styled(" open · ", Style::default().fg(muted)),
+            Span::styled("/", Style::default().fg(accent)),
+            Span::styled(" filter · ", Style::default().fg(muted)),
+            Span::styled("?", Style::default().fg(accent)),
+            Span::styled(" keys", Style::default().fg(muted)),
+        ]);
+        let paragraph = Paragraph::new(footer_line)
+            .style(Style::default().bg(rgb(20, 24, 30)));
+        frame.render_widget(paragraph, area);
     }
 
     fn render_claude_takeover_confirmation(&self, frame: &mut Frame) {
