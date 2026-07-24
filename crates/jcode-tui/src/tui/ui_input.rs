@@ -4,7 +4,7 @@ use super::tools_ui::{get_tool_activity_detail, summarize_batch_running_tools_co
 use super::visual_debug::{self, FrameCaptureBuilder};
 use super::{
     ProcessingStatus, TuiState, accent_color, ai_color, animated_tool_color, asap_color, dim_color,
-    pending_color, queued_color, rainbow_prompt_color, user_color,
+    queued_color, user_color,
 };
 use crate::message::ConnectionPhase;
 use crate::tui::app;
@@ -310,15 +310,21 @@ pub(super) fn send_mode_reserved_width(app: &dyn TuiState) -> usize {
 }
 
 pub(super) fn input_prompt(app: &dyn TuiState) -> (&'static str, Color) {
+    let tier = jcode_tui_style::palette::detect_tier();
+    let accent = jcode_tui_style::palette::role_color(jcode_tui_style::palette::Role::Accent, tier);
     let mode = composer_mode(app.input(), app.is_remote_mode());
     if mode.is_shell() {
-        ("$ ", shell_mode_color())
-    } else if app.is_processing() {
-        ("… ", queued_color())
-    } else if app.active_skill().is_some() {
-        ("» ", accent_color())
+        if matches!(tier, jcode_tui_style::palette::Tier::Plain) {
+            ("$> ", accent)
+        } else {
+            ("$❯ ", accent)
+        }
     } else {
-        ("> ", user_color())
+        if matches!(tier, jcode_tui_style::palette::Tier::Plain) {
+            ("> ", accent)
+        } else {
+            ("❯ ", accent)
+        }
     }
 }
 
@@ -403,7 +409,7 @@ pub(super) fn pending_queue_preview(app: &dyn TuiState) -> Vec<String> {
     previews
 }
 
-pub(super) fn draw_queued(frame: &mut Frame, app: &dyn TuiState, area: Rect, start_num: usize) {
+pub(super) fn draw_queued(frame: &mut Frame, app: &dyn TuiState, area: Rect, _start_num: usize) {
     let mut items: Vec<(QueuedMsgType, &str)> = Vec::new();
     if app.is_processing() {
         for msg in app.pending_soft_interrupts() {
@@ -421,30 +427,17 @@ pub(super) fn draw_queued(frame: &mut Frame, app: &dyn TuiState, area: Rect, sta
         items.push((QueuedMsgType::Queued, msg.as_str()));
     }
 
-    let pending_count = items.len();
+    let dim = Style::default().fg(dim_color());
     let lines: Vec<Line> = items
         .iter()
         .take(3)
         .enumerate()
-        .map(|(i, (msg_type, msg))| {
+        .map(|(i, (_, msg))| {
             let normalized_msg = normalize_repaint_sensitive_notice_text(msg);
-            let distance = pending_count.saturating_sub(i);
-            let num_color = rainbow_prompt_color(distance);
-            let (indicator, indicator_color, msg_color, dim) = match msg_type {
-                QueuedMsgType::Pending => ("↻", pending_color(), pending_color(), false),
-                QueuedMsgType::Interleave => ("⚡", asap_color(), asap_color(), false),
-                QueuedMsgType::Queued => ("⏳", queued_color(), queued_color(), true),
-            };
-            let mut msg_style = Style::default().fg(msg_color);
-            if dim {
-                msg_style = msg_style.dim();
-            }
+            let preview = normalized_msg.chars().take(100).collect::<String>();
             Line::from(vec![
-                Span::styled(format!("{}", start_num + i), Style::default().fg(num_color)),
-                Span::raw(" "),
-                Span::styled(indicator, Style::default().fg(indicator_color)),
-                Span::raw(" "),
-                Span::styled(normalized_msg, msg_style),
+                Span::styled(format!("+{} ", i + 1), dim),
+                Span::styled(preview, dim),
             ])
         })
         .collect();
@@ -1257,7 +1250,9 @@ fn streaming_status_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jcode_tui_style::palette::{self, Role, Tier};
     use ratatui::style::Modifier;
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
     fn right_fact_stack_shifts_up_as_a_unit_when_bottom_row_is_occupied() {
@@ -1853,6 +1848,181 @@ mod tests {
         let prefix: usize = spans[0].content.width() + spans[1].content.width();
         assert_eq!(prefix, 2);
         assert_eq!(spans[3].content.as_ref(), " · src/app.rs");
+    }
+
+    // ── WP6 input area tests ────────────────────────────────────────
+
+
+
+
+    /// Minimal state for testing `draw_queued`.
+    struct QueuedTestState {
+        processing: bool,
+        queued: Vec<String>,
+    }
+
+    impl TuiState for QueuedTestState {
+        fn is_processing(&self) -> bool { self.processing }
+        fn queued_messages(&self) -> &[String] { &self.queued }
+        fn pending_soft_interrupts(&self) -> &[String] { &[] }
+        fn interleave_message(&self) -> Option<&str> { None }
+        fn centered_mode(&self) -> bool { false }
+        fn input(&self) -> &str { "" }
+        fn cursor_pos(&self) -> usize { 0 }
+        fn is_remote_mode(&self) -> bool { false }
+        fn display_messages(&self) -> &[crate::tui::DisplayMessage] { &[] }
+        fn display_user_message_count(&self) -> usize { 0 }
+        fn compacted_hidden_user_prompts(&self) -> usize { 0 }
+        fn has_display_edit_tool_messages(&self) -> bool { false }
+        fn side_pane_images(&self) -> Vec<crate::session::RenderedImage> { vec![] }
+        fn display_messages_version(&self) -> u64 { 0 }
+        fn streaming_text(&self) -> &str { "" }
+        fn scroll_offset(&self) -> usize { 0 }
+        fn auto_scroll_paused(&self) -> bool { false }
+        fn provider_name(&self) -> String { "mock".into() }
+        fn provider_model(&self) -> String { "mock-model".into() }
+        fn upstream_provider(&self) -> Option<String> { None }
+        fn connection_type(&self) -> Option<String> { None }
+        fn status_detail(&self) -> Option<String> { None }
+        fn mcp_servers(&self) -> Vec<(String, usize)> { vec![] }
+        fn available_skills(&self) -> Vec<String> { vec![] }
+        fn streaming_tokens(&self) -> (u64, u64) { (0, 0) }
+        fn streaming_cache_tokens(&self) -> (Option<u64>, Option<u64>) { (None, None) }
+        fn output_tps(&self) -> Option<f32> { None }
+        fn streaming_tool_calls(&self) -> Vec<crate::tui::ToolCall> { vec![] }
+        fn elapsed(&self) -> Option<std::time::Duration> { None }
+        fn status(&self) -> ProcessingStatus { ProcessingStatus::Idle }
+        fn command_suggestions(&self) -> Vec<(String, &'static str)> { vec![] }
+        fn active_skill(&self) -> Option<String> { None }
+        fn subagent_status(&self) -> Option<String> { None }
+        fn batch_progress(&self) -> Option<crate::bus::BatchProgress> { None }
+        fn time_since_activity(&self) -> Option<std::time::Duration> { None }
+        fn chat_overscroll_active(&self) -> bool { false }
+        fn chat_overscroll_remaining(&self) -> Option<f32> { None }
+        fn total_session_tokens(&self) -> Option<(u64, u64)> { None }
+        fn is_canary(&self) -> bool { false }
+        fn is_replay(&self) -> bool { false }
+        fn diff_mode(&self) -> crate::config::DiffDisplayMode { crate::config::DiffDisplayMode::Off }
+        fn current_session_id(&self) -> Option<String> { None }
+        fn session_display_name(&self) -> Option<String> { None }
+        fn server_display_name(&self) -> Option<String> { None }
+        fn server_display_icon(&self) -> Option<String> { None }
+        fn server_sessions(&self) -> Vec<String> { vec![] }
+        fn connected_clients(&self) -> Option<usize> { None }
+        fn status_notice(&self) -> Option<String> { None }
+        fn inline_swarm_gallery_active(&self) -> bool { false }
+        fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> { vec![] }
+        fn swarm_members_for_transcript(&self) -> Vec<crate::protocol::SwarmMemberStatus> { vec![] }
+        fn swarm_panel_selected(&self) -> usize { 0 }
+        fn swarm_panel_focused(&self) -> bool { false }
+        fn swarm_panel_full_page(&self) -> bool { false }
+        fn remote_startup_phase_active(&self) -> bool { false }
+        fn dictation_key_label(&self) -> Option<String> { None }
+        fn animation_elapsed(&self) -> f32 { 0.0 }
+        fn rate_limit_remaining(&self) -> Option<std::time::Duration> { None }
+        fn queue_mode(&self) -> bool { false }
+        fn next_prompt_new_session_armed(&self) -> bool { false }
+        fn has_stashed_input(&self) -> bool { false }
+        fn context_info(&self) -> crate::prompt::ContextInfo { Default::default() }
+        fn context_limit(&self) -> Option<usize> { None }
+        fn info_widget_overlays_enabled(&self) -> bool { false }
+        fn client_update_available(&self) -> bool { false }
+        fn server_update_available(&self) -> Option<bool> { None }
+        fn info_widget_data(&self) -> crate::tui::info_widget::InfoWidgetData { Default::default() }
+        fn render_streaming_markdown(&self, _: usize) -> Vec<Line<'static>> { vec![] }
+        fn auth_status(&self) -> crate::auth::AuthStatus { Default::default() }
+        fn update_cost(&mut self) {}
+        fn diagram_mode(&self) -> crate::config::DiagramDisplayMode { Default::default() }
+        fn diagram_focus(&self) -> bool { false }
+        fn diagram_index(&self) -> usize { 0 }
+        fn diagram_scroll(&self) -> (i32, i32) { (0, 0) }
+        fn diagram_pane_ratio(&self) -> u8 { 50 }
+        fn diagram_pane_ratio_user_adjusted(&self) -> bool { false }
+        fn diagram_pane_animating(&self) -> bool { false }
+        fn diagram_pane_enabled(&self) -> bool { false }
+        fn diagram_pane_position(&self) -> crate::config::DiagramPanePosition { Default::default() }
+        fn diagram_zoom(&self) -> u8 { 100 }
+        fn diff_pane_scroll(&self) -> usize { 0 }
+        fn diff_pane_scroll_x(&self) -> i32 { 0 }
+        fn side_panel_image_zoom_percent(&self) -> u8 { 100 }
+        fn diff_pane_focus(&self) -> bool { false }
+        fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot {
+            static EMPTY: std::sync::LazyLock<crate::side_panel::SidePanelSnapshot> =
+                std::sync::LazyLock::new(crate::side_panel::SidePanelSnapshot::default);
+            &EMPTY
+        }
+        fn pin_images(&self) -> bool { false }
+        fn inline_images_visible(&self) -> bool { false }
+        fn diff_line_wrap(&self) -> bool { true }
+        fn inline_interactive_state(&self) -> Option<&crate::tui::InlineInteractiveState> { None }
+        fn inline_view_state(&self) -> Option<&crate::tui::InlineViewState> { None }
+        fn changelog_scroll(&self) -> Option<usize> { None }
+        fn help_scroll(&self) -> Option<usize> { None }
+        fn model_status_overlay(&self) -> Option<(usize, &str)> { None }
+        fn session_picker_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::session_picker::SessionPicker>> { None }
+        fn login_picker_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::login_picker::LoginPicker>> { None }
+        fn account_picker_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::account_picker::AccountPicker>> { None }
+        fn usage_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::usage_overlay::UsageOverlay>> { None }
+        fn working_dir(&self) -> Option<String> { None }
+        fn now_millis(&self) -> u64 { 0 }
+        fn copy_badge_ui(&self) -> crate::tui::CopyBadgeUiState { Default::default() }
+        fn copy_selection_mode(&self) -> bool { false }
+        fn copy_selection_range(&self) -> Option<crate::tui::CopySelectionRange> { None }
+        fn copy_selection_status(&self) -> Option<crate::tui::CopySelectionStatus> { None }
+        fn suggestion_prompts(&self) -> Vec<(String, String)> { vec![] }
+        fn onboarding_preview_mode(&self) -> bool { false }
+        fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> { None }
+        fn chat_native_scrollbar(&self) -> bool { false }
+        fn side_panel_native_scrollbar(&self) -> bool { false }
+    }
+
+    #[test]
+    fn draw_queued_shows_numbered_lines_for_two_items() {
+        let state = QueuedTestState {
+            processing: true,
+            queued: vec!["first message".into(), "second message".into()],
+        };
+
+        let backend = TestBackend::new(60, 5);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_queued(frame, &state, Rect::new(0, 0, 60, 5), 0);
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let text: Vec<String> = (0..5)
+            .map(|y| {
+                (0..60)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        // Should have 2 lines, each starting with +N
+        assert_eq!(text.len(), 2, "expected 2 queued message lines, got: {text:?}");
+        assert!(text[0].starts_with("+1 "), "first line: {}", text[0]);
+        assert!(text[1].starts_with("+2 "), "second line: {}", text[1]);
+        assert!(text[0].contains("first message"), "line 0: {text:?}");
+        assert!(text[1].contains("second message"), "line 1: {text:?}");
+    }
+
+    #[test]
+    fn input_prompt_chat_mode_uses_accent_color() {
+        let state = QueuedTestState { processing: false, queued: vec![] };
+        let (_prompt, color) = input_prompt(&state);
+        let expected = palette::role_color(Role::Accent, palette::detect_tier());
+        assert_eq!(color, expected, "prompt should use Accent color");
+    }
+
+    #[test]
+    fn input_prompt_shell_mode_includes_dollar_mode_chip() {
+        assert!(composer_mode("!echo hello", false).is_shell());
+        assert!(!composer_mode("hello", false).is_shell());
     }
 }
 
@@ -3190,7 +3360,7 @@ pub(crate) fn wrap_input_text<'a>(
         }
 
         if idx == 0 {
-            let num_color = rainbow_prompt_color(0);
+            let num_color = dim_color();
             lines.push(Line::from(vec![
                 Span::styled(num_str.to_string(), Style::default().fg(num_color)),
                 Span::styled(prompt_char.to_string(), Style::default().fg(caret_color)),
@@ -3262,3 +3432,4 @@ enum QueuedMsgType {
     Interleave,
     Queued,
 }
+
