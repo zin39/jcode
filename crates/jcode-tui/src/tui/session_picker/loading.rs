@@ -233,6 +233,7 @@ pub(super) fn build_search_index(
     title: &str,
     working_dir: Option<&str>,
     save_label: Option<&str>,
+    category: Option<&str>,
     messages_preview: &[PreviewMessage],
 ) -> String {
     let mut combined = String::new();
@@ -250,6 +251,11 @@ pub(super) fn build_search_index(
     if let Some(label) = save_label {
         combined.push(' ');
         combined.push_str(label);
+    }
+
+    if let Some(cat) = category {
+        combined.push(' ');
+        combined.push_str(cat);
     }
 
     let mut budget = SEARCH_CONTENT_BUDGET_BYTES;
@@ -465,6 +471,7 @@ fn build_search_index_from_summary(
     title: &str,
     working_dir: Option<&str>,
     save_label: Option<&str>,
+    category: Option<&str>,
     transcript_search_text: &str,
 ) -> String {
     let mut combined = String::new();
@@ -482,6 +489,11 @@ fn build_search_index_from_summary(
     if let Some(label) = save_label {
         combined.push(' ');
         combined.push_str(label);
+    }
+
+    if let Some(cat) = category {
+        combined.push(' ');
+        combined.push_str(cat);
     }
 
     if !transcript_search_text.is_empty() {
@@ -1159,6 +1171,8 @@ struct SessionSummary {
     #[serde(default)]
     save_label: Option<String>,
     #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
     status: SessionStatus,
 }
 
@@ -1461,6 +1475,8 @@ struct SessionJournalSummaryMeta {
     #[serde(default)]
     save_label: Option<String>,
     #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
     status: SessionStatus,
     #[serde(default)]
     last_active_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1505,6 +1521,7 @@ fn load_session_summary(path: &Path) -> Result<SessionSummary> {
                         summary.saved = saved;
                     }
                     summary.save_label = entry.meta.save_label;
+                    summary.category = entry.meta.category;
                     summary.status = entry.meta.status;
                     summary.messages.merge(entry.append_messages);
                 }
@@ -1643,6 +1660,7 @@ fn parse_jcode_session_info(
         &title,
         session.working_dir.as_deref(),
         session.save_label.as_deref(),
+        session.category.as_deref(),
         &session.messages.search_text,
     );
 
@@ -1665,6 +1683,7 @@ fn parse_jcode_session_info(
         is_debug: session.is_debug,
         saved: session.saved,
         save_label: session.save_label,
+        category: session.category,
         status,
         needs_catchup,
         estimated_tokens,
@@ -1851,6 +1870,7 @@ fn load_external_claude_code_sessions(scan_limit: usize) -> Vec<SessionInfo> {
                 &title,
                 working_dir.as_deref(),
                 None,
+                None,
                 &[],
             );
 
@@ -1879,6 +1899,7 @@ fn load_external_claude_code_sessions(scan_limit: usize) -> Vec<SessionInfo> {
                 first_user_prompt: Some(session.first_prompt.clone()),
                 messages_preview: Vec::new(),
                 search_index,
+                category: None,
                 server_name: None,
                 server_icon: None,
                 source: SessionSource::ClaudeCode,
@@ -2005,6 +2026,7 @@ fn load_codex_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         &title,
         working_dir.as_deref(),
         None,
+        None,
         &[],
     );
 
@@ -2033,6 +2055,7 @@ fn load_codex_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         first_user_prompt: None,
         messages_preview: Vec::new(),
         search_index,
+        category: None,
         server_name: None,
         server_icon: None,
         source: SessionSource::Codex,
@@ -2202,6 +2225,7 @@ fn load_pi_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         &title,
         working_dir.as_deref(),
         None,
+        None,
         &[],
     );
 
@@ -2230,6 +2254,7 @@ fn load_pi_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         first_user_prompt: None,
         messages_preview: Vec::new(),
         search_index,
+        category: None,
         server_name: None,
         server_icon: None,
         source: SessionSource::Pi,
@@ -2362,6 +2387,7 @@ fn load_pi_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         &title,
         working_dir.as_deref(),
         None,
+        None,
         &preview,
     );
     let first_user_prompt = preview
@@ -2394,6 +2420,7 @@ fn load_pi_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         first_user_prompt,
         messages_preview: preview,
         search_index,
+        category: None,
         server_name: None,
         server_icon: None,
         source: SessionSource::Pi,
@@ -2475,6 +2502,7 @@ fn load_opencode_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         &title,
         working_dir.as_deref(),
         None,
+        None,
         &[],
     );
 
@@ -2503,6 +2531,7 @@ fn load_opencode_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         first_user_prompt: None,
         messages_preview: Vec::new(),
         search_index,
+        category: None,
         server_name: None,
         server_icon: None,
         source: SessionSource::OpenCode,
@@ -2621,6 +2650,7 @@ fn load_opencode_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         &title,
         working_dir.as_deref(),
         None,
+        None,
         &preview,
     );
     let first_user_prompt = preview
@@ -2653,6 +2683,7 @@ fn load_opencode_session_info(path: &Path) -> Result<Option<SessionInfo>> {
         first_user_prompt,
         messages_preview: preview,
         search_index,
+        category: None,
         server_name: None,
         server_icon: None,
         source: SessionSource::OpenCode,
@@ -2800,6 +2831,7 @@ fn load_cursor_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         &title,
         working_dir.as_deref(),
         None,
+        None,
         &[],
     );
 
@@ -2828,6 +2860,7 @@ fn load_cursor_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
         first_user_prompt: first_user_text,
         messages_preview: Vec::new(),
         search_index,
+        category: None,
         server_name: None,
         server_icon: None,
         source: SessionSource::Cursor,

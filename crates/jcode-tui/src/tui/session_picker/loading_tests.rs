@@ -124,6 +124,7 @@ fn cached_grouped_sessions_round_trip_from_disk() {
         first_user_prompt: None,
         messages_preview: Vec::new(),
         search_index: "cache test".to_string(),
+        category: None,
         server_name: None,
         server_icon: None,
         source: SessionSource::Jcode,

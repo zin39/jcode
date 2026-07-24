@@ -132,6 +132,8 @@ pub struct SessionInfo {
     pub messages_preview: Vec<PreviewMessage>,
     /// Lowercased searchable text used by picker filtering.
     pub search_index: String,
+    /// Use-case category (selfdev, coding, etc.) set on session close.
+    pub category: Option<String>,
     /// Server name this session belongs to (if running).
     pub server_name: Option<String>,
     /// Server icon.

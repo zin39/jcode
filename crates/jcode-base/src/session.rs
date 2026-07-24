@@ -33,6 +33,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+mod classify;
 mod crash;
 mod journal;
 mod maintenance;
@@ -46,6 +47,7 @@ pub use crash::{
     CrashedSessionsInfo, detect_crashed_sessions, find_recent_crashed_sessions,
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
 };
+use classify::classify_session;
 pub use jcode_session_types::{
     EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
@@ -165,6 +167,9 @@ pub struct Session {
     /// Optional user-provided label for saved sessions
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub save_label: Option<String>,
+    /// Use-case category (selfdev, coding, learning, etc.) set on close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// Environment snapshots for post-mortem debugging
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_snapshots: Vec<EnvSnapshot>,
@@ -243,6 +248,8 @@ struct SessionStartupStub {
     saved: bool,
     #[serde(default)]
     save_label: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
 }
 
 const MAX_SESSION_JOURNAL_BYTES: u64 = 512 * 1024;
@@ -338,6 +345,7 @@ impl Session {
         session.is_debug = stub.is_debug;
         session.saved = stub.saved;
         session.save_label = stub.save_label;
+        session.category = stub.category;
         session.messages.clear();
         session.env_snapshots.clear();
         session.memory_injections.clear();
@@ -374,6 +382,7 @@ impl Session {
         session.is_debug = snapshot.is_debug;
         session.saved = snapshot.saved;
         session.save_label = snapshot.save_label;
+        session.category = snapshot.category;
         session.replay_events.clear();
         session.env_snapshots.clear();
         session.memory_injections.clear();
@@ -512,6 +521,7 @@ impl Session {
             is_debug: self.is_debug,
             saved: self.saved,
             save_label: self.save_label.clone(),
+            category: self.category.clone(),
         }
     }
 
@@ -755,6 +765,7 @@ impl Session {
             is_debug,
             saved: false,
             save_label: None,
+            category: None,
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
@@ -810,6 +821,7 @@ impl Session {
             is_debug,
             saved: false,
             save_label: None,
+            category: None,
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
@@ -1037,6 +1049,9 @@ request in this new forked session, using the inherited conversation only as con
     /// Mark session as closed normally
     pub fn mark_closed(&mut self) {
         self.status = SessionStatus::Closed;
+        if self.category.is_none() && self.has_any_visible_messages() {
+            self.category = classify_session(self.title.as_deref(), &self.messages);
+        }
         unregister_active_pid(&self.id);
     }
 
@@ -1639,6 +1654,8 @@ struct RemoteStartupSessionSnapshot {
     saved: bool,
     #[serde(default)]
     save_label: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
 }
 
 #[cfg(test)]

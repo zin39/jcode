@@ -35,6 +35,7 @@ pub(super) struct SessionJournalMeta {
     pub(super) is_debug: bool,
     pub(super) saved: bool,
     pub(super) save_label: Option<String>,
+    pub(super) category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
