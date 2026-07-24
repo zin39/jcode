@@ -472,6 +472,216 @@ fn format_stream_tokens(tokens: u64) -> String {
     }
 }
 
+// ── Status-bar reserved-width segments (WP5, spec §3.3) ────────────────────
+
+/// Fixed width for the left status-bar segment (spinner + state word + elapsed).
+const STATUS_LEFT_WIDTH: u16 = 28;
+
+/// Fixed width for the right status-bar segment (metrics or warning).
+const STATUS_RIGHT_WIDTH: u16 = 30;
+
+/// Map every [`ProcessingStatus`] variant to its canonical semantic state word.
+///
+/// These words are the primary status affordance; they must stay at a constant
+/// x-position across all variants so the status bar never shifts laterally.
+fn status_state_word(status: &ProcessingStatus) -> &'static str {
+    match status {
+        ProcessingStatus::Idle => "done",
+        ProcessingStatus::Sending => "sending…",
+        ProcessingStatus::Connecting(_) => "connecting…",
+        ProcessingStatus::Thinking(_) => "thinking…",
+        ProcessingStatus::Streaming => "streaming…",
+        ProcessingStatus::WaitingForNetwork { .. } => "blocked",
+        ProcessingStatus::RunningTool(_) => "running",
+    }
+}
+
+/// Semantic palette role for the state word, mirroring spec §3.3 roles.
+fn status_state_role(status: &ProcessingStatus) -> jcode_tui_style::palette::Role {
+    use jcode_tui_style::palette::Role;
+    match status {
+        ProcessingStatus::Idle => Role::Agent,
+        ProcessingStatus::Sending
+        | ProcessingStatus::Connecting(_)
+        | ProcessingStatus::Thinking(_) => Role::Info,
+        ProcessingStatus::Streaming | ProcessingStatus::RunningTool(_) => Role::Agent,
+        ProcessingStatus::WaitingForNetwork { .. } => Role::Warn,
+    }
+}
+
+/// Build the left segment: `spinner state_word elapsed` at a reserved width.
+fn build_left_segment(
+    spinner: &'static str,
+    state_word: &'static str,
+    elapsed_str: String,
+    extra_detail: Option<Vec<Span<'static>>>,
+    color: Color,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(spinner, Style::default().fg(color)),
+        Span::styled(" ", Style::default()),
+        Span::styled(state_word, Style::default().fg(color).bold()),
+    ];
+    if let Some(detail) = extra_detail {
+        spans.extend(detail);
+    }
+    spans.push(Span::styled(" ", Style::default()));
+    spans.push(Span::styled(elapsed_str, Style::default().fg(dim_color())));
+    spans
+}
+
+/// Build the right segment: metrics or warning, always at a reserved width.
+fn build_right_segment(
+    app: &dyn TuiState,
+    kv_cache_problem: Option<&crate::tui::KvCacheProblem>,
+    elapsed: f32,
+) -> String {
+    if let Some(problem) = kv_cache_problem {
+        let miss_tokens = problem.affected_tokens.unwrap_or(0);
+        let miss_str = if miss_tokens >= 1000 {
+            format!("{}k", miss_tokens / 1000)
+        } else if miss_tokens > 0 {
+            format!("{}", miss_tokens)
+        } else {
+            "kv".to_string()
+        };
+        return format!("⚠ {} cache miss", miss_str);
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(tps) = app.output_tps() {
+        parts.push(format!("{:.1} tps", tps));
+    }
+
+    let (input_tokens, output_tokens) = app.streaming_tokens();
+    if input_tokens > 0 || output_tokens > 0 {
+        parts.push(format!(
+            "↑{} ↓{}",
+            format_stream_tokens(input_tokens),
+            format_stream_tokens(output_tokens)
+        ));
+    }
+
+    // Context-usage percentage from the info widget.
+    let info = app.info_widget_data();
+    if let Some(ctx_limit) = info.context_limit {
+        let used = info
+            .observed_context_tokens
+            .map(|t| t as usize)
+            .or_else(|| {
+                info.context_info
+                    .as_ref()
+                    .map(|ci| ci.estimated_tokens())
+                    .filter(|&e| e > 0)
+            })
+            .unwrap_or(0);
+        if ctx_limit > 0 {
+            let pct = ((used as f64 / ctx_limit as f64) * 100.0) as u32;
+            parts.push(format!("{}% ctx", pct));
+        }
+    }
+
+    if parts.is_empty() {
+        let _ = elapsed; // keep elapsed available if needed later
+        String::new()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Build the center-segment text: session name · model.
+fn build_center_text(app: &dyn TuiState) -> String {
+    let info = app.info_widget_data();
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(ref name) = info.session_name {
+        if !name.is_empty() {
+            parts.push(name.clone());
+        }
+    }
+
+    let model = info
+        .model
+        .clone()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| app.provider_model());
+    if !model.is_empty() {
+        parts.push(model);
+    }
+
+    parts.join(" · ")
+}
+
+/// Truncate a string to at most `max_width` display columns, appending "…" when cut.
+fn truncate_str(s: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if s.width() <= max_width {
+        return s.to_string();
+    }
+    let budget = max_width.saturating_sub(1);
+    let mut taken = String::new();
+    let mut tw = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+        if tw + cw > budget {
+            break;
+        }
+        tw += cw;
+        taken.push(ch);
+    }
+    taken.push('…');
+    taken
+}
+
+/// Compute the total display-column width of a slice of spans.
+fn span_display_width(spans: &[Span<'_>]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    spans.iter().map(|s| s.content.width()).sum()
+}
+
+/// Truncate a list of spans to fit within `max_width` display columns.
+/// Drops spans that don't fit; appends "…" when content is cut.
+fn truncate_spans_to_width(spans: &[Span<'static>], max_width: usize) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let w = span.content.width();
+        if used + w <= max_width {
+            used += w;
+            out.push(span.clone());
+        } else {
+            let remaining = max_width.saturating_sub(used);
+            if remaining > 0 {
+                let mut taken = String::new();
+                let mut tw = 0usize;
+                for ch in span.content.chars() {
+                    let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+                    if tw + cw > remaining {
+                        break;
+                    }
+                    tw += cw;
+                    taken.push(ch);
+                }
+                if !taken.is_empty() {
+                    out.push(Span::styled(taken, span.style));
+                }
+            }
+            break;
+        }
+    }
+    if span_display_width(&out) < max_width && span_display_width(spans) > max_width {
+        out.push(Span::styled("…", Style::default().fg(dim_color())));
+    }
+    out
+}
+
+/// Compute how many padding spaces to add so spans reach `target_width` display columns.
+fn reserved_width_padding(spans: &[Span<'_>], target_width: usize) -> usize {
+    target_width.saturating_sub(span_display_width(spans))
+}
+
 fn occasional_session_history_warning(
     total_tokens: u64,
     compaction_count: usize,
@@ -515,6 +725,7 @@ fn occasional_session_history_warning(
     ))
 }
 
+#[allow(dead_code)]
 fn connection_phase_label(phase: &ConnectionPhase) -> String {
     match phase {
         ConnectionPhase::Authenticating => "refreshing auth".to_string(),
@@ -601,12 +812,14 @@ fn transport_context_labels(app: &dyn TuiState) -> Vec<String> {
     )
 }
 
+#[allow(dead_code)]
 fn append_transport_context(status_text: &mut String, app: &dyn TuiState) {
     for label in transport_context_labels(app) {
         status_text.push_str(&format!(" · {}", label));
     }
 }
 
+#[allow(dead_code)]
 fn streaming_liveness_label(
     time_str: String,
     stale_secs: Option<f32>,
@@ -690,7 +903,6 @@ pub(super) fn build_status_line(
     pending_count: usize,
 ) -> Line<'static> {
     let elapsed = app.elapsed().map(|d| d.as_secs_f32()).unwrap_or(0.0);
-    let stale_secs = app.time_since_activity().map(|d| d.as_secs_f32());
     let (cache_read, cache_creation) = app.streaming_cache_tokens();
     let user_turn_count = app.display_user_message_count();
     let (streaming_input_tokens, _) = app.streaming_tokens();
@@ -747,120 +959,28 @@ pub(super) fn build_status_line(
             ),
         ])
     } else if app.is_processing() {
+        let status = app.status();
+        if matches!(status, ProcessingStatus::Idle) {
+            return if app.centered_mode() {
+                Line::from("").alignment(Alignment::Center)
+            } else {
+                Line::from("")
+            };
+        }
+
+        let state_word = status_state_word(&status);
+        let time_str = format_elapsed(elapsed);
+        let tier = jcode_tui_style::palette::detect_tier();
+        let role = status_state_role(&status);
+        let state_color = jcode_tui_style::palette::role_color(role, tier);
+
+        // ── LEFT segment: spinner + state_word [+ extra] + elapsed ──────
         let spinner = super::activity_indicator(elapsed, 12.5);
 
-        match app.status() {
-            ProcessingStatus::Idle => Line::from(""),
-            ProcessingStatus::Sending => {
-                let mut spans = vec![
-                    Span::styled(spinner, Style::default().fg(ai_color())),
-                    Span::styled(
-                        format!(" sending… {}", format_elapsed(elapsed)),
-                        Style::default().fg(dim_color()),
-                    ),
-                ];
-                push_queued_suffix(&mut spans, &queued_suffix);
-                Line::from(spans)
-            }
-            ProcessingStatus::Connecting(ref phase) => {
-                let mut label = format!(
-                    " {}… {}",
-                    connection_phase_label(phase),
-                    format_elapsed(elapsed)
-                );
-                append_transport_context(&mut label, app);
-                // "Suspiciously long" is measured per connection attempt, not
-                // across the whole turn, so later round-trips don't immediately
-                // render yellow just because the turn has been running a while.
-                let phase_elapsed = app
-                    .connection_phase_elapsed()
-                    .map_or(elapsed, |d| d.as_secs_f32());
-                let label_color = match phase {
-                    crate::message::ConnectionPhase::Retrying { .. } => rgb(255, 193, 7),
-                    crate::message::ConnectionPhase::Authenticating if phase_elapsed > 10.0 => {
-                        rgb(255, 193, 7)
-                    }
-                    crate::message::ConnectionPhase::Connecting if phase_elapsed > 10.0 => {
-                        rgb(255, 193, 7)
-                    }
-                    _ => dim_color(),
-                };
-                let mut spans = vec![
-                    Span::styled(spinner, Style::default().fg(ai_color())),
-                    Span::styled(label, Style::default().fg(label_color)),
-                ];
-                push_queued_suffix(&mut spans, &queued_suffix);
-                Line::from(spans)
-            }
-            ProcessingStatus::Thinking(_start) => {
-                let mut label = format!(" thinking… {}", format_elapsed(elapsed));
-                append_transport_context(&mut label, app);
-                let mut spans = vec![
-                    Span::styled(spinner, Style::default().fg(ai_color())),
-                    Span::styled(label, Style::default().fg(dim_color())),
-                ];
-                push_queued_suffix(&mut spans, &queued_suffix);
-                Line::from(spans)
-            }
-            ProcessingStatus::Streaming => {
-                let time_str = format_elapsed(elapsed);
-                let (input_tokens, output_tokens) = app.streaming_tokens();
-                let stream_message_ended = app.stream_message_ended();
-                let mut status_text =
-                    streaming_liveness_label(time_str, stale_secs, stream_message_ended);
-                if let Some(tps) = app.output_tps() {
-                    status_text = format!("{} · {:.1} tps", status_text, tps);
-                }
-                if input_tokens > 0 || output_tokens > 0 {
-                    status_text = format!(
-                        "{} · ↑{} ↓{}",
-                        status_text,
-                        format_stream_tokens(input_tokens),
-                        format_stream_tokens(output_tokens)
-                    );
-                }
-                append_transport_context(&mut status_text, app);
-                if let Some(problem) = kv_cache_problem {
-                    let miss_tokens = problem.affected_tokens.unwrap_or(0);
-                    let miss_str = if miss_tokens >= 1000 {
-                        format!("{}k", miss_tokens / 1000)
-                    } else if miss_tokens > 0 {
-                        format!("{}", miss_tokens)
-                    } else {
-                        "kv".to_string()
-                    };
-                    status_text = format!("⚠ {} cache miss · {}", miss_str, status_text);
-                }
-                let spans = streaming_status_spans(
-                    spinner,
-                    status_text,
-                    stream_message_ended,
-                    kv_cache_problem.is_some(),
-                    &queued_suffix,
-                );
-                Line::from(spans)
-            }
-            ProcessingStatus::WaitingForNetwork { listener } => {
-                let mut spans = vec![
-                    Span::styled("↻ ", Style::default().fg(rgb(255, 193, 7))),
-                    Span::styled(
-                        format!(
-                            "network disconnected, waiting to retry · {} · {}",
-                            listener,
-                            format_elapsed(elapsed)
-                        ),
-                        Style::default().fg(rgb(255, 193, 7)),
-                    ),
-                ];
-                push_queued_suffix(&mut spans, &queued_suffix);
-                Line::from(spans)
-            }
-            ProcessingStatus::RunningTool(ref name) => {
+        let extra_detail: Option<Vec<Span<'static>>> = match &status {
+            ProcessingStatus::RunningTool(name) => {
                 let half_width = 3;
                 let decorative = crate::perf::tui_policy().enable_decorative_animations;
-                // When decorative animations are disabled we still nudge the bar
-                // forward at a slow "liveness" rate so a long-running tool (e.g.
-                // bash) reads as alive instead of frozen.
                 let bar_speed = if decorative {
                     2.0
                 } else {
@@ -880,11 +1000,17 @@ pub(super) fn build_status_line(
                         }
                     })
                     .collect();
-
                 let anim_color = animated_tool_color(elapsed);
+
+                let mut detail = vec![
+                    Span::styled(" ", Style::default()),
+                    Span::styled(left_bar, Style::default().fg(anim_color)),
+                    Span::styled(name.to_string(), Style::default().fg(anim_color).bold()),
+                    Span::styled(right_bar, Style::default().fg(anim_color)),
+                ];
+
                 let batch_prog = app.batch_progress();
                 let is_batch = name == "batch";
-                // For batch: compute initial total from the streaming tool call input
                 let batch_total_initial = if is_batch {
                     app.streaming_tool_calls()
                         .last()
@@ -894,88 +1020,155 @@ pub(super) fn build_status_line(
                 } else {
                     None
                 };
-                let tool_detail = if is_batch {
-                    None // batch always uses progress display
-                } else {
-                    app.streaming_tool_calls()
-                        .last()
-                        .map(get_tool_activity_detail)
-                        .filter(|s| !s.is_empty())
-                };
-                let experimental_notice = app.active_experimental_feature_notice();
-                let subagent = app.subagent_status();
 
-                let mut spans = vec![
-                    Span::styled(left_bar, Style::default().fg(anim_color)),
-                    Span::styled(" ", Style::default()),
-                    Span::styled(name.to_string(), Style::default().fg(anim_color).bold()),
-                    Span::styled(" ", Style::default()),
-                    Span::styled(right_bar, Style::default().fg(anim_color)),
-                ];
-
-                // For batch tool: show "completed/total · last_tool" progress
                 if is_batch {
                     append_batch_progress_spans(
-                        &mut spans,
+                        &mut detail,
                         anim_color,
                         batch_prog,
                         batch_total_initial,
                     );
-                } else if let Some(detail) = tool_detail {
-                    spans.push(Span::styled(
-                        format!(" · {}", detail),
-                        Style::default().fg(dim_color()),
-                    ));
+                } else {
+                    let tool_detail = app
+                        .streaming_tool_calls()
+                        .last()
+                        .map(get_tool_activity_detail)
+                        .filter(|s| !s.is_empty());
+                    if let Some(td) = tool_detail {
+                        detail.push(Span::styled(
+                            format!(" · {}", td),
+                            Style::default().fg(dim_color()),
+                        ));
+                    }
                 }
 
-                if let Some(notice) = experimental_notice {
-                    spans.push(Span::styled(
+                if let Some(notice) = app.active_experimental_feature_notice() {
+                    detail.push(Span::styled(
                         format!(" · ⚠ {}", notice),
                         Style::default().fg(rgb(255, 193, 7)).bold(),
                     ));
                 }
 
-                if let Some(status) = subagent {
-                    spans.push(Span::styled(
-                        format!(" ({})", status),
+                if let Some(sub_status) = app.subagent_status() {
+                    detail.push(Span::styled(
+                        format!(" ({})", sub_status),
                         Style::default().fg(dim_color()),
                     ));
                 }
-                for label in transport_context_labels(app) {
-                    spans.push(Span::styled(
-                        format!(" · {}", label),
-                        Style::default().fg(dim_color()),
-                    ));
-                }
-                spans.push(Span::styled(
-                    format!(" · {}", format_elapsed(elapsed)),
-                    Style::default().fg(dim_color()),
-                ));
 
-                if let Some(problem) = kv_cache_problem {
-                    let miss_tokens = problem.affected_tokens.unwrap_or(0);
-                    let miss_str = if miss_tokens >= 1000 {
-                        format!("{}k", miss_tokens / 1000)
-                    } else if miss_tokens > 0 {
-                        format!("{}", miss_tokens)
-                    } else {
-                        "kv".to_string()
-                    };
-                    spans.push(Span::styled(
-                        format!(" · ⚠ {} cache miss", miss_str),
-                        Style::default().fg(rgb(255, 193, 7)),
-                    ));
-                }
-
-                spans.push(Span::styled(
-                    " · Alt+B bg",
-                    Style::default().fg(rgb(100, 100, 100)),
-                ));
-
-                push_queued_suffix(&mut spans, &queued_suffix);
-                Line::from(spans)
+                Some(detail)
             }
+            ProcessingStatus::Connecting(_) => {
+                // Show per-connection-attempt elapsed as detail
+                let phase_elapsed = app
+                    .connection_phase_elapsed()
+                    .map_or(elapsed, |d| d.as_secs_f32());
+                Some(vec![Span::styled(
+                    format!(" ({})", format_elapsed(phase_elapsed)),
+                    Style::default().fg(dim_color()),
+                )])
+            }
+            _ => None,
+        };
+
+        let left_spans = build_left_segment(
+            spinner,
+            state_word,
+            time_str,
+            extra_detail,
+            state_color,
+        );
+
+        // ── RIGHT segment: metrics or warning ──────────────────────────
+        let right_text = build_right_segment(app, kv_cache_problem.as_ref(), elapsed);
+
+        // ── CENTER segment: session · model [+ transports] ─────────────
+        let mut center_spans: Vec<Span<'static>> = Vec::new();
+        let center_session_text = build_center_text(app);
+        if !center_session_text.is_empty() {
+            center_spans.push(Span::styled(
+                center_session_text,
+                Style::default().fg(dim_color()),
+            ));
         }
+
+        // Transport context labels (websocket/https etc.)
+        let transport_labels = transport_context_labels(app);
+        for label in &transport_labels {
+            center_spans.push(Span::styled(
+                format!(" · {}", label),
+                Style::default().fg(dim_color()),
+            ));
+        }
+
+        // RunningTool also shows Alt+B bg hint
+        if matches!(status, ProcessingStatus::RunningTool(_)) {
+            center_spans.push(Span::styled(
+                " · Alt+B bg",
+                Style::default().fg(rgb(100, 100, 100)),
+            ));
+        }
+
+        // Queued suffix in center
+        if !queued_suffix.is_empty() {
+            center_spans.push(Span::styled(
+                queued_suffix.clone(),
+                Style::default().fg(queued_color()),
+            ));
+        }
+
+        // ── Assemble: three fixed-width segments ───────────────────────
+        let mut all_spans = left_spans;
+
+        // Pad left segment to reserved width
+        let left_pad = reserved_width_padding(&all_spans, STATUS_LEFT_WIDTH as usize);
+        if left_pad > 0 {
+            all_spans.push(Span::raw(" ".repeat(left_pad)));
+        }
+
+        // Center segment: fill remaining space between left and right
+        let right_reserved = if right_text.is_empty() {
+            0
+        } else {
+            STATUS_RIGHT_WIDTH as usize
+        };
+        let left_total = STATUS_LEFT_WIDTH as usize;
+        let available_width = area_width as usize;
+        let center_width = available_width
+            .saturating_sub(left_total)
+            .saturating_sub(right_reserved);
+
+        if center_width > 0 {
+            let center_line = truncate_spans_to_width(&center_spans, center_width);
+            all_spans.extend(center_line);
+        }
+
+        // Pad before right segment to reach right-aligned position
+        let right_x = available_width.saturating_sub(right_reserved);
+        let current_width = span_display_width(&all_spans);
+        if current_width < right_x && right_reserved > 0 {
+            let gap = right_x.saturating_sub(current_width);
+            all_spans.push(Span::raw(" ".repeat(gap)));
+        }
+
+        // Right segment
+        if !right_text.is_empty() {
+            let right_color = if kv_cache_problem.is_some() {
+                rgb(255, 193, 7) // Warn
+            } else {
+                dim_color()
+            };
+            let truncated = truncate_str(&right_text, STATUS_RIGHT_WIDTH as usize);
+            all_spans.push(Span::styled(truncated, Style::default().fg(right_color)));
+        }
+
+        let line = Line::from(all_spans);
+        crate::memory::check_staleness();
+        return if app.centered_mode() {
+            line.alignment(Alignment::Center)
+        } else {
+            line
+        };
     } else if let Some((total_in, total_out)) = app.total_session_tokens() {
         let total = total_in + total_out;
         if let Some(warning) = occasional_session_history_warning(
@@ -1029,6 +1222,7 @@ pub(super) fn build_status_line(
 /// Append the "+N queued" suffix span (in the queued accent color) when there
 /// are queued follow-up messages. Centralizes the repeated check/styling shared
 /// by every processing-status branch in `draw_status`.
+#[allow(dead_code)]
 fn push_queued_suffix(spans: &mut Vec<Span<'static>>, queued_suffix: &str) {
     if !queued_suffix.is_empty() {
         spans.push(Span::styled(
@@ -1038,6 +1232,7 @@ fn push_queued_suffix(spans: &mut Vec<Span<'static>>, queued_suffix: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn streaming_status_spans(
     spinner: &'static str,
     status_text: String,
@@ -1602,6 +1797,62 @@ mod tests {
             normalize_repaint_sensitive_notice_text("all clear"),
             "all clear"
         );
+    }
+
+    /// WP5: the state word in every status variant must start at the same
+    /// display column so the status bar never shifts laterally as state changes.
+    #[test]
+    fn status_bar_state_word_column_is_constant_across_status_variants() {
+        use unicode_width::UnicodeWidthStr;
+
+        let variants: Vec<(&'static str, ProcessingStatus)> = vec![
+            ("sending…", ProcessingStatus::Sending),
+            ("connecting…", ProcessingStatus::Connecting(
+                crate::message::ConnectionPhase::Connecting,
+            )),
+            ("thinking…", ProcessingStatus::Thinking(std::time::Instant::now())),
+            ("streaming…", ProcessingStatus::Streaming),
+            ("blocked", ProcessingStatus::WaitingForNetwork {
+                listener: "tcp".to_string(),
+            }),
+            ("running", ProcessingStatus::RunningTool("bash".to_string())),
+        ];
+
+        // State words are correct.
+        for (expected, status) in &variants {
+            assert_eq!(status_state_word(status), *expected, "status={status:?}");
+        }
+        assert_eq!(status_state_word(&ProcessingStatus::Idle), "done");
+
+        // Build left segments and verify state word always at span index 2
+        // (spinner=0, space=1, state_word=2).
+        for (_expected, status) in &variants {
+            let spans = build_left_segment(
+                "⠋",
+                status_state_word(status),
+                "5s".to_string(),
+                None,
+                Color::White,
+            );
+            assert!(spans.len() >= 5, "≥5 spans, got {}", spans.len());
+            // Verify display-column position: spinner(col0,w1)+space(col1,w1) → col2
+            let prefix: usize = spans[0].content.width() + spans[1].content.width();
+            assert_eq!(prefix, 2, "state word must start at display column 2");
+        }
+
+        // RunningTool with extra_detail still keeps state word at span 2.
+        let extra = Some(vec![Span::styled(" · src/app.rs", Style::default())]);
+        let spans = build_left_segment(
+            "⠋",
+            "running",
+            "12s".to_string(),
+            extra,
+            Color::White,
+        );
+        assert_eq!(spans[2].content.as_ref(), "running");
+        let prefix: usize = spans[0].content.width() + spans[1].content.width();
+        assert_eq!(prefix, 2);
+        assert_eq!(spans[3].content.as_ref(), " · src/app.rs");
     }
 }
 
