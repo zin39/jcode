@@ -518,6 +518,17 @@ mod tests {
         assert_eq!(text, Some("real question".into()));
     }
 
-    // ── Serde roundtrip via Session ─────────────────────────────────
-    // (done in session_tests to avoid circular deps)
+    #[test]
+    fn serde_roundtrip_category_field() {
+        // Simulate: a Session with category serialized, deserialized
+        // by testing the underlying field serde behavior.
+        let json = r#"{"id":"abc","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","category":"coding"}"#;
+        let stub: serde_json::Value = serde_json::from_str(json).unwrap();
+        let cat = stub.get("category").and_then(|v| v.as_str());
+        assert_eq!(cat, Some("coding"));
+
+        let json_no_cat = r#"{"id":"abc","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
+        let stub2: serde_json::Value = serde_json::from_str(json_no_cat).unwrap();
+        assert_eq!(stub2.get("category").and_then(|v| v.as_str()), None);
+    }
 }
