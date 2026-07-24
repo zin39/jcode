@@ -107,11 +107,31 @@ pub(super) async fn create_headless_session(
         // the *outcome*, not whether `set_model` returned Ok: a provider that
         // cannot switch is fine as long as it already serves the requested model,
         // and a switch that "succeeds" onto a different model is not.
-        let switch_error = new_agent.set_model(&model_request).err();
+        let mut switch_error = new_agent.set_model(&model_request).err();
         if let Some(error) = switch_error.as_ref() {
             crate::logging::warn(&format!(
                 "Failed to set headless session model override '{model}' (request '{model_request}'): {error}"
             ));
+            // If the model request is a bare name (no route prefix), the
+            // coordinator's provider may simply not serve it. Try to resolve
+            // it across available routes (e.g. "glm-5" -> "openrouter:glm-5")
+            // before the outcome check below decides whether to refuse.
+            if !model_request.contains(':') {
+                let routes = provider_template.model_routes();
+                if let Ok(pinned) =
+                    crate::provider::resolve_bare_model_to_route_pinned(&model_request, &routes)
+                {
+                    crate::logging::info(&format!(
+                        "Resolved bare spawn model '{model_request}' to route-pinned '{pinned}'"
+                    ));
+                    switch_error = new_agent.set_model(&pinned).err();
+                    if let Some(error) = switch_error.as_ref() {
+                        crate::logging::warn(&format!(
+                            "Failed to set headless session model override '{model}' (resolved to '{pinned}'): {error}"
+                        ));
+                    }
+                }
+            }
         }
         let resolved = new_agent.provider_model();
         if !models_are_equivalent(&resolved, &model) {

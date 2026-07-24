@@ -83,7 +83,14 @@ fn create_visible_spawn_session(
     // reclaim their transcripts (see headless.rs, which does the same).
     session.set_debug(true);
     if let Some(model) = model_override {
-        session.model = Some(model.to_string());
+        // Build a model-switch request that preserves the coordinator's auth
+        // route, same as create_headless_session does for headless spawns.
+        let model_request = crate::provider::MultiProvider::model_switch_request_for_session_route(
+            model,
+            provider_key_override,
+            route_api_method_override,
+        );
+        session.model = Some(model_request);
     }
     if let Some(provider_key) = provider_key_override {
         session.provider_key = Some(provider_key.to_string());
