@@ -107,3 +107,96 @@ fn onboarding_welcome_centers_within_tall_area() {
         "content should be vertically padded from the top:\n{text}"
     );
 }
+
+/// Render the empty-state chat screen (initial transcript with no messages)
+/// via `draw` and return the flattened text of the whole buffer.
+fn render_empty_chat(state: &TestState, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
+    terminal
+        .draw(|frame| {
+            crate::tui::ui::draw(frame, state);
+        })
+        .expect("failed to draw empty chat");
+
+    let buf = terminal.backend().buffer();
+    let mut lines = Vec::with_capacity(height as usize);
+    for y in 0..height {
+        let mut line = String::with_capacity(width as usize);
+        for x in 0..width {
+            line.push_str(buf[(x, y)].symbol());
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+#[test]
+fn empty_session_shows_wordmark_and_three_ghost_prompts() {
+    let state = TestState {
+        welcome_suggestions: vec![
+            ("Explain this codebase".to_string(), "Explain the codebase".to_string()),
+            ("Add error handling in a recent file".to_string(), "Add error handling".to_string()),
+            ("Fix the failing tests".to_string(), "Fix failing tests".to_string()),
+        ],
+        ..Default::default()
+    };
+    let text = render_empty_chat(&state, 100, 30);
+
+    assert!(
+        text.contains("❯ jcode"),
+        "wordmark should be present in empty session:\n{text}"
+    );
+    assert!(
+        text.contains("1  Explain this codebase"),
+        "first ghost prompt should be rendered:\n{text}"
+    );
+    assert!(
+        text.contains("2  Add error handling in a recent file"),
+        "second ghost prompt should be rendered:\n{text}"
+    );
+    assert!(
+        text.contains("3  Fix the failing tests"),
+        "third ghost prompt should be rendered:\n{text}"
+    );
+}
+
+#[test]
+fn empty_session_without_welcome_prompts_shows_wordmark_only() {
+    let state = TestState::default();
+    let text = render_empty_chat(&state, 100, 30);
+
+    assert!(
+        text.contains("❯ jcode"),
+        "wordmark should be present even without ghost prompts (no blank screen):\n{text}"
+    );
+    assert!(
+        !text.contains("1  Explain this codebase"),
+        "no ghost prompts should be rendered when welcome_suggestions is empty:\n{text}"
+    );
+}
+
+#[test]
+fn non_empty_session_renders_messages_not_welcome() {
+    let state = TestState {
+        display_messages: vec![DisplayMessage::user("hello")],
+        welcome_suggestions: vec![
+            ("Explain this codebase".to_string(), "Explain the codebase".to_string()),
+        ],
+        ..Default::default()
+    };
+    let text = render_empty_chat(&state, 100, 30);
+
+    assert!(
+        text.contains("hello"),
+        "user message should be rendered:\n{text}"
+    );
+    assert!(
+        !text.contains("❯ jcode"),
+        "wordmark should NOT appear when messages exist:\n{text}"
+    );
+    assert!(
+        !text.contains("Explain this codebase"),
+        "ghost prompts should NOT appear when messages exist:\n{text}"
+    );
+}

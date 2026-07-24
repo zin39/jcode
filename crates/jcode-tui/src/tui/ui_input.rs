@@ -1971,6 +1971,7 @@ mod tests {
         fn copy_selection_range(&self) -> Option<crate::tui::CopySelectionRange> { None }
         fn copy_selection_status(&self) -> Option<crate::tui::CopySelectionStatus> { None }
         fn suggestion_prompts(&self) -> Vec<(String, String)> { vec![] }
+        fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)> { vec![] }
         fn onboarding_preview_mode(&self) -> bool { false }
         fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> { None }
         fn chat_native_scrollbar(&self) -> bool { false }

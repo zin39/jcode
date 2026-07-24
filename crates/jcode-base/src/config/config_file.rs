@@ -247,6 +247,20 @@ impl Config {
         Ok(())
     }
 
+    /// Mark that the first-run onboarding welcome has been completed.
+    /// Call this when the user sends their first message so the ghost
+    /// prompts never show again.
+    pub fn set_has_completed_onboarding(completed: bool) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.features.has_completed_onboarding = completed;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved features.has_completed_onboarding to config: {}",
+            completed
+        ));
+        Ok(())
+    }
+
     /// Persist the baked global launch-hotkey mapping.
     ///
     /// Auto-import calls this once with the per-repo chord -> directory layout it

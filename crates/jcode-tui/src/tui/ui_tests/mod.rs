@@ -138,6 +138,7 @@ struct TestState {
     chat_native_scrollbar: bool,
     onboarding_preview: bool,
     suggestions: Vec<(String, String)>,
+    welcome_suggestions: Vec<(String, String)>,
     compacted_hidden_user_prompts: usize,
     side_pane_images: Vec<crate::session::RenderedImage>,
     pin_images: bool,
@@ -487,6 +488,9 @@ impl crate::tui::TuiState for TestState {
     }
     fn suggestion_prompts(&self) -> Vec<(String, String)> {
         self.suggestions.clone()
+    }
+    fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)> {
+        self.welcome_suggestions.clone()
     }
     fn onboarding_preview_mode(&self) -> bool {
         self.onboarding_preview

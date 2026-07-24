@@ -3581,6 +3581,9 @@ impl App {
         // assistant paragraph shows up later out of order.
         self.commit_pending_streaming_assistant_message();
 
+        // Mark first-run onboarding as completed on first message submit.
+        let _ = crate::config::Config::set_has_completed_onboarding(true);
+
         if let Some(pending) = self.pending_login.take() {
             self.handle_login_input(pending, input);
             return;
