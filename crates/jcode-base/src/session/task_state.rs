@@ -70,11 +70,7 @@ pub fn write_task_state(session_id: &str, content: &str) -> Result<()> {
 ///
 /// Messages under 20 chars (e.g. "hi") are skipped. Messages over 2000 chars
 /// are truncated at a char boundary with a "... [truncated]" suffix.
-pub fn seed_task_state_if_empty_in_dir(
-    base: &Path,
-    session_id: &str,
-    first_user_message: &str,
-) {
+pub fn seed_task_state_if_empty_in_dir(base: &Path, session_id: &str, first_user_message: &str) {
     if read_task_state_in_dir(base, session_id).is_some() {
         return; // Already has state – no-op
     }
@@ -130,7 +126,10 @@ mod tests {
         let big = "x".repeat(MAX_TASK_STATE_CHARS + 100);
         write_task_state_in_dir(dir.path(), "s2", &big).unwrap();
         let read = read_task_state_in_dir(dir.path(), "s2").unwrap();
-        assert_eq!(read.chars().count(), MAX_TASK_STATE_CHARS + TRUNCATION_MARKER.chars().count());
+        assert_eq!(
+            read.chars().count(),
+            MAX_TASK_STATE_CHARS + TRUNCATION_MARKER.chars().count()
+        );
         assert!(read.ends_with(TRUNCATION_MARKER));
     }
 
@@ -145,7 +144,11 @@ mod tests {
     #[test]
     fn seed_creates_state_when_empty() {
         let dir = tempfile::tempdir().unwrap();
-        seed_task_state_if_empty_in_dir(dir.path(), "s1", "I need to build a CRUD API for my todo app");
+        seed_task_state_if_empty_in_dir(
+            dir.path(),
+            "s1",
+            "I need to build a CRUD API for my todo app",
+        );
         let state = read_task_state_in_dir(dir.path(), "s1").unwrap();
         assert!(state.starts_with("# Original Task (auto-captured)"));
         assert!(state.contains("build a CRUD API"));
@@ -267,7 +270,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raw = "<system-reminder>\n# Session Context\nstuff\n</system-reminder>please refactor the auth module for me";
         // Simulate caller stripping (same logic as prompting.rs).
-        let cleaned = match (raw.find("</system-reminder>"), raw.contains("<system-reminder")) {
+        let cleaned = match (
+            raw.find("</system-reminder>"),
+            raw.contains("<system-reminder"),
+        ) {
             (Some(end), true) => raw[end + "</system-reminder>".len()..].trim(),
             _ => raw.trim(),
         };
@@ -278,7 +284,10 @@ mod tests {
 
         // A message that is ONLY a system-reminder strips to empty -> skipped.
         let only = "<system-reminder>\nsession context only, quite long indeed\n</system-reminder>";
-        let cleaned2 = match (only.find("</system-reminder>"), only.contains("<system-reminder")) {
+        let cleaned2 = match (
+            only.find("</system-reminder>"),
+            only.contains("<system-reminder"),
+        ) {
             (Some(end), true) => only[end + "</system-reminder>".len()..].trim(),
             _ => only.trim(),
         };
