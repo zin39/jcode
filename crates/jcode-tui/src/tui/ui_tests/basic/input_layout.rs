@@ -27,6 +27,7 @@ fn test_file_diff_cache_reuses_entry_when_signature_matches() {
                 first_change_line: 0,
                 additions: 1,
                 deletions: 0,
+                hunk_count: 0,
                 file_ext: None,
             },
         );

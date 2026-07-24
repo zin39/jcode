@@ -1,12 +1,13 @@
 use crate::{message::ToolCall, tui::ui::tools_ui};
+use jcode_tui_style::palette::{self, Role};
 use ratatui::prelude::*;
 
 pub(super) fn diff_add_color() -> Color {
-    Color::Rgb(100, 200, 100)
+    palette::role_color(Role::Agent, palette::detect_tier())
 }
 
 pub(super) fn diff_del_color() -> Color {
-    Color::Rgb(200, 100, 100)
+    palette::role_color(Role::Error, palette::detect_tier())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
