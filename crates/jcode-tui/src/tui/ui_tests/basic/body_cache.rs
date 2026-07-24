@@ -449,12 +449,26 @@ fn test_prepare_body_incremental_applies_compaction_prompt_offset() {
     let full = super::prepare::prepare_body(&grown_state, width, false);
 
     let prompt_number_for = |prep: &PreparedMessages, content: &str| -> Option<usize> {
-        for line in &prep.wrapped_lines {
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            if let Some((prefix, rest)) = text.split_once("› ")
-                && rest.starts_with(content)
-            {
-                return prefix.trim().parse::<usize>().ok();
+        // In the new format (WP3), user messages have a header row
+        // " ▌N › name" followed by gutter body lines " │ text...".
+        // We scan for the header line containing the prompt number,
+        // then verify the body line contains the expected prompt text.
+        for i in 0..prep.wrapped_lines.len().saturating_sub(1) {
+            let header_text: String =
+                prep.wrapped_lines[i].spans.iter().map(|s| s.content.as_ref()).collect();
+            if let Some((prefix, _rest)) = header_text.split_once("› ") {
+                let body_text: String = prep.wrapped_lines[i + 1]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                if body_text.contains(content) {
+                    return prefix
+                        .trim()
+                        .trim_start_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<usize>()
+                        .ok();
+                }
             }
         }
         None
