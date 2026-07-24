@@ -58,6 +58,8 @@ pub(super) enum FileDiffDisplayRowKind {
     Add,
     Del,
     Placeholder,
+    /// `@@` hunk separator line displayed in Muted color.
+    HunkSeparator,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +76,7 @@ pub(super) struct FileDiffViewCacheEntry {
     pub(super) first_change_line: usize,
     pub(super) additions: usize,
     pub(super) deletions: usize,
+    pub(super) hunk_count: usize,
     pub(super) file_ext: Option<String>,
 }
 
@@ -147,6 +150,12 @@ fn render_file_diff_row(row: &FileDiffDisplayRow, file_ext: Option<&str>) -> Lin
                 spans.push(tint_span_with_diff_color(span, diff_del_color()));
             }
             Line::from(spans)
+        }
+        FileDiffDisplayRowKind::HunkSeparator => {
+            Line::from(Span::styled(
+                row.text.clone(),
+                Style::default().fg(dim_color()),
+            ))
         }
     }
 }
@@ -284,10 +293,26 @@ fn build_file_diff_cache_entry(
     let line_num_width = file_lines_vec.len().to_string().len().max(3);
     let gutter_pad = " ".repeat(line_num_width);
 
+    // Build the short path for @@ hunk separator lines.
+    let short_name = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file_path);
+
+    let mut hunk_count = 0usize;
+
     for (i, line_text) in file_lines_vec.iter().enumerate() {
         let line_num = i + 1;
 
         if let Some(dels) = add_to_dels.get(&i) {
+            // Emit a hunk separator before the first del of each hunk.
+            hunk_count += 1;
+            rows.push(FileDiffDisplayRow {
+                prefix: String::new(),
+                text: format!("@@ {short_name}:{line_num} @@"),
+                kind: FileDiffDisplayRowKind::HunkSeparator,
+            });
+
             for del_text in dels {
                 if first_change_line == usize::MAX {
                     first_change_line = rows.len();
@@ -320,16 +345,28 @@ fn build_file_diff_cache_entry(
         }
     }
 
-    for del_text in &orphan_dels {
-        if first_change_line == usize::MAX {
-            first_change_line = rows.len();
+    if !orphan_dels.is_empty() {
+        // Emit a separator for orphan deletions if there were preceding hunks.
+        if hunk_count > 0 {
+            hunk_count += 1;
+            rows.push(FileDiffDisplayRow {
+                prefix: String::new(),
+                text: format!("@@ {short_name} (unmatched) @@"),
+                kind: FileDiffDisplayRowKind::HunkSeparator,
+            });
         }
-        del_count += 1;
-        rows.push(FileDiffDisplayRow {
-            prefix: format!("{} │-", gutter_pad),
-            text: del_text.clone(),
-            kind: FileDiffDisplayRowKind::Del,
-        });
+
+        for del_text in &orphan_dels {
+            if first_change_line == usize::MAX {
+                first_change_line = rows.len();
+            }
+            del_count += 1;
+            rows.push(FileDiffDisplayRow {
+                prefix: format!("{} │-", gutter_pad),
+                text: del_text.clone(),
+                kind: FileDiffDisplayRowKind::Del,
+            });
+        }
     }
 
     if rows.is_empty() {
@@ -349,6 +386,7 @@ fn build_file_diff_cache_entry(
         first_change_line,
         additions: add_count,
         deletions: del_count,
+        hunk_count,
         file_ext,
     }
 }
@@ -505,7 +543,7 @@ pub(super) fn draw_file_diff_view(
         cache.insert(cache_key.clone(), entry);
     }
 
-    let (additions, deletions, total_lines, first_change_line) = {
+    let (additions, deletions, total_lines, first_change_line, hunk_count) = {
         let cache = match file_diff_cache().lock() {
             Ok(c) => c,
             Err(poisoned) => poisoned.into_inner(),
@@ -518,6 +556,7 @@ pub(super) fn draw_file_diff_view(
             cached.deletions,
             cached.rows.len(),
             cached.first_change_line,
+            cached.hunk_count,
         )
     };
 
@@ -543,7 +582,7 @@ pub(super) fn draw_file_diff_view(
         title_parts.push(Span::styled(" ", Style::default().fg(dim_color())));
         if additions > 0 {
             title_parts.push(Span::styled(
-                format!("+{}", additions),
+                format!("+{additions}"),
                 Style::default().fg(diff_add_color()),
             ));
         }
@@ -552,10 +591,16 @@ pub(super) fn draw_file_diff_view(
                 title_parts.push(Span::styled(" ", Style::default().fg(dim_color())));
             }
             title_parts.push(Span::styled(
-                format!("-{}", deletions),
+                format!("-{deletions}"),
                 Style::default().fg(diff_del_color()),
             ));
         }
+    }
+    if hunk_count > 0 {
+        title_parts.push(Span::styled(
+            format!(" {hunk_count}/{} hunk{}", hunk_count, if hunk_count == 1 { "" } else { "s" }),
+            Style::default().fg(dim_color()),
+        ));
     }
     title_parts.push(Span::styled(
         format!(" {}L ", total_lines),
@@ -612,4 +657,179 @@ pub(super) fn draw_file_diff_view(
 
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::ToolCall;
+    use jcode_tui_messages::DisplayMessage;
+    use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn diff_header_counts_and_hunk_separators() {
+        // Create a temp file with post-edit content (the file diff view reads
+        // the current file on disk and overlays the edit diff annotations).
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        write!(tmp, "line1\nLINE2\nline3\n").expect("write");
+        let path = tmp.path().to_string_lossy().to_string();
+
+        // Build a DisplayMessage with an edit tool that changed line2 -> LINE2.
+        let msg = DisplayMessage {
+            role: "tool".to_string(),
+            content: String::new(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: Some(ToolCall {
+                id: "tool_1".to_string(),
+                name: "edit".to_string(),
+                input: json!({
+                    "file_path": &path,
+                    "old_string": "line2\n",
+                    "new_string": "LINE2\n",
+                }),
+                intent: None,
+                thought_signature: None,
+            }),
+        };
+
+        let sig = file_content_signature(&path);
+        let entry = build_file_diff_cache_entry(&path, Some(&msg), sig);
+
+        // Header counts: 1 added line, 1 deleted line.
+        assert_eq!(
+            entry.additions, 1,
+            "expected 1 addition, got {}",
+            entry.additions
+        );
+        assert_eq!(
+            entry.deletions, 1,
+            "expected 1 deletion, got {}",
+            entry.deletions
+        );
+
+        // Hunk count.
+        assert_eq!(
+            entry.hunk_count, 1,
+            "expected 1 hunk, got {}",
+            entry.hunk_count
+        );
+
+        // Verify a HunkSeparator row exists with "@@" markers.
+        let separators: Vec<_> = entry
+            .rows
+            .iter()
+            .filter(|r| r.kind == FileDiffDisplayRowKind::HunkSeparator)
+            .collect();
+        assert!(
+            !separators.is_empty(),
+            "expected at least one HunkSeparator row"
+        );
+        for sep in &separators {
+            assert!(
+                sep.text.starts_with("@@") && sep.text.ends_with("@@"),
+                "hunk separator should be @@ ... @@, got: {:?}",
+                sep.text
+            );
+            assert!(
+                sep.prefix.is_empty(),
+                "hunk separator should have empty prefix"
+            );
+        }
+
+        // Verify some rows have Add or Del kind.
+        let has_add = entry
+            .rows
+            .iter()
+            .any(|r| r.kind == FileDiffDisplayRowKind::Add);
+        let has_del = entry
+            .rows
+            .iter()
+            .any(|r| r.kind == FileDiffDisplayRowKind::Del);
+        assert!(has_add, "expected at least one Add row");
+        assert!(has_del, "expected at least one Del row");
+
+        // Render rows to verify no panics on HunkSeparator rendering.
+        let file_ext = entry.file_ext.as_deref();
+        for row in &entry.rows {
+            let _line = render_file_diff_row(row, file_ext);
+        }
+    }
+
+    #[test]
+    fn multi_hunk_diff_counts() {
+        // File with post-edit content (both edits applied).
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        write!(tmp, "a\nB\nc\nDDD\ne\n").expect("write");
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let msg = DisplayMessage {
+            role: "tool".to_string(),
+            content: String::new(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: Some(ToolCall {
+                id: "tool_2".to_string(),
+                name: "multiedit".to_string(),
+                input: json!({
+                    "file_path": &path,
+                    "edits": [
+                        {"old_string": "b\n", "new_string": "B\n"},
+                        {"old_string": "d\n", "new_string": "DDD\n"},
+                    ]
+                }),
+                intent: None,
+                thought_signature: None,
+            }),
+        };
+
+        let sig = file_content_signature(&path);
+        let entry = build_file_diff_cache_entry(&path, Some(&msg), sig);
+
+        // Each edit: 1 old line removed, 1 new line added = 2 additions, 2 deletions total.
+        assert_eq!(entry.additions, 2, "expected 2 additions");
+        assert_eq!(entry.deletions, 2, "expected 2 deletions");
+        assert_eq!(entry.hunk_count, 2, "expected 2 hunks");
+
+        let separators: Vec<_> = entry
+            .rows
+            .iter()
+            .filter(|r| r.kind == FileDiffDisplayRowKind::HunkSeparator)
+            .collect();
+        assert_eq!(separators.len(), 2, "expected 2 hunk separator rows");
+    }
+
+    #[test]
+    fn plain_tier_add_del_colors_use_named_ansi() {
+        // Verify that diff_add_color / diff_del_color produce named ANSI-16
+        // colors at plain tier (no Rgb or Indexed).
+        unsafe { std::env::set_var("JCODE_TIER", "plain") };
+        let add = diff_add_color();
+        let del = diff_del_color();
+        unsafe { std::env::remove_var("JCODE_TIER") };
+
+        assert!(
+            !matches!(add, Color::Rgb(..)),
+            "plain-tier add color should not be Rgb"
+        );
+        assert!(
+            !matches!(add, Color::Indexed(_)),
+            "plain-tier add color should not be Indexed"
+        );
+        assert!(
+            !matches!(del, Color::Rgb(..)),
+            "plain-tier del color should not be Rgb"
+        );
+        assert!(
+            !matches!(del, Color::Indexed(_)),
+            "plain-tier del color should not be Indexed"
+        );
+
+        // The Agent role maps to LightGreen at plain tier; Error maps to LightRed.
+        assert_eq!(add, Color::LightGreen, "plain add should be LightGreen (Agent)");
+        assert_eq!(del, Color::LightRed, "plain del should be LightRed (Error)");
+    }
 }
