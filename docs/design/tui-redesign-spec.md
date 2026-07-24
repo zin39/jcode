@@ -1,7 +1,8 @@
 # jcode TUI Redesign Spec
 
 Status: design-only. Implementers: see §6. Grounded in `docs/research/tui-ux-research.md`
-(cited as R:<section>) and `docs/research/tui-current-state.md` (cited as CS:<section>).
+(cited as R:<section>), `docs/research/tui-polish-research.md` (cited as R:polish <area>),
+and `docs/research/tui-current-state.md` (cited as CS:<section>).
 No rendering-architecture changes: ratatui 0.30, crossterm, event loop, full-buffer draw,
 and the light-mode luminance-inversion pipeline all stay (CS:1, CS:2).
 
@@ -257,56 +258,92 @@ diffs). Mockup (100x30), side panel focused:
  ❯ ▍
 ```
 
-### 3.7 Transcript economy mode (scrolled-back history)
+### 3.7 Transcript economy (virtual list + compacted history)
 
-In long sessions, distant history keeps its text but sheds its chrome (principle 1).
-Rule: blocks within ~1.5 screen heights of the live tail render full (§3.1); blocks
-beyond render compact. Distance is measured in laid-out rows, not block count.
+The transcript is a viewport, not the record: the full conversation always lands in
+`~/.jcode/logs/`; the TUI renders a window onto it (R:polish economy "TUI is a
+viewport, not canonical record"). Alternate-screen mode has no native scrollback,
+so the app owns all scrolling (R:polish economy, Codex TUI docs).
 
+Rendering (hard rules):
+- Virtual list: only rows intersecting the viewport plus ~0.5 screen of overscan are
+  laid out and drawn; off-screen history is never rendered into the buffer
+  (R:polish economy "render only visible lines + overscan"; less/bat seek model).
+  Compatible with full-buffer redraw (CS:1): the buffer only ever holds the window.
+- Tail batching: auto-scroll commits at ~100ms or paragraph boundaries, never per
+  token (R:polish economy "DON'T auto-scroll to bottom on every token").
+- Scroll-anchor lock: when the user scrolls up, the anchor (block id, row-in-block)
+  is pinned and streamed output never moves its screen row; a `↓ new output` pill
+  sits at the bottom edge until tail-follow resumes (R:polish motion scroll-anchor
+  lock; R:polish economy scroll-jump complaints).
+
+Compaction: blocks within ~1.5 screen heights of the live tail render full (§3.1);
+beyond, they shed chrome (principle 1). Distance is measured in laid-out rows.
 Compact block, exact differences from full:
-- No per-block headers: gutter bar, `N › name · time` row, and model tag omitted.
-  Plain/monochrome tier keeps the ASCII `|` role marker so identity stays labeled
-  (principles 3, 6).
-- No surface backgrounds: surface-1 behind user text dropped; text colors unchanged.
-- Tool groups always render as the folded one-line summary; expansion is suspended,
-  not lost, and returns when the block re-enters the full region.
-- Denser spacing: 0 blank lines between blocks (vs 1); tool groups lose their
-  surrounding blank lines.
+- No per-block headers (gutter bar, `N › name · time`, model tag omitted); plain tier
+  keeps the ASCII `|` role marker so identity stays labeled (principles 3, 6).
+- No surface backgrounds; text colors unchanged.
+- Tool groups render as the folded one-line summary (`⚙ cargo build ✓ · 142 lines`);
+  expansion is suspended, not lost, and returns on re-entry to the full region
+  (R:polish economy "collapse tool-call blocks to summary line").
+- Denser spacing: 0 blank lines between blocks; tool groups lose surrounding blanks.
 
 Transition rule (hard): instant per-block swap at layout time; no animation, no fade,
-no intermediate frame. Scroll is anchored to (block id, row-in-block); when a block
-above the anchor swaps, the scroll offset compensates by its height delta so the
-anchor's screen row never moves (principle 7; R:motion "prefer stable row heights and
-reserved status space").
+no intermediate frame. When a block above the anchor swaps, the scroll offset
+compensates by its height delta so the anchor's screen row never moves (principle 7;
+R:motion "prefer stable row heights and reserved status space").
+
+Full history on demand: `ctrl+t` opens a read-only pager over the complete session
+(virtual list, `/` search, `q` close) without leaving the alternate screen
+(R:polish economy "internal pager for full-history review"). After ~50 compacted
+turns, the status bar offers `archive and start fresh` once per session.
 
 ### 3.8 Pane focus and cycling
 
-With 2+ panes open (chat + side panel, diff, or swarm gallery):
-- Focused pane keeps the accent edge (§3.5; palette `accent` = active pane edge). When
-  the transcript is the focused pane, its left gutter column takes accent.
-- Status bar adds one hint, `ctrl+w cycle panes` in muted, in reserved trailing space
-  of the right segment, shown only while pane count ≥ 2. It never shifts the state
-  word; metrics truncate first (principle 7, §3.3).
-- Unfocused pane content shifts text-secondary → muted; every other role and all
-  backgrounds unchanged. Why: attention is unequal, so weight content, not chrome
-  (R:best "DON'T make panes visually equal when attention is unequal"); backgrounds
-  must not flicker on focus change (principle 1).
-Keyboard-first discoverability: the binding is named in the chrome whenever it is
-relevant and repeated in `?` help; no mouse-only affordance is introduced.
+With 2+ panes open (chat + side panel, diff, or swarm gallery), focus is readable at
+a glance (R:polish panes "DON'T make panes look identical"; Zellij #2180):
+- Focused pane keeps the accent edge at full strength (§3.5; palette `accent` =
+  active pane edge); inactive rails fall to `faint`, a 2-3x brightness gap
+  (R:polish panes "2-3x brightness difference"; tmux pattern). When the transcript
+  is the focused pane, its left gutter column takes accent.
+- Inactive pane content dims 15-20% toward the background at rich tier; at 256/plain
+  the fallback is text-secondary → muted, border-only where color depth is absent
+  (R:polish panes "dim inactive panes 15-20%"). Dimmed text stays at or above
+  WCAG AA 4.5:1, and backgrounds never change on focus switch (principle 1). Why
+  weight content, not chrome: attention is unequal (R:best "DON'T make panes
+  visually equal when attention is unequal").
+- Every pane is labeled in its title row (`side · todos`, `side · file diff`; the
+  transcript needs none) (R:polish panes "label each pane").
+- Navigation: `ctrl+w` then `h/j/k/l` moves focus directionally (vim-style);
+  `ctrl+w w` cycles in order; arrow keys work where unambiguous (R:polish panes;
+  Zellij alt+hjkl precedent). Focus never changes without explicit user action.
+- Status bar adds `^W hjkl panes` in muted in reserved trailing space of the right
+  segment, only while pane count ≥ 2; metrics truncate before the state word moves
+  (principle 7, §3.3; R:polish panes status-bar hints). The binding is repeated in
+  `?` help; no mouse-only affordance is introduced.
 
 ### 3.9 First-run / empty session
 
-A new session with an empty transcript renders a quiet welcome instead of a blank void:
+First launch never shows a blank screen (R:polish first-run; NNGroup empty-state
+guidance). A new session with an empty transcript renders a quiet ghost welcome:
 - Wordmark: `❯ jcode` in accent, small, in the upper third; no logo art, no version
   banner.
 - Mode line: when a directory mode is active, one muted line under the wordmark, e.g.
   `learning mode · ~/learning`; omitted entirely when no mode is active.
-- Starter actions: three numbered suggestions in muted (color, not the dim attribute,
-  per §2.2): explain this codebase / fix the failing tests / `/help`.
+- Ghost prompts: exactly three numbered example prompts in muted (color, not the dim
+  attribute, per §2.2): one codebase-oriented, one task-oriented, one fix-oriented
+  (R:polish first-run "ghost-row example prompts"). One primary CTA only: type and
+  press enter (R:polish first-run "no >1 primary CTA").
+- Deferred setup: no API-key or config demand before any value is shown; the key
+  prompt fires inline on the first action that needs it (R:polish first-run "defer
+  setup until the first action that needs it"; gh device-flow precedent).
+- Show once: `has_completed_onboarding` is set in config when the first message is
+  sent; later empty sessions render only wordmark + input, never the ghosts again
+  (R:polish first-run "never show full welcome twice"; lazygit #4052).
 - Input is focused with the accent caret; the only motion on screen is the caret
   (principle 1). No spinner, shimmer, or entrance animation.
-The screen is replaced by the normal transcript on the first message; starters are
-suggestions, never buttons that steal focus. Plain tier renders `>` per §2.2.
+The screen is replaced by the normal transcript on the first message; ghost prompts
+are suggestions, never buttons that steal focus. Plain tier renders `>` per §2.2.
 Mockup (100x30):
 
 ```
@@ -322,8 +359,8 @@ Mockup (100x30):
  learning mode · ~/learning
 
  1  explain this codebase
- 2  fix the failing tests
- 3  /help for keys and commands
+ 2  add error handling in src/app.rs
+ 3  fix the failing tests
 
 
 
@@ -344,23 +381,38 @@ Mockup (100x30):
 
 ## 4. Motion design
 
-Keep (motion that explains state): single-cell braille spinner at 12.5fps via the existing
-fast patch path (CS:1, CS:4); streaming caret; determinate progress bars whenever progress
-is knowable, e.g. build %, test counts (R:motion "DON'T hide latency with endless
-spinners"); tail-follow scroll catch-up.
+Off switch (hard): `JCODE_NO_ANIMATION=1` freezes all decorative animation and
+typewriter streaming (text renders instantly); `NO_COLOR` implies it, as do
+Minimal/SSH/WSL performance tiers. `JCODE_REDUCED_MOTION` stays accepted as an
+alias. Terminals have no `prefers-reduced-motion`, so env is the contract
+(R:polish motion; WCAG 2.3.3: interaction-triggered animation must be disable-able).
 
-Remove or make opt-in: 3D idle donut/orbit/gyroscope (decorative, opt-in at rich tier,
-off elsewhere); rainbow prompt/queue fades; cyan↔purple tool pulse → static accent
+Keep (motion that explains state):
+- Single-cell braille spinner at 12.5fps via the existing fast patch path (CS:1,
+  CS:4), always paired with a static state word (`thinking…`, `building…`) and tied
+  to a named, completable operation; infinite decorative loops are banned
+  (R:polish motion; WCAG 2.2.2: motion over 5s must end or be stoppable, ours ends
+  with the operation; MFA11y: static text alongside spinner).
+- Determinate progress whenever total work is known (`3/10 tests`, build %);
+  indeterminate only for unbounded LLM waits (R:polish motion; cargo/docker
+  determinate-progress precedent; gh #8536).
+- Streaming caret; tail-follow catch-up batched at ~100ms; scroll-anchor lock while
+  the user is scrolled up (§3.7; R:polish motion).
+- `ctrl+s` pauses tail-follow (the stream continues to the log); any key resumes.
+
+Remove or make opt-in: 3D idle donut/orbit/gyroscope are decorative, so default OFF
+at every tier and enabled only by explicit config at rich tier; the anim crate is
+not polled otherwise (R:polish motion "no bouncing, parallax, or dancing effects";
+CS:4). Rainbow prompt/queue fades removed; cyan↔purple tool pulse → static accent
 (R:motion "motion should explain progress or focus changes").
 
 Restraint rules (hard):
-- `JCODE_REDUCED_MOTION=1`, `NO_COLOR`, or Minimal/SSH/WSL performance tier: freeze all
-  decorative animation; spinner becomes ASCII `- \ | /` at 1.5fps (CS:2 liveness path).
-- Plain tier: no animation beyond the ASCII spinner.
-- Background/unfocused sessions: passive-liveness 1Hz only (CS:1 governor already does
-  this; keep).
+- Plain tier: no animation beyond the ASCII `- \ | /` spinner at 1.5fps (CS:2
+  liveness path); under the off switch every tier degrades to exactly this.
+- Background/unfocused sessions: passive-liveness 1Hz only (CS:1 governor; keep).
 - During heavy streaming (>40 tps or SSH): pause spinner to 1Hz; text is the signal
   (R:motion "pause or reduce animation when there is meaningful text streaming").
+- No large-area flash above 3Hz (WCAG 2.3.1); the single-cell spinner is exempt.
 - Never animate on resize; land one coherent frame (R:motion resize guidance).
 
 ## 5. Degradation tiers (per R:capability matrix)
@@ -373,7 +425,7 @@ Restraint rules (hard):
 | Diff emphasis | `+/-` glyphs + bold + words | fg + tinted bg | fg + tinted bg |
 | Borders | ASCII `|` rail | `│` | `│` |
 | Spinner | ASCII 1.5fps | braille 12.5fps | braille 12.5fps |
-| Idle 3D anim | off | off | opt-in |
+| Idle 3D anim | off | off | config opt-in, default off |
 | Images | off | off | opt-in Kitty (existing) |
 | Economy mode (§3.7) | compact, ASCII role marker kept | compact | compact |
 | Detection | NO_COLOR, dumb, SSH doubt, override | TERM *-256color, no COLORTERM | COLORTERM=truecolor/24bit or known TERM_PROGRAM (CS:2 order unchanged) |
@@ -391,8 +443,8 @@ macOS VS Code/AppleTerminal stay forced to 256 (glyph atlas #330, CS:5).
 6. **Input area**: `❯` glyph + mode chip, numbered queued lines; delete shimmer/pulse code paths. AC: mode readable in plain tier; queued order shown as numbers.
 7. **Diff header/hunks**: summary row `path +N -M`, `@@` separators. AC: counts correct on fixture diffs; plain tier readable without bg.
 8. **Session picker preview**: right preview pane ≥100 cols, row glyphs, footer hints. AC: preview hidden <100 cols; selection uses reverse+accent, no bg band.
-9. **Motion restraint**: `JCODE_REDUCED_MOTION`, ASCII spinner fallback, rich-only idle anim behind config (default off). AC: with flag set, only ASCII spinner ticks; idle-anim crate not polled.
+9. **Motion restraint**: `JCODE_NO_ANIMATION` env (alias `JCODE_REDUCED_MOTION`; implied by `NO_COLOR` and Minimal/SSH/WSL tiers) freezes decorative animation and typewriter streaming; ASCII 1.5fps spinner; determinate progress for known totals, single labeled spinner otherwise; 3D idle anims move behind config, default OFF at all tiers; scroll-anchor lock during streaming (§4, §3.7; R:polish motion; WCAG 2.2.2/2.3.3; cargo/docker determinate precedent). AC: with env set, only the ASCII spinner ticks and streamed text renders instantly; default config never polls the idle-anim crate; anchor row stays fixed while tokens stream into a scrolled-up viewport (test).
 10. **Docs**: theme/tier config keys and tier behavior in user docs. AC: every config key in §5 documented with detection order.
-11. **Transcript economy mode**: distance-based block classification (~1.5 screens from live tail), compact render path, (block id, row) scroll anchoring with height-delta compensation. AC: anchor block's screen row unchanged across compact↔full swaps in tests; swap completes in one frame, no animation; expanded tool groups render folded beyond the boundary and re-expand on return; plain tier keeps ASCII role marker.
-12. **Pane focus + cycle hint**: unfocused-pane text-secondary→muted shift, `ctrl+w` pane cycling, status-bar hint when pane count ≥ 2. AC: hint absent with one pane, present with two; state-word x-position constant when hint appears; snapshot shows muted content with unchanged backgrounds in the unfocused pane; accent edge tracks focus.
-13. **First-run state**: empty-transcript layout (accent wordmark, optional mode line, 3 muted starters, focused input). AC: shown iff transcript empty; mode line only when a directory mode is active; 100x30 snapshot matches §3.9; no animation sources active besides the caret; replaced by the transcript on first message.
+11. **First-run ghost welcome**: empty-transcript layout per §3.9 (accent wordmark, optional mode line, exactly 3 ghost example prompts, focused input); `has_completed_onboarding` config flag set when the first message is sent; API-key setup deferred until the first action that needs it (R:polish first-run). AC: welcome shown iff transcript empty and flag unset; exactly 3 ghosts; 100x30 snapshot matches §3.9; only the caret animates; flag persists across restarts so the welcome never repeats (lazygit #4052); replaced by the transcript on first message.
+12. **Transcript economy**: virtual-list renderer (viewport rows + ~0.5 screen overscan only), tail batching at ~100ms/paragraph, distance-based compaction (~1.5 screens from live tail), (block id, row) scroll anchoring with height-delta compensation, `↓ new output` pill, `ctrl+t` full-history pager with `/` search (§3.7; R:polish economy). AC: per-frame render touches only viewport-intersecting rows; anchor block's screen row unchanged across compact↔full swaps and across streamed tokens while scrolled up; swap completes in one frame, no animation; folded tool groups re-expand on return; plain tier keeps the ASCII role marker; pager round-trips with no transcript state loss; every response present in the log file.
+13. **Pane focus + cycling**: focused accent edge at 2-3x inactive brightness; inactive content dimmed 15-20% (256/plain fallback text-secondary→muted, AA 4.5:1 floor); pane labels; `ctrl+w h/j/k/l` directional + `ctrl+w w` cycle; status-bar `^W hjkl panes` hint when panes ≥ 2 (§3.8; R:polish panes). AC: hint absent with one pane, present with two, state-word x-position constant; snapshot shows accent focused edge and 15-20% dimmed inactive content with unchanged backgrounds; directional keys land on the geometrically correct pane; focus never moves without user input.
