@@ -44,6 +44,119 @@ pub struct SubtaskResult {
     pub model_used: String,
 }
 
+// ── Run-scoped circuit breaker ──────────────────────────────────────────
+
+/// What kind of failure occurred, for circuit-breaker classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakerFailureKind {
+    /// Non-retryable config/auth error (4xx): invalid_request, product not
+    /// activated, auth failures. One strike trips the breaker.
+    ConfigError,
+    /// The candidate timed out. Two consecutive timeouts trip the breaker.
+    Timeout,
+}
+
+/// Per-route breaker state within one [`run_cheap_route`] invocation.
+#[derive(Debug, Clone, Default)]
+struct RouteBreakerState {
+    consecutive_failures: usize,
+    last_failure_kind: Option<BreakerFailureKind>,
+}
+
+/// Run-scoped circuit breaker that remembers which routes have failed
+/// and skips dead ones for the remainder of the run.
+struct RouteBreaker {
+    map: std::collections::HashMap<String, RouteBreakerState>,
+}
+
+impl RouteBreaker {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record a failure for `route_key` (model name). Returns `true` if
+    /// this failure tripped the breaker (the route should now be skipped).
+    fn record_failure(&mut self, route_key: &str, kind: BreakerFailureKind) -> bool {
+        let entry = self.map.entry(route_key.to_string()).or_default();
+
+        // If the failure kind changed (e.g. timeout after a config error),
+        // reset the consecutive count — we track each kind independently.
+        if entry.last_failure_kind != Some(kind) {
+            entry.consecutive_failures = 0;
+        }
+        entry.consecutive_failures += 1;
+        entry.last_failure_kind = Some(kind);
+
+        // Trip thresholds:
+        // - One ConfigError (invalid_request/product-not-activated/auth)
+        // - Two consecutive Timeouts
+        match kind {
+            BreakerFailureKind::ConfigError => entry.consecutive_failures >= 1,
+            BreakerFailureKind::Timeout => entry.consecutive_failures >= 2,
+        }
+    }
+
+    /// Whether this route is currently tripped and should be skipped.
+    fn is_tripped(&self, route_key: &str) -> bool {
+        self.map.get(route_key).map_or(false, |s| match s.last_failure_kind {
+            Some(BreakerFailureKind::ConfigError) => s.consecutive_failures >= 1,
+            Some(BreakerFailureKind::Timeout) => s.consecutive_failures >= 2,
+            None => false,
+        })
+    }
+
+    /// Filter `candidates` through the breaker. Returns the survivors.
+    /// If the breaker would empty the list, returns the original candidates
+    /// unchanged (never-empty fallback).
+    fn filter_candidates(
+        &self,
+        candidates: &[(String, Option<String>)],
+    ) -> Vec<(String, Option<String>)> {
+        let survivors: Vec<_> = candidates
+            .iter()
+            .filter(|(model, _)| !self.is_tripped(model))
+            .cloned()
+            .collect();
+        if survivors.is_empty() {
+            candidates.to_vec() // fallback: never skip ALL candidates
+        } else {
+            survivors
+        }
+    }
+}
+
+/// Classify a provider error string for circuit-breaker purposes.
+fn classify_failure(error: &anyhow::Error) -> BreakerFailureKind {
+    let msg = error.to_string().to_ascii_lowercase();
+    if msg.contains("status: 400")
+        || msg.contains("status: 401")
+        || msg.contains("status: 403")
+        || msg.contains("status: 404")
+        || msg.contains("invalid_request")
+        || msg.contains("invalid request")
+        || msg.contains("product not activated")
+        || msg.contains("product-not-activated")
+        || msg.contains("not activated")
+        || msg.contains("unauthorized")
+        || msg.contains("authentication")
+        || msg.contains("invalid api key")
+        || msg.contains("invalid key")
+        || msg.contains("access denied")
+        || msg.contains("forbidden")
+        || msg.contains("model_not_found")
+        || msg.contains("model not found")
+    {
+        BreakerFailureKind::ConfigError
+    } else {
+        // Everything else is treated as a transient error. The only other
+        // failure that reaches the breaker is a timeout, which is
+        // classified by the caller.
+        BreakerFailureKind::Timeout
+    }
+}
+
 /// Full outcome of an auto cheap-routing run.
 #[derive(Debug, Clone)]
 pub struct CheapRouteOutcome {
@@ -517,6 +630,10 @@ pub async fn run_cheap_route(
     }
 
     // 5. Run each subtask (with fallback) and have the parent review each result.
+    //    A run-scoped circuit breaker skips routes that repeatedly fail across
+    //    subtasks so dead routes (e.g. product-not-activated, persistent timeouts)
+    //    don't waste a full timeout on every subtask.
+    let mut breaker = RouteBreaker::new();
     let mut results = Vec::with_capacity(subtasks.len());
     for (subtask_index, subtask) in subtasks.iter().enumerate() {
         // Gold mode: run a multi-model debate on a HARD REASONING subtask
@@ -561,10 +678,22 @@ pub async fn run_cheap_route(
                 candidates.clone()
             };
 
-        let mut chosen: Option<(String, Option<String>, String)> = None; // (model, api_method, output)
+        // Circuit breaker: skip routes that have already been tripped by
+        // failures on earlier subtasks (e.g. product-not-activated, 2x timeouts).
+        let active_candidates = breaker.filter_candidates(&task_candidates);
         let mut errors: Vec<String> = Vec::new();
+        // Report skipped routes so final error messages stay informative.
+        for (model, _) in &task_candidates {
+            if breaker.is_tripped(model) {
+                errors.push(format!(
+                    "{model}: skipped (circuit breaker tripped — route dead)"
+                ));
+            }
+        }
+
+        let mut chosen: Option<(String, Option<String>, String)> = None; // (model, api_method, output)
         let attempt_timeout = subtask_attempt_timeout(subtask.difficulty, difficulty_threshold);
-        for (model, api_method) in &task_candidates {
+        for (model, api_method) in &active_candidates {
             backend.reporter().subtask(
                 subtask_index,
                 DebatePhase::Running,
@@ -580,11 +709,20 @@ pub async fn run_cheap_route(
                     chosen = Some((model.to_string(), api_method.clone(), output));
                     break;
                 }
-                Ok(Err(err)) => errors.push(format!("{model}: {err}")),
-                Err(_) => errors.push(format!(
-                    "{model}: timed out after {}s",
-                    attempt_timeout.as_secs()
-                )),
+                Ok(Err(err)) => {
+                    let kind = classify_failure(&err);
+                    let tripped = breaker.record_failure(model, kind);
+                    let suffix = if tripped { " (circuit breaker tripped)" } else { "" };
+                    errors.push(format!("{model}: {err}{suffix}"));
+                }
+                Err(_) => {
+                    let tripped = breaker.record_failure(model, BreakerFailureKind::Timeout);
+                    let suffix = if tripped { " (circuit breaker tripped)" } else { "" };
+                    errors.push(format!(
+                        "{model}: timed out after {}s{suffix}",
+                        attempt_timeout.as_secs()
+                    ));
+                }
             }
         }
         let (model_used, api_method_used, mut output) = match chosen {
@@ -3001,6 +3139,373 @@ mod tests {
             strong.iter().filter(|p| p.contains("candidate 1")).count(),
             1,
             "exactly one aggregate debate (hard reasoning subtask only)"
+        );
+    }
+
+    // ── Circuit breaker tests ────────────────────────────────────────────
+
+    /// Backend that scripts per-model results for circuit-breaker testing.
+    /// Each model has a queue of `Ok(output)` / `Err(msg)`. Models in
+    /// `sleep_models` sleep past the subtask timeout (use `start_paused`).
+    struct BreakerScriptedBackend {
+        parent_responses: Mutex<VecDeque<String>>,
+        routes: Vec<ModelRoute>,
+        subtask_queue:
+            Mutex<std::collections::HashMap<String, VecDeque<Result<String, String>>>>,
+        attempts: Mutex<Vec<(String, String)>>, // (model, subtask description)
+        sleep_models: std::collections::HashSet<String>,
+        current: String,
+    }
+
+    impl BreakerScriptedBackend {
+        fn new(
+            parent_responses: Vec<String>,
+            routes: Vec<ModelRoute>,
+            current: &str,
+        ) -> Self {
+            Self {
+                parent_responses: Mutex::new(VecDeque::from(parent_responses)),
+                routes,
+                subtask_queue: Mutex::new(std::collections::HashMap::new()),
+                attempts: Mutex::new(Vec::new()),
+                sleep_models: std::collections::HashSet::new(),
+                current: current.to_string(),
+            }
+        }
+
+        /// Register a queue of `Ok(output)` / `Err(msg)` results for `model`.
+        fn queue(
+            self,
+            model: &str,
+            results: Vec<Result<String, String>>,
+        ) -> Self {
+            self.subtask_queue
+                .lock()
+                .unwrap()
+                .insert(model.to_string(), VecDeque::from(results));
+            self
+        }
+
+        /// Make `model` sleep past the subtask timeout (simulates hang).
+        fn hang(mut self, model: &str) -> Self {
+            self.sleep_models.insert(model.to_string());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl CheapRouteBackend for BreakerScriptedBackend {
+        async fn ask_parent(&self, _prompt: &str) -> Result<String> {
+            Ok(self
+                .parent_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        async fn run_subtask(
+            &self,
+            subtask: &Subtask,
+            model: &str,
+            _route_api_method: Option<&str>,
+        ) -> Result<String> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push((model.to_string(), subtask.description.clone()));
+
+            if self.sleep_models.contains(model) {
+                // Sleep past the subtask timeout to trigger tokio::time::timeout.
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                return Ok("too-late".to_string());
+            }
+
+            let mut queue = self.subtask_queue.lock().unwrap();
+            match queue.get_mut(model).and_then(|q| q.pop_front()) {
+                Some(Ok(output)) => Ok(output),
+                Some(Err(msg)) => Err(anyhow!("{msg}")),
+                None => Err(anyhow!("no scripted result for model '{model}'")),
+            }
+        }
+
+        fn routes(&self) -> Vec<ModelRoute> {
+            self.routes.clone()
+        }
+
+        fn current_model(&self) -> String {
+            self.current.clone()
+        }
+    }
+
+    fn breaker_test_routes() -> Vec<ModelRoute> {
+        vec![priced_route("route-a", 100), priced_route("route-b", 200)]
+    }
+
+    #[tokio::test]
+    async fn breaker_skips_after_config_error() {
+        let _temp = isolate_config();
+        // Two subtasks. route-a fails on subtask 1 with a non-retryable config
+        // error → breaker trips route-a for the rest of the run.
+        // route-b always works.
+        let backend = BreakerScriptedBackend::new(
+            vec![
+                // decompose: two subtasks
+                r#"[
+                    {"description":"task1","prompt":"p","difficulty":1},
+                    {"description":"task2","prompt":"p","difficulty":1}
+                ]"#
+                .to_string(),
+                "use route-a".to_string(), // recommend
+                "OK".to_string(),          // review subtask 1
+                "OK".to_string(),          // review subtask 2
+            ],
+            breaker_test_routes(),
+            "",
+        )
+        .queue("route-a", vec![Err("status: 400 invalid_request".to_string())])
+        .queue("route-b", vec![Ok("done-b".to_string()), Ok("done-b2".to_string())]);
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.results.len(), 2);
+        // Subtask 1: route-a errored (config), route-b succeeded.
+        assert_eq!(outcome.results[0].model_used, "route-b");
+        // Subtask 2: route-a was SKIPPED by breaker, route-b succeeded.
+        assert_eq!(outcome.results[1].model_used, "route-b");
+
+        let attempts = backend.attempts.lock().unwrap();
+        // route-a tried once (subtask 1), then skipped on subtask 2.
+        // route-b tried on both subtasks.
+        assert_eq!(
+            *attempts,
+            vec![
+                ("route-a".to_string(), "task1".to_string()),
+                ("route-b".to_string(), "task1".to_string()),
+                ("route-b".to_string(), "task2".to_string()),
+            ],
+            "route-a must be skipped on subtask 2 after config error"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn breaker_skips_after_two_timeouts() {
+        // Three subtasks. route-a times out on subtask 1 (1st timeout — not
+        // tripped), times out again on subtask 2 (2nd timeout — tripped), then
+        // is skipped on subtask 3.  route-b always works.
+        let decompose = r#"[
+            {"description":"task1","prompt":"p","difficulty":1},
+            {"description":"task2","prompt":"p","difficulty":1},
+            {"description":"task3","prompt":"p","difficulty":1}
+        ]"#;
+        let backend = BreakerScriptedBackend::new(
+            vec![
+                decompose.to_string(),
+                "use route-a".to_string(),
+                "OK".to_string(),
+                "OK".to_string(),
+                "OK".to_string(),
+            ],
+            breaker_test_routes(),
+            "",
+        )
+        .hang("route-a") // every call to route-a hangs → timeout
+        .queue("route-b", vec![
+            Ok("done-b1".to_string()),
+            Ok("done-b2".to_string()),
+            Ok("done-b3".to_string()),
+        ]);
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.results.len(), 3);
+        // All 3 subtasks ultimately succeeded via route-b.
+        assert!(outcome.results.iter().all(|r| r.model_used == "route-b"));
+
+        let attempts = backend.attempts.lock().unwrap();
+        // route-a tried on subtask 1 and 2 (two timeouts), skipped on subtask 3.
+        // route-b tried on all three subtasks.
+        assert_eq!(
+            *attempts,
+            vec![
+                ("route-a".to_string(), "task1".to_string()),
+                ("route-b".to_string(), "task1".to_string()),
+                ("route-a".to_string(), "task2".to_string()),
+                ("route-b".to_string(), "task2".to_string()),
+                // route-a SKIPPED on task3
+                ("route-b".to_string(), "task3".to_string()),
+            ],
+            "route-a must be skipped on subtask 3 after 2 timeouts"
+        );
+    }
+
+    /// Three routes: two fail with config errors on subtask 1, both tripped for
+    /// subtask 2.  The third route survives.  Verifies the breaker carries over
+    /// across subtasks but does not empty the candidate list.
+    #[tokio::test]
+    async fn breaker_carries_over_and_partial_filter() {
+        let _temp = isolate_config();
+        let routes = vec![
+            priced_route("route-a", 100),
+            priced_route("route-b", 200),
+            priced_route("route-c", 300),
+        ];
+        let backend = BreakerScriptedBackend::new(
+            vec![
+                r#"[
+                    {"description":"task1","prompt":"p","difficulty":1},
+                    {"description":"task2","prompt":"p","difficulty":1}
+                ]"#
+                .to_string(),
+                "use route-a".to_string(),
+                "OK".to_string(),
+                "OK".to_string(),
+            ],
+            routes,
+            "",
+        )
+        .queue(
+            "route-a",
+            vec![
+                Err("status: 400 invalid_request".to_string()),
+                Err("status: 400 invalid_request".to_string()),
+            ],
+        )
+        .queue(
+            "route-b",
+            vec![
+                Err("status: 403 unauthorized".to_string()),
+                Err("status: 403 unauthorized".to_string()),
+            ],
+        )
+        .queue("route-c", vec![Ok("done-c1".to_string()), Ok("done-c2".to_string())]);
+
+        let outcome = run_cheap_route(&backend, "task").await.unwrap();
+
+        assert_eq!(outcome.results.len(), 2);
+        assert_eq!(outcome.results[0].model_used, "route-c");
+        assert_eq!(outcome.results[1].model_used, "route-c");
+
+        let attempts = backend.attempts.lock().unwrap();
+        // Subtask 1: route-a (config err), route-b (config err), route-c (OK).
+        // Subtask 2: route-a SKIPPED, route-b SKIPPED, route-c (OK).
+        assert_eq!(
+            *attempts,
+            vec![
+                ("route-a".to_string(), "task1".to_string()),
+                ("route-b".to_string(), "task1".to_string()),
+                ("route-c".to_string(), "task1".to_string()),
+                ("route-c".to_string(), "task2".to_string()),
+            ],
+            "route-a and route-b tripped on subtask 1, skipped on subtask 2; route-c survives"
+        );
+    }
+
+    // ── RouteBreaker unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn route_breaker_config_error_trips_immediately() {
+        let mut b = RouteBreaker::new();
+        assert!(!b.is_tripped("m"));
+        let tripped = b.record_failure("m", BreakerFailureKind::ConfigError);
+        assert!(tripped, "first config error must trip the breaker");
+        assert!(b.is_tripped("m"));
+    }
+
+    #[test]
+    fn route_breaker_timeout_trips_after_two() {
+        let mut b = RouteBreaker::new();
+        // First timeout: not yet tripped.
+        assert!(!b.record_failure("m", BreakerFailureKind::Timeout));
+        assert!(!b.is_tripped("m"));
+        // Second timeout: tripped.
+        assert!(b.record_failure("m", BreakerFailureKind::Timeout));
+        assert!(b.is_tripped("m"));
+    }
+
+    #[test]
+    fn route_breaker_filter_never_empty() {
+        let mut b = RouteBreaker::new();
+        b.record_failure("a", BreakerFailureKind::ConfigError);
+        b.record_failure("b", BreakerFailureKind::ConfigError);
+
+        let candidates = vec![
+            ("a".to_string(), None),
+            ("b".to_string(), None),
+        ];
+        let filtered = b.filter_candidates(&candidates);
+        // Both tripped → fallback returns full list.
+        assert_eq!(filtered, candidates);
+    }
+
+    #[test]
+    fn route_breaker_filter_removes_tripped() {
+        let mut b = RouteBreaker::new();
+        b.record_failure("a", BreakerFailureKind::ConfigError);
+        // b is not tripped.
+
+        let candidates = vec![
+            ("a".to_string(), None),
+            ("b".to_string(), None),
+        ];
+        let filtered = b.filter_candidates(&candidates);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "b");
+    }
+
+    #[test]
+    fn route_breaker_independent_routes() {
+        let mut b = RouteBreaker::new();
+        b.record_failure("a", BreakerFailureKind::ConfigError);
+        // b has one timeout (not tripped yet).
+        b.record_failure("b", BreakerFailureKind::Timeout);
+
+        assert!(b.is_tripped("a"));
+        assert!(!b.is_tripped("b"));
+        assert!(!b.is_tripped("c")); // never seen
+    }
+
+    #[test]
+    fn classify_failure_detects_config_errors() {
+        use anyhow::anyhow;
+
+        assert_eq!(
+            classify_failure(&anyhow!("status: 400 invalid_request")),
+            BreakerFailureKind::ConfigError
+        );
+        assert_eq!(
+            classify_failure(&anyhow!("product not activated")),
+            BreakerFailureKind::ConfigError
+        );
+        assert_eq!(
+            classify_failure(&anyhow!("status: 401 unauthorized")),
+            BreakerFailureKind::ConfigError
+        );
+        assert_eq!(
+            classify_failure(&anyhow!("status: 403 access denied")),
+            BreakerFailureKind::ConfigError
+        );
+        assert_eq!(
+            classify_failure(&anyhow!("model not found")),
+            BreakerFailureKind::ConfigError
+        );
+    }
+
+    #[test]
+    fn classify_failure_defaults_to_timeout() {
+        use anyhow::anyhow;
+
+        assert_eq!(
+            classify_failure(&anyhow!("network error: connection refused")),
+            BreakerFailureKind::Timeout
+        );
+        assert_eq!(
+            classify_failure(&anyhow!("status: 429 rate limited")),
+            BreakerFailureKind::Timeout
+        );
+        assert_eq!(
+            classify_failure(&anyhow!("status: 500 internal server error")),
+            BreakerFailureKind::Timeout
         );
     }
 }
