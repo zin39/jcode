@@ -85,6 +85,7 @@ pub struct TuiPerfPolicy {
     pub redraw_fps: u32,
     pub animation_fps: u32,
     pub enable_decorative_animations: bool,
+    pub no_animation: bool,
     pub enable_focus_change: bool,
     pub enable_mouse_capture: bool,
     pub enable_keyboard_enhancement: bool,
@@ -198,6 +199,33 @@ pub fn tui_policy() -> TuiPerfPolicy {
     tui_policy_for(profile(), &crate::config::config().display)
 }
 
+/// Detect whether non-essential animation is disabled via environment variables.
+///
+/// Detection order (first match wins):
+/// 1. `JCODE_NO_ANIMATION` — truthy disables non-essential animation.
+/// 2. `JCODE_REDUCED_MOTION` — alias for `JCODE_NO_ANIMATION`.
+/// 3. `NO_COLOR` — implies `JCODE_NO_ANIMATION` per no-color.org convention.
+pub fn no_animation_enabled() -> bool {
+    if env_flag_enabled_str("JCODE_NO_ANIMATION") {
+        return true;
+    }
+    if env_flag_enabled_str("JCODE_REDUCED_MOTION") {
+        return true;
+    }
+    // NO_COLOR (any non-empty value) implies no animation.
+    std::env::var("NO_COLOR").map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
+/// Check whether an env variable has a truthy value.
+fn env_flag_enabled_str(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
 pub fn tui_policy_for(
     profile: &SystemProfile,
     display: &crate::config::DisplayConfig,
@@ -205,11 +233,16 @@ pub fn tui_policy_for(
     let mut redraw_fps = display.redraw_fps.clamp(1, 120);
     let mut animation_fps = display.animation_fps.clamp(1, 120);
     let mut enable_decorative_animations = !matches!(profile.tier, PerformanceTier::Minimal);
+    let no_animation = no_animation_enabled();
     let mut enable_focus_change = true;
     let enable_mouse_capture = display.mouse_capture;
     let mut enable_keyboard_enhancement = true;
     let mut simplified_model_picker = false;
     let mut linked_side_panel_refresh_interval = std::time::Duration::from_millis(250);
+
+    if no_animation {
+        enable_decorative_animations = false;
+    }
 
     if profile.is_wsl || profile.is_windows_terminal_family() {
         enable_decorative_animations = false;
@@ -266,6 +299,7 @@ pub fn tui_policy_for(
         redraw_fps,
         animation_fps,
         enable_decorative_animations,
+        no_animation,
         enable_focus_change,
         enable_mouse_capture,
         enable_keyboard_enhancement,
@@ -921,5 +955,60 @@ mod tests {
                 std::env::set_var("JCODE_GLYPH_SAFE_MODE", prev);
             }
         }
+    }
+
+    #[test]
+    fn test_no_animation_disabled_by_default() {
+        let profile = synthetic_profile(SyntheticSystemProfile::Native);
+        let mut display = crate::config::DisplayConfig::default();
+        display.redraw_fps = 48;
+        display.animation_fps = 50;
+        let policy = tui_policy_for(&profile, &display);
+        assert!(!policy.no_animation);
+        assert!(policy.enable_decorative_animations);
+    }
+
+    #[test]
+    fn test_no_animation_force_disables_decorative_animations() {
+        let profile = synthetic_profile(SyntheticSystemProfile::Native);
+        let mut display = crate::config::DisplayConfig::default();
+        display.redraw_fps = 60;
+        display.animation_fps = 60;
+
+        // Temporarily set JCODE_NO_ANIMATION=1 and verify the policy.
+        let prev = std::env::var("JCODE_NO_ANIMATION").ok();
+        unsafe { std::env::set_var("JCODE_NO_ANIMATION", "1"); }
+        let policy = tui_policy_for(&profile, &display);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("JCODE_NO_ANIMATION", &v); },
+            None => unsafe { std::env::remove_var("JCODE_NO_ANIMATION"); },
+        }
+
+        assert!(policy.no_animation);
+        assert!(!policy.enable_decorative_animations);
+    }
+
+    #[test]
+    fn test_env_flag_enabled_str_truthy_and_falsy() {
+        // Non-existent env var is falsy.
+        assert!(!super::env_flag_enabled_str("JCODE_NONEXISTENT_12345"));
+        // Truthy values.
+        assert!(env_truthy("1"));
+        assert!(env_truthy("true"));
+        assert!(env_truthy("TRUE"));
+        assert!(env_truthy("yes"));
+        assert!(env_truthy("on"));
+        // Falsy values.
+        assert!(!env_truthy("0"));
+        assert!(!env_truthy("false"));
+        assert!(!env_truthy("no"));
+        assert!(!env_truthy("off"));
+        assert!(!env_truthy(""));
+    }
+
+    /// Mini helper that mirrors the truthy logic in `env_flag_enabled_str`.
+    fn env_truthy(value: &str) -> bool {
+        let v = value.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes" || v == "on"
     }
 }

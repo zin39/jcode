@@ -93,6 +93,7 @@ pub(super) fn status_spinner_only_symbol(app: &App) -> Option<&'static str> {
             status_spinner_elapsed(app),
             STATUS_SPINNER_FPS,
             policy.enable_decorative_animations,
+            policy.no_animation,
         ))
     } else {
         None
@@ -986,16 +987,19 @@ mod tests {
             full_status_elapsed,
             STATUS_SPINNER_FPS,
             true,
+            false,
         );
         let old_app_lifetime_symbol = jcode_tui_style::theme::activity_indicator(
             app_lifetime_elapsed,
             STATUS_SPINNER_FPS,
             true,
+            false,
         );
         let fast_path_symbol = jcode_tui_style::theme::activity_indicator(
             status_spinner_elapsed_for_sources(Some(full_status_elapsed)),
             STATUS_SPINNER_FPS,
             true,
+            false,
         );
 
         assert_ne!(

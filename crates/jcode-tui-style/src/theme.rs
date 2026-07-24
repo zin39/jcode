@@ -57,6 +57,10 @@ pub fn header_session_color() -> Color {
 // sequence should read as a circular spin, not a grow/recede pulse.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// ASCII spinner frames used when `JCODE_NO_ANIMATION` is set. Degrades to
+/// a static `- \ | /` tick at 1.5 fps — still alive but no braille motion.
+const SPINNER_FRAMES_ASCII: &[&str] = &["-", "\\", "|", "/"];
+
 /// Frame rate for slow, full-line "liveness" indicators that can only be
 /// repainted by a full TUI redraw (e.g. the running-tool progress bar) when
 /// decorative animations are disabled (Minimal tier, SSH, WSL, etc.). These
@@ -95,7 +99,12 @@ pub fn activity_indicator_frame_index(
     elapsed: f32,
     fps: f32,
     enable_decorative_animations: bool,
+    no_animation: bool,
 ) -> usize {
+    if no_animation {
+        // ASCII spinner at 1.5 fps (slow liveness rate).
+        return ((elapsed * LIVENESS_INDICATOR_FPS) as usize) % SPINNER_FRAMES_ASCII.len();
+    }
     if enable_decorative_animations {
         spinner_frame_index(elapsed, fps)
     } else {
@@ -110,8 +119,15 @@ pub fn activity_indicator(
     elapsed: f32,
     fps: f32,
     enable_decorative_animations: bool,
+    no_animation: bool,
 ) -> &'static str {
-    SPINNER_FRAMES[activity_indicator_frame_index(elapsed, fps, enable_decorative_animations)]
+    if no_animation {
+        SPINNER_FRAMES_ASCII
+            [activity_indicator_frame_index(elapsed, fps, enable_decorative_animations, no_animation)]
+    } else {
+        SPINNER_FRAMES
+            [activity_indicator_frame_index(elapsed, fps, enable_decorative_animations, no_animation)]
+    }
 }
 
 /// Convert HSL to RGB (h in 0-360, s and l in 0-1)
@@ -243,8 +259,8 @@ mod tests {
     fn activity_indicator_still_advances_without_decorative_animations() {
         // With decorative animations disabled the single-cell spinner must keep
         // ticking instead of freezing on one frame.
-        let first = activity_indicator(0.0, 12.5, false);
-        let later = activity_indicator(1.0, 12.5, false);
+        let first = activity_indicator(0.0, 12.5, false, false);
+        let later = activity_indicator(1.0, 12.5, false, false);
         assert!(SPINNER_FRAMES.contains(&first));
         assert_ne!(
             first, later,
@@ -257,7 +273,7 @@ mod tests {
         // The single-cell fast path patches one status cell per 80ms tick, so the
         // non-decorative liveness spinner should advance well faster than ~1 Hz
         // (it should not still read as frozen between consecutive fast-path ticks).
-        let frame_at = |elapsed: f32| activity_indicator(elapsed, 12.5, false);
+        let frame_at = |elapsed: f32| activity_indicator(elapsed, 12.5, false, false);
         // One 80ms fast-path tick should already move to the next frame.
         assert_ne!(
             frame_at(0.0),
@@ -271,5 +287,24 @@ mod tests {
                 "liveness spinner should animate at a smooth, responsive rate"
             );
         }
+    }
+
+    #[test]
+    fn no_animation_uses_ascii_frames() {
+        let first = activity_indicator(0.0, 12.5, false, true);
+        let later = activity_indicator(1.0, 12.5, false, true);
+        assert!(SPINNER_FRAMES_ASCII.contains(&first));
+        assert_ne!(first, later, "ASCII spinner should advance");
+    }
+
+    #[test]
+    fn no_animation_spinner_uses_slow_liveness_rate() {
+        // At 1.5 fps, the frame should not change within 500ms.
+        let a = activity_indicator(0.0, 12.5, false, true);
+        let b = activity_indicator(0.5, 12.5, false, true);
+        assert_eq!(a, b, "should stay on same frame at 0.5s with 1.5 fps");
+        // But it should change after ~667ms.
+        let c = activity_indicator(1.0, 12.5, false, true);
+        assert_ne!(a, c, "should change frame after ~1s");
     }
 }

@@ -1204,7 +1204,7 @@ impl Default for DisplayConfig {
             diagram_mode: DiagramDisplayMode::default(),
             markdown_spacing: MarkdownSpacingMode::default(),
             latex_rendering: LatexRenderingMode::default(),
-            idle_animation: true,
+            idle_animation: false,
             prompt_entry_animation: true,
             disabled_animations: Vec::new(),
             diff_line_wrap: true,
@@ -1284,6 +1284,10 @@ pub struct FeatureConfig {
     pub kv_cache_miss_notices: bool,
     /// Update channel: "stable" (releases only) or "main" (latest commits)
     pub update_channel: UpdateChannel,
+    /// Whether the first-run onboarding welcome has been completed.
+    /// Set when the user sends their first message; persists across restarts
+    /// so returning users never see the ghost prompts again.
+    pub has_completed_onboarding: bool,
 }
 
 impl Default for FeatureConfig {
@@ -1296,6 +1300,7 @@ impl Default for FeatureConfig {
             persist_memory_injections: false,
             kv_cache_miss_notices: true,
             update_channel: UpdateChannel::default(),
+            has_completed_onboarding: false,
         }
     }
 }
