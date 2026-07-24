@@ -650,10 +650,22 @@ pub struct AgentsConfig {
     /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
     #[serde(default = "default_swarm_max_concurrent_agents")]
     pub swarm_max_concurrent_agents: usize,
+    /// Maximum characters allowed in a single tool result before it is truncated
+    /// to protect the agent's context window from giant outputs (e.g. a huge
+    /// `swarm list_models` result). When a tool output exceeds this limit, the
+    /// first 75% and last 25% are kept with a marker pointing to the full output
+    /// file saved under the session directory. Default 60_000 (~15k tokens).
+    /// Set to 0 to disable this truncation.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
 }
 
 fn default_swarm_max_concurrent_agents() -> usize {
     32
+}
+
+fn default_max_tool_result_chars() -> usize {
+    60_000
 }
 
 fn default_memory_embedding_backend() -> String {
@@ -710,6 +722,7 @@ impl Default for AgentsConfig {
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
+            max_tool_result_chars: default_max_tool_result_chars(),
         }
     }
 }
