@@ -387,7 +387,7 @@ pub fn cursor_auth_file_path() -> Result<PathBuf> {
         // while Codex/Claude/Gemini/Copilot correctly look under
         // `$JCODE_HOME/external/...`, so a fresh-install sandbox would show only
         // Cursor as importable.
-        if std::env::var_os("JCODE_HOME").is_some() {
+        if crate::storage::home_is_overridden() {
             return crate::storage::user_home_path(".config/cursor/auth.json")
                 .context("No home directory found for Cursor auth.json");
         }

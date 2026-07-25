@@ -60,7 +60,13 @@ static AUTH_STATUS_FAST_CACHE: std::sync::LazyLock<RwLock<Option<CachedAuthStatu
     std::sync::LazyLock::new(|| RwLock::new(None));
 
 fn auth_cache_home_key() -> Option<std::ffi::OsString> {
-    std::env::var_os("JCODE_HOME")
+    // Resolved through `jcode_dir()`, the same function the auth probes use to
+    // locate credential files. Reading `JCODE_HOME` directly would miss a
+    // thread-scoped home (see `jcode_core::env::home_override`), which defeats
+    // the whole point of this key.
+    crate::storage::jcode_dir()
+        .ok()
+        .map(|home| home.into_os_string())
 }
 
 const AUTH_STATUS_CACHE_TTL_SECS: u64 = 30;
