@@ -14,6 +14,8 @@ where
 {
     #[cfg(any(test, feature = "test-support"))]
     mirror_home_override_on_set(key.as_ref(), value.as_ref());
+    #[cfg(any(test, feature = "test-support"))]
+    mirror_runtime_provider_on_set(key.as_ref(), value.as_ref());
 
     // SAFETY: jcode treats these mutations as process-global configuration.
     // They are a pre-existing design choice used throughout startup, auth,
@@ -32,6 +34,8 @@ where
 {
     #[cfg(any(test, feature = "test-support"))]
     mirror_home_override_on_remove(key.as_ref());
+    #[cfg(any(test, feature = "test-support"))]
+    mirror_runtime_provider_on_remove(key.as_ref());
 
     // SAFETY: see `set_var` above; this is the corresponding centralized
     // removal operation for the same process-global configuration surface.
@@ -92,6 +96,59 @@ fn mirror_home_override_on_set(key: &OsStr, value: &OsStr) {
 fn mirror_home_override_on_remove(key: &OsStr) {
     if key == OsStr::new(JCODE_HOME_VAR) {
         HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Environment variable pinning the active runtime provider.
+pub const JCODE_RUNTIME_PROVIDER_VAR: &str = "JCODE_RUNTIME_PROVIDER";
+
+/// The runtime provider pin, reading the process environment.
+#[cfg(not(any(test, feature = "test-support")))]
+#[inline]
+pub fn runtime_provider() -> Option<String> {
+    std::env::var(JCODE_RUNTIME_PROVIDER_VAR).ok()
+}
+
+/// The runtime provider pin, preferring a value scoped to the current thread.
+///
+/// Like [`home_override`], this exists because the var is process-global while
+/// tests treat it as local setup. Pinning `claude-api` in one test flipped
+/// pricing and credential-mode resolution for every test rendering
+/// concurrently, so cost assertions failed depending on interleaving.
+#[cfg(any(test, feature = "test-support"))]
+pub fn runtime_provider() -> Option<String> {
+    if let Some(pinned) = RUNTIME_PROVIDER_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Some(pinned);
+    }
+    // A thread that has never touched the var falls back to the process
+    // environment so single-threaded runs and real binaries behave alike.
+    if RUNTIME_PROVIDER_TOUCHED.with(|slot| slot.get()) {
+        return None;
+    }
+    std::env::var(JCODE_RUNTIME_PROVIDER_VAR).ok()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static RUNTIME_PROVIDER_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static RUNTIME_PROVIDER_TOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn mirror_runtime_provider_on_set(key: &OsStr, value: &OsStr) {
+    if key == OsStr::new(JCODE_RUNTIME_PROVIDER_VAR) {
+        let value = value.to_string_lossy().into_owned();
+        RUNTIME_PROVIDER_TOUCHED.with(|slot| slot.set(true));
+        RUNTIME_PROVIDER_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(value));
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn mirror_runtime_provider_on_remove(key: &OsStr) {
+    if key == OsStr::new(JCODE_RUNTIME_PROVIDER_VAR) {
+        RUNTIME_PROVIDER_TOUCHED.with(|slot| slot.set(true));
+        RUNTIME_PROVIDER_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
     }
 }
 

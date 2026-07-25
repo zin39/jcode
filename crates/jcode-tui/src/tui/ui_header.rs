@@ -313,7 +313,7 @@ pub(super) fn build_auth_status_line(auth: &AuthStatus, max_width: usize) -> Lin
         auth: &AuthStatus,
     ) -> Option<&'static str> {
         use crate::auth::{ActiveCredential, resolve_dual_credential_auth};
-        let runtime_provider = std::env::var("JCODE_RUNTIME_PROVIDER").ok();
+        let runtime_provider = crate::env::runtime_provider();
         let resolved = resolve_dual_credential_auth(provider, auth, runtime_provider.as_deref())?;
         Some(match (resolved.has_oauth, resolved.has_api_key) {
             (true, true) => match resolved.active {
@@ -419,7 +419,7 @@ pub(super) fn build_auth_status_line(auth: &AuthStatus, max_width: usize) -> Lin
 }
 
 fn header_provider_auth_tag(name: &str, auth: &AuthStatus) -> &'static str {
-    let runtime_provider = std::env::var("JCODE_RUNTIME_PROVIDER").ok();
+    let runtime_provider = crate::env::runtime_provider();
 
     // Anthropic and OpenAI share one credential-resolution source of truth so
     // the header tag never drifts from the info widget / model-switch line. We

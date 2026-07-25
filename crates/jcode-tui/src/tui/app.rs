@@ -132,8 +132,7 @@ pub(crate) fn extract_input_shell_command(input: &str) -> Option<&str> {
 pub(crate) const COMMAND_SUGGESTION_VISIBLE_LIMIT: usize = 8;
 
 fn active_runtime_provider_key() -> Option<String> {
-    std::env::var("JCODE_RUNTIME_PROVIDER")
-        .ok()
+    crate::env::runtime_provider()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
 }
