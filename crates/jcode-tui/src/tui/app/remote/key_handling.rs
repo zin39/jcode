@@ -548,6 +548,14 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    // ctrl_prompt_rank must be checked before prompt_jump because on macOS
+    // ctrl_bracket_fallback_to_esc remaps Ctrl+5 -> Ctrl+], which prompt_jump
+    // would otherwise consume as a "next prompt" command.
+    if let Some(rank) = App::ctrl_prompt_rank(&code, modifiers) {
+        app.scroll_to_recent_prompt_rank(rank);
+        return Ok(());
+    }
+
     if let Some(dir) = app.scroll_keys.prompt_jump(code, modifiers) {
         if dir < 0 {
             app.scroll_to_prev_prompt();
@@ -559,11 +567,6 @@ async fn handle_remote_key_internal(
 
     if let Some(ratio) = App::ctrl_side_panel_ratio_preset(&code, modifiers) {
         app.set_side_panel_ratio_preset(ratio);
-        return Ok(());
-    }
-
-    if let Some(rank) = App::ctrl_prompt_rank(&code, modifiers) {
-        app.scroll_to_recent_prompt_rank(rank);
         return Ok(());
     }
 
