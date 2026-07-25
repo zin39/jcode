@@ -417,6 +417,20 @@ pub trait TuiState {
         false
     }
 
+    // ---- Pane focus (WP13) ----
+    /// Number of visible panes in the current layout (chat = 1 minimum).
+    fn pane_count(&self) -> usize {
+        1
+    }
+    /// Which pane currently has keyboard focus.
+    fn focused_pane_kind(&self) -> crate::tui::app::PaneKind {
+        crate::tui::app::PaneKind::Chat
+    }
+    /// Whether a pane-navigation chord (ctrl+w) is pending.
+    fn ctrl_w_waiting(&self) -> bool {
+        false
+    }
+
     // ---- Workspace ----
     /// Whether workspace mode is enabled for this client.
     fn workspace_mode_enabled(&self) -> bool {

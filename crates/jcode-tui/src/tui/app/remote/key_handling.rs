@@ -288,6 +288,11 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    // WP13: ctrl+w pane cycling. Intercept BEFORE normal input.
+    if app.handle_ctrl_w_chord(code, modifiers) {
+        return Ok(());
+    }
+
     if app.changelog_scroll.is_some() {
         return app.handle_changelog_key(code);
     }

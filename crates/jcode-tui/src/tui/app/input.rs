@@ -2518,6 +2518,12 @@ impl App {
             return Ok(());
         }
 
+        // WP13: ctrl+w pane cycling. Intercept BEFORE normal input so ctrl+w
+        // followed by h/j/k/l/w cycles pane focus instead of entering text.
+        if self.handle_ctrl_w_chord(code, modifiers) {
+            return Ok(());
+        }
+
         if handle_modal_key(self, code, modifiers)? {
             return Ok(());
         }

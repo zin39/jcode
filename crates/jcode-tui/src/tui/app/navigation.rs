@@ -2,6 +2,26 @@ use super::*;
 use crate::tui::ui::input_ui;
 use ratatui::layout::Rect;
 
+/// Direct swarm-gallery-active check for use in impl App methods
+/// without importing the TuiState trait.
+fn inline_swarm_gallery_active(app: &App) -> bool {
+    if app.debug_force_inline_gallery {
+        return !app.remote_swarm_members.is_empty();
+    }
+    if !app.swarm_enabled {
+        return false;
+    }
+    // Only active in Inline spawn mode.
+    if !matches!(
+        crate::config::config().agents.swarm_spawn_mode,
+        crate::config::SwarmSpawnMode::Inline
+    ) {
+        return false;
+    }
+    // Need non-empty members.
+    !app.remote_swarm_members.is_empty()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MouseScrollTraceState {
     chat_offset: usize,
@@ -1831,5 +1851,162 @@ impl App {
 
     pub(super) fn debug_scroll_bottom(&mut self) {
         self.follow_chat_bottom();
+    }
+
+    /// Handle ctrl+w chord for pane cycling (WP13).
+    ///
+    /// When ctrl+w is pressed alone, enter "waiting" mode.
+    /// The next key completes the chord:
+    ///   - `h`/`j`/`k`/`l` moves focus directionally
+    ///   - `w` cycles to the next pane
+    ///   - Any other key cancels the chord (key is NOT consumed)
+    ///
+    /// Returns true if the event was consumed.
+    pub(super) fn handle_ctrl_w_chord(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        // Only handle ctrl+w or follow-up keys when already waiting.
+        let is_ctrl_w = code == KeyCode::Char('w')
+            && modifiers.contains(KeyModifiers::CONTROL)
+            && !modifiers.contains(KeyModifiers::ALT)
+            && !modifiers.contains(KeyModifiers::SUPER);
+
+        if self.ctrl_w_waiting {
+            self.ctrl_w_waiting = false;
+            // If ctrl+w pressed again, keep waiting (double ctrl+w)
+            if is_ctrl_w {
+                self.ctrl_w_waiting = true;
+                return true;
+            }
+            match code {
+                KeyCode::Char('h') | KeyCode::Char('j') | KeyCode::Char('k')
+                | KeyCode::Char('l') => {
+                    if let KeyCode::Char(dir) = code {
+                        self.focus_pane_directional(dir);
+                    }
+                    return true;
+                }
+                KeyCode::Char('w') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cycle_pane_focus();
+                    return true;
+                }
+                _ => {
+                    // Unknown chord key: cancel, do NOT consume so the
+                    // key can be used for its normal purpose.
+                    return false;
+                }
+            }
+        }
+
+        if is_ctrl_w {
+            self.ctrl_w_waiting = true;
+            return true;
+        }
+
+        false
+    }
+
+    // ── WP13: Multi-pane focus ──────────────────────────────────────────
+
+    /// Count visible panes in the current layout.
+    pub(super) fn pane_count(&self) -> usize {
+        let mut count: usize = 1; // chat is always present
+        if self.diff_pane_visible() {
+            count += 1;
+        }
+        // Count diagram pane if it's pinned and enabled (and not overlapping with diff pane)
+        if self.diagram_pane_enabled
+            && self.diagram_mode == crate::config::DiagramDisplayMode::Pinned
+        {
+            count += 1;
+        }
+        // Count swarm strip if active and not full-page
+        if inline_swarm_gallery_active(self) && !self.swarm_panel_full_page {
+            count += 1;
+        }
+        count
+    }
+
+    /// Which panes are currently visible in the layout, in left-to-right / top-to-bottom order.
+    pub(super) fn visible_panes(&self) -> Vec<crate::tui::app::PaneKind> {
+        let mut panes = vec![crate::tui::app::PaneKind::Chat];
+        if self.diff_pane_visible() {
+            panes.push(crate::tui::app::PaneKind::DiffPane);
+        }
+        if self.diagram_pane_enabled
+            && self.diagram_mode == crate::config::DiagramDisplayMode::Pinned
+        {
+            panes.push(crate::tui::app::PaneKind::DiagramPane);
+        }
+        if inline_swarm_gallery_active(self) && !self.swarm_panel_full_page {
+            panes.push(crate::tui::app::PaneKind::SwarmStrip);
+        }
+        panes
+    }
+
+    /// Focus a specific pane, updating both the unified field and the legacy booleans.
+    pub(super) fn focus_pane(&mut self, pane: crate::tui::app::PaneKind) {
+        self.focused_pane = pane;
+        // Reconcile legacy boolean fields
+        self.diff_pane_focus = pane == crate::tui::app::PaneKind::DiffPane
+            || pane == crate::tui::app::PaneKind::SidePanel;
+        self.diagram_focus = pane == crate::tui::app::PaneKind::DiagramPane;
+        self.swarm_panel_focused = pane == crate::tui::app::PaneKind::SwarmStrip;
+    }
+
+    /// Cycle focus to the next visible pane (ctrl+w w).
+    pub(super) fn cycle_pane_focus(&mut self) {
+        let panes = self.visible_panes();
+        if panes.len() <= 1 {
+            return;
+        }
+        let current_idx = panes
+            .iter()
+            .position(|&p| p == self.focused_pane)
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % panes.len();
+        self.focus_pane(panes[next_idx]);
+        self.set_status_notice(&format!("Focus: {}", self.pane_label(panes[next_idx])));
+    }
+
+    /// Focus the pane in the given direction (vim-style h/j/k/l).
+    /// h = left, j = down, k = up, l = right.
+    pub(super) fn focus_pane_directional(&mut self, dir: char) {
+        let panes = self.visible_panes();
+        if panes.len() <= 1 {
+            return;
+        }
+        let current_idx = panes
+            .iter()
+            .position(|&p| p == self.focused_pane)
+            .unwrap_or(0);
+
+        let next = match dir {
+            'h' | 'k' => {
+                // Left or up: move to previous pane
+                if current_idx == 0 {
+                    panes.len() - 1
+                } else {
+                    current_idx - 1
+                }
+            }
+            'l' | 'j' => {
+                // Right or down: move to next pane
+                (current_idx + 1) % panes.len()
+            }
+            _ => return,
+        };
+
+        self.focus_pane(panes[next]);
+        self.set_status_notice(&format!("Focus: {}", self.pane_label(panes[next])));
+    }
+
+    /// Human-readable label for a pane kind.
+    pub(super) fn pane_label(&self, pane: crate::tui::app::PaneKind) -> &'static str {
+        match pane {
+            crate::tui::app::PaneKind::Chat => "chat",
+            crate::tui::app::PaneKind::SidePanel => "side panel",
+            crate::tui::app::PaneKind::DiffPane => "diff pane",
+            crate::tui::app::PaneKind::DiagramPane => "diagram",
+            crate::tui::app::PaneKind::SwarmStrip => "swarm",
+        }
     }
 }

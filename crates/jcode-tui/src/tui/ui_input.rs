@@ -1155,6 +1155,19 @@ pub(super) fn build_status_line(
             all_spans.push(Span::styled(truncated, Style::default().fg(right_color)));
         }
 
+        // WP13: transient pane-focus hint when 2+ panes are open
+        if app.pane_count() >= 2 {
+            let hint = if app.ctrl_w_waiting() {
+                " ^W h/j/k/l/w?"
+            } else {
+                " ^W hjkl panes"
+            };
+            all_spans.push(Span::styled(
+                hint,
+                Style::default().fg(rgb(80, 80, 80)),
+            ));
+        }
+
         let line = Line::from(all_spans);
         crate::memory::check_staleness();
         return if app.centered_mode() {
