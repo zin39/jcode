@@ -614,8 +614,12 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         app.scroll_offset += 1;
         clean = render_and_snap(&app, &mut terminal);
     }
+    // The sentinel must be a glyph the real UI never draws. 'Z' collided with
+    // the randomly generated session name in the header ("client: Zebra"),
+    // which made this test fail roughly one run in six.
+    const GHOST: char = '\u{2593}';
     assert!(
-        !clean.contains('Z'),
+        !clean.contains(GHOST),
         "ghost marker must not be present before injection:\n{clean}"
     );
     let target_row = clean
@@ -628,7 +632,7 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         .expect("expected file activity suffix")
         + "read lines 1-9".len();
 
-    let ghost = ratatui::buffer::Buffer::with_lines(["ZZZZ"]);
+    let ghost = ratatui::buffer::Buffer::with_lines([GHOST.to_string().repeat(4)]);
     let updates = ghost
         .content()
         .iter()
@@ -643,7 +647,7 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
     let scrolled = render_and_snap(&app, &mut terminal);
 
     assert!(
-        scrolled.contains('Z'),
+        scrolled.contains(GHOST),
         "expected an injected ghost marker to remain after scroll-like repaint:\n{scrolled}"
     );
 }
