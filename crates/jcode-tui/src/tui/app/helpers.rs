@@ -193,9 +193,24 @@ pub(super) fn partition_queued_messages(
     (user_messages, reminder, display_system_messages)
 }
 
+/// Resolve legacy control-byte collisions for macOS terminals.
+///
+/// Without the Kitty keyboard protocol, terminals encode `Ctrl+[` as `0x1B`
+/// (indistinguishable from `Esc`) and `Ctrl+]` as `0x1D`, which crossterm
+/// decodes as `Ctrl+5` because `0x1C..=0x1F` map to `Ctrl+4..Ctrl+7`. We
+/// therefore re-expand those to the bracket chords so prompt navigation works
+/// on legacy terminals.
+///
+/// This is skipped entirely when the Kitty protocol is active: there the
+/// terminal reports the true key, so `Ctrl+5` really is `Ctrl+5` (rank jump)
+/// and `Ctrl+]` really is `Ctrl+]` (next prompt). Remapping in that mode would
+/// hijack genuine keypresses.
 #[cfg(target_os = "macos")]
 pub(super) fn ctrl_bracket_fallback_to_esc(code: &mut KeyCode, modifiers: &mut KeyModifiers) {
     if !modifiers.contains(KeyModifiers::CONTROL) {
+        return;
+    }
+    if crate::tui::keyboard_enhancement_active() {
         return;
     }
     match code {

@@ -368,6 +368,10 @@ pub fn init_tui_runtime() -> Result<(ratatui::DefaultTerminal, TuiRuntimeGuard)>
         // stack-based keyboard enhancement flags again. A later normal exit must
         // still disable every inherited mode, so retain them in the guard.
         let modes = inherited_modes.unwrap_or(fallback_modes);
+        // The enable sequence is not re-issued here, so record the inherited
+        // state explicitly. Key decoding depends on knowing whether the Kitty
+        // protocol is live (see `tui::keyboard_enhancement_active`).
+        tui::set_keyboard_enhancement_active(modes.keyboard_enhanced);
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
         if modes.focus_change {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange)?;

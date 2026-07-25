@@ -1206,10 +1206,6 @@ impl App {
         }
         match code {
             KeyCode::Char(c) if ('5'..='9').contains(c) => Some((*c as u8 - b'0') as usize),
-            // macOS: ctrl_bracket_fallback_to_esc remaps Ctrl+5 → Ctrl+], so accept
-            // the bracket as equivalent to digit 5 on that platform.
-            #[cfg(target_os = "macos")]
-            KeyCode::Char(']') => Some(5),
             _ => None,
         }
     }
@@ -2011,6 +2007,106 @@ impl App {
             crate::tui::app::PaneKind::DiffPane => "diff pane",
             crate::tui::app::PaneKind::DiagramPane => "diagram",
             crate::tui::app::PaneKind::SwarmStrip => "swarm",
+        }
+    }
+}
+
+/// Key-decoding regression tests for the `Ctrl+]` / `Ctrl+5` collision.
+///
+/// Legacy terminals encode both chords as the control byte `0x1D`, which
+/// crossterm surfaces as `Ctrl+5`. The macOS fallback re-expands that to
+/// `Ctrl+]` so prompt navigation works, but the fallback must not run when the
+/// Kitty keyboard protocol is active, or it hijacks a genuine `Ctrl+]`.
+#[cfg(test)]
+mod ctrl_bracket_decoding_tests {
+    use crate::tui::app::App;
+    use crate::tui::app::helpers::ctrl_bracket_fallback_to_esc;
+    use crate::tui::KeyboardEnhancementTestGuard as EnhancementGuard;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// Mirror the real key pipeline: decode fallback first, then resolve a rank
+    /// jump, then fall back to a prompt jump.
+    fn resolve(code: KeyCode, modifiers: KeyModifiers) -> Resolution {
+        let mut code = code;
+        let mut modifiers = modifiers;
+        ctrl_bracket_fallback_to_esc(&mut code, &mut modifiers);
+
+        if let Some(rank) = App::ctrl_prompt_rank(&code, modifiers) {
+            return Resolution::Rank(rank);
+        }
+        if let Some(dir) = crate::tui::keybind::load_scroll_keys().prompt_jump(code, modifiers) {
+            return Resolution::PromptJump(dir);
+        }
+        Resolution::Unhandled
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Resolution {
+        Rank(usize),
+        PromptJump(i8),
+        Unhandled,
+    }
+
+    #[test]
+    fn ctrl_bracket_close_jumps_to_next_prompt_under_kitty_protocol() {
+        let _guard = EnhancementGuard::set(true);
+        assert_eq!(
+            resolve(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            Resolution::PromptJump(1),
+            "Ctrl+] must move to the next prompt when the terminal reports the real key"
+        );
+    }
+
+    #[test]
+    fn ctrl_bracket_open_jumps_to_prev_prompt_under_kitty_protocol() {
+        let _guard = EnhancementGuard::set(true);
+        assert_eq!(
+            resolve(KeyCode::Char('['), KeyModifiers::CONTROL),
+            Resolution::PromptJump(-1),
+            "Ctrl+[ must move to the previous prompt under the Kitty protocol"
+        );
+    }
+
+    #[test]
+    fn ctrl_digit_five_is_rank_jump_under_kitty_protocol() {
+        let _guard = EnhancementGuard::set(true);
+        assert_eq!(
+            resolve(KeyCode::Char('5'), KeyModifiers::CONTROL),
+            Resolution::Rank(5),
+            "Ctrl+5 must stay a recency-rank jump when reported verbatim"
+        );
+    }
+
+    /// On legacy macOS terminals `Ctrl+5` and `Ctrl+]` are the same byte, so the
+    /// fallback deliberately resolves it to the bracket (prompt jump). Other
+    /// platforms never remap, so the digit stays a rank jump.
+    #[test]
+    fn ctrl_digit_five_uses_legacy_fallback_without_kitty_protocol() {
+        let _guard = EnhancementGuard::set(false);
+        let expected = if cfg!(target_os = "macos") {
+            Resolution::PromptJump(1)
+        } else {
+            Resolution::Rank(5)
+        };
+        assert_eq!(
+            resolve(KeyCode::Char('5'), KeyModifiers::CONTROL),
+            expected,
+            "legacy 0x1D decoding must follow the platform fallback"
+        );
+    }
+
+    /// Ranks 6-9 are unambiguous in every mode; only 5 collides with `Ctrl+]`.
+    #[test]
+    fn ctrl_digits_six_through_nine_are_rank_jumps_in_both_modes() {
+        for active in [true, false] {
+            let _guard = EnhancementGuard::set(active);
+            for (ch, rank) in [('6', 6), ('7', 7), ('8', 8), ('9', 9)] {
+                assert_eq!(
+                    resolve(KeyCode::Char(ch), KeyModifiers::CONTROL),
+                    Resolution::Rank(rank),
+                    "Ctrl+{ch} must be rank {rank} (kitty active: {active})"
+                );
+            }
         }
     }
 }

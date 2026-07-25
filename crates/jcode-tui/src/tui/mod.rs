@@ -85,6 +85,61 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
+/// Tracks whether the Kitty keyboard protocol is currently active.
+///
+/// Key *decoding* depends on this. Legacy terminals collapse several distinct
+/// chords onto the same control byte (notably `Ctrl+]` and `Ctrl+5`, which are
+/// both `0x1D`), so the disambiguation fallbacks in
+/// `app::helpers::ctrl_bracket_fallback_to_esc` must only run when the protocol
+/// is *not* active. With the protocol active the terminal reports the real key
+/// and no fallback is needed; applying one would hijack genuine `Ctrl+]` /
+/// `Ctrl+[` presses.
+static KEYBOARD_ENHANCEMENT_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the Kitty keyboard protocol is currently active for this process.
+pub fn keyboard_enhancement_active() -> bool {
+    KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Override the recorded Kitty keyboard protocol state.
+///
+/// Used by the CLI when it inherits already-configured terminal modes from a
+/// parent process (so it never re-issues the enable sequence), and by tests
+/// that exercise both legacy and enhanced decoding paths.
+pub fn set_keyboard_enhancement_active(active: bool) {
+    KEYBOARD_ENHANCEMENT_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pins the Kitty keyboard protocol state for the lifetime of the guard.
+///
+/// The flag is process-global, so this also serializes against other guards to
+/// keep parallel tests deterministic. The previous value is restored on drop.
+#[cfg(test)]
+pub(crate) struct KeyboardEnhancementTestGuard {
+    prev: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl KeyboardEnhancementTestGuard {
+    pub(crate) fn set(active: bool) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // Ignore poisoning: a panicking test still needs to hand the lock on.
+        let lock = LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let prev = keyboard_enhancement_active();
+        set_keyboard_enhancement_active(active);
+        Self { prev, _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeyboardEnhancementTestGuard {
+    fn drop(&mut self) {
+        set_keyboard_enhancement_active(self.prev);
+    }
+}
+
 /// Enable Kitty keyboard protocol for unambiguous key reporting.
 ///
 /// Intentionally avoid REPORT_ALL_KEYS_AS_ESCAPE_CODES for now. When that flag is enabled,
@@ -102,6 +157,7 @@ pub fn enable_keyboard_enhancement() -> bool {
         PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
     )
     .is_ok();
+    set_keyboard_enhancement_active(result);
     crate::logging::info(&format!(
         "Kitty keyboard protocol: {}",
         if result { "enabled" } else { "FAILED" }
@@ -115,6 +171,7 @@ pub fn disable_keyboard_enhancement() {
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags
     );
+    set_keyboard_enhancement_active(false);
 }
 
 /// Hash a rendered image's transcript anchor into `hasher`. Shared by the
