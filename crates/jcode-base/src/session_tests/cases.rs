@@ -2237,28 +2237,37 @@ fn streaming_guard_creates_visible_macos_sleep_assertion() {
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
 
     let reason = "Jcode streaming model response";
-    {
-        let _streaming = StreamingGuard::new("session_power");
 
+    // `pmset -g assertions` reports assertions system-wide, so any other jcode
+    // process streaming on this machine holds an identically named assertion
+    // and the naive substring check can never go false. Match on this
+    // process's own pid, which pmset prints as `pid <n>(<name>):`.
+    let own_pid_marker = format!("pid {}(", std::process::id());
+    let assertion_held_by_this_process = || {
         let output = std::process::Command::new("pmset")
             .args(["-g", "assertions"])
             .output()
             .expect("pmset -g assertions should run on macOS");
         assert!(output.status.success(), "pmset should succeed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let held = stdout
+            .lines()
+            .any(|line| line.contains(&own_pid_marker) && line.contains(reason));
+        (held, stdout)
+    };
+
+    {
+        let _streaming = StreamingGuard::new("session_power");
+        let (held, stdout) = assertion_held_by_this_process();
         assert!(
-            stdout.contains(reason),
-            "pmset output should show the streaming assertion; output was:\n{stdout}"
+            held,
+            "pmset output should show this process holding the streaming assertion; output was:\n{stdout}"
         );
     }
 
-    let output = std::process::Command::new("pmset")
-        .args(["-g", "assertions"])
-        .output()
-        .expect("pmset -g assertions should run on macOS");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (held, stdout) = assertion_held_by_this_process();
     assert!(
-        !stdout.contains(reason),
+        !held,
         "streaming assertion should be released after guard drop; output was:\n{stdout}"
     );
 }

@@ -10,38 +10,39 @@ fn desired_nofile_soft_limit_only_raises_when_possible() {
 #[cfg(unix)]
 #[test]
 fn spawn_detached_creates_new_session() {
-    use tempfile::NamedTempFile;
-
-    let output = NamedTempFile::new().expect("temp file");
-    let output_path = output.path().to_string_lossy().to_string();
     let parent_sid = unsafe { libc::getsid(0) };
 
+    // Sleep long enough to still be alive when we read its session id.
+    // `ps -o sid=` is not portable: macOS spells the column `sess`, so the
+    // child exited non-zero there and the test could never run. `getsid(pid)`
+    // is the POSIX call `ps` itself reports, so this queries the property
+    // under test directly instead of parsing another tool's output.
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c")
-        .arg("ps -o sid= -p $$ > \"$JCODE_TEST_OUTPUT\"")
-        .env("JCODE_TEST_OUTPUT", &output_path)
+        .arg("sleep 5")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     let mut child = super::spawn_detached(&mut cmd).expect("spawn detached child");
-    let status = child.wait().expect("wait for child");
-    assert!(status.success(), "child should exit successfully");
-
-    let child_sid = std::fs::read_to_string(&output_path)
-        .expect("read child sid")
-        .trim()
-        .parse::<u32>()
-        .expect("parse child sid");
+    let child_pid = child.id();
+    let child_sid = unsafe { libc::getsid(child_pid as libc::pid_t) };
+    assert!(
+        child_sid >= 0,
+        "getsid failed for detached child: {}",
+        std::io::Error::last_os_error()
+    );
 
     assert_eq!(
-        child_sid,
-        child.id(),
+        child_sid as u32, child_pid,
         "detached child should lead its own session"
     );
     assert_ne!(
-        child_sid as i32, parent_sid,
+        child_sid, parent_sid,
         "detached child should not share parent session"
     );
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(windows)]
