@@ -1088,10 +1088,18 @@ fn test_prompt_jump_ctrl_brackets() {
     assert!(app.auto_scroll_paused);
     assert!(app.scroll_offset > 0);
 
+    // Ctrl+] must return to exactly where Ctrl+[ started, i.e. it is the true
+    // inverse "next prompt" motion. Asserting only `offset <= after_up` is too
+    // weak: a recency-rank jump also satisfies it, which previously let a
+    // Ctrl+] hijack regression pass unnoticed.
     let after_up = app.scroll_offset;
     app.handle_key(KeyCode::Char(']'), KeyModifiers::CONTROL)
         .unwrap();
-    assert!(app.scroll_offset <= after_up);
+    assert_eq!(
+        app.scroll_offset, 0,
+        "Ctrl+] should step back down to the newest prompt, not perform a rank jump \
+         (offset after Ctrl+[ was {after_up})"
+    );
 }
 
 // NOTE: test_prompt_jump_ctrl_digits_by_recency was removed because it relied on

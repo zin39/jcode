@@ -1927,9 +1927,10 @@ pub(super) fn handle_navigation_shortcuts(
         return true;
     }
 
-    // ctrl_prompt_rank must be checked before prompt_jump because on macOS
-    // ctrl_bracket_fallback_to_esc remaps Ctrl+5 -> Ctrl+], which prompt_jump
-    // would otherwise consume as a "next prompt" command.
+    // Rank jumps are resolved before prompt jumps so an explicit Ctrl+<digit>
+    // can never be swallowed by the bracket/prompt-jump chords. `prompt_jump`
+    // already excludes digits, so this ordering is defensive rather than
+    // load-bearing.
     if let Some(rank) = App::ctrl_prompt_rank(&code, modifiers) {
         app.scroll_to_recent_prompt_rank(rank);
         return true;

@@ -1,6 +1,11 @@
 #[test]
 fn test_prompt_jump_ctrl_digit_is_recency_rank_in_app() {
     let _render_lock = scroll_render_test_lock();
+    // Ctrl+5 is only distinguishable from Ctrl+] when the terminal reports the
+    // real key. On a legacy macOS tty both arrive as the byte 0x1D, so the
+    // rank-jump binding is unreachable there by construction. Pin the enhanced
+    // decoding mode so this test exercises the rank path on every platform.
+    let _keyboard = crate::tui::KeyboardEnhancementTestGuard::set(true);
     let (mut app, mut terminal) = create_scroll_test_app(100, 30, 1, 20);
 
     // Seed max scroll estimates before key handling.
@@ -10,7 +15,7 @@ fn test_prompt_jump_ctrl_digit_is_recency_rank_in_app() {
     app.handle_key(prompt_up_code, prompt_up_mods).unwrap();
     assert!(app.scroll_offset > 0);
 
-    // Ctrl+5 now means "5th most-recent prompt" (clamped to oldest).
+    // Ctrl+5 means "5th most-recent prompt" (clamped to oldest).
     app.handle_key(KeyCode::Char('5'), KeyModifiers::CONTROL)
         .unwrap();
     assert!(app.scroll_offset > 0);
@@ -301,6 +306,9 @@ fn test_remote_ctrl_digit_side_panel_preset() {
 #[test]
 fn test_remote_prompt_jump_ctrl_digit_is_recency_rank() {
     let _render_lock = scroll_render_test_lock();
+    // See test_prompt_jump_ctrl_digit_is_recency_rank_in_app: Ctrl+5 only
+    // reaches the rank binding when the terminal reports the real key.
+    let _keyboard = crate::tui::KeyboardEnhancementTestGuard::set(true);
     let (mut app, mut terminal) = create_scroll_test_app(100, 30, 1, 20);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
