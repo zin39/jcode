@@ -189,6 +189,14 @@ pub trait TuiState {
     }
     /// Version counter for display_messages (monotonic, increments on mutation)
     fn display_messages_version(&self) -> u64;
+    /// WP12: number of messages from the tail that render in FULL mode; messages
+    /// beyond this offset render in COMPACT form (no per-block header, no surface
+    /// background, tool groups always folded, tighter spacing). Defaults to 50
+    /// (roughly 1.5 screens on a typical terminal). Override for responsive
+    /// distance-based thresholds.
+    fn economy_compact_threshold_msgs(&self) -> usize {
+        50
+    }
     fn streaming_text(&self) -> &str;
 
     // ---- Input ----

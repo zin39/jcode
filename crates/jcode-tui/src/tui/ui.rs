@@ -910,6 +910,9 @@ struct BodyCacheKey {
     /// WP4: tool-call fold/expand state.  Toggling must invalidate the body so
     /// the fold summary line appears or disappears immediately.
     tool_fold_expanded: bool,
+    /// WP12: compact threshold used when the body was built; changing the
+    /// threshold (e.g. on resize) must invalidate the cached body.
+    compact_threshold_msgs: usize,
 }
 
 #[derive(Clone)]
@@ -993,6 +996,7 @@ impl BodyCacheState {
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
                     && entry.key.tool_fold_expanded == key.tool_fold_expanded
+                    && entry.key.compact_threshold_msgs == key.compact_threshold_msgs
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -1015,6 +1019,7 @@ impl BodyCacheState {
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
                     && entry.key.tool_fold_expanded == key.tool_fold_expanded
+                    && entry.key.compact_threshold_msgs == key.compact_threshold_msgs
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -1056,6 +1061,7 @@ impl BodyCacheState {
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
                     && entry.key.tool_fold_expanded == key.tool_fold_expanded
+                    && entry.key.compact_threshold_msgs == key.compact_threshold_msgs
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (false, idx, entry.msg_count));
@@ -1079,6 +1085,7 @@ impl BodyCacheState {
                     && entry.key.expanded_images_version == key.expanded_images_version
                     && entry.key.swarm_members_signature == key.swarm_members_signature
                     && entry.key.tool_fold_expanded == key.tool_fold_expanded
+                    && entry.key.compact_threshold_msgs == key.compact_threshold_msgs
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (true, idx, entry.msg_count));
@@ -1188,6 +1195,9 @@ struct FullPrepCacheKey {
     swarm_members_signature: u64,
     /// WP4: tool-call fold/expand state.
     tool_fold_expanded: bool,
+    /// WP12: compact threshold used when the frame was built; changing the
+    /// threshold (e.g. on resize) must invalidate the cached frame.
+    compact_threshold_msgs: usize,
 }
 
 #[derive(Clone)]

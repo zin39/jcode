@@ -430,6 +430,49 @@ fn push_user_prompt_lines(
     }
 }
 
+/// WP12: compact user prompt rendering (gutter + text only, no header, no
+/// surface background). Plain tier keeps the ASCII `|` role marker for identity
+/// (spec §3.7, principle 6).
+fn push_user_prompt_lines_compact(
+    lines: &mut Vec<Line<'static>>,
+    raw_plain_lines: &mut Vec<String>,
+    line_raw_overrides: &mut Vec<Option<WrappedLineMap>>,
+    line_copy_offsets: &mut Vec<usize>,
+    user_line_indices: &mut Vec<usize>,
+    _prompt_num: usize,
+    content: &str,
+    align: ratatui::layout::Alignment,
+    tier: Tier,
+) {
+    let (_header_gutter, body_gutter) = gutter_glyphs(tier);
+    let self_color = role_color(Role::SelfRole, tier);
+    let text_color = role_color(Role::TextPrimary, tier);
+
+    let user_line_start = lines.len();
+    user_line_indices.push(user_line_start);
+
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    for content_line in normalized.split('\n') {
+        let raw_line = raw_plain_lines.len();
+        raw_plain_lines.push(content_line.to_string());
+        let prompt_width = unicode_width::UnicodeWidthStr::width(content_line);
+
+        let gutter_span = Span::styled(
+            format!("{body_gutter} "),
+            Style::default().fg(self_color),
+        );
+        let text_span = Span::styled(content_line.to_string(), Style::default().fg(text_color));
+
+        lines.push(Line::from(vec![gutter_span, text_span]).alignment(align));
+        line_raw_overrides.push(Some(WrappedLineMap {
+            raw_line,
+            start_col: 0,
+            end_col: prompt_width,
+        }));
+        line_copy_offsets.push(2); // skip gutter
+    }
+}
+
 fn empty_prepared_messages() -> PreparedMessages {
     PreparedMessages {
         wrapped_lines: Vec::new(),
@@ -704,6 +747,7 @@ pub(super) fn prepare_messages(
         expanded_images_version: app.expanded_images_version(),
         swarm_members_signature: swarm_members_signature(&app.swarm_members_for_transcript()),
         tool_fold_expanded: ui::tool_fold_expanded(),
+        compact_threshold_msgs: app.economy_compact_threshold_msgs(),
     };
 
     super::note_full_prep_request();
@@ -1148,6 +1192,7 @@ fn prepare_body_cached(app: &dyn TuiState, width: u16) -> Arc<PreparedMessages> 
         expanded_images_version: app.expanded_images_version(),
         swarm_members_signature: swarm_members_signature(&app.swarm_members_for_transcript()),
         tool_fold_expanded: ui::tool_fold_expanded(),
+        compact_threshold_msgs: app.economy_compact_threshold_msgs(),
     };
     let msg_count = app.display_messages().len();
     let cache_lookup_start = Instant::now();
@@ -1329,6 +1374,10 @@ struct BodyRenderCtx<'a> {
     session_name: String,
     /// Current colour tier; drives gutter glyphs and background policy.
     tier: Tier,
+    /// WP12: number of messages from the tail that render in FULL mode;
+    /// messages beyond this threshold render in COMPACT mode
+    /// (no headers, no surface backgrounds, tool groups folded, tighter spacing).
+    compact_threshold_msgs: usize,
 }
 
 /// Mutable accumulator for one body build. Both `prepare_body` (full) and
@@ -1392,6 +1441,18 @@ impl BodyAcc {
     }
 }
 
+/// WP12: whether a message should render in COMPACT mode (far from the live
+/// tail). Messages beyond `compact_threshold_msgs` from the end of the message
+/// list are compacted.
+fn message_is_compact(ctx: &BodyRenderCtx<'_>, msg_global_idx: usize) -> bool {
+    let msg_count = ctx.messages.len();
+    if msg_count == 0 {
+        return false;
+    }
+    let distance_from_tail = msg_count.saturating_sub(msg_global_idx + 1);
+    distance_from_tail >= ctx.compact_threshold_msgs
+}
+
 /// Render a single transcript message into `acc`. This is the one canonical
 /// per-message renderer; the full and incremental body builders both call it so
 /// their output cannot drift (which previously caused subtle text-selection and
@@ -1407,13 +1468,17 @@ fn render_message_into(
     let app = ctx.app;
     let role = msg.effective_role();
     let align = default_message_alignment(role, centered);
+    let compact = message_is_compact(ctx, msg_global_idx);
 
-    if (acc.body_has_content || !acc.lines.is_empty())
-        && role != "tool"
-        && role != "meta"
-        && role != "swarm"
-    {
-        acc.push_blank();
+    // COMPACT mode: no blank separators between blocks
+    if !compact {
+        if (acc.body_has_content || !acc.lines.is_empty())
+            && role != "tool"
+            && role != "meta"
+            && role != "swarm"
+        {
+            acc.push_blank();
+        }
     }
 
     match role {
@@ -1421,18 +1486,33 @@ fn render_message_into(
             acc.prompt_num += 1;
             acc.user_prompt_texts.push(msg.content.clone());
             let displayed_prompt_num = acc.prompt_num + ctx.prompt_number_offset;
-            push_user_prompt_lines(
-                &mut acc.lines,
-                &mut acc.raw_plain_lines,
-                &mut acc.line_raw_overrides,
-                &mut acc.line_copy_offsets,
-                &mut acc.user_line_indices,
-                displayed_prompt_num,
-                &msg.content,
-                align,
-                ctx.tier,
-                &ctx.session_name,
-            );
+            if compact {
+                // WP12 compact: gutter + text only, no header, no surface bg
+                push_user_prompt_lines_compact(
+                    &mut acc.lines,
+                    &mut acc.raw_plain_lines,
+                    &mut acc.line_raw_overrides,
+                    &mut acc.line_copy_offsets,
+                    &mut acc.user_line_indices,
+                    displayed_prompt_num,
+                    &msg.content,
+                    align,
+                    ctx.tier,
+                );
+            } else {
+                push_user_prompt_lines(
+                    &mut acc.lines,
+                    &mut acc.raw_plain_lines,
+                    &mut acc.line_raw_overrides,
+                    &mut acc.line_copy_offsets,
+                    &mut acc.user_line_indices,
+                    displayed_prompt_num,
+                    &msg.content,
+                    align,
+                    ctx.tier,
+                    &ctx.session_name,
+                );
+            }
             if !crate::session::is_attached_image_label_text(&msg.content) {
                 let ordinal = acc.anchor_prompt_ordinal;
                 acc.anchor_prompt_ordinal += 1;
@@ -1457,20 +1537,22 @@ fn render_message_into(
                 render_assistant_message,
             );
 
-            // Prepend a "jcode · <model>" tag line at block start (spec §3.1).
-            let agent_color = role_color(Role::Agent, ctx.tier);
-            let tag_text = format!("jcode · {}", ctx.model_name);
-            acc.raw_plain_lines.push(tag_text.clone());
-            acc.lines.push(
-                Line::from(Span::styled(tag_text, Style::default().fg(agent_color)))
-                    .alignment(align),
-            );
-            acc.line_raw_overrides.push(Some(WrappedLineMap {
-                raw_line: acc.raw_plain_lines.len() - 1,
-                start_col: 0,
-                end_col: 0,
-            }));
-            acc.line_copy_offsets.push(0);
+            // WP12 compact: omit the per-block header "jcode · <model>" tag
+            if !compact {
+                let agent_color = role_color(Role::Agent, ctx.tier);
+                let tag_text = format!("jcode · {}", ctx.model_name);
+                acc.raw_plain_lines.push(tag_text.clone());
+                acc.lines.push(
+                    Line::from(Span::styled(tag_text, Style::default().fg(agent_color)))
+                        .alignment(align),
+                );
+                acc.line_raw_overrides.push(Some(WrappedLineMap {
+                    raw_line: acc.raw_plain_lines.len() - 1,
+                    start_col: 0,
+                    end_col: 0,
+                }));
+                acc.line_copy_offsets.push(0);
+            }
 
             let message_copy_targets = assistant_message_copy_targets(&msg.content, &cached);
             for target in message_copy_targets {
@@ -1548,7 +1630,11 @@ fn render_message_into(
             // If we are in a run of > 3 consecutive tool messages and the
             // fold is not yet expanded, render only the first 3 and collapse
             // the rest into a single summary line.
-            let fold_info = if ui::tool_fold_expanded() {
+            // WP12 compact mode: tool groups always fold to summary line
+            // (expansion is suspended, not lost — returns on re-entry).
+            let fold_info = if compact {
+                fold_position(ctx.messages, msg_global_idx)
+            } else if ui::tool_fold_expanded() {
                 None
             } else {
                 fold_position(ctx.messages, msg_global_idx)
@@ -1916,6 +2002,7 @@ pub(super) fn prepare_body_incremental(
         model_name,
         session_name,
         tier,
+        compact_threshold_msgs: app.economy_compact_threshold_msgs(),
     };
 
     let mut acc = BodyAcc {
@@ -2246,6 +2333,7 @@ pub(super) fn prepare_body_prepended(
         model_name,
         session_name,
         tier,
+        compact_threshold_msgs: app.economy_compact_threshold_msgs(),
     };
 
     // The head sits at the very top of the transcript, so it starts with the
@@ -2500,6 +2588,7 @@ pub(super) fn prepare_body(
         model_name,
         session_name,
         tier,
+        compact_threshold_msgs: app.economy_compact_threshold_msgs(),
     };
 
     let mut acc = BodyAcc::default();
