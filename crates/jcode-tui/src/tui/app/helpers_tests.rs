@@ -429,6 +429,10 @@ fn invalidate_todos_cache_backdates_entry_so_next_gather_refetches() {
     let _env_lock = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    // This test asserts on the stale-while-revalidate background fetch itself,
+    // so opt back into it. Safe because we hold the env lock for the whole test,
+    // so the refresh threads can only ever see this test's JCODE_HOME.
+    let _refresh = super::BackgroundRefreshTestGuard::enable();
     clear_todos_cache_for_tests();
 
     let session_id = "freshness-test-session";
