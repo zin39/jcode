@@ -163,64 +163,34 @@ pub fn jcode_dir() -> Result<PathBuf> {
 /// which home is active. They previously each read `JCODE_HOME` inline, which
 /// meant a sandbox honored by one was silently ignored by the others.
 fn configured_home() -> Option<PathBuf> {
-    if let Some(path) = thread_local_home_override() {
+    // `jcode_core::env` owns the override because it also owns the `set_var` /
+    // `remove_var` choke point that keeps it in sync, so a test that exports
+    // JCODE_HOME the ordinary way gets a thread-scoped home automatically.
+    if let Some(path) = jcode_core::env::home_override() {
         return Some(path);
     }
-    std::env::var_os("JCODE_HOME")
+    std::env::var_os(jcode_core::env::JCODE_HOME_VAR)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
-#[inline]
-fn thread_local_home_override() -> Option<PathBuf> {
-    None
-}
-
-/// Per-thread `JCODE_HOME` override, checked ahead of the environment.
-///
-/// `JCODE_HOME` is process-global, so tests that point it at their own
-/// `tempfile::tempdir()` are mutating shared state. Under a parallel test runner
-/// that races: one test sets the var, another overwrites or clears it, and the
-/// first then reads a home it never wrote (or a tempdir that has already been
-/// deleted). Serializing every such test on one mutex is the usual workaround,
-/// but it does not compose, since helpers that take the lock cannot be called
-/// from tests that already hold it.
-///
-/// Cargo runs each test on its own thread, so a thread-local override gives real
-/// isolation instead: concurrent tests cannot observe each other's home at all,
-/// and no lock is required.
+/// The per-thread home override, owned by `jcode_core::env`.
 #[cfg(any(test, feature = "test-support"))]
 fn thread_local_home_override() -> Option<PathBuf> {
-    TEST_HOME_OVERRIDE.with(|slot| slot.borrow().clone())
-}
-
-#[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
+    jcode_core::env::home_override()
 }
 
 /// Point `jcode_dir()` at `path` for the current thread only, until the returned
-/// guard drops. See [`thread_local_home_override`].
+/// guard drops.
+///
+/// `JCODE_HOME` is process-global, so tests that export it are mutating state
+/// every other test can observe; under the default parallel runner one test's
+/// tempdir can be overwritten or deleted while another still resolves paths
+/// against it. Cargo runs each test on its own thread, so a per-thread home
+/// makes isolation structural instead of a convention.
 #[cfg(any(test, feature = "test-support"))]
-pub fn scoped_test_home(path: impl Into<PathBuf>) -> ScopedTestHome {
-    let previous = TEST_HOME_OVERRIDE.with(|slot| slot.borrow_mut().replace(path.into()));
-    ScopedTestHome { previous }
-}
-
-/// Restores the previous per-thread home override on drop, including on panic.
-#[cfg(any(test, feature = "test-support"))]
-pub struct ScopedTestHome {
-    previous: Option<PathBuf>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Drop for ScopedTestHome {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        TEST_HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = previous);
-    }
+pub fn scoped_test_home(path: impl Into<PathBuf>) -> jcode_core::env::ScopedHomeOverride {
+    jcode_core::env::scoped_home_override(path)
 }
 
 /// Wraps a closure that will run on another thread so it observes the spawning
@@ -245,7 +215,7 @@ pub fn inherit_test_home<F, T>(f: F) -> impl FnOnce() -> T
 where
     F: FnOnce() -> T,
 {
-    let home = TEST_HOME_OVERRIDE.with(|slot| slot.borrow().clone());
+    let home = thread_local_home_override();
     move || {
         let _scoped = home.map(scoped_test_home);
         f()
