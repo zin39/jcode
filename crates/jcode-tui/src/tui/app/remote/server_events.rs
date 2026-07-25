@@ -2116,7 +2116,11 @@ pub(in crate::tui::app) fn handle_server_event(
                         self_id,
                     );
                     let next = app_mod::tui_state::filter_inline_swarm_subtree(&members, self_id);
-                    if let Some(notice) = swarm_status_transition_notice(&prev, &next) {
+                    if let Some(notice) = swarm_status_transition_notice(
+                        &prev,
+                        &next,
+                        Some(crate::tui::keybind::swarm_panel_focus_key_label().as_str()),
+                    ) {
                         app.set_status_notice(notice);
                     }
                 }

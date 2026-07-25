@@ -16,6 +16,7 @@ const MAX_NAMES_PER_CATEGORY: usize = 3;
 /// Lifecycle buckets worth announcing when a member newly enters them.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Transition {
+    Spawned,
     Done,
     Failed,
     Blocked,
@@ -25,6 +26,7 @@ enum Transition {
 impl Transition {
     fn verb(self) -> &'static str {
         match self {
+            Transition::Spawned => "spawned",
             Transition::Done => "done",
             Transition::Failed => "failed",
             Transition::Blocked => "blocked",
@@ -79,9 +81,14 @@ fn format_names(mut names: Vec<String>) -> String {
 /// lifecycle transitions, e.g. `🐝 bat done · 2/7 active` or
 /// `🐝 crab failed · hen blocked · all 7 finished`. Returns `None` when
 /// nothing announceable changed.
+///
+/// When `view_key_label` is provided, spawned-agent notices include a keybind
+/// hint (e.g. `🐝 bat spawned · Alt+N to view · 1/3 active`) so the user
+/// discovers how to open the inline swarm panel.
 pub(in crate::tui::app) fn swarm_status_transition_notice(
     prev: &[SwarmMemberStatus],
     next: &[SwarmMemberStatus],
+    view_key_label: Option<&str>,
 ) -> Option<String> {
     if prev.is_empty() || next.is_empty() {
         return None;
@@ -94,7 +101,12 @@ pub(in crate::tui::app) fn swarm_status_transition_notice(
     let mut buckets: Vec<(Transition, Vec<String>)> = Vec::new();
     for member in next {
         let Some(prev_status) = prev_status.get(member.session_id.as_str()) else {
-            // New member: spawning is user/agent initiated and already visible.
+            // New member: announce the spawn so the user knows an agent was
+            // created and is about to start working.
+            match buckets.iter_mut().find(|(t, _)| *t == Transition::Spawned) {
+                Some((_, names)) => names.push(member_label(member)),
+                None => buckets.push((Transition::Spawned, vec![member_label(member)])),
+            }
             continue;
         };
         if let Some(transition) = classify(prev_status, &member.status) {
@@ -111,7 +123,17 @@ pub(in crate::tui::app) fn swarm_status_transition_notice(
 
     let mut segments: Vec<String> = buckets
         .into_iter()
-        .map(|(transition, names)| format!("{} {}", format_names(names), transition.verb()))
+        .map(|(transition, names)| {
+            let mut segment = format!("{} {}", format_names(names), transition.verb());
+            // Append the view-keybind hint only to spawn announcements so the
+            // user discovers how to open the inline swarm panel.
+            if transition == Transition::Spawned {
+                if let Some(key) = view_key_label {
+                    segment.push_str(&format!(" · {key} to view"));
+                }
+            }
+            segment
+        })
         .collect();
 
     // Tail: the same "M/N active" tally the strip shows, or a wrap-up line
@@ -155,7 +177,7 @@ mod tests {
         let prev = vec![member("ant", "running"), member("bat", "running")];
         let next = vec![member("ant", "completed"), member("bat", "running")];
         assert_eq!(
-            swarm_status_transition_notice(&prev, &next).as_deref(),
+            swarm_status_transition_notice(&prev, &next, None).as_deref(),
             Some("🐝 ant done · 1/2 active")
         );
     }
@@ -165,7 +187,7 @@ mod tests {
         let prev = vec![member("ant", "running"), member("bat", "thinking")];
         let next = vec![member("ant", "ready"), member("bat", "thinking")];
         assert_eq!(
-            swarm_status_transition_notice(&prev, &next).as_deref(),
+            swarm_status_transition_notice(&prev, &next, None).as_deref(),
             Some("🐝 ant done · 1/2 active")
         );
     }
@@ -174,7 +196,7 @@ mod tests {
     fn ready_on_startup_is_silent() {
         let prev = vec![member("ant", "spawned"), member("bat", "running")];
         let next = vec![member("ant", "ready"), member("bat", "running")];
-        assert_eq!(swarm_status_transition_notice(&prev, &next), None);
+        assert_eq!(swarm_status_transition_notice(&prev, &next, None), None);
     }
 
     #[test]
@@ -190,7 +212,7 @@ mod tests {
             member("crab", "running"),
         ];
         assert_eq!(
-            swarm_status_transition_notice(&prev, &next).as_deref(),
+            swarm_status_transition_notice(&prev, &next, None).as_deref(),
             Some("🐝 ant failed · bat blocked · 1/3 active")
         );
     }
@@ -200,7 +222,7 @@ mod tests {
         let prev = vec![member("ant", "completed"), member("bat", "running")];
         let next = vec![member("ant", "completed"), member("bat", "completed")];
         assert_eq!(
-            swarm_status_transition_notice(&prev, &next).as_deref(),
+            swarm_status_transition_notice(&prev, &next, None).as_deref(),
             Some("🐝 bat done · all 2 finished")
         );
     }
@@ -208,23 +230,26 @@ mod tests {
     #[test]
     fn unchanged_snapshot_is_silent() {
         let prev = vec![member("ant", "running"), member("bat", "completed")];
-        assert_eq!(swarm_status_transition_notice(&prev, &prev.clone()), None);
+        assert_eq!(swarm_status_transition_notice(&prev, &prev.clone(), None), None);
     }
 
     #[test]
-    fn active_churn_and_new_members_are_silent() {
+    fn active_churn_is_silent_but_new_members_are_announced() {
         let prev = vec![member("ant", "running")];
         let next = vec![
             member("ant", "thinking"), // running -> thinking: animation noise
-            member("bat", "spawned"),  // new member: spawn already visible
+            member("bat", "spawned"),  // new member: announced
         ];
-        assert_eq!(swarm_status_transition_notice(&prev, &next), None);
+        assert_eq!(
+            swarm_status_transition_notice(&prev, &next, None).as_deref(),
+            Some("🐝 bat spawned · 1/2 active")
+        );
     }
 
     #[test]
     fn first_snapshot_is_silent() {
         let next = vec![member("ant", "completed")];
-        assert_eq!(swarm_status_transition_notice(&[], &next), None);
+        assert_eq!(swarm_status_transition_notice(&[], &next, None), None);
     }
 
     #[test]
@@ -238,7 +263,7 @@ mod tests {
             .map(|id| member(id, "completed"))
             .collect();
         assert_eq!(
-            swarm_status_transition_notice(&prev, &next).as_deref(),
+            swarm_status_transition_notice(&prev, &next, None).as_deref(),
             Some("🐝 ant, bat, crab +2 done · all 5 finished")
         );
     }
@@ -250,8 +275,42 @@ mod tests {
         let mut next_member = member("session-long-identifier", "completed");
         next_member.friendly_name = None;
         assert_eq!(
-            swarm_status_transition_notice(&[prev_member], &[next_member]).as_deref(),
+            swarm_status_transition_notice(&[prev_member], &[next_member], None).as_deref(),
             Some("🐝 session- done · all 1 finished")
+        );
+    }
+
+    #[test]
+    fn spawn_notice_includes_view_key_hint_when_provided() {
+        let prev = vec![member("ant", "running")];
+        let next = vec![member("ant", "running"), member("bat", "spawned")];
+        assert_eq!(
+            swarm_status_transition_notice(&prev, &next, Some("Alt+N")).as_deref(),
+            Some("🐝 bat spawned · Alt+N to view · 1/2 active")
+        );
+    }
+
+    #[test]
+    fn multiple_spawns_are_grouped_with_key_hint() {
+        let prev = vec![member("ant", "running")];
+        let next = vec![
+            member("ant", "running"),
+            member("bat", "spawned"),
+            member("crab", "spawned"),
+        ];
+        assert_eq!(
+            swarm_status_transition_notice(&prev, &next, Some("⌥+N")).as_deref(),
+            Some("🐝 bat, crab spawned · ⌥+N to view · 1/3 active")
+        );
+    }
+
+    #[test]
+    fn spawn_notice_omits_key_hint_when_none_provided() {
+        let prev = vec![member("ant", "running")];
+        let next = vec![member("ant", "running"), member("bat", "spawned")];
+        assert_eq!(
+            swarm_status_transition_notice(&prev, &next, None).as_deref(),
+            Some("🐝 bat spawned · 1/2 active")
         );
     }
 }
