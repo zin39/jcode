@@ -2495,6 +2495,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         // same validation follow-up is queued again.
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
+        app.auto_poke_cooldown_until = None;
         app.is_processing = true;
         super::local::finish_turn(&mut app);
         assert!(app.auto_poke_incomplete_todos);
@@ -2514,6 +2515,7 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         crate::todo::save_todos(&app.session.id, &validated).expect("save validated todos");
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
+        app.auto_poke_cooldown_until = None;
         app.is_processing = true;
         super::local::finish_turn(&mut app);
         assert!(!app.auto_poke_incomplete_todos);
@@ -2598,6 +2600,7 @@ fn test_finish_turn_challenges_confidence_spike_once() {
 
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
+        app.auto_poke_cooldown_until = None;
         app.is_processing = true;
         super::local::finish_turn(&mut app);
 
