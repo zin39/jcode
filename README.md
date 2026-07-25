@@ -620,13 +620,56 @@ Agents dont like to commit in dirty git state with active changes. Git was clear
 
 Build speed improvements: An incremental debug cargo build with cache enabled takes about 1 minute on my machine. The goal is 5-20 seconds. Refactors and crates seams should be able to make this happen. 
 
-<!-- Add iOS / native OpenClaw preview and fuller writeup here. -->
+---
+
+## Terminal UI: theming, tiers, and motion
+
+### Capability tiers
+
+jcode renders the TUI at one of three color-precision tiers:
+
+| Tier    | Colors    | Detection |
+|---------|-----------|-----------|
+| **Rich**   | 24-bit truecolor (16.7M) | `COLORTERM=truecolor` or `24bit`; known terminal programs (Ghostty, iTerm2, WezTerm, Warp, Alacritty, Hyper); `TERM` containing `kitty`, `ghostty`, or `alacritty` |
+| **256**    | 256-color indexed palette | `TERM` containing `256color` (fallback) |
+| **Plain**  | ANSI-16 named slots | `NO_COLOR` set, `TERM=dumb`, or explicit `JCODE_TIER=plain` |
+
+Detection order: `JCODE_TIER` → `NO_COLOR` → `TERM=dumb` → terminal capability (`COLORTERM` → `TERM_PROGRAM` → `TERM`). Force a tier with `JCODE_TIER=rich|256|plain`.
+
+On macOS, truecolor is automatically downgraded to 256-color for terminals with fragile glyph atlases (VS Code, Apple Terminal). `JCODE_TIER=rich` overrides this downgrade.
+
+### Color
+
+`NO_COLOR` (any non-empty value) forces Plain tier per [no-color.org](https://no-color.org). It also implies no animation.
+
+### Motion
+
+- `JCODE_NO_ANIMATION` (any truthy value) disables non-essential animation. `JCODE_REDUCED_MOTION` is a recognized alias.
+- 3D idle animations are **opt-in**: set `JCODE_TIER=rich` and set config `display.idle_animation = true` in your config file.
+
+### Keybinds (TUI)
+
+| Key | Action |
+|-----|--------|
+| `ctrl+o` | Toggle tool-call fold/expand (collapse verbose tool outputs) |
+| `ctrl+w h/j/k/l` | Move focus to left/down/up/right pane |
+| `ctrl+w w` | Cycle focus to next pane |
+
+### Config keys
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `display.idle_animation` | `false` | 3D idle animation (requires Rich tier) |
+| `features.has_completed_onboarding` | `false` | Set automatically after first-use onboarding |
+| (built-in) `economy_compact_threshold_msgs` | `50` | Messages past this threshold rendered compactly; override via custom app traits |
 
 ---
 
 <div align="center">
 
 ## Quick Start
+
+</div>
 
 </div>
 
