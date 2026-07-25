@@ -195,6 +195,13 @@ pub(super) async fn stream_response(
             };
 
             if refresh_token.is_empty() {
+                if !is_chatgpt_mode {
+                    // API-key mode: the key itself was rejected, not an OAuth token.
+                    return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                        "Your OpenAI API key was rejected. Update it via /login (OpenAI → API key): {}",
+                        body
+                    )));
+                }
                 return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
                     "OpenAI rejected the access token and no refresh token is available; run /login to re-authenticate: {}",
                     body
@@ -1608,6 +1615,16 @@ mod stream_runtime_tests {
         ));
         assert!(!is_retryable_error(
             "openai token refresh failed; run /login to re-authenticate: network error"
+        ));
+    }
+
+    #[test]
+    fn api_key_401_produces_api_key_error_not_oauth_error() {
+        // In API-key mode (no refresh_token, no id_token), a 401 means the
+        // key itself was rejected. The error message must mention API keys
+        // and NOT mention OAuth refresh tokens.
+        assert!(!is_retryable_error(
+            "your openai api key was rejected. update it via /login (openai → api key): incorrect api key provided"
         ));
     }
 
