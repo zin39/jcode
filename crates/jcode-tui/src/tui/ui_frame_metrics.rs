@@ -352,6 +352,7 @@ const FLICKER_UI_NOTICE_MAX_AGE_MS: u64 = 30_000;
 
 static FRAME_PERF_STATS: OnceLock<Mutex<FramePerfStats>> = OnceLock::new();
 static SLOW_FRAME_HISTORY: OnceLock<Mutex<SlowFrameHistory>> = OnceLock::new();
+#[cfg(not(test))]
 static FLICKER_FRAME_HISTORY: OnceLock<Mutex<FlickerFrameHistory>> = OnceLock::new();
 static FRAME_RESOURCE_START: OnceLock<Mutex<Option<FrameResourceStart>>> = OnceLock::new();
 
@@ -363,8 +364,37 @@ fn slow_frame_history() -> &'static Mutex<SlowFrameHistory> {
     SLOW_FRAME_HISTORY.get_or_init(|| Mutex::new(SlowFrameHistory::default()))
 }
 
+#[cfg(not(test))]
 fn flicker_frame_history() -> &'static Mutex<FlickerFrameHistory> {
     FLICKER_FRAME_HISTORY.get_or_init(|| Mutex::new(FlickerFrameHistory::default()))
+}
+
+/// Per-thread flicker history under `cargo test`.
+///
+/// In production this is one process-global buffer, which is what we want: it
+/// aggregates flicker diagnostics across the whole run. Under test, though,
+/// `flicker_detection_enabled()` is unconditionally true and *every* frame draw
+/// records a sample, so a single shared buffer is written by every test that
+/// renders anything. Tests that assert on their own sample counts (e.g.
+/// `buffered_samples == 3`) then fail nondeterministically when an unrelated
+/// test renders concurrently.
+///
+/// Locking could not fix this: samples are recorded from ~30 files, most of
+/// which have no reason to know about a render mutex, so any lock discipline
+/// would be one missed call site away from flaking again. Cargo runs each test
+/// on its own thread, so giving each thread its own history makes the
+/// isolation structural instead of conventional.
+///
+/// Leaked rather than returned by value so the signature still yields
+/// `&'static Mutex<_>`, keeping all call sites identical across cfgs. One small
+/// allocation per test thread that records frames.
+#[cfg(test)]
+fn flicker_frame_history() -> &'static Mutex<FlickerFrameHistory> {
+    thread_local! {
+        static THREAD_HISTORY: &'static Mutex<FlickerFrameHistory> =
+            Box::leak(Box::new(Mutex::new(FlickerFrameHistory::default())));
+    }
+    THREAD_HISTORY.with(|history| *history)
 }
 
 fn frame_resource_start() -> &'static Mutex<Option<FrameResourceStart>> {
