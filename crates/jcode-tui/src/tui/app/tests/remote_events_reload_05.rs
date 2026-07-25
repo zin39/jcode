@@ -179,6 +179,7 @@ fn test_completion_gate_nudges_stop_after_budget_exhausted() {
             );
             app.hidden_queued_system_messages.clear();
             app.pending_queued_dispatch = false;
+            app.auto_poke_cooldown_until = None;
         }
 
         // Budget exhausted: the gate must stop scheduling and disarm auto-poke
