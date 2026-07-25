@@ -12,6 +12,9 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    #[cfg(any(test, feature = "test-support"))]
+    mirror_home_override_on_set(key.as_ref(), value.as_ref());
+
     // SAFETY: jcode treats these mutations as process-global configuration.
     // They are a pre-existing design choice used throughout startup, auth,
     // provider bootstrap, tests, and self-dev flows. Centralizing the unsafe
@@ -27,9 +30,176 @@ pub fn remove_var<K>(key: K)
 where
     K: AsRef<OsStr>,
 {
+    #[cfg(any(test, feature = "test-support"))]
+    mirror_home_override_on_remove(key.as_ref());
+
     // SAFETY: see `set_var` above; this is the corresponding centralized
     // removal operation for the same process-global configuration surface.
     unsafe {
         std::env::remove_var(key);
+    }
+}
+
+/// Environment variable naming the jcode home directory.
+pub const JCODE_HOME_VAR: &str = "JCODE_HOME";
+
+/// The jcode home scoped to the current thread, if one is active.
+///
+/// Always `None` outside test builds, where the process environment is the only
+/// source of truth.
+#[cfg(not(any(test, feature = "test-support")))]
+#[inline]
+pub fn home_override() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// The jcode home scoped to the current thread, if one is active.
+///
+/// `JCODE_HOME` is process-global, so tests that point it at their own temp dir
+/// are mutating state every other test can see. Under the default parallel
+/// runner that races: one test sets the var, another overwrites or clears it,
+/// and the first then resolves paths against a home it never wrote.
+///
+/// Cargo runs each test on its own thread, so scoping the home per thread makes
+/// isolation structural rather than a convention every test has to remember.
+/// [`set_var`] and [`remove_var`] maintain this automatically for `JCODE_HOME`,
+/// which is why existing tests need no changes.
+#[cfg(any(test, feature = "test-support"))]
+pub fn home_override() -> Option<std::path::PathBuf> {
+    HOME_OVERRIDE.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static HOME_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keep the per-thread home in sync when a caller sets `JCODE_HOME` directly.
+///
+/// The process env var is still written, so subprocesses and any code reading
+/// the raw environment behave as before. Path resolution prefers the per-thread
+/// value, so the setter gets isolation without opting in.
+#[cfg(any(test, feature = "test-support"))]
+fn mirror_home_override_on_set(key: &OsStr, value: &OsStr) {
+    if key == OsStr::new(JCODE_HOME_VAR) {
+        let path = std::path::PathBuf::from(value);
+        HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(path));
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn mirror_home_override_on_remove(key: &OsStr) {
+    if key == OsStr::new(JCODE_HOME_VAR) {
+        HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Scope the jcode home to the current thread until the returned guard drops,
+/// without touching the process environment. See [`home_override`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn scoped_home_override(path: impl Into<std::path::PathBuf>) -> ScopedHomeOverride {
+    let previous = HOME_OVERRIDE.with(|slot| slot.borrow_mut().replace(path.into()));
+    ScopedHomeOverride { previous }
+}
+
+/// Restores the previous per-thread home on drop, including on panic.
+#[cfg(any(test, feature = "test-support"))]
+pub struct ScopedHomeOverride {
+    previous: Option<std::path::PathBuf>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ScopedHomeOverride {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Wrap a future so it observes the spawning thread's home override wherever it
+/// is polled.
+///
+/// A future spawned onto a runtime runs on a worker thread, and may migrate
+/// between them, so a thread-local set on the spawning thread is invisible to
+/// it. Without this, background work would resolve paths against the
+/// developer's real `~/.jcode` while the test believes it is sandboxed. The
+/// override is installed for the duration of each `poll` and removed
+/// afterwards, so the worker thread is left exactly as it was found.
+///
+/// Compiles to the identity function outside test builds.
+#[cfg(not(any(test, feature = "test-support")))]
+#[inline]
+pub fn inherit_home<F: std::future::Future>(future: F) -> F {
+    future
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn inherit_home<F: std::future::Future>(future: F) -> InheritHome<F> {
+    InheritHome {
+        home: home_override(),
+        future,
+    }
+}
+
+/// Future returned by [`inherit_home`].
+#[cfg(any(test, feature = "test-support"))]
+pub struct InheritHome<F> {
+    home: Option<std::path::PathBuf>,
+    future: F,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<F: std::future::Future> std::future::Future for InheritHome<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: standard pin projection. `home` is `Unpin` and never moved
+        // out; `future` is only ever exposed as a `Pin<&mut F>`.
+        let (home, future) = unsafe {
+            let this = self.get_unchecked_mut();
+            (&this.home, std::pin::Pin::new_unchecked(&mut this.future))
+        };
+        let _scoped = home.clone().map(scoped_home_override);
+        future.poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn setting_jcode_home_scopes_it_to_this_thread() {
+        let _guard = super::scoped_home_override("/tmp/outer");
+        super::set_var(super::JCODE_HOME_VAR, "/tmp/inner");
+        assert_eq!(
+            super::home_override(),
+            Some(std::path::PathBuf::from("/tmp/inner"))
+        );
+
+        // A thread that never set the var must not inherit the setter's home,
+        // even though the process env var is still exported for subprocesses.
+        let observed = std::thread::spawn(super::home_override).join().unwrap();
+        assert_eq!(observed, None);
+    }
+
+    #[test]
+    fn removing_jcode_home_clears_the_thread_override() {
+        super::set_var(super::JCODE_HOME_VAR, "/tmp/removed");
+        super::remove_var(super::JCODE_HOME_VAR);
+        assert_eq!(super::home_override(), None);
+    }
+
+    #[test]
+    fn unrelated_vars_do_not_touch_the_home_override() {
+        let _guard = super::scoped_home_override("/tmp/kept");
+        super::set_var("JCODE_SOME_OTHER_VAR", "x");
+        super::remove_var("JCODE_SOME_OTHER_VAR");
+        assert_eq!(
+            super::home_override(),
+            Some(std::path::PathBuf::from("/tmp/kept"))
+        );
     }
 }

@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Exposes the per-thread JCODE_HOME override so downstream test targets get
+# isolated homes without editing every test.
+test-support = []
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9.3"

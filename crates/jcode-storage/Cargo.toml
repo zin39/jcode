@@ -7,7 +7,7 @@ publish = false
 [features]
 # Exposes `scoped_test_home` so downstream crates can isolate `jcode_dir()`
 # per test thread instead of racing on the process-global JCODE_HOME.
-test-support = ["dep:tempfile"]
+test-support = ["dep:tempfile", "jcode-core/test-support"]
 
 [dependencies]
 anyhow = "1"
@@ -20,4 +20,7 @@ serde_json = "1"
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
+# Storage's own tests exercise the per-thread home, which lives behind
+# jcode-core's test-support feature.
+jcode-core = { path = "../jcode-core", features = ["test-support"] }
 tempfile = "3"

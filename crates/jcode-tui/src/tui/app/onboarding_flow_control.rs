@@ -765,7 +765,9 @@ impl App {
             ));
             return;
         };
-        runtime.spawn(async move {
+        // The import resolves external auth files through the jcode home, so the
+        // spawned task must inherit it (a no-op in release builds).
+        runtime.spawn(crate::env::inherit_home(async move {
             let outcome = match crate::external_auth::run_external_auth_auto_import_candidates(
                 &candidates,
                 &approved,
@@ -809,7 +811,7 @@ impl App {
                     message: outcome.render_markdown(),
                 },
             ));
-        });
+        }));
     }
 
     /// Open the action-only onboarding choice. Session history remains available
