@@ -1889,11 +1889,28 @@ fn test_debug_command_side_panel_latency_bench_reports_immediate_redraw() {
         Some(0),
         "each injected event should change effective side-pane scroll"
     );
+
+    // The timing path must always be exercised: every post-warmup iteration has
+    // to produce a finite, positive latency sample. This part is load
+    // independent, so it is asserted unconditionally.
+    let p95 = value["summary"]["latency_ms"]["p95"].as_f64();
+    assert_eq!(
+        value["summary"]["samples"].as_u64(),
+        Some(8),
+        "expected one latency sample per post-warmup iteration: {}",
+        result
+    );
+    assert!(
+        p95.is_some_and(|p95| p95.is_finite() && p95 > 0.0),
+        "expected a finite positive p95 latency measurement: {}",
+        result
+    );
+
     // Wall-clock budgets measure the host scheduler too: observed at 16.2ms
     // against 16.0ms purely from machine load, while passing in isolation. The
     // behavioral assertions above are the real subject, so gate only the timing
     // (refs #592).
-    let p95 = value["summary"]["latency_ms"]["p95"].as_f64().unwrap_or(0.0);
+    let p95 = p95.unwrap_or(0.0);
     assert_perf_budget(p95 < 16.0, || {
         format!("side-panel p95 should stay within a 60fps frame budget: {result}")
     });
