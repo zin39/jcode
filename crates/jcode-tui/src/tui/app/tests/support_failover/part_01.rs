@@ -325,20 +325,10 @@ fn test_side_panel_snapshot(page_id: &str, title: &str) -> crate::side_panel::Si
 }
 
 fn ensure_test_jcode_home_if_unset() {
-    use std::sync::OnceLock;
-
-    static TEST_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-
-    if std::env::var_os("JCODE_HOME").is_some() {
-        return;
-    }
-
-    let path = TEST_HOME.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!("jcode-test-home-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&path);
-        path
-    });
-    crate::env::set_var("JCODE_HOME", path);
+    // Per-thread sandbox: see `storage::ensure_thread_test_home`. A shared
+    // per-process home would still let concurrent tests read back each
+    // other's persisted catalogs, caches, and ambient queues.
+    crate::storage::ensure_thread_test_home();
 }
 
 fn clear_persisted_test_ui_state() {
@@ -356,8 +346,11 @@ fn clear_persisted_test_ui_state() {
 fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
-    let prev_home = std::env::var_os("JCODE_HOME");
-    crate::env::set_var("JCODE_HOME", temp.path());
+    // Scope the home to this thread rather than exporting JCODE_HOME, so a
+    // concurrent test cannot observe (or clobber) this tempdir. The env lock is
+    // still held because the auth overrides and caches touched below really are
+    // process-global.
+    let _scoped_home = crate::storage::scoped_test_home(temp.path());
     crate::auth::claude::set_active_account_override(None);
     crate::auth::codex::set_active_account_override(None);
     crate::auth::AuthStatus::invalidate_cache();
@@ -369,11 +362,6 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     crate::auth::codex::set_active_account_override(None);
     crate::auth::AuthStatus::invalidate_cache();
     crate::tui::app::helpers::clear_ambient_info_cache_for_tests();
-    if let Some(prev_home) = prev_home {
-        crate::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
-    }
     result
 }
 

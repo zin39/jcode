@@ -1215,6 +1215,9 @@ impl App {
             let _ = tx.send(Ok(ModelPickerRoutesResult { routes, routes_ms }));
         };
 
+        // Route loads resolve per-model disk caches through `jcode_dir()`, so the
+        // worker must inherit the spawning thread's test home (no-op in release).
+        let build = crate::storage::inherit_test_home(build);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn_blocking(build);
         } else {
@@ -1253,6 +1256,9 @@ impl App {
             let _ = tx.send(Ok(ModelPickerRoutesResult { routes, routes_ms }));
         };
 
+        // Route loads resolve per-model disk caches through `jcode_dir()`, so the
+        // worker must inherit the spawning thread's test home (no-op in release).
+        let build = crate::storage::inherit_test_home(build);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn_blocking(build);
         } else {

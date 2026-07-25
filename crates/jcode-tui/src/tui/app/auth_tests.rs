@@ -18,14 +18,16 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     ]
     .map(|key| (key, std::env::var_os(key)));
 
-    crate::env::set_var("JCODE_HOME", temp.path());
+    // Home is scoped to this thread; the remaining vars are genuinely
+    // process-global, which is why the env lock above is still required.
+    let _scoped_home = crate::storage::scoped_test_home(temp.path());
     for (key, _) in saved_env.iter().skip(1) {
         crate::env::remove_var(key);
     }
 
     let result = f();
 
-    for (key, value) in saved_env {
+    for (key, value) in saved_env.into_iter().skip(1) {
         if let Some(value) = value {
             crate::env::set_var(key, value);
         } else {

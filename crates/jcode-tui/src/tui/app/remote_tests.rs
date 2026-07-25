@@ -59,20 +59,10 @@ fn create_test_app() -> crate::tui::app::App {
 /// breaks the unfocused-redraw assertions). Mirrors the helper of the same
 /// name used by the main app test suite.
 fn ensure_test_jcode_home_if_unset() {
-    use std::sync::OnceLock;
-
-    static TEST_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-
-    if std::env::var_os("JCODE_HOME").is_some() {
-        return;
-    }
-
-    let path = TEST_HOME.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!("jcode-test-home-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&path);
-        path
-    });
-    crate::env::set_var("JCODE_HOME", path);
+    // Per-thread sandbox: see `storage::ensure_thread_test_home`. A shared
+    // per-process home would still let concurrent tests read back each
+    // other's persisted catalogs, caches, and ambient queues.
+    crate::storage::ensure_thread_test_home();
 }
 
 #[test]

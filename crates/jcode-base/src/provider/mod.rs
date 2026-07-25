@@ -541,7 +541,12 @@ impl MultiProvider {
             "{}|{}|{}|{:?}|{}|{}|{}|{}",
             // Scope by home so sandboxes (tests, JCODE_HOME switches) never
             // share catalogs that were built from different credential files.
-            std::env::var("JCODE_HOME").unwrap_or_default(),
+            // Resolved via `jcode_dir()` rather than reading JCODE_HOME directly:
+            // that is the same function the catalog itself uses to find those
+            // files, so any override mechanism stays consistent with the key.
+            crate::storage::jcode_dir()
+                .map(|home| home.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             Self::provider_key(active),
             self.model(),
             credential_mode,

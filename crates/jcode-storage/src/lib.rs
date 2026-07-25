@@ -148,12 +148,143 @@ fn ensure_private_runtime_dir(path: &Path) {
 }
 
 pub fn jcode_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("JCODE_HOME") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = configured_home() {
+        return Ok(path);
     }
 
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
     Ok(home.join(".jcode"))
+}
+
+/// The explicitly configured jcode home, if any.
+///
+/// Single resolution point for every "is the home overridden?" question, so
+/// `jcode_dir`, `app_config_dir`, and `user_home_path` can never disagree about
+/// which home is active. They previously each read `JCODE_HOME` inline, which
+/// meant a sandbox honored by one was silently ignored by the others.
+fn configured_home() -> Option<PathBuf> {
+    if let Some(path) = thread_local_home_override() {
+        return Some(path);
+    }
+    std::env::var_os("JCODE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+#[inline]
+fn thread_local_home_override() -> Option<PathBuf> {
+    None
+}
+
+/// Per-thread `JCODE_HOME` override, checked ahead of the environment.
+///
+/// `JCODE_HOME` is process-global, so tests that point it at their own
+/// `tempfile::tempdir()` are mutating shared state. Under a parallel test runner
+/// that races: one test sets the var, another overwrites or clears it, and the
+/// first then reads a home it never wrote (or a tempdir that has already been
+/// deleted). Serializing every such test on one mutex is the usual workaround,
+/// but it does not compose, since helpers that take the lock cannot be called
+/// from tests that already hold it.
+///
+/// Cargo runs each test on its own thread, so a thread-local override gives real
+/// isolation instead: concurrent tests cannot observe each other's home at all,
+/// and no lock is required.
+#[cfg(any(test, feature = "test-support"))]
+fn thread_local_home_override() -> Option<PathBuf> {
+    TEST_HOME_OVERRIDE.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point `jcode_dir()` at `path` for the current thread only, until the returned
+/// guard drops. See [`thread_local_home_override`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn scoped_test_home(path: impl Into<PathBuf>) -> ScopedTestHome {
+    let previous = TEST_HOME_OVERRIDE.with(|slot| slot.borrow_mut().replace(path.into()));
+    ScopedTestHome { previous }
+}
+
+/// Restores the previous per-thread home override on drop, including on panic.
+#[cfg(any(test, feature = "test-support"))]
+pub struct ScopedTestHome {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ScopedTestHome {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        TEST_HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Wraps a closure that will run on another thread so it observes the spawning
+/// thread's home override.
+///
+/// Background work (catalog loads, cache refreshes) resolves paths through
+/// [`jcode_dir`] on a worker thread. A thread-local override is invisible there,
+/// so without this wrapper such work would silently read the developer's real
+/// `~/.jcode` while the test believes it is sandboxed. In non-test builds this
+/// is a zero-cost identity function.
+#[cfg(not(any(test, feature = "test-support")))]
+#[inline]
+pub fn inherit_test_home<F, T>(f: F) -> impl FnOnce() -> T
+where
+    F: FnOnce() -> T,
+{
+    f
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn inherit_test_home<F, T>(f: F) -> impl FnOnce() -> T
+where
+    F: FnOnce() -> T,
+{
+    let home = TEST_HOME_OVERRIDE.with(|slot| slot.borrow().clone());
+    move || {
+        let _scoped = home.map(scoped_test_home);
+        f()
+    }
+}
+
+/// Give the calling thread its own hermetic `~/.jcode`, once per thread.
+///
+/// Test helpers that build an `App` need *some* sandboxed home so they never
+/// read the developer's real state (a populated ambient queue, for instance,
+/// flips `has_notification()` on). Pointing the whole process at one shared temp
+/// dir achieves that but not isolation: tests still write catalogs, caches, and
+/// queues into a directory their neighbours read back, which is a race under a
+/// parallel runner.
+///
+/// Cargo gives each test its own thread, so allocating the sandbox per thread
+/// makes those writes private. The directory is intentionally leaked: it must
+/// outlive every guard the test creates, and the OS reclaims the temp dir.
+#[cfg(any(test, feature = "test-support"))]
+pub fn ensure_thread_test_home() {
+    thread_local! {
+        static THREAD_HOME: std::cell::OnceCell<PathBuf> = const {
+            std::cell::OnceCell::new()
+        };
+    }
+
+    let home = THREAD_HOME.with(|cell| {
+        cell.get_or_init(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("jcode-test-home-")
+                .tempdir()
+                .expect("test home tempdir");
+            dir.keep()
+        })
+        .clone()
+    });
+
+    // Leak the guard: the sandbox stays active for the rest of this thread.
+    std::mem::forget(scoped_test_home(home));
 }
 
 pub fn logs_dir() -> Result<PathBuf> {
@@ -187,8 +318,8 @@ pub fn durable_state_dir() -> PathBuf {
 /// `$JCODE_HOME/config/jcode` so self-dev/tests do not leak into the user's
 /// real config directory.
 pub fn app_config_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("JCODE_HOME") {
-        return Ok(PathBuf::from(path).join("config").join("jcode"));
+    if let Some(path) = configured_home() {
+        return Ok(path.join("config").join("jcode"));
     }
 
     let config_dir =
@@ -210,8 +341,8 @@ pub fn user_home_path(relative: impl AsRef<Path>) -> Result<PathBuf> {
         );
     }
 
-    if let Ok(path) = std::env::var("JCODE_HOME") {
-        return Ok(PathBuf::from(path).join("external").join(relative));
+    if let Some(path) = configured_home() {
+        return Ok(path.join("external").join(relative));
     }
 
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;

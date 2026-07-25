@@ -123,7 +123,7 @@ default = ["embeddings", "bedrock"]
 # `pub` so downstream crates' test targets can reach them. Enabled as a
 # dev-dependency feature by jcode-app-core / jcode / etc.; never in normal
 # (non-test) builds.
-test-support = []
+test-support = ["jcode-storage/test-support"]
 jemalloc = [
     "dep:tikv-jemalloc-ctl",
     "dep:tikv-jemalloc-sys",
