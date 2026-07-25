@@ -34,6 +34,73 @@ type TodosCache = std::collections::HashMap<String, TodosCacheEntry>;
 static TODOS_CACHE: std::sync::LazyLock<Mutex<TodosCache>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Spawn a detached stale-while-revalidate refresh for one of the info-widget
+/// caches above.
+///
+/// Every cache in this module follows the same shape: on a stale/missing entry
+/// the reader returns immediately with whatever it has and kicks a background
+/// thread to refill the process-global cache. That keeps renders off the
+/// filesystem, but the refresh threads are detached and resolve `JCODE_HOME`
+/// (and the repo working dir) whenever they happen to be scheduled, which can
+/// be long after the caller returned.
+///
+/// Under `cargo test` that is an isolation hazard rather than a latency win:
+/// building UI state renders the info widget, so almost any test can launch one
+/// of these threads, and it then reads a `JCODE_HOME` belonging to a different
+/// test (or a tempdir that has already been deleted) and writes the result into
+/// the shared cache. That produced nondeterministic cross-test failures.
+///
+/// So tests opt out: refreshes run only when explicitly enabled, and otherwise
+/// become no-ops. Tests that want cache behaviour call
+/// `background_refresh_test_guard()` to turn it back on for their duration.
+/// Production is unchanged and always refreshes.
+fn spawn_cache_refresh<F>(refresh: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if !background_refresh_enabled() {
+        return;
+    }
+    std::thread::spawn(refresh);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn background_refresh_enabled() -> bool {
+    true
+}
+
+/// In tests, background cache refreshes are opt-in. See [`spawn_cache_refresh`].
+#[cfg(test)]
+fn background_refresh_enabled() -> bool {
+    BACKGROUND_REFRESH_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static BACKGROUND_REFRESH_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable background cache refreshes for the lifetime of the guard.
+///
+/// Hold this only while also holding the shared test env lock, so the refresh
+/// threads cannot observe another test's `JCODE_HOME`.
+#[cfg(test)]
+pub(crate) struct BackgroundRefreshTestGuard(bool);
+
+#[cfg(test)]
+impl BackgroundRefreshTestGuard {
+    pub(crate) fn enable() -> Self {
+        Self(BACKGROUND_REFRESH_ENABLED.swap(true, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackgroundRefreshTestGuard {
+    fn drop(&mut self) {
+        BACKGROUND_REFRESH_ENABLED.store(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Backdate `Instant::now()` by up to `amount`, saturating instead of
 /// panicking when the clock's epoch is too recent.
 ///
@@ -1016,7 +1083,7 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
             }
             let stale = cached.clone();
             *refreshing = true;
-            std::thread::spawn(|| {
+            spawn_cache_refresh(|| {
                 let result = gather_git_info_inner();
                 if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
                     *guard = Some((Instant::now(), result, false));
@@ -1026,7 +1093,7 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
         }
 
         *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
-        std::thread::spawn(|| {
+        spawn_cache_refresh(|| {
             let result = gather_git_info_inner();
             if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
                 *guard = Some((Instant::now(), result, false));
@@ -1068,7 +1135,7 @@ pub(super) fn gather_todos_and_goals_for_session(
             let stale = (todos.clone(), goals.clone());
             *refreshing = true;
             let session_id = session_id.to_string();
-            std::thread::spawn(move || {
+            spawn_cache_refresh(move || {
                 let (todos, goals) = fetch(&session_id);
                 if let Ok(mut cache) = TODOS_CACHE.lock() {
                     cache.insert(session_id, (Instant::now(), todos, goals, false));
@@ -1087,7 +1154,7 @@ pub(super) fn gather_todos_and_goals_for_session(
                 true,
             ),
         );
-        std::thread::spawn(move || {
+        spawn_cache_refresh(move || {
             let (todos, goals) = fetch(&session_id);
             if let Ok(mut cache) = TODOS_CACHE.lock() {
                 cache.insert(session_id, (Instant::now(), todos, goals, false));
@@ -1147,7 +1214,7 @@ pub(super) fn gather_memory_info(
             };
             *refreshing = true;
             let working_dir = working_dir.clone();
-            std::thread::spawn(move || {
+            spawn_cache_refresh(move || {
                 let result = gather_memory_info_inner(working_dir);
                 if let Ok(mut guard) = CACHE.lock() {
                     *guard = Some((Instant::now(), result, false));
@@ -1157,7 +1224,7 @@ pub(super) fn gather_memory_info(
         }
 
         *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
-        std::thread::spawn(move || {
+        spawn_cache_refresh(move || {
             let result = gather_memory_info_inner(working_dir);
             if let Ok(mut guard) = CACHE.lock() {
                 *guard = Some((Instant::now(), result, false));
@@ -1276,7 +1343,7 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
             };
             *refreshing = true;
             *cached_enabled = ambient_enabled;
-            std::thread::spawn(move || {
+            spawn_cache_refresh(move || {
                 let result = gather_ambient_info_inner(ambient_enabled);
                 if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock() {
                     *guard = Some((Instant::now(), ambient_enabled, result, false));
@@ -1291,7 +1358,7 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
             None,
             true,
         ));
-        std::thread::spawn(move || {
+        spawn_cache_refresh(move || {
             let result = gather_ambient_info_inner(ambient_enabled);
             if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock() {
                 *guard = Some((Instant::now(), ambient_enabled, result, false));
