@@ -1333,6 +1333,13 @@ pub fn save_named_api_key(env_file: &str, key_name: &str, key: &str) -> Result<(
     }
 
     let config_dir = crate::storage::app_config_dir()?;
+    // Ensure the config directory exists with secure permissions before
+    // writing any secret material. This matches the TUI path and prevents
+    // silent write failures when the directory is missing or has incorrect
+    // permissions.
+    std::fs::create_dir_all(&config_dir)?;
+    crate::platform::set_directory_permissions_owner_only(&config_dir)?;
+
     let file_path = config_dir.join(env_file);
     crate::storage::upsert_env_file_value(&file_path, key_name, Some(key))?;
 

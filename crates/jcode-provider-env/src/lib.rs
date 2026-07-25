@@ -405,4 +405,28 @@ mod tests {
             Some("sk-env-key")
         );
     }
+
+    #[test]
+    fn openai_api_key_save_load_roundtrip() {
+        // Verify that saving an OpenAI API key through the standard env-file
+        // path (save_env_value_to_env_file) produces a key that is loadable
+        // by the same config path (load_api_key_from_env_or_config), matching
+        // what load_env_api_key in codex.rs reads.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::new(&["JCODE_HOME", "OPENAI_API_KEY"]);
+        jcode_core::env::set_var("JCODE_HOME", temp.path());
+        // Ensure the process env does not shadow the file.
+        jcode_core::env::remove_var("OPENAI_API_KEY");
+
+        let test_key = "sk-test-openai-key-roundtrip-123";
+
+        // Save the key.
+        save_env_value_to_env_file("OPENAI_API_KEY", "openai.env", Some(test_key))
+            .expect("save should succeed");
+
+        // Load it back from the file (env var is cleared, so it reads from
+        // the config file).
+        let loaded = load_api_key_from_env_or_config("OPENAI_API_KEY", "openai.env");
+        assert_eq!(loaded.as_deref(), Some(test_key));
+    }
 }
