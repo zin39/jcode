@@ -140,6 +140,10 @@ struct TestState {
     suggestions: Vec<(String, String)>,
     welcome_suggestions: Vec<(String, String)>,
     compacted_hidden_user_prompts: usize,
+    /// WP12: compact threshold for economy mode tests.  Default is MAX so
+    /// existing tests get full rendering; opt-in by setting a lower value.
+    #[allow(dead_code)]
+    economy_compact_threshold: usize,
     side_pane_images: Vec<crate::session::RenderedImage>,
     pin_images: bool,
     inline_images_visible: bool,
@@ -165,6 +169,15 @@ impl crate::tui::TuiState for TestState {
     }
     fn compacted_hidden_user_prompts(&self) -> usize {
         self.compacted_hidden_user_prompts
+    }
+    fn economy_compact_threshold_msgs(&self) -> usize {
+        // 0 means "not set" - use the trait default so existing tests
+        // (which use `..Default::default()`) don't accidentally compact.
+        if self.economy_compact_threshold == 0 {
+            50
+        } else {
+            self.economy_compact_threshold
+        }
     }
     fn has_display_edit_tool_messages(&self) -> bool {
         self.display_messages.iter().any(|message| {
