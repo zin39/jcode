@@ -162,6 +162,14 @@ pub fn jcode_dir() -> Result<PathBuf> {
 /// `jcode_dir`, `app_config_dir`, and `user_home_path` can never disagree about
 /// which home is active. They previously each read `JCODE_HOME` inline, which
 /// meant a sandbox honored by one was silently ignored by the others.
+/// Whether an explicit jcode home is configured (sandboxed run or test).
+///
+/// Callers that branch on "is JCODE_HOME set?" must use this rather than reading
+/// the variable, so a thread-scoped home is honored consistently.
+pub fn home_is_overridden() -> bool {
+    configured_home().is_some()
+}
+
 fn configured_home() -> Option<PathBuf> {
     // `jcode_core::env` owns the override because it also owns the `set_var` /
     // `remove_var` choke point that keeps it in sync, so a test that exports

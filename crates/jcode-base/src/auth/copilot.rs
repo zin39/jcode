@@ -431,8 +431,13 @@ pub fn trust_external_auth_source(source: ExternalCopilotAuthSource) -> Result<(
 }
 
 fn copilot_cli_dir() -> PathBuf {
-    if let Ok(path) = std::env::var("JCODE_HOME") {
-        return PathBuf::from(path).join("external").join(".copilot");
+    // `user_home_path` applies the `$JCODE_HOME/external/...` sandbox itself and
+    // resolves the home through one shared code path, so a thread-scoped home
+    // (tests) is honored the same way a process-wide one is.
+    if crate::storage::home_is_overridden()
+        && let Ok(path) = crate::storage::user_home_path(".copilot")
+    {
+        return path;
     }
 
     let home = std::env::var("HOME").unwrap_or_default();
@@ -440,11 +445,10 @@ fn copilot_cli_dir() -> PathBuf {
 }
 
 fn legacy_copilot_config_dir() -> PathBuf {
-    if let Ok(path) = std::env::var("JCODE_HOME") {
-        return PathBuf::from(path)
-            .join("external")
-            .join(".config")
-            .join("github-copilot");
+    if crate::storage::home_is_overridden()
+        && let Ok(path) = crate::storage::user_home_path(".config/github-copilot")
+    {
+        return path;
     }
 
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
