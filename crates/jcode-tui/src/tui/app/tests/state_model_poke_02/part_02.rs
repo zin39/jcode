@@ -38,21 +38,30 @@ fn test_agents_review_picker_saves_config_override() {
                 entry.name.clone()
             };
             let route = &entry.options[entry.selected_option];
-            if route.api_method == "copilot" {
+            // Compare against the parsed route method, not the raw string. The
+            // catalog legitimately emits aliases ("openai-api-key" for
+            // "openai-api"), and the canonical alias table in
+            // `ModelRouteApiMethod::parse` is what the product resolves through.
+            // Matching raw strings made this expectation silently fall through
+            // to the bare model name whenever an alias showed up, so the test
+            // failed depending on which spelling the catalog happened to carry.
+            let method = crate::provider::ModelRouteApiMethod::parse(&route.api_method);
+            use crate::provider::ModelRouteApiMethod as Method;
+            if matches!(method, Method::Copilot) {
                 format!("copilot:{}", base)
-            } else if route.api_method == "cursor" {
+            } else if matches!(method, Method::Cursor) {
                 format!("cursor:{}", base)
-            } else if route.api_method == "openai-oauth" {
+            } else if matches!(method, Method::OpenAIOAuth) {
                 format!("openai-oauth:{}", base)
-            } else if route.api_method == "openai-api" {
+            } else if matches!(method, Method::OpenAIApiKey) {
                 format!("openai-api:{}", base)
-            } else if route.api_method == "claude-oauth" {
+            } else if matches!(method, Method::ClaudeOAuth) {
                 format!("claude-oauth:{}", base)
-            } else if route.api_method == "claude-api" && route.provider == "Anthropic" {
+            } else if matches!(method, Method::AnthropicApiKey) && route.provider == "Anthropic" {
                 format!("claude-api:{}", base)
-            } else if route.api_method == "bedrock" {
+            } else if matches!(method, Method::Bedrock) {
                 format!("bedrock:{}", base)
-            } else if route.api_method == "openrouter" && route.provider != "auto" {
+            } else if matches!(method, Method::OpenRouter) && route.provider != "auto" {
                 let catalog_model = crate::provider::openrouter_catalog_model_id(&base)
                     .unwrap_or_else(|| base.clone());
                 format!("{}@{}", catalog_model, route.provider)
