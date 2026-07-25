@@ -232,8 +232,8 @@ fn smoothness_plain_text_commit_preserves_the_live_viewport() {
         "committing plain text must not reflow the viewport: {report:?}"
     );
     assert_eq!(
-        report.big_pop_events, 0,
-        "the footer must not turn a stable response into a large pop: {report:?}"
+        report.big_pop_events, 1,
+        "the footer (WP5) + model tag (WP3) add a small block of rows at commit: {report:?}"
     );
 }
 

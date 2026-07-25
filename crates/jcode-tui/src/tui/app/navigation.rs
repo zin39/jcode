@@ -1206,6 +1206,10 @@ impl App {
         }
         match code {
             KeyCode::Char(c) if ('5'..='9').contains(c) => Some((*c as u8 - b'0') as usize),
+            // macOS: ctrl_bracket_fallback_to_esc remaps Ctrl+5 → Ctrl+], so accept
+            // the bracket as equivalent to digit 5 on that platform.
+            #[cfg(target_os = "macos")]
+            KeyCode::Char(']') => Some(5),
             _ => None,
         }
     }

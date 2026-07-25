@@ -2153,6 +2153,10 @@ fn test_externally_started_turn_adopts_processing_state_and_settles_on_done() {
     );
 
     app.handle_server_event(crate::protocol::ServerEvent::MessageEnd, &mut remote);
+    // Drain any remaining stream buffer so Done processes immediately (WP9
+    // pacing may leave residual ops in the buffer after MessageEnd).
+    let ops = app.stream_buffer.flush();
+    app.apply_stream_ops(ops);
     app.handle_server_event(crate::protocol::ServerEvent::Done { id: 0 }, &mut remote);
 
     assert!(
