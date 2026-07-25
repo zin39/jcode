@@ -1738,6 +1738,30 @@ impl crate::tui::TuiState for App {
         self.swarm_panel_full_page && self.inline_swarm_gallery_active()
     }
 
+    fn pane_count(&self) -> usize {
+        let mut count: usize = 1;
+        if self.diff_pane_visible() {
+            count += 1;
+        }
+        if self.diagram_pane_enabled
+            && self.diagram_mode == crate::config::DiagramDisplayMode::Pinned
+        {
+            count += 1;
+        }
+        if self.inline_swarm_gallery_active() && !self.swarm_panel_full_page {
+            count += 1;
+        }
+        count
+    }
+
+    fn focused_pane_kind(&self) -> crate::tui::app::PaneKind {
+        self.focused_pane
+    }
+
+    fn ctrl_w_waiting(&self) -> bool {
+        self.ctrl_w_waiting
+    }
+
     fn diagram_focus(&self) -> bool {
         self.diagram_focus
     }

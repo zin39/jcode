@@ -1742,3 +1742,88 @@ fn remote_clear_resets_provider_reported_context_usage() {
 
     assert_clear_usage_reset(&app);
 }
+
+// ── WP13: Multi-pane focus unit tests ─────────────────────────────────
+
+#[test]
+fn pane_kind_chat_is_default() {
+    let app = create_test_app();
+    assert_eq!(app.focused_pane, crate::tui::app::PaneKind::Chat);
+    assert_eq!(app.pane_count(), 1);
+}
+
+#[test]
+fn visible_panes_starts_with_chat() {
+    let app = create_test_app();
+    let panes = app.visible_panes();
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0], crate::tui::app::PaneKind::Chat);
+}
+
+#[test]
+fn focus_pane_reconciles_booleans() {
+    let mut app = create_test_app();
+    app.focus_pane(crate::tui::app::PaneKind::DiffPane);
+    assert_eq!(app.focused_pane, crate::tui::app::PaneKind::DiffPane);
+    assert!(app.diff_pane_focus);
+    assert!(!app.diagram_focus);
+    assert!(!app.swarm_panel_focused);
+}
+
+#[test]
+fn focus_pane_chat_reconciles_booleans() {
+    let mut app = create_test_app();
+    app.focus_pane(crate::tui::app::PaneKind::DiagramPane);
+    app.focus_pane(crate::tui::app::PaneKind::Chat);
+    assert_eq!(app.focused_pane, crate::tui::app::PaneKind::Chat);
+    assert!(!app.diff_pane_focus);
+    assert!(!app.diagram_focus);
+    assert!(!app.swarm_panel_focused);
+}
+
+#[test]
+fn ctrl_w_chord_starts_waiting() {
+    let mut app = create_test_app();
+    let consumed = app.handle_ctrl_w_chord(KeyCode::Char('w'), KeyModifiers::CONTROL);
+    assert!(consumed);
+    assert!(app.ctrl_w_waiting);
+}
+
+#[test]
+fn ctrl_w_unknown_key_cancels_and_passes_through() {
+    let mut app = create_test_app();
+    app.handle_ctrl_w_chord(KeyCode::Char('w'), KeyModifiers::CONTROL);
+    assert!(app.ctrl_w_waiting);
+    let consumed = app.handle_ctrl_w_chord(KeyCode::Char('x'), KeyModifiers::empty());
+    assert!(!consumed);
+    assert!(!app.ctrl_w_waiting);
+}
+
+#[test]
+fn pane_label_returns_correct_labels() {
+    let app = create_test_app();
+    assert_eq!(app.pane_label(crate::tui::app::PaneKind::Chat), "chat");
+    assert_eq!(
+        app.pane_label(crate::tui::app::PaneKind::DiffPane),
+        "diff pane"
+    );
+    assert_eq!(
+        app.pane_label(crate::tui::app::PaneKind::DiagramPane),
+        "diagram"
+    );
+    assert_eq!(
+        app.pane_label(crate::tui::app::PaneKind::SwarmStrip),
+        "swarm"
+    );
+}
+
+#[test]
+fn focus_pane_with_single_pane_is_noop() {
+    let mut app = create_test_app();
+    app.cycle_pane_focus();
+    assert_eq!(app.focused_pane, crate::tui::app::PaneKind::Chat);
+    app.focus_pane_directional('h');
+    assert_eq!(app.focused_pane, crate::tui::app::PaneKind::Chat);
+    app.focus_pane_directional('l');
+    assert_eq!(app.focused_pane, crate::tui::app::PaneKind::Chat);
+}

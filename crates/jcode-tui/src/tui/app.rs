@@ -39,6 +39,24 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+/// Which pane currently has keyboard focus in a multi-pane layout (WP13).
+///
+/// The chat pane is always present and is the default. Additional panes
+/// appear when a side panel, diff pane, diagram pane, or swarm panel
+/// is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PaneKind {
+    /// Main chat transcript + input area.
+    Chat,
+    /// Right-rail side panel (todos, split view, file diff, etc.).
+    SidePanel,
+    /// Pinned file diff pane.
+    DiffPane,
+    /// Pinned diagram pane.
+    DiagramPane,
+    /// Inline swarm strip / gallery viewport.
+    SwarmStrip,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppRuntimeMode {
     /// Normal product TUI. The client renders state owned by the jcode server.
@@ -1205,6 +1223,13 @@ pub struct App {
     swarm_panel_focused: bool,
     // Whether the focused swarm panel owns the main transcript viewport.
     swarm_panel_full_page: bool,
+    // WP13: unified pane focus — which pane has keyboard focus in multi-pane layouts.
+    // Initialized to Chat (the default) and reconciled with individual focus booleans.
+    focused_pane: PaneKind,
+    // WP13: set to true when ctrl+w is pressed; cleared after the next key.
+    // While true, the next h/j/k/l/w key moves pane focus directionally instead
+    // of being treated as a regular keypress.
+    ctrl_w_waiting: bool,
     // Diff display mode (toggle with Alt+G)
     diff_mode: crate::config::DiffDisplayMode,
     // Center all content (from config)
