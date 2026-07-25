@@ -254,12 +254,12 @@ fn prompt_up_key(app: &App) -> (KeyCode, KeyModifiers) {
 }
 
 fn scroll_render_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    // Delegates to the single shared render test lock defined in tests.rs.
+    // The two formerly-separate locks (scroll_render_test_lock and
+    // viewport_snapshot_test_lock) were different mutexes guarding the
+    // SAME process-global render state, so they provided zero mutual
+    // exclusion between the two groups.
+    render_test_lock()
 }
 
 /// Render app to TestBackend and return the buffer text.

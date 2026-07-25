@@ -2456,4 +2456,4 @@ fn ratio_pct(numerator: u64, denominator: u64) -> u8 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -1,5 +1,24 @@
 #![cfg_attr(test, allow(clippy::clone_on_copy))]
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Single shared lock for all process-global render state in tests.
+///
+/// Serializes tests that mutate or read the global visual-debug frame buffer,
+/// markdown diagram-mode override, and mermaid ACTIVE_DIAGRAMS.  Every test
+/// that calls `crate::tui::ui::draw()` (or any render path that touches
+/// `crate::tui::visual_debug`, `crate::tui::mermaid`, or the markdown
+/// diagram-mode stack) must hold this lock.
+///
+/// Lock ordering: always acquire `crate::storage::lock_test_env()` BEFORE
+/// `render_test_lock()` to avoid deadlock when both are needed.
+pub(crate) fn render_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 include!("tests/support_failover/part_01.rs");
 include!("tests/support_failover/part_02.rs");
 include!("tests/commands_accounts_01/part_01.rs");
