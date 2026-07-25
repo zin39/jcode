@@ -266,6 +266,18 @@ where
 /// outlive every guard the test creates, and the OS reclaims the temp dir.
 #[cfg(any(test, feature = "test-support"))]
 pub fn ensure_thread_test_home() {
+    // Respect a home already scoped to *this* thread: callers nest this inside
+    // helpers like `with_temp_jcode_home`, which have already pointed the thread
+    // at a fixture they populated, and clobbering it would make that fixture
+    // invisible.
+    //
+    // A process-global `JCODE_HOME` is deliberately *not* respected. It belongs
+    // to whichever thread happened to export it, so honoring it here is what
+    // made concurrent tests share one home in the first place.
+    if thread_local_home_override().is_some() {
+        return;
+    }
+
     thread_local! {
         static THREAD_HOME: std::cell::OnceCell<PathBuf> = const {
             std::cell::OnceCell::new()
