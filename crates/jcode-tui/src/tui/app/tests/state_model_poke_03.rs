@@ -441,6 +441,12 @@ impl Provider for CountingModelRoutesProvider {
 
 #[test]
 fn test_model_picker_reuses_cached_entries_until_invalidated() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -485,6 +491,12 @@ fn test_model_picker_reuses_cached_entries_until_invalidated() {
 
 #[test]
 fn test_shift_tab_model_favorite_hotkey_preserves_input_line() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -514,6 +526,12 @@ fn test_shift_tab_model_favorite_hotkey_preserves_input_line() {
 
 #[test]
 fn test_tui_api_key_auth_refreshes_catalog_shows_diff_without_opening_picker() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -931,6 +949,12 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
 
 #[test]
 fn test_tui_openai_compatible_empty_catalog_does_not_switch_to_profile_default() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -991,6 +1015,12 @@ fn test_tui_openai_compatible_empty_catalog_does_not_switch_to_profile_default()
 
 #[test]
 fn test_tui_openai_compatible_local_refresh_failure_is_pending_not_final_failure() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1058,6 +1088,12 @@ fn test_tui_openai_compatible_local_refresh_failure_is_pending_not_final_failure
 
 #[test]
 fn test_model_picker_opens_simplified_state_before_async_routes_complete() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1100,6 +1136,12 @@ fn test_model_picker_opens_simplified_state_before_async_routes_complete() {
 
 #[test]
 fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1171,6 +1213,12 @@ fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration
 
 #[test]
 fn test_model_picker_does_not_cache_single_model_fallback() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1234,6 +1282,12 @@ fn test_local_model_picker_selection_failure_keeps_picker_open_and_shows_next_st
 
 #[test]
 fn test_login_completed_spawns_auth_refresh_when_runtime_is_available() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1278,6 +1332,12 @@ fn test_login_completed_spawns_auth_refresh_when_runtime_is_available() {
 
 #[test]
 fn test_model_picker_waits_for_async_post_login_catalog_activation() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();

@@ -446,6 +446,12 @@ fn test_remote_jcode_subscription_catalog_is_not_augmented_with_local_auth_route
 
 #[test]
 fn test_remote_mixed_catalog_keeps_jcode_subscription_separate_from_other_providers() {
+    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
+    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
+    // another test's hermetic tempdir contents (or read a tempdir that a sibling
+    // had already dropped), which made unrelated tests fail at random under
+    // parallel execution while passing with --test-threads=1.
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
