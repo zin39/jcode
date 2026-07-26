@@ -3018,52 +3018,30 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         (prepared.total_wrapped_lines().max(1) as u16) + stable_fixed_height > available_height
     };
 
-    // Resolving native-scrollbar overflow can require wrapping the transcript at
-    // two different widths (the wide layout, and one column narrower to reserve a
-    // scrollbar column). Preparing both every frame doubles the most expensive work
-    // and thrashes the prep caches on long transcripts during streaming. Use the
-    // previous frame's scrollbar decision as hysteresis so the steady state only
-    // prepares a single width; the second width is only built at a visibility
-    // transition. This is safe because narrow wraps at least as much as wide, so
-    // "narrow fits" implies "wide fits".
+    // Always reserve the scrollbar column while the native scrollbar is
+    // enabled, whether or not it is currently visible.
+    //
+    // Previously the wrap width depended on the scrollbar's visibility, so
+    // crossing the fits/overflows threshold re-wrapped the entire transcript
+    // one column narrower. Adding a single line could therefore reflow every
+    // line on screen, which reads as a shimmy rather than as new content
+    // arriving. Reserving the column unconditionally makes the wrap width a
+    // constant of the layout, so appearing and disappearing scrollbars never
+    // reflow text; only the scrollbar itself changes.
+    //
+    // This also removes the two-width dance entirely: exactly one prepare per
+    // frame, so no hysteresis is needed and no transition frame pays double
+    // the most expensive work. The cost is one column of width when the
+    // scrollbar is hidden, which is a fixed, non-flickering trade.
     let scrollbar_enabled = app.chat_native_scrollbar() && chat_area.width > 1;
-    let initial_content_height;
-    let (prepared, chat_scrollbar_visible) = if !scrollbar_enabled {
-        let prepared_wide = prepare_at(wide_prepare_width);
-        initial_content_height = prepared_wide.total_wrapped_lines().max(1) as u16;
-        (prepared_wide, false)
-    } else if last_chat_scrollbar_visible() {
-        // Scrollbar was visible last frame: prepare the narrow (reserved-column)
-        // layout first. If it still overflows we keep it without touching wide.
-        let prepared_narrow = prepare_at(narrow_prepare_width);
-        initial_content_height = prepared_narrow.total_wrapped_lines().max(1) as u16;
-        if overflows(&prepared_narrow) {
-            (prepared_narrow, true)
-        } else {
-            // Content shrank enough to fit even at the narrower width, so the wide
-            // layout (which wraps no more) also fits: drop the scrollbar.
-            (prepare_at(wide_prepare_width), false)
-        }
+    let stable_prepare_width = if scrollbar_enabled {
+        narrow_prepare_width
     } else {
-        // No scrollbar last frame: prepare the wide layout first. Only when it
-        // overflows do we evaluate the narrow layout to decide on the scrollbar.
-        let prepared_wide = prepare_at(wide_prepare_width);
-        initial_content_height = prepared_wide.total_wrapped_lines().max(1) as u16;
-        if !overflows(&prepared_wide) {
-            (prepared_wide, false)
-        } else {
-            let prepared_narrow = prepare_at(narrow_prepare_width);
-            if overflows(&prepared_narrow) {
-                (prepared_narrow, true)
-            } else {
-                // Reserving a scrollbar column changed the wrapped content enough to
-                // make it fit. Prefer the wide layout without the native scrollbar so
-                // the UI does not oscillate between two self-contradictory states
-                // across consecutive frames.
-                (prepared_wide, false)
-            }
-        }
+        wide_prepare_width
     };
+    let prepared = prepare_at(stable_prepare_width);
+    let initial_content_height = prepared.total_wrapped_lines().max(1) as u16;
+    let chat_scrollbar_visible = scrollbar_enabled && overflows(&prepared);
     set_last_chat_scrollbar_visible(chat_scrollbar_visible);
     if let Some(ref mut capture) = debug_capture {
         capture.image_regions = prepared
