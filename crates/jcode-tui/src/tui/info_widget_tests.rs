@@ -626,6 +626,66 @@ fn cost_based_usage_widgets_show_price_and_tokens() {
     assert!(compact_text.contains("12.3K in + 678 out"));
 }
 
+/// A subscription/OAuth user still needs to see what a session consumed. The
+/// quota bars are the real limit, so the accrued figure is shown alongside them
+/// and worded as "value" rather than spend, because it is not billed.
+#[test]
+fn oauth_usage_widget_shows_equivalent_value_alongside_quota_bars() {
+    let usage = UsageInfo {
+        provider: UsageProvider::Anthropic,
+        primary_limit_label: Some("5-hour".to_string()),
+        five_hour: 0.25,
+        secondary_limit_label: Some("Weekly".to_string()),
+        seven_day: 0.5,
+        total_cost: 4.2,
+        input_tokens: 1_500_000,
+        output_tokens: 25_000,
+        available: true,
+        ..Default::default()
+    };
+    let data = InfoWidgetData {
+        usage_info: Some(usage),
+        ..Default::default()
+    };
+
+    let text = lines_text(&render_usage_widget(&data, Rect::new(0, 0, 40, 8)));
+    assert!(
+        text.contains("5-hour") && text.contains("Weekly"),
+        "quota bars must remain the primary signal, got:\n{text}"
+    );
+    assert!(
+        text.contains("~$4.20 value"),
+        "accrued equivalent value must be visible, got:\n{text}"
+    );
+    assert!(
+        !text.contains("spent"),
+        "must not imply the user is billed this amount, got:\n{text}"
+    );
+}
+
+/// With nothing consumed yet there is no value line to show, so the widget
+/// stays quiet instead of rendering a meaningless "~$0.00".
+#[test]
+fn oauth_usage_widget_omits_value_line_before_any_tokens() {
+    let usage = UsageInfo {
+        provider: UsageProvider::Anthropic,
+        primary_limit_label: Some("5-hour".to_string()),
+        five_hour: 0.0,
+        total_cost: 0.0,
+        input_tokens: 0,
+        output_tokens: 0,
+        available: true,
+        ..Default::default()
+    };
+    let data = InfoWidgetData {
+        usage_info: Some(usage),
+        ..Default::default()
+    };
+
+    let text = lines_text(&render_usage_widget(&data, Rect::new(0, 0, 40, 8)));
+    assert!(!text.contains("value"), "got:\n{text}");
+}
+
 fn node(kind: &str, label: &str, degree: usize) -> GraphNode {
     GraphNode {
         id: format!("{}:{}", kind, label.replace(' ', "_")),

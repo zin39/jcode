@@ -447,9 +447,13 @@ impl App {
                     seven_day_resets_at: usage.seven_day_resets_at.clone(),
                     spark: None,
                     spark_resets_at: None,
-                    total_cost: 0.0,
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    // A subscription is not billed per token, but the accrued
+                    // figure is still the only way to see what a session is
+                    // worth. Surface it (labelled as equivalent value, not
+                    // spend) rather than discarding it.
+                    total_cost: self.cost.total_cost,
+                    input_tokens: display_input_tokens,
+                    output_tokens: display_output_tokens,
                     cache_read_tokens: None,
                     cache_write_tokens: None,
                     output_tps,
@@ -499,9 +503,11 @@ impl App {
                         .spark
                         .as_ref()
                         .and_then(|w| w.resets_at.clone()),
-                    total_cost: 0.0,
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    // Same reasoning as the Anthropic OAuth branch: show the
+                    // accrued equivalent value instead of dropping it.
+                    total_cost: self.cost.total_cost,
+                    input_tokens: display_input_tokens,
+                    output_tokens: display_output_tokens,
                     cache_read_tokens: None,
                     cache_write_tokens: None,
                     output_tps,
