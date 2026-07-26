@@ -648,3 +648,98 @@ async fn graceful_shutdown_sessions_times_out_on_partial_checkpoint() {
         "the laggard session may remain running without blocking reload past the deadline"
     );
 }
+
+
+/// Scoped env var override for the reload env-resync tests. Mirrors the guard
+/// used elsewhere in this crate's test modules.
+struct ReloadEnvGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl ReloadEnvGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        crate::env::set_var(key, value);
+        Self { key, prev }
+    }
+}
+
+impl Drop for ReloadEnvGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            crate::env::set_var(self.key, prev);
+        } else {
+            crate::env::remove_var(self.key);
+        }
+    }
+}
+
+fn openai_env_from_exec_command(cmd: &std::process::Command) -> Option<Option<String>> {
+    cmd.get_envs()
+        .find(|(k, _)| *k == std::ffi::OsStr::new("OPENAI_API_KEY"))
+        .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+}
+
+/// A daemon that inherited a wrong API key must not carry it across `exec`.
+/// This is the shape of the MiniMax/OpenAI collision: the env file on disk was
+/// repaired, but the long-lived server kept 401ing on the stale process value.
+#[test]
+fn reload_overrides_process_env_api_key_that_disagrees_with_its_env_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("config").join("jcode");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(config.join("openai.env"), "OPENAI_API_KEY=sk-real-key\n")
+        .expect("write env file");
+
+    let _home = ReloadEnvGuard::set("JCODE_HOME", temp.path());
+    let _stale = ReloadEnvGuard::set("OPENAI_API_KEY", "sk-cp-wrong-key");
+
+    let mut cmd = std::process::Command::new("/bin/true");
+    super::resync_stale_api_key_env(&mut cmd);
+
+    assert_eq!(
+        openai_env_from_exec_command(&cmd),
+        Some(Some("sk-real-key".to_string())),
+        "reload should re-read the key from disk when the process env disagrees"
+    );
+}
+
+/// An exported key with no env file backing it is the user's explicit choice
+/// and must survive reload untouched.
+#[test]
+fn reload_leaves_process_env_api_key_alone_when_no_env_file_exists() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join("config").join("jcode")).expect("config dir");
+
+    let _home = ReloadEnvGuard::set("JCODE_HOME", temp.path());
+    let _exported = ReloadEnvGuard::set("OPENAI_API_KEY", "sk-exported-by-user");
+
+    let mut cmd = std::process::Command::new("/bin/true");
+    super::resync_stale_api_key_env(&mut cmd);
+
+    assert!(
+        openai_env_from_exec_command(&cmd).is_none(),
+        "an exported key with no env file must not be overridden"
+    );
+}
+
+/// The common case: process env already matches disk, so reload changes nothing.
+#[test]
+fn reload_does_not_touch_api_key_env_that_already_matches_its_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("config").join("jcode");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(config.join("openai.env"), "OPENAI_API_KEY=sk-same\n").expect("write env file");
+
+    let _home = ReloadEnvGuard::set("JCODE_HOME", temp.path());
+    let _current = ReloadEnvGuard::set("OPENAI_API_KEY", "sk-same");
+
+    let mut cmd = std::process::Command::new("/bin/true");
+    super::resync_stale_api_key_env(&mut cmd);
+
+    assert!(
+        openai_env_from_exec_command(&cmd).is_none(),
+        "a key that already matches disk needs no override"
+    );
+}
