@@ -1392,11 +1392,6 @@ pub(crate) use frame_metrics::{
     recent_average_draw_cost_ms, recent_futile_draw_ratio, record_draw_call_attribution, set_frame_input_attribution,
     wall_clock_ms,
 };
-#[cfg(test)]
-pub(crate) use frame_metrics::{
-    clear_draw_call_history_for_tests, draw_call_governor_test_lock,
-    record_draw_call_attribution_for_tests,
-};
 pub(crate) use frame_metrics::{
     debug_draw_call_history, debug_flicker_frame_history, debug_slow_frame_history,
     recent_flicker_copy_target_for_key, recent_flicker_ui_notice,

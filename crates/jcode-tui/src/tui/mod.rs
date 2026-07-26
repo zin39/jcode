@@ -1816,32 +1816,50 @@ pub(crate) fn redraw_interval(state: &dyn TuiState) -> Duration {
 /// soon as drawing gets cheap again (e.g. side panel closed).
 fn govern_redraw_interval_by_draw_cost(requested: Duration) -> Duration {
     const GOVERNOR_WINDOW: usize = 12;
-    /// Target duty cycle: drawing should take at most ~40% of each period.
-    const DUTY_FACTOR: f64 = 2.5;
-    /// Don't throttle below this even for pathological frame costs.
-    const GOVERNOR_MAX_INTERVAL: Duration = Duration::from_millis(250);
-
-    /// A draw that changed no cells at all cannot have had any visible effect,
-    /// so when most recent draws were futile we back off regardless of how
-    /// cheap they were. Requires a clear majority so that genuinely animating
-    /// UI (spinners, countdowns), which changes a handful of cells every frame,
-    /// is never throttled.
-    const FUTILE_MAJORITY: f64 = 0.75;
-    /// Deliberately below the 250ms cost ceiling: this path is reached only
-    /// when the screen is provably static, and any real change (keypress,
-    /// stream token, resize) wakes the loop immediately rather than waiting
-    /// for this tick.
-    const FUTILE_MAX_INTERVAL: Duration = Duration::from_millis(400);
 
     let Some(avg_ms) = ui::recent_average_draw_cost_ms(GOVERNOR_WINDOW) else {
         return requested;
     };
+    let futile_ratio = ui::recent_futile_draw_ratio(GOVERNOR_WINDOW);
+    redraw_interval_floor(requested, avg_ms, futile_ratio)
+}
+
+/// Pure policy for the redraw governor, split out from the global-history read
+/// so it can be tested directly. An earlier end-to-end test drove this by
+/// mutating the process-global draw history, which broke an unrelated spinner
+/// test that reads the same global.
+fn redraw_interval_floor(
+    requested: Duration,
+    avg_ms: f64,
+    futile_ratio: Option<f64>,
+) -> Duration {
+    /// Target duty cycle: drawing should take at most ~40% of each period.
+    const DUTY_FACTOR: f64 = 2.5;
+    /// Don't throttle below this even for pathological frame costs.
+    const GOVERNOR_MAX_INTERVAL: Duration = Duration::from_millis(250);
+    /// A clear majority, so that genuinely animating UI (spinners, countdowns),
+    /// which changes a handful of cells every frame, is never throttled.
+    const FUTILE_MAJORITY: f64 = 0.75;
+    /// Deliberately above the cost ceiling: this is reached only when the screen
+    /// is provably static, and any real change (keypress, stream token, resize)
+    /// wakes the loop immediately rather than waiting for this tick.
+    const FUTILE_MAX_INTERVAL: Duration = Duration::from_millis(400);
+
     let mut floor = Duration::from_millis((avg_ms * DUTY_FACTOR) as u64).min(GOVERNOR_MAX_INTERVAL);
 
     // Cheap frames defeat the cost governor: at ~5.6ms the floor is only 14ms,
-    // so a static screen was still being re-rendered ~2.7 times a second to
-    // produce a byte-identical buffer. Futility is the missing signal.
-    if ui::recent_futile_draw_ratio(GOVERNOR_WINDOW).is_some_and(|r| r >= FUTILE_MAJORITY) {
+    // so a static screen was still re-rendered ~2.7 times a second to produce a
+    // byte-identical buffer (measured live: 36 of 60 idle draws changed 0
+    // cells). Futility is the missing signal, since a draw that changes nothing
+    // cannot by definition have had any visible effect.
+    //
+    // Only ever applied to an idle cadence. A shorter requested interval comes
+    // from a branch that explicitly knows something is animating (spinners,
+    // countdowns, streaming, scroll), and those must win: the futility ratio is
+    // backward-looking, so an animation that has only just started still has a
+    // history full of static frames and would otherwise be throttled for its
+    // first frames, making it stutter exactly when it appears.
+    if requested >= REDRAW_IDLE && futile_ratio.is_some_and(|r| r >= FUTILE_MAJORITY) {
         floor = floor.max(FUTILE_MAX_INTERVAL);
     }
 
@@ -2301,41 +2319,64 @@ mod redraw_governor_tests {
         assert_eq!(govern_redraw_interval_by_draw_cost(requested), requested);
     }
 
-    /// End-to-end through the real global history, unlike the sibling tests
-    /// which only replicate the floor arithmetic. This is what pins that the
-    /// futility signal is actually consulted: cheap frames leave the cost floor
-    /// at ~14ms, so without the futility branch a provably static screen keeps
-    /// being redrawn (measured live at 36 of 60 idle draws changing 0 cells).
+    /// Cheap frames leave the cost floor at only ~14ms, so without a futility
+    /// signal a provably static screen keeps being redrawn: measured live at 36
+    /// of 60 idle draws changing ZERO cells, each costing a full ~5.6ms render
+    /// to produce a byte-identical buffer.
     #[test]
-    fn governor_backs_off_when_recent_draws_changed_nothing() {
-        let _guard = crate::tui::ui::draw_call_governor_test_lock();
-        crate::tui::ui::clear_draw_call_history_for_tests();
-
-        for i in 0..12 {
-            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(0));
-        }
-
-        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+    fn a_static_screen_is_throttled_even_though_its_frames_are_cheap() {
+        let governed = super::redraw_interval_floor(
+            Duration::from_millis(16),
+            5.6,
+            Some(1.0),
+        );
         assert!(
             governed >= Duration::from_millis(400),
             "a static screen should be throttled hard, but the governor \
              returned {governed:?}; cheap frames make the cost floor only \
              ~14ms, so futility must be what triggers the back-off"
         );
+    }
 
-        // A spinner changes a few cells every frame: real work, must not throttle.
-        crate::tui::ui::clear_draw_call_history_for_tests();
-        for i in 0..12 {
-            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(4));
-        }
-        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+    /// The counterpart, and the reason a clear majority is required: animating
+    /// UI changes only a few cells per frame and must never be mistaken for
+    /// futile work, or spinners and countdowns would visibly stutter.
+    #[test]
+    fn animating_ui_is_not_throttled_as_if_it_were_futile() {
+        let governed = super::redraw_interval_floor(
+            Duration::from_millis(16),
+            5.6,
+            Some(0.0),
+        );
+        assert_eq!(
+            governed,
+            Duration::from_millis(16),
+            "a spinner changing a few cells per frame is real visible work; \
+             throttling it would make the animation stutter"
+        );
+    }
+
+    /// The futility ratio is backward-looking, so an animation that has just
+    /// started still has a history full of static frames. Callers that asked for
+    /// an animation cadence must therefore be exempt, or a spinner would be
+    /// throttled for its first frames - stuttering exactly as it appears, which
+    /// is the moment the user is most likely to be looking at it.
+    #[test]
+    fn a_freshly_started_animation_is_not_throttled_by_a_stale_futile_history() {
+        let spinner = crate::tui::REDRAW_SWARM_SPINNER;
         assert!(
-            governed < Duration::from_millis(400),
-            "animating UI was throttled as if futile ({governed:?}), which \
-             would make spinners and countdowns visibly stutter"
+            spinner < crate::tui::REDRAW_IDLE,
+            "this test assumes the spinner cadence is faster than idle"
         );
 
-        crate::tui::ui::clear_draw_call_history_for_tests();
+        // History is entirely static: the spinner's own frames are not in it yet.
+        let governed = super::redraw_interval_floor(spinner, 5.6, Some(1.0));
+        assert_eq!(
+            governed,
+            spinner,
+            "a just-started spinner was throttled on the strength of the static \
+             frames that preceded it, so its first frames would stutter"
+        );
     }
 
     #[test]
