@@ -13,11 +13,56 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
 const RELOAD_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// API-key env vars whose on-disk env file is authoritative for a long-lived
+/// daemon. A login writes the freshly entered key into the *running* process
+/// environment (`auth::lifecycle::sync_env_from_file`), so a provider profile
+/// that names the wrong variable can overwrite an unrelated provider's key for
+/// the rest of that process's life. The env file is then correct on disk while
+/// the daemon keeps sending the stale value, and because `exec` inherits the
+/// environment, plain reloads propagate the bad key indefinitely.
+///
+/// Re-reading these from disk at exec time makes reload a real repair path.
+const RELOAD_ENV_RESYNC_KEYS: &[(&str, &str)] = &[
+    ("OPENAI_API_KEY", "openai.env"),
+    ("ANTHROPIC_API_KEY", "anthropic.env"),
+    ("MINIMAX_API_KEY", "minimax.env"),
+    ("DEEPSEEK_API_KEY", "deepseek.env"),
+    ("MOONSHOT_API_KEY", "moonshotai.env"),
+    ("ZHIPU_API_KEY", "zai.env"),
+    ("OPENAI_COMPAT_API_KEY", "openai-compatible.env"),
+];
+
+/// Override process-env API keys that disagree with their env file so the
+/// exec'd server starts from the on-disk truth. Keys with no env file are left
+/// untouched, so a value the user deliberately exported still wins.
+fn resync_stale_api_key_env(cmd: &mut std::process::Command) {
+    for (env_key, env_file) in RELOAD_ENV_RESYNC_KEYS {
+        let Ok(process_value) = std::env::var(env_key) else {
+            continue;
+        };
+        let Some(file_value) =
+            jcode_base::provider_catalog::load_env_value_from_config_file(env_key, env_file)
+        else {
+            // No env file to contradict the process value; leave it alone.
+            continue;
+        };
+        if process_value == file_value {
+            continue;
+        }
+        cmd.env(env_key, &file_value);
+        crate::logging::warn(&format!(
+            "reload: process env {} disagreed with {}; re-reading the key from disk",
+            env_key, env_file
+        ));
+    }
+}
+
 fn prepare_server_exec(cmd: &mut std::process::Command, socket_path: &std::path::Path) {
     // The replacement daemon must own the published socket paths. Unlink them
     // before exec so we never inherit a stale on-disk endpoint through reload.
     crate::server::cleanup_socket_pair(socket_path);
     cmd.env_remove("JCODE_READY_FD");
+    resync_stale_api_key_env(cmd);
 
     // The shared daemon may have inherited stderr from the client process that
     // originally spawned it. Once that client exits, later reload execs can hit
