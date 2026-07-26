@@ -492,3 +492,36 @@ fn backdated_now_never_panics_and_prefers_past_instants() {
     let zero = super::backdated_now(Duration::ZERO);
     assert!(zero <= Instant::now());
 }
+
+/// The sidecar label was previously rebuilt on every `gather_memory_info`
+/// call, and the status widgets call that several times per frame. Each rebuild
+/// re-read the config and probed up to three credential files, so an idle
+/// terminal was doing disk I/O purely to redraw an unchanged string.
+///
+/// This pins the caching behaviour rather than the label text, which depends on
+/// whichever credentials the developer happens to have: repeated calls within
+/// the TTL must agree, and must not cost anything like a fresh construction.
+#[test]
+fn the_sidecar_label_is_cached_rather_than_rebuilt_every_frame() {
+    // Warm the cache, then count real constructions rather than wall time. A
+    // timing bound is not enough here: with the cache defeated the credential
+    // files stay in the OS page cache, so the rebuild is fast enough to slip
+    // under any threshold loose enough to be non-flaky.
+    let first = super::cached_sidecar_label();
+    let builds_after_warmup = super::sidecar_label_build_count();
+
+    for _ in 0..200 {
+        assert_eq!(
+            super::cached_sidecar_label(),
+            first,
+            "a cached label must stay stable within its TTL"
+        );
+    }
+
+    assert_eq!(
+        super::sidecar_label_build_count(),
+        builds_after_warmup,
+        "200 further reads rebuilt the sidecar label, so the status widgets are \
+         still re-reading config and probing credential files on the draw path"
+    );
+}
