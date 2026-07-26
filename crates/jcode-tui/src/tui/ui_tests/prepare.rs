@@ -1283,3 +1283,30 @@ fn test_prepare_messages_renders_anchored_reasoning_message_in_flow() {
         joined[reasoning_idx]
     );
 }
+
+/// The running-tool readout used to cycle hue with elapsed time, making the
+/// loudest pixels on screen also the most restless. Liveness is carried by the
+/// spinner and travelling dot, so colour must now be time-invariant.
+#[test]
+fn running_tool_status_colors_do_not_change_over_time() {
+    let colors_at = |elapsed: f32| {
+        let state = TestState {
+            display_messages: vec![DisplayMessage::user("build it")],
+            status: ProcessingStatus::RunningTool("bash".to_string()),
+            anim_elapsed: elapsed,
+            ..Default::default()
+        };
+        crate::tui::ui::input_ui::build_status_line(&state, 120, 0)
+            .spans
+            .iter()
+            .map(|s| format!("{:?}", s.style.fg))
+            .collect::<Vec<_>>()
+    };
+
+    let early = colors_at(0.25);
+    let later = colors_at(7.5);
+    assert_eq!(
+        early, later,
+        "status-line colours must not depend on elapsed time"
+    );
+}
