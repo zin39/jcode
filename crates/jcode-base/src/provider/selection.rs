@@ -524,6 +524,23 @@ pub fn resolve_bare_model_to_route_pinned(
             }
         }
         _ => {
+            // A generic OpenAI-compatible endpoint often mirrors models that a
+            // dedicated provider also serves (e.g. a dashscope-backed custom
+            // endpoint mirroring deepseek and kimi). That made common bare
+            // names like "deepseek-v4-pro" ambiguous purely because the same
+            // model was reachable two ways, which silently blocked delegation
+            // by short name. When exactly one candidate is a dedicated
+            // provider route, it is unambiguously the better answer, so prefer
+            // it instead of failing.
+            let specific: Vec<&&ModelRoute> = matches
+                .iter()
+                .filter(|r| r.api_method != "openai-compatible")
+                .collect();
+            if specific.len() == 1 {
+                let route = specific[0];
+                return Ok(format!("{}:{}", route.api_method, bare_model));
+            }
+
             let candidates: Vec<String> = matches
                 .iter()
                 .map(|r| format!("{}:{}", r.api_method, r.model))
@@ -901,6 +918,32 @@ mod tests {
             detail: String::new(),
             cheapness: None,
         }
+    }
+
+    /// A generic OpenAI-compatible endpoint frequently mirrors models a
+    /// dedicated provider also serves, so the same bare name is reachable two
+    /// ways. That is not genuine ambiguity: the dedicated route is the better
+    /// answer, and failing here silently blocked delegation by short name.
+    #[test]
+    fn bare_model_prefers_dedicated_route_over_generic_compatible_mirror() {
+        let routes = vec![
+            make_route("deepseek-v4-pro", "openai-compatible:deepseek", true),
+            make_route("deepseek-v4-pro", "openai-compatible", true),
+        ];
+        let result = resolve_bare_model_to_route_pinned("deepseek-v4-pro", &routes).unwrap();
+        assert_eq!(result, "openai-compatible:deepseek:deepseek-v4-pro");
+    }
+
+    /// Two dedicated providers serving the same name is real ambiguity, so the
+    /// caller must still be asked to disambiguate rather than silently pick.
+    #[test]
+    fn bare_model_still_reports_ambiguity_between_two_dedicated_routes() {
+        let routes = vec![
+            make_route("glm-5", "openai-compatible:zai", true),
+            make_route("glm-5", "openai-compatible:moonshotai", true),
+        ];
+        let err = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap_err();
+        assert!(err.to_string().contains("Ambiguous model"), "{err}");
     }
 
     #[test]
