@@ -1230,3 +1230,75 @@ fn test_side_pane_scroll_by_clamps_to_rendered_extent() {
     assert!(app.side_pane_scroll_by(-3));
     assert_eq!(app.diff_pane_scroll, 7);
 }
+
+/// Regression guard for the cost bug where inline screenshots dominated real
+/// transcripts. The 413-recovery budget is far too loose to act as a cost
+/// control: a realistic session of moderate screenshots sits well under it and
+/// is therefore never pruned, so every image is re-sent on every later request.
+/// The proactive budget must actually bite on that same transcript.
+#[test]
+fn test_proactive_image_budget_prunes_what_payload_budget_ignores() {
+    use crate::message::ContentBlock;
+
+    let build = || {
+        let mut app = create_test_app();
+        app.session.replace_messages(Vec::new());
+        // 10 x 400 KiB screenshots = ~4 MiB total: under the 12 MiB 413 budget,
+        // but far above a sane per-turn working set.
+        let img = "a".repeat(400 * 1024);
+        for _ in 0..10 {
+            app.session.add_message(
+                Role::User,
+                vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: img.clone(),
+                }],
+            );
+        }
+        app
+    };
+
+    let count_images = |app: &crate::tui::app::App| {
+        app.session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count()
+    };
+
+    // The 413 budget does nothing here, which is exactly the bug.
+    let mut app = build();
+    assert_eq!(
+        app.session
+            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET),
+        0,
+        "413 budget should not fire below the provider cap"
+    );
+    assert_eq!(count_images(&app), 10);
+
+    // The proactive budget prunes oldest-first down to the working set.
+    let mut app = build();
+    let stripped = app
+        .session
+        .strip_oversized_images(crate::compaction::PROACTIVE_IMAGE_CHAR_BUDGET);
+    assert!(stripped > 0, "proactive budget must prune stale images");
+    let remaining = count_images(&app);
+    assert!(
+        remaining < 10 && remaining > 0,
+        "should keep a recent working set, kept {remaining}"
+    );
+
+    // Surviving images must be the most recent ones.
+    let first_kept = app
+        .session
+        .messages
+        .iter()
+        .position(|m| matches!(m.content[0], ContentBlock::Image { .. }))
+        .expect("at least one image kept");
+    assert_eq!(
+        first_kept,
+        10 - remaining,
+        "kept images must be the newest suffix"
+    );
+}
