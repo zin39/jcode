@@ -1089,7 +1089,8 @@ fn cheap_provider_health() -> &'static std::sync::Mutex<std::collections::HashMa
 /// key), so cheap routing skips all of its models instead of retrying siblings
 /// that share the same broken credential.
 pub fn mark_provider_unhealthy(provider: &str) {
-    let provider = provider.trim();
+    let provider = normalize_provider_key(provider);
+    let provider = provider.as_str();
     if provider.is_empty() {
         return;
     }
@@ -1106,12 +1107,22 @@ pub fn mark_provider_unhealthy(provider: &str) {
     ));
 }
 
+/// Provider names reach this module with inconsistent casing (display names like
+/// `OpenRouter` from route metadata vs ids like `openrouter` from config), so
+/// cooldowns must be keyed case-insensitively. Keying on the raw string made
+/// `mark_provider_unhealthy("OpenRouter")` invisible to a route tagged
+/// `openrouter`, silently disabling provider-level cooldown.
+fn normalize_provider_key(provider: &str) -> String {
+    provider.trim().to_ascii_lowercase()
+}
+
 fn provider_is_healthy(provider: &str) -> bool {
+    let provider = normalize_provider_key(provider);
     let health = cheap_provider_health()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     health
-        .get(provider)
+        .get(&provider)
         .copied()
         .map(|until| until <= cheap_route_now_unix())
         .unwrap_or(true)
@@ -1906,6 +1917,17 @@ mod tests {
             ranked_with_preferences(vec![a, b]).is_empty(),
             "a total credential blackout must yield no routes so the caller uses its own model"
         );
+    }
+
+    /// Provider names arrive with mixed casing (`OpenRouter` display name vs
+    /// `openrouter` id), so cooldowns must match case-insensitively. They did
+    /// not, which silently disabled provider-level cooldown entirely.
+    #[test]
+    fn provider_cooldown_matches_case_insensitively() {
+        mark_provider_unhealthy("TestMixedCaseProvider");
+        assert!(!provider_is_healthy("testmixedcaseprovider"));
+        assert!(!provider_is_healthy("TESTMIXEDCASEPROVIDER"));
+        assert!(!provider_is_healthy("  TestMixedCaseProvider  "));
     }
 
     /// A 401 from a permanently-dead credential must cool the route down. It
