@@ -18,6 +18,37 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
     clippy::too_many_arguments,
     reason = "headless session creation wires provider, global session, swarm state, interrupts, and MCP pool together"
 )]
+/// Choose the route-pinned model request for a spawned headless session.
+///
+/// Resolution must happen BEFORE `set_model`, not as a fallback after it
+/// fails. As a fallback it silently misrouted whenever a generic
+/// OpenAI-compatible endpoint happened to accept the bare name: `set_model`
+/// "succeeded" against that generic endpoint, so the dedicated provider route
+/// was never consulted. A bare "deepseek-v4-pro" went to a dashscope-backed
+/// generic endpoint instead of DeepSeek and then failed at request time with a
+/// confusing transport error rather than a routing one.
+///
+/// Already-prefixed requests are honoured as-is, and an unresolvable bare name
+/// is left bare so the coordinator's own provider can still try to serve it.
+fn resolve_spawn_model_request(
+    model_request: String,
+    routes: &[jcode_base::provider::ModelRoute],
+) -> String {
+    if model_request.contains(':') {
+        return model_request;
+    }
+    match crate::provider::resolve_bare_model_to_route_pinned(&model_request, routes) {
+        Ok(pinned) => {
+            crate::logging::info(&format!(
+                "Resolved bare spawn model '{}' to route-pinned '{}'",
+                model_request, pinned
+            ));
+            pinned
+        }
+        Err(_) => model_request,
+    }
+}
+
 pub(super) async fn create_headless_session(
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
@@ -101,38 +132,15 @@ pub(super) async fn create_headless_session(
             provider_key_override.as_deref(),
             route_api_method_override.as_deref(),
         );
+        let model_request =
+            resolve_spawn_model_request(model_request, &provider_template.model_routes());
         if let Err(e) = new_agent.set_model(&model_request) {
-            // If the model request is a bare name (no route prefix), the
-            // coordinator's provider can't serve it. Try to resolve it
-            // across available routes (e.g. "glm-5" → "openrouter:glm-5").
-            if !model_request.contains(':') {
-                let routes = provider_template.model_routes();
-                match crate::provider::resolve_bare_model_to_route_pinned(&model_request, &routes) {
-                    Ok(pinned) => {
-                        crate::logging::info(&format!(
-                            "Resolved bare spawn model '{}' to route-pinned '{}'",
-                            model_request, pinned
-                        ));
-                        if let Err(e2) = new_agent.set_model(&pinned) {
-                            return Err(anyhow::anyhow!(
-                                "Failed to set headless session model override '{}' (resolved to '{}'): {}",
-                                model, pinned, e2
-                            ));
-                        }
-                    }
-                    Err(resolve_err) => {
-                        return Err(anyhow::anyhow!(
-                            "Failed to set headless session model override '{}': {}. {}",
-                            model, e, resolve_err
-                        ));
-                    }
-                }
-            } else {
-                crate::logging::warn(&format!(
-                    "Failed to set headless session model override '{}' (request '{}'): {}",
-                    model, model_request, e
-                ));
-            }
+            // Resolution already happened above, so anything still failing
+            // here is a genuine inability to serve the request.
+            crate::logging::warn(&format!(
+                "Failed to set headless session model override '{}' (request '{}'): {}",
+                model, model_request, e
+            ));
         }
     }
 
@@ -295,4 +303,64 @@ pub(super) async fn create_headless_session(
         "is_canary": selfdev_requested,
     })
     .to_string())
+}
+
+#[cfg(test)]
+mod headless_model_route_tests {
+    use super::resolve_spawn_model_request;
+    use jcode_base::provider::ModelRoute;
+
+    fn route(model: &str, api_method: &str) -> ModelRoute {
+        ModelRoute {
+            model: model.to_string(),
+            provider: "Test".to_string(),
+            api_method: api_method.to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        }
+    }
+
+    /// A bare name must be pinned to the dedicated provider route.
+    ///
+    /// This is the regression that made delegation route to the wrong backend:
+    /// a generic dashscope-backed endpoint also advertises "deepseek-v4-pro",
+    /// and because resolution ran only after `set_model` failed, the generic
+    /// endpoint won and the spawn later died with a transport error.
+    #[test]
+    fn bare_spawn_model_is_pinned_to_the_dedicated_route() {
+        let routes = vec![
+            route("deepseek-v4-pro", "openai-compatible:deepseek"),
+            route("deepseek-v4-pro", "openai-compatible"),
+        ];
+        assert_eq!(
+            resolve_spawn_model_request("deepseek-v4-pro".to_string(), &routes),
+            "openai-compatible:deepseek:deepseek-v4-pro"
+        );
+    }
+
+    /// An explicit route prefix is the caller being deliberate, so it must be
+    /// passed through untouched rather than re-resolved.
+    #[test]
+    fn explicitly_routed_spawn_model_is_left_alone() {
+        let routes = vec![route("deepseek-v4-pro", "openai-compatible:deepseek")];
+        assert_eq!(
+            resolve_spawn_model_request(
+                "openai-compatible:deepseek:deepseek-v4-pro".to_string(),
+                &routes
+            ),
+            "openai-compatible:deepseek:deepseek-v4-pro"
+        );
+    }
+
+    /// An unknown bare name must stay bare so the coordinator's own provider
+    /// still gets a chance to serve it, instead of hard-failing the spawn.
+    #[test]
+    fn unresolvable_bare_spawn_model_is_left_bare() {
+        let routes = vec![route("deepseek-v4-pro", "openai-compatible:deepseek")];
+        assert_eq!(
+            resolve_spawn_model_request("some-unknown-model".to_string(), &routes),
+            "some-unknown-model"
+        );
+    }
 }
