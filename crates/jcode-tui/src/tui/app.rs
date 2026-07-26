@@ -291,6 +291,10 @@ struct PendingModelPickerLoad {
     signature: ModelPickerCacheSignature,
     picker_started: Instant,
     receiver: mpsc::Receiver<anyhow::Result<ModelPickerRoutesResult>>,
+    /// Store the delivered routes back into `remote_model_options` (used by
+    /// the route-extension build, which upgrades the server-provided catalog
+    /// in place; plain fallback loads must not overwrite the catalog).
+    store_remote_options: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
