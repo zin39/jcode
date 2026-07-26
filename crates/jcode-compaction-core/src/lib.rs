@@ -297,7 +297,14 @@ pub const PAYLOAD_IMAGE_CHAR_BUDGET: usize = 12 * 1024 * 1024;
 /// changed, and the surrounding tool text plus the on-disk screenshot path is
 /// usually enough to recover context. So we keep a small recent-image working
 /// set and let older ones degrade to text markers.
-pub const PROACTIVE_IMAGE_CHAR_BUDGET: usize = 1024 * 1024;
+///
+/// Sizing matters for quality, not just cost. Real screenshots here measure
+/// ~0.7-3.5 MiB of base64 each, so a budget of only ~1 MiB would strip even the
+/// screenshot the model just captured and break vision workflows outright. 4 MiB
+/// keeps roughly the two most recent full-size screenshots (more when they are
+/// smaller) while still cutting the long stale tail that drives the re-send
+/// cost.
+pub const PROACTIVE_IMAGE_CHAR_BUDGET: usize = 4 * 1024 * 1024;
 
 /// Approximate chars per token for estimation
 pub const CHARS_PER_TOKEN: usize = 4;
