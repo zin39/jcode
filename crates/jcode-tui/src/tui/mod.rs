@@ -1930,11 +1930,8 @@ mod redraw_governor_tests {
     /// to produce a byte-identical buffer.
     #[test]
     fn a_static_screen_is_throttled_even_though_its_frames_are_cheap() {
-        let governed = super::redraw_interval_floor(
-            Duration::from_millis(16),
-            5.6,
-            Some(1.0),
-        );
+        // The idle cadence is what a static screen actually asks for.
+        let governed = super::redraw_interval_floor(crate::tui::REDRAW_IDLE, 5.6, Some(1.0));
         assert!(
             governed >= Duration::from_millis(400),
             "a static screen should be throttled hard, but the governor \
