@@ -2983,3 +2983,47 @@ model_catalog = false
 
     jcode_base::config::invalidate_config_cache();
 }
+
+/// The generic OpenAI-compatible profile's own id is literally
+/// "openai-compatible", which is also the transport prefix. Prefixing it
+/// produced the stuttered route "openai-compatible:openai-compatible". Because
+/// that route is synthesised for every model, it collided with real
+/// provider-specific routes and made bare model names ambiguous, silently
+/// blocking delegation by short name.
+#[test]
+fn generic_openai_compatible_profile_does_not_stutter_its_route_prefix() {
+    let _lock = ENV_LOCK.lock();
+    let temp = TempDir::new().expect("create temp home");
+    let jcode_home = temp.path().join("jcode-home");
+    let _jcode_home = EnvVarGuard::set("JCODE_HOME", &jcode_home);
+    let _home = EnvVarGuard::set("HOME", temp.path());
+    let _appdata = EnvVarGuard::set("APPDATA", temp.path().join("AppData").join("Roaming"));
+    let _env = isolate_openrouter_autodetect_env();
+
+    let _base = EnvVarGuard::set(
+        "JCODE_OPENROUTER_API_BASE",
+        "https://compat.example.invalid/v1",
+    );
+    // The generic profile resolves to id "openai-compatible", which is also the
+    // transport prefix. This is the exact state a user reaches via the
+    // openai-compatible.env login profile.
+    let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "openai-compatible");
+    let _key_name = EnvVarGuard::set("JCODE_OPENROUTER_API_KEY_NAME", "OPENAI_COMPAT_API_KEY");
+    let _provider_features = EnvVarGuard::set("JCODE_OPENROUTER_PROVIDER_FEATURES", "0");
+    let _transport = EnvVarGuard::set("JCODE_OPENROUTER_TRANSPORT_STATE", "direct-compatible");
+    let _key = EnvVarGuard::set("OPENAI_COMPAT_API_KEY", "compat-test-key");
+
+    let provider = OpenRouterProvider::new().expect("build generic compatible runtime");
+    let (_, api_method, _) = provider
+        .direct_openai_compatible_route_parts()
+        .expect("generic compatible runtime exposes a direct route");
+
+    assert!(
+        !api_method.contains("openai-compatible:openai-compatible"),
+        "route prefix must not stutter, got {api_method}"
+    );
+    assert_eq!(
+        api_method, "openai-compatible",
+        "the generic profile is the unprefixed transport itself"
+    );
+}

@@ -1303,9 +1303,16 @@ impl OpenRouterProvider {
                     .unwrap_or_else(|| profile_id.to_string())
             })
             .unwrap_or_else(|| "OpenAI-compatible".to_string());
+        // The generic profile's own id is literally "openai-compatible", which
+        // is also the transport prefix. Naively prefixing produced the stuttered
+        // route "openai-compatible:openai-compatible", and because that route is
+        // synthesised for every model it collided with real provider-specific
+        // routes and made bare model names ambiguous, silently blocking
+        // delegation by short name (e.g. "deepseek-v4-pro").
         let api_method = self
             .profile_id
             .as_deref()
+            .filter(|profile_id| *profile_id != "openai-compatible")
             .map(|profile_id| format!("openai-compatible:{}", profile_id))
             .unwrap_or_else(|| "openai-compatible".to_string());
 
