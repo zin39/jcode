@@ -502,6 +502,154 @@ fn model_picker_route_is_default(
     default_model == model_name
 }
 
+
+/// Free-function core of [`App::append_jcode_subscription_routes`]: kept
+/// `self`-free so the off-thread model-picker route build can run it without
+/// borrowing the `App` (the synchronous build froze `/model` for seconds).
+fn append_jcode_subscription_routes_impl(
+    routes: &mut Vec<crate::provider::ModelRoute>,
+    require_credentials: bool,
+    require_remote_advertisement: bool,
+    remote_available_entries: &[String],
+) {
+    if require_credentials && !crate::subscription_catalog::has_credentials() {
+        return;
+    }
+
+    let tier = crate::subscription_catalog::effective_tier();
+    let existing = routes
+        .iter()
+        .filter(|route| {
+            route
+                .api_method
+                .eq_ignore_ascii_case(crate::subscription_catalog::JCODE_ROUTE_API_METHOD)
+        })
+        .filter_map(|route| crate::subscription_catalog::canonical_model_id(&route.model))
+        .collect::<HashSet<_>>();
+    for model in crate::subscription_catalog::curated_models()
+        .iter()
+        .filter(|model| {
+            tier.allows(model.min_tier)
+                && !existing.contains(model.id)
+                && (!require_remote_advertisement
+                    || remote_available_entries.iter().any(|available| {
+                        crate::subscription_catalog::canonical_model_id(available)
+                            == Some(model.id)
+                    }))
+        })
+    {
+        routes.push(crate::provider::ModelRoute {
+            model: model.id.to_string(),
+            provider: crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME.to_string(),
+            api_method: crate::subscription_catalog::JCODE_ROUTE_API_METHOD.to_string(),
+            available: true,
+            detail: crate::subscription_catalog::routing_policy_detail(model),
+            cheapness: None,
+        });
+    }
+}
+
+/// Free-function core of [`App::extend_remote_routes_for_uncovered_models`]:
+/// walks auth state and per-model disk caches (O(models x catalog)), so it
+/// must be runnable on a worker thread. See
+/// [`App::start_remote_model_picker_route_extension`].
+fn extend_remote_routes_for_uncovered_models_impl(
+    routes: &mut Vec<crate::provider::ModelRoute>,
+    remote_provider_name: Option<&str>,
+    remote_available_entries: &[String],
+) {
+        // Jcode subscription routes are a complete, server-managed catalog.
+        // Do not mix in locally configured Anthropic/OpenAI credentials merely
+        // because a curated model also belongs to one of those upstreams.
+        let provider_is_jcode_subscription =
+            remote_provider_name.is_some_and(|name| {
+                name.eq_ignore_ascii_case(crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME)
+            });
+        if provider_is_jcode_subscription {
+            routes.clear();
+            append_jcode_subscription_routes_impl(routes, false, false, remote_available_entries);
+            return;
+        }
+        let poisoned_by_jcode_subscription = !routes.is_empty()
+            && routes.iter().all(|route| {
+                route
+                    .api_method
+                    .eq_ignore_ascii_case(crate::subscription_catalog::JCODE_ROUTE_API_METHOD)
+            });
+        if poisoned_by_jcode_subscription {
+            // Version 1 could turn a mixed provider catalog into all-Jcode rows
+            // after seeing just one managed subscription route. Rebuild ordinary
+            // routes from the names catalog, then append only the current tier's
+            // actual subscription entitlements.
+            *routes = crate::provider::remote_model_routes_fallback(
+                remote_provider_name,
+                remote_available_entries,
+            );
+            append_jcode_subscription_routes_impl(routes, false, true, remote_available_entries);
+            return;
+        }
+        let mut methods_by_model: std::collections::HashMap<&str, HashSet<&str>> =
+            std::collections::HashMap::new();
+        for route in routes.iter() {
+            methods_by_model
+                .entry(route.model.as_str())
+                .or_default()
+                .insert(route.api_method.as_str());
+        }
+        let auth = crate::auth::AuthStatus::check_fast();
+        let bedrock_available = auth.bedrock != crate::auth::AuthState::NotConfigured
+            || crate::provider::bedrock::BedrockProvider::has_credentials();
+        let missing: Vec<String> = remote_available_entries
+            .iter()
+            .filter(|model| match methods_by_model.get(model.as_str()) {
+                None => true,
+                Some(methods) => {
+                    let missing_anthropic_method = crate::provider::provider_for_model(model)
+                        == Some("claude")
+                        && !model.contains('/')
+                        && ((auth.anthropic.has_api_key && !methods.contains("claude-api"))
+                            || (auth.anthropic.has_oauth && !methods.contains("claude-oauth")));
+                    let missing_bedrock_method = bedrock_available
+                        && crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model)
+                        && !methods.contains("bedrock");
+                    missing_anthropic_method || missing_bedrock_method
+                }
+            })
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let existing: HashSet<(String, String, String)> = routes
+                .iter()
+                .map(|route| {
+                    (
+                        route.model.clone(),
+                        route.provider.clone(),
+                        route.api_method.clone(),
+                    )
+                })
+                .collect();
+            for route in crate::provider::remote_model_routes_fallback(
+                remote_provider_name,
+                &missing,
+            ) {
+                if !existing.contains(&(
+                    route.model.clone(),
+                    route.provider.clone(),
+                    route.api_method.clone(),
+                )) {
+                    routes.push(route);
+                }
+            }
+        }
+        // Detailed provider hydration describes ordinary configured routes. A
+        // signed-in Jcode subscriber still needs the managed route for each
+        // entitled curated model alongside those Anthropic/OpenAI/etc. rows.
+        // The curated client catalog is versioned with the backend and is the
+        // authority for managed subscription entitlements. Do not hide newly
+        // launched subscription models behind a stale remote names snapshot.
+        append_jcode_subscription_routes_impl(routes, true, false, remote_available_entries);
+    }
+
 impl App {
     pub(super) fn remote_model_catalog_snapshot(
         &self,
@@ -564,41 +712,12 @@ impl App {
         require_credentials: bool,
         require_remote_advertisement: bool,
     ) {
-        if require_credentials && !crate::subscription_catalog::has_credentials() {
-            return;
-        }
-
-        let tier = crate::subscription_catalog::effective_tier();
-        let existing = routes
-            .iter()
-            .filter(|route| {
-                route
-                    .api_method
-                    .eq_ignore_ascii_case(crate::subscription_catalog::JCODE_ROUTE_API_METHOD)
-            })
-            .filter_map(|route| crate::subscription_catalog::canonical_model_id(&route.model))
-            .collect::<HashSet<_>>();
-        for model in crate::subscription_catalog::curated_models()
-            .iter()
-            .filter(|model| {
-                tier.allows(model.min_tier)
-                    && !existing.contains(model.id)
-                    && (!require_remote_advertisement
-                        || self.remote_available_entries.iter().any(|available| {
-                            crate::subscription_catalog::canonical_model_id(available)
-                                == Some(model.id)
-                        }))
-            })
-        {
-            routes.push(crate::provider::ModelRoute {
-                model: model.id.to_string(),
-                provider: crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME.to_string(),
-                api_method: crate::subscription_catalog::JCODE_ROUTE_API_METHOD.to_string(),
-                available: true,
-                detail: crate::subscription_catalog::routing_policy_detail(model),
-                cheapness: None,
-            });
-        }
+        append_jcode_subscription_routes_impl(
+            routes,
+            require_credentials,
+            require_remote_advertisement,
+            &self.remote_available_entries,
+        );
     }
 
     fn extend_remote_routes_for_uncovered_models(
@@ -608,97 +727,11 @@ impl App {
         if !self.is_remote || self.remote_available_entries.is_empty() {
             return;
         }
-        // Jcode subscription routes are a complete, server-managed catalog.
-        // Do not mix in locally configured Anthropic/OpenAI credentials merely
-        // because a curated model also belongs to one of those upstreams.
-        let provider_is_jcode_subscription =
-            self.remote_provider_name.as_deref().is_some_and(|name| {
-                name.eq_ignore_ascii_case(crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME)
-            });
-        if provider_is_jcode_subscription {
-            routes.clear();
-            self.append_jcode_subscription_routes(routes, false, false);
-            return;
-        }
-        let poisoned_by_jcode_subscription = !routes.is_empty()
-            && routes.iter().all(|route| {
-                route
-                    .api_method
-                    .eq_ignore_ascii_case(crate::subscription_catalog::JCODE_ROUTE_API_METHOD)
-            });
-        if poisoned_by_jcode_subscription {
-            // Version 1 could turn a mixed provider catalog into all-Jcode rows
-            // after seeing just one managed subscription route. Rebuild ordinary
-            // routes from the names catalog, then append only the current tier's
-            // actual subscription entitlements.
-            *routes = crate::provider::remote_model_routes_fallback(
-                self.remote_provider_name.as_deref(),
-                &self.remote_available_entries,
-            );
-            self.append_jcode_subscription_routes(routes, false, true);
-            return;
-        }
-        let mut methods_by_model: std::collections::HashMap<&str, HashSet<&str>> =
-            std::collections::HashMap::new();
-        for route in routes.iter() {
-            methods_by_model
-                .entry(route.model.as_str())
-                .or_default()
-                .insert(route.api_method.as_str());
-        }
-        let auth = crate::auth::AuthStatus::check_fast();
-        let bedrock_available = auth.bedrock != crate::auth::AuthState::NotConfigured
-            || crate::provider::bedrock::BedrockProvider::has_credentials();
-        let missing: Vec<String> = self
-            .remote_available_entries
-            .iter()
-            .filter(|model| match methods_by_model.get(model.as_str()) {
-                None => true,
-                Some(methods) => {
-                    let missing_anthropic_method = crate::provider::provider_for_model(model)
-                        == Some("claude")
-                        && !model.contains('/')
-                        && ((auth.anthropic.has_api_key && !methods.contains("claude-api"))
-                            || (auth.anthropic.has_oauth && !methods.contains("claude-oauth")));
-                    let missing_bedrock_method = bedrock_available
-                        && crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model)
-                        && !methods.contains("bedrock");
-                    missing_anthropic_method || missing_bedrock_method
-                }
-            })
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            let existing: HashSet<(String, String, String)> = routes
-                .iter()
-                .map(|route| {
-                    (
-                        route.model.clone(),
-                        route.provider.clone(),
-                        route.api_method.clone(),
-                    )
-                })
-                .collect();
-            for route in crate::provider::remote_model_routes_fallback(
-                self.remote_provider_name.as_deref(),
-                &missing,
-            ) {
-                if !existing.contains(&(
-                    route.model.clone(),
-                    route.provider.clone(),
-                    route.api_method.clone(),
-                )) {
-                    routes.push(route);
-                }
-            }
-        }
-        // Detailed provider hydration describes ordinary configured routes. A
-        // signed-in Jcode subscriber still needs the managed route for each
-        // entitled curated model alongside those Anthropic/OpenAI/etc. rows.
-        // The curated client catalog is versioned with the backend and is the
-        // authority for managed subscription entitlements. Do not hide newly
-        // launched subscription models behind a stale remote names snapshot.
-        self.append_jcode_subscription_routes(routes, true, false);
+        extend_remote_routes_for_uncovered_models_impl(
+            routes,
+            self.remote_provider_name.as_deref(),
+            &self.remote_available_entries,
+        );
     }
 
     fn hydrate_remote_model_catalog_snapshot(
@@ -1036,17 +1069,25 @@ impl App {
         let routes_started = std::time::Instant::now();
         let routes: Vec<crate::provider::ModelRoute> = if self.is_remote {
             if !self.remote_model_options.is_empty() {
-                let mut routes = std::mem::take(&mut self.remote_model_options);
-                self.extend_remote_routes_for_uncovered_models(&mut routes);
+                // Open instantly with the server-provided routes; extending
+                // them for uncovered models (auth probing + per-model disk
+                // caches, O(models × catalog)) took multiple seconds and
+                // previously ran synchronously here, freezing the UI while
+                // `/model` was being typed. Upgrade off-thread instead.
+                let routes = self.remote_model_options.clone();
                 let routes_ms = routes_started.elapsed().as_millis();
-                self.remote_model_options = self.open_model_picker_with_routes(
-                    cache_signature,
+                let _ = self.open_model_picker_with_routes(
+                    cache_signature.clone(),
                     picker_started,
                     routes,
                     routes_ms,
                     preserve_input,
-                    true,
+                    false,
                 );
+                if self.inline_interactive_state.is_some() {
+                    self.set_status_notice("Updating model routes…");
+                }
+                self.start_remote_model_picker_route_extension(cache_signature, picker_started);
                 return;
             }
             // Names-only remote catalog: synthesize properly classified
@@ -1157,6 +1198,7 @@ impl App {
             signature,
             picker_started,
             receiver: rx,
+            store_remote_options: false,
         });
     }
 
@@ -1198,6 +1240,58 @@ impl App {
             signature,
             picker_started,
             receiver: rx,
+            store_remote_options: false,
+        });
+    }
+
+    /// Off-thread variant of [`Self::extend_remote_routes_for_uncovered_models`].
+    ///
+    /// Extending server-provided routes probes auth state and per-model disk
+    /// caches (O(models × catalog)); on large catalogs that took ~5s and used
+    /// to run synchronously inside `open_model_picker`, freezing the UI right
+    /// after `/model` was typed. The picker now opens instantly with the
+    /// unextended routes and upgrades in place when this build completes
+    /// (delivered through the same [`Self::poll_model_picker_load`] channel).
+    fn start_remote_model_picker_route_extension(
+        &mut self,
+        signature: ModelPickerCacheSignature,
+        picker_started: std::time::Instant,
+    ) {
+        self.model_picker_load_request_id = self.model_picker_load_request_id.wrapping_add(1);
+        let request_id = self.model_picker_load_request_id;
+        let remote_provider_name = self.remote_provider_name.clone();
+        let remote_available_entries = self.remote_available_entries.clone();
+        let base_routes = self.remote_model_options.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let build = move || {
+            let routes_started = std::time::Instant::now();
+            let mut routes = base_routes;
+            if !remote_available_entries.is_empty() {
+                extend_remote_routes_for_uncovered_models_impl(
+                    &mut routes,
+                    remote_provider_name.as_deref(),
+                    &remote_available_entries,
+                );
+            }
+            let routes_ms = routes_started.elapsed().as_millis();
+            let _ = tx.send(Ok(ModelPickerRoutesResult { routes, routes_ms }));
+        };
+
+        // Route loads resolve per-model disk caches through `jcode_dir()`, so the
+        // worker must inherit the spawning thread's test home (no-op in release).
+        let build = crate::storage::inherit_test_home(build);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(build);
+        } else {
+            std::thread::spawn(build);
+        }
+
+        self.pending_model_picker_load = Some(PendingModelPickerLoad {
+            request_id,
+            signature,
+            picker_started,
+            receiver: rx,
+            store_remote_options: true,
         });
     }
 
@@ -1259,7 +1353,7 @@ impl App {
 
         match received {
             Ok(result) => {
-                self.open_model_picker_with_routes(
+                let routes = self.open_model_picker_with_routes(
                     pending.signature,
                     pending.picker_started,
                     result.routes,
@@ -1267,6 +1361,12 @@ impl App {
                     true,
                     true,
                 );
+                if pending.store_remote_options && !routes.is_empty() {
+                    // The extension build upgraded the server catalog (e.g.
+                    // added API-key/Bedrock routes); keep it so the next
+                    // /model open starts from the extended set.
+                    self.remote_model_options = routes;
+                }
                 if self.inline_interactive_state.is_some() {
                     self.set_status_notice("Model list updated");
                 }
@@ -3103,6 +3203,14 @@ impl App {
                     let route = entry.options.get(entry.selected_option);
 
                     let bare_name = model_entry_base_name(entry);
+
+                    // Check for placeholder values before attempting save
+                    if bare_name.trim().is_empty() || bare_name == "unknown" {
+                        self.set_status_notice(
+                            "Cannot set model as default: model information is still loading".to_string()
+                        );
+                        return Ok(());
+                    }
 
                     let (model_spec, provider_key) = if let Some(r) = route {
                         let selection =

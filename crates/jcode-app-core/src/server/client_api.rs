@@ -171,7 +171,11 @@ impl Client {
         let request = Request::GetHistory { id };
         let json = serde_json::to_string(&request)? + "\n";
         self.writer.write_all(json.as_bytes()).await?;
-        for _ in 0..10 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!("Timeout waiting for history event");
+            }
             let mut line = String::new();
             let n = self.reader.read_line(&mut line).await?;
             if n == 0 {
@@ -180,15 +184,12 @@ impl Client {
             let event: ServerEvent = serde_json::from_str(&line)?;
             match event {
                 ServerEvent::Ack { .. } => continue,
-                _ => return Ok(event),
+                ServerEvent::History { .. } => return Ok(event),
+                // Skip unsolicited broadcast events (SwarmStatus, SwarmPlan, etc)
+                // and keep polling for the actual History response
+                _ => continue,
             }
         }
-
-        Ok(ServerEvent::Error {
-            id,
-            message: "History response not received".to_string(),
-            retry_after_secs: None,
-        })
     }
 
     pub async fn resume_session(&mut self, session_id: &str) -> Result<u64> {
