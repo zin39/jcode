@@ -5,6 +5,15 @@ use crate::message::{Message, ToolDefinition};
 /// Injected into a coordinator's system prompt when `agents.auto_delegate` is on.
 /// Pushes execution onto cheap subagents so the expensive coordinator model is
 /// spent on planning + review rather than grunt work.
+///
+/// The safe/unsafe split is not arbitrary. Cheap models track frontier models
+/// closely on retrieval and single-file edits, but fall off a cliff on
+/// multi-file refactors and long-horizon debugging (the SWE-bench
+/// Verified -> Pro gap), and they are materially worse at tool-call
+/// round-tripping. Several cheap families also default to premature "task
+/// complete" claims, so delegated work needs an explicit verification step
+/// rather than a trusted self-report. See
+/// `cheap-models-coding-agents-research.md`.
 const AUTO_DELEGATION_DIRECTIVE: &str = "\
 # Delegation policy (cost control)
 
@@ -21,7 +30,22 @@ execution to them and reserve yourself for planning and review:
   concurrently, which is faster.
 - Keep yourself for: understanding the request, decomposing it into delegable \
   subtasks, choosing what to delegate, and reviewing/integrating subagent \
-  results before the next step.";
+  results before the next step.
+
+Delegation is for gathering and grunt work, not for judgment. Keep these on \
+yourself, because cheap models measurably collapse on them:
+
+- Multi-file refactors (roughly 4+ files), architecture and design decisions, \
+  root-cause debugging, and security-sensitive changes. Delegate the reading \
+  and reproduction around them, then make the call and write the fix yourself.
+
+Never trust a subagent's word that it finished. Cheap models frequently report \
+success on unfinished work, so:
+
+- Ask subagents to return evidence (diffs, command output, test results), not a \
+  claim of completion.
+- Confirm anything load-bearing yourself — check the diff, or have a subagent \
+  run the tests and show you the output — before you build on it or report done.";
 
 /// Injected into a coordinator's system prompt when gold mode is on for the
 /// session (`session.gold_mode_enabled` AND `agents.cheap_route_gold_mode`).
