@@ -167,43 +167,6 @@ pub(crate) fn record_draw_call_attribution(sample: DrawCallAttribution) {
     }
 }
 
-/// Test-only handle on the draw history so the redraw governor can be driven
-/// end-to-end rather than by replicating its arithmetic in the test.
-#[cfg(test)]
-pub(crate) fn clear_draw_call_history_for_tests() {
-    draw_call_history()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
-}
-
-#[cfg(test)]
-pub(crate) fn record_draw_call_attribution_for_tests(
-    timestamp_ms: u64,
-    render_ms: f64,
-    changed_cells: Option<usize>,
-) {
-    record_draw_call_attribution(DrawCallAttribution {
-        timestamp_ms,
-        total_ms: render_ms + 1.0,
-        render_ms,
-        backend_flush_ms: 1.0,
-        changed_cells,
-        total_cells: Some(1000),
-        force_full_redraw: false,
-        input: FrameInputAttribution::default(),
-    });
-}
-
-/// The draw history is process-global, so governor tests must not interleave.
-#[cfg(test)]
-pub(crate) fn draw_call_governor_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 const DRAW_CALL_HISTORY_MAX_SAMPLES: usize = 240;
 
 static DRAW_CALL_HISTORY: OnceLock<Mutex<VecDeque<DrawCallAttribution>>> = OnceLock::new();

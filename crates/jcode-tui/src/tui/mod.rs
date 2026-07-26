@@ -1924,41 +1924,64 @@ mod redraw_governor_tests {
         assert_eq!(govern_redraw_interval_by_draw_cost(requested), requested);
     }
 
-    /// End-to-end through the real global history, unlike the sibling tests
-    /// which only replicate the floor arithmetic. This is what pins that the
-    /// futility signal is actually consulted: cheap frames leave the cost floor
-    /// at ~14ms, so without the futility branch a provably static screen keeps
-    /// being redrawn (measured live at 36 of 60 idle draws changing 0 cells).
+    /// Cheap frames leave the cost floor at only ~14ms, so without a futility
+    /// signal a provably static screen keeps being redrawn: measured live at 36
+    /// of 60 idle draws changing ZERO cells, each costing a full ~5.6ms render
+    /// to produce a byte-identical buffer.
     #[test]
-    fn governor_backs_off_when_recent_draws_changed_nothing() {
-        let _guard = crate::tui::ui::draw_call_governor_test_lock();
-        crate::tui::ui::clear_draw_call_history_for_tests();
-
-        for i in 0..12 {
-            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(0));
-        }
-
-        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+    fn a_static_screen_is_throttled_even_though_its_frames_are_cheap() {
+        let governed = super::redraw_interval_floor(
+            Duration::from_millis(16),
+            5.6,
+            Some(1.0),
+        );
         assert!(
             governed >= Duration::from_millis(400),
             "a static screen should be throttled hard, but the governor \
              returned {governed:?}; cheap frames make the cost floor only \
              ~14ms, so futility must be what triggers the back-off"
         );
+    }
 
-        // A spinner changes a few cells every frame: real work, must not throttle.
-        crate::tui::ui::clear_draw_call_history_for_tests();
-        for i in 0..12 {
-            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(4));
-        }
-        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+    /// The counterpart, and the reason a clear majority is required: animating
+    /// UI changes only a few cells per frame and must never be mistaken for
+    /// futile work, or spinners and countdowns would visibly stutter.
+    #[test]
+    fn animating_ui_is_not_throttled_as_if_it_were_futile() {
+        let governed = super::redraw_interval_floor(
+            Duration::from_millis(16),
+            5.6,
+            Some(0.0),
+        );
+        assert_eq!(
+            governed,
+            Duration::from_millis(16),
+            "a spinner changing a few cells per frame is real visible work; \
+             throttling it would make the animation stutter"
+        );
+    }
+
+    /// The futility ratio is backward-looking, so an animation that has just
+    /// started still has a history full of static frames. Callers that asked for
+    /// an animation cadence must therefore be exempt, or a spinner would be
+    /// throttled for its first frames - stuttering exactly as it appears, which
+    /// is the moment the user is most likely to be looking at it.
+    #[test]
+    fn a_freshly_started_animation_is_not_throttled_by_a_stale_futile_history() {
+        let spinner = crate::tui::REDRAW_SWARM_SPINNER;
         assert!(
-            governed < Duration::from_millis(400),
-            "animating UI was throttled as if futile ({governed:?}), which \
-             would make spinners and countdowns visibly stutter"
+            spinner < crate::tui::REDRAW_IDLE,
+            "this test assumes the spinner cadence is faster than idle"
         );
 
-        crate::tui::ui::clear_draw_call_history_for_tests();
+        // History is entirely static: the spinner's own frames are not in it yet.
+        let governed = super::redraw_interval_floor(spinner, 5.6, Some(1.0));
+        assert_eq!(
+            governed,
+            spinner,
+            "a just-started spinner was throttled on the strength of the static \
+             frames that preceded it, so its first frames would stutter"
+        );
     }
 
     #[test]
