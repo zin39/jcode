@@ -1184,9 +1184,27 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
     // coordinator (e.g. Claude). Retrying a cooled CHEAP route is always safer.
     // `ranked` already had banned routes dropped, so nothing returned here is a
     // banned model.
+    //
+    // A provider cooled for a DEAD CREDENTIAL is different: retrying it cannot
+    // succeed, because the key is rejected identically every time. So it is
+    // dropped unconditionally, before the "everything is cooled" fallback. Without
+    // this, an unusable key on the cheapest provider (e.g. free OpenRouter models
+    // on a deleted account) was re-admitted by the fallback and re-picked on every
+    // retry, so cheap routing exhausted its attempt budget without ever reaching a
+    // provider that actually works.
+    let ranked: Vec<CheapRouteCandidate> = {
+        let usable: Vec<CheapRouteCandidate> = ranked
+            .iter()
+            .filter(|c| provider_is_healthy(&c.route.provider))
+            .cloned()
+            .collect();
+        // Keep the original list if EVERY provider is credential-cooled, so a
+        // total blackout still degrades to a retry rather than to "no routes".
+        if usable.is_empty() { ranked } else { usable }
+    };
     let healthy: Vec<CheapRouteCandidate> = ranked
         .iter()
-        .filter(|c| route_is_healthy(&c.route.model) && provider_is_healthy(&c.route.provider))
+        .filter(|c| route_is_healthy(&c.route.model))
         .cloned()
         .collect();
     if healthy.is_empty() { ranked } else { healthy }
@@ -1844,6 +1862,30 @@ mod tests {
             models,
             vec!["alive-model".to_string()],
             "all routes on a cooled provider must be skipped, not just the one that failed"
+        );
+    }
+
+    /// The "everything is cooled, retry anyway" fallback must not resurrect a
+    /// provider cooled for a DEAD CREDENTIAL. It did, so the dead provider was
+    /// re-picked on every retry and cheap routing never reached a working one.
+    #[test]
+    fn credential_cooled_provider_is_not_resurrected_by_the_all_cooled_fallback() {
+        let dead_provider = "test-fallback-dead-provider";
+        mark_provider_unhealthy(dead_provider);
+
+        let mut dead = priced_route("fallback-dead-model", 1);
+        dead.provider = dead_provider.to_string();
+        let alive = priced_route("fallback-alive-model", 9_000);
+        // Cool the healthy provider's MODEL too, which triggers the
+        // "no healthy routes" fallback path.
+        mark_route_unhealthy("fallback-alive-model");
+
+        let ranked = ranked_with_preferences(vec![dead, alive]);
+        let models: Vec<_> = ranked.iter().map(|c| c.route.model.clone()).collect();
+        assert_eq!(
+            models,
+            vec!["fallback-alive-model".to_string()],
+            "the fallback may retry a rate-cooled model, but must never retry a dead credential"
         );
     }
 
