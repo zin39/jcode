@@ -92,7 +92,7 @@ fn auth_issue_profile_metadata_matches_direct_provider_endpoints() {
     assert_eq!(DEEPSEEK_PROFILE.default_model, Some("deepseek-v4-flash"));
     assert_eq!(DEEPSEEK_PROFILE.setup_url, "https://api-docs.deepseek.com/");
     assert_eq!(MINIMAX_PROFILE.api_base, "https://api.minimax.io/v1");
-    assert_eq!(MINIMAX_PROFILE.api_key_env, "OPENAI_API_KEY");
+    assert_eq!(MINIMAX_PROFILE.api_key_env, "MINIMAX_API_KEY");
     assert_eq!(
         ALIBABA_CODING_PLAN_PROFILE.api_base,
         "https://coding-intl.dashscope.aliyuncs.com/v1"
@@ -196,8 +196,8 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
 #[test]
 fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_international_default() {
     let _lock = crate::storage::lock_test_env();
-    let _guard = EnvGuard::save(&["OPENAI_API_KEY", "JCODE_HOME"]);
-    crate::env::remove_var("OPENAI_API_KEY");
+    let _guard = EnvGuard::save(&["MINIMAX_API_KEY", "JCODE_HOME"]);
+    crate::env::remove_var("MINIMAX_API_KEY");
     // Isolate from the developer's real config dir: a genuine minimax.env
     // holding an sk-cp- (China plan) key would flip the "international
     // default" half of this test through the config-file fallback.
@@ -1154,8 +1154,9 @@ fn minimax_default_provider_applies_openai_api_key_env_not_openrouter() {
         std::env::var("JCODE_OPENROUTER_API_KEY_NAME")
             .ok()
             .as_deref(),
-        Some("OPENAI_API_KEY"),
-        "MiniMax profile must use OPENAI_API_KEY, not OPENROUTER_API_KEY"
+        Some("MINIMAX_API_KEY"),
+        "MiniMax must use its own MINIMAX_API_KEY: not OPENROUTER_API_KEY, and \
+         not OPENAI_API_KEY (which would shadow the real OpenAI platform key)"
     );
     assert_eq!(
         std::env::var("JCODE_OPENROUTER_ENV_FILE").ok().as_deref(),
