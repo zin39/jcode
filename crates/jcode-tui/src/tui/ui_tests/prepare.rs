@@ -1310,3 +1310,30 @@ fn running_tool_status_colors_do_not_change_over_time() {
         "status-line colours must not depend on elapsed time"
     );
 }
+
+/// A per-frame memo keyed on the frame epoch is only correct if the epoch
+/// advances when, and only when, a frame is actually rendered. If drawing did
+/// not advance it, such a memo would freeze at its first value for the whole
+/// session and the status widgets would stop updating.
+///
+/// The epoch is process-global and other tests render concurrently, so this
+/// asserts the direction of travel rather than an exact delta: an exact `+1`
+/// is a race, not a contract.
+#[test]
+fn rendering_a_frame_advances_the_frame_epoch() {
+    let before = crate::tui::ui::current_frame_epoch();
+
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+    let state = super::TestState::default();
+    terminal
+        .draw(|frame| crate::tui::ui::draw(frame, &state))
+        .expect("draw");
+
+    assert!(
+        crate::tui::ui::current_frame_epoch() > before,
+        "rendering a frame must advance the frame epoch, otherwise anything \
+         memoised per frame would never notice a new frame and would serve \
+         its first value forever"
+    );
+}
