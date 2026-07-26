@@ -145,6 +145,25 @@ mod catalog;
 pub use catalog::*;
 use catalog::{LOGIN_PROVIDERS, OPENAI_COMPAT_PROFILES};
 
+/// The transport prefix used for every OpenAI-compatible route.
+pub const OPENAI_COMPAT_TRANSPORT: &str = "openai-compatible";
+
+/// Build the canonical route `api_method` for an OpenAI-compatible profile.
+///
+/// The generic profile's id is literally `openai-compatible`, identical to the
+/// transport prefix, so naively formatting `openai-compatible:{id}` yields the
+/// stuttered `openai-compatible:openai-compatible`. That is not a real route:
+/// it collides with dedicated provider routes and makes bare model names look
+/// ambiguous, which silently blocks delegation by short name. The generic
+/// profile *is* the unprefixed transport, so it is returned bare.
+pub fn openai_compatible_api_method(profile_id: &str) -> String {
+    if profile_id == OPENAI_COMPAT_TRANSPORT {
+        OPENAI_COMPAT_TRANSPORT.to_string()
+    } else {
+        format!("{OPENAI_COMPAT_TRANSPORT}:{profile_id}")
+    }
+}
+
 pub fn openai_compatible_profiles() -> &'static [OpenAiCompatibleProfile] {
     &OPENAI_COMPAT_PROFILES
 }

@@ -489,6 +489,16 @@ impl MultiProvider {
 /// like "glm-5" into "openrouter:glm-5" when the coordinator's provider
 /// can't serve the model and `model_switch_request_for_session_route` returns
 /// a bare name.
+/// Is this `api_method` the generic OpenAI-compatible transport rather than a
+/// dedicated provider route?
+///
+/// Older catalog caches recorded the generic profile as the stuttered
+/// `openai-compatible:openai-compatible`, so both spellings must be recognised
+/// or previously cached entries keep looking like dedicated routes.
+fn is_generic_openai_compatible_method(api_method: &str) -> bool {
+    api_method == "openai-compatible" || api_method == "openai-compatible:openai-compatible"
+}
+
 pub fn resolve_bare_model_to_route_pinned(
     bare_model: &str,
     model_routes: &[ModelRoute],
@@ -530,7 +540,7 @@ pub fn resolve_bare_model_to_route_pinned(
             // it instead of failing.
             let specific: Vec<&&ModelRoute> = matches
                 .iter()
-                .filter(|r| r.api_method != "openai-compatible")
+                .filter(|r| !is_generic_openai_compatible_method(&r.api_method))
                 .collect();
             if specific.len() == 1 {
                 let route = specific[0];
@@ -940,6 +950,24 @@ mod tests {
         ];
         let err = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap_err();
         assert!(err.to_string().contains("Ambiguous model"), "{err}");
+    }
+
+    /// Catalog caches written before the stutter fix recorded the generic
+    /// profile as "openai-compatible:openai-compatible". Those entries must
+    /// still be recognised as generic, or a stale cache silently reintroduces
+    /// the ambiguity and blocks bare-name delegation again.
+    #[test]
+    fn bare_model_treats_a_stale_stuttered_generic_route_as_generic() {
+        let routes = vec![
+            make_route("deepseek-v4-pro", "openai-compatible:deepseek", true),
+            make_route(
+                "deepseek-v4-pro",
+                "openai-compatible:openai-compatible",
+                true,
+            ),
+        ];
+        let result = resolve_bare_model_to_route_pinned("deepseek-v4-pro", &routes).unwrap();
+        assert_eq!(result, "openai-compatible:deepseek:deepseek-v4-pro");
     }
 
     #[test]
