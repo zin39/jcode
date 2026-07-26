@@ -992,3 +992,102 @@ fn test_flicker_frame_history_ignores_manual_scroll_feedback() {
     assert_eq!(payload["buffered_samples"], 3);
     assert_eq!(payload["buffered_events"], 0);
 }
+
+/// Crossing the scrollbar's fits/overflows threshold must not reflow the
+/// transcript.
+///
+/// The wrap width used to depend on whether the scrollbar was visible, so
+/// adding one line could re-wrap every line on screen one column narrower.
+/// That reads as the whole view shimmying rather than as new content arriving.
+/// Reserving the column unconditionally makes the wrap width a constant, so
+/// the same message must wrap to byte-identical text on both sides of the
+/// threshold; only the scrollbar column itself may differ.
+#[test]
+fn crossing_the_scrollbar_threshold_does_not_rewrap_the_transcript() {
+    let _lock = viewport_snapshot_test_lock();
+
+    // A long single message whose wrapping is highly sensitive to width.
+    let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliett \
+                kilo lima mike november oscar papa quebec romeo sierra tango"
+        .to_string();
+
+    let width = 40_u16;
+    let render = |height: u16| -> String {
+        let state = TestState {
+            display_messages: vec![DisplayMessage::assistant(&long)],
+            messages_version: 1,
+            chat_native_scrollbar: true,
+            ..Default::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
+        clear_flicker_frame_history_for_tests();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &state))
+            .expect("draw should succeed");
+        buffer_to_text(&terminal)
+    };
+
+    // Walk heights across the point where the content stops fitting. Compare
+    // the wrapped word sequence, which is exactly what a reflow would change,
+    // while ignoring the scrollbar glyphs that are *supposed* to appear.
+    let words_of = |frame: &str| -> Vec<String> {
+        frame
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric() || *ch == ' ')
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|line| !line.is_empty())
+            .collect()
+    };
+
+    // The wrapping of a given message is fully determined by the wrap width,
+    // so compare the actual wrapped line contents across the threshold. Track
+    // the set of distinct transcript lines produced at each height; if the
+    // width changed, the words break at different points and new distinct
+    // lines appear.
+    let mut wrap_shapes: Vec<(u16, Vec<String>)> = Vec::new();
+    for height in 12_u16..=26 {
+        let frame = render(height);
+        let mut lines = words_of(&frame);
+        // Keep only lines that are part of the long message, so unrelated
+        // chrome (header, status, input) cannot mask or fake a difference.
+        lines.retain(|line| line.split_whitespace().any(|w| long.contains(w)));
+        if !lines.is_empty() {
+            wrap_shapes.push((height, lines));
+        }
+    }
+    assert!(
+        wrap_shapes.len() > 1,
+        "test needs several heights to compare, got {wrap_shapes:#?}"
+    );
+
+    // Any line that appears at one height and is not a prefix/suffix boundary
+    // line of another must appear verbatim wherever that text is shown. The
+    // strongest simple invariant: the set of *interior* wrapped lines (all but
+    // the last, which may be cut off by the viewport) must be consistent.
+    let mut reference: Option<(u16, Vec<String>)> = None;
+    for (height, lines) in &wrap_shapes {
+        let interior: Vec<String> = lines.iter().take(lines.len() - 1).cloned().collect();
+        match &reference {
+            None => reference = Some((*height, interior)),
+            Some((ref_height, ref_interior)) => {
+                let shared = interior.len().min(ref_interior.len());
+                assert_eq!(
+                    &interior[..shared],
+                    &ref_interior[..shared],
+                    "transcript re-wrapped between height {ref_height} and {height}; crossing the \
+                     scrollbar threshold must not change the wrap width"
+                );
+                if interior.len() > ref_interior.len() {
+                    reference = Some((*height, interior));
+                }
+            }
+        }
+    }
+}
