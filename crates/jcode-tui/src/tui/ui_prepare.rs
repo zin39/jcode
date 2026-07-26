@@ -1471,6 +1471,24 @@ impl BodyAcc {
 /// tool/meta interruption) breaks the run. Tool and meta rows are treated as
 /// part of the assistant's turn, since they are work the assistant performed,
 /// not a different speaker taking the floor.
+/// True when any tool in this folded run failed. Folding is decided purely by
+/// position, which previously let a failing 5th tool vanish behind
+/// "N more tool calls" with no signal at all. A fold is a summarising
+/// convenience, so it must never be the reason a user misses an error.
+fn folded_run_has_failure(
+    messages: &[DisplayMessage],
+    msg_global_idx: usize,
+    pos: usize,
+    run_len: usize,
+) -> bool {
+    let run_start = msg_global_idx.saturating_sub(pos);
+    messages
+        .iter()
+        .skip(run_start)
+        .take(run_len)
+        .any(|m| m.effective_role() == "tool" && tools_ui::tool_output_looks_failed(&m.content))
+}
+
 fn assistant_header_is_redundant(ctx: &BodyRenderCtx<'_>, msg_global_idx: usize) -> bool {
     for prev in ctx.messages[..msg_global_idx].iter().rev() {
         match prev.effective_role() {
@@ -1690,7 +1708,10 @@ fn render_message_into(
                 // pos 0, 1, 2: render normally.
                 // pos 2: also append a fold-summary line after rendering.
                 // pos >= 3: skip rendering entirely (just record the segment).
-                if pos < 3 {
+                let run_failed =
+                    folded_run_has_failure(ctx.messages, msg_global_idx, pos, run_len);
+                // A failed tool always renders, whatever its position in the run.
+                if pos < 3 || tools_ui::tool_output_looks_failed(&msg.content) {
                     let tool_start_line = acc.lines.len();
                     let cached = get_cached_message_lines(
                         msg,
@@ -1710,14 +1731,21 @@ fn render_message_into(
                         let remaining = run_len - 3;
                         let tier = detect_tier();
                         let glyph = if tier == Tier::Plain { ">>" } else { "▸" };
-                        let fold_line_text = format!(
-                            "  {} {} more tool calls · ctrl+o expand",
-                            glyph, remaining
-                        );
-                        let fold_span = Span::styled(
-                            fold_line_text,
-                            Style::default().fg(dim_color()),
-                        );
+                        let fold_line_text = if run_failed {
+                            format!(
+                                "  {} {} more tool calls · contains a failure · ctrl+o expand",
+                                glyph, remaining
+                            )
+                        } else {
+                            format!("  {} {} more tool calls · ctrl+o expand", glyph, remaining)
+                        };
+                        // Dim suits a quiet summary, but not one hiding an error.
+                        let fold_style = if run_failed {
+                            Style::default().fg(ratatui::style::Color::Rgb(220, 100, 100))
+                        } else {
+                            Style::default().fg(dim_color())
+                        };
+                        let fold_span = Span::styled(fold_line_text, fold_style);
                         acc.push_auto(Line::from(fold_span).alignment(align));
                     }
                 }
