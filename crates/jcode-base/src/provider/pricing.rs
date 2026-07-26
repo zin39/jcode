@@ -272,6 +272,11 @@ pub(crate) fn cheapness_for_route(
     }
 
     if let Some(profile_id) = api_method.strip_prefix("openai-compatible:") {
+        // NOT migrated to openai_compatible_api_method on purpose. This site
+        // has already stripped the prefix, so it is reconstructing the exact
+        // string it was given. The helper collapses the generic id to a bare
+        // transport, which would silently change the pricing-source key for a
+        // stuttered input instead of round-tripping it.
         return metered_pricing_for_source(&format!("openai-compatible:{}", profile_id), model);
     }
 
