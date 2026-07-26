@@ -1254,6 +1254,57 @@ pub(super) fn gather_todos_and_goals_for_session(
     (Vec::new(), Vec::new())
 }
 
+/// The sidecar label is a pure function of config plus which credentials exist
+/// on disk, so it changes about as often as the user logs in. Building it
+/// eagerly meant `Sidecar::new()` ran on every call to `gather_memory_info`,
+/// which the status widgets invoke several times per frame, and each
+/// construction re-read the config and probed up to three credential files.
+/// That was disk I/O on the draw path to render a string that had not changed.
+///
+/// This is deliberately cached separately from the surrounding memory-info
+/// cache: that one holds the live counts, which genuinely go stale, whereas
+/// this is effectively static for the life of a session.
+/// Counts how many times the label was actually constructed, so tests can
+/// prove the cache is doing its job instead of merely timing it (a timing
+/// bound passes even with the cache defeated, because the OS page-caches the
+/// credential files).
+static SIDECAR_LABEL_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn sidecar_label_build_count() -> usize {
+    SIDECAR_LABEL_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn cached_sidecar_label() -> Option<String> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(60);
+
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((ts, label)) = guard.as_ref() {
+            if ts.elapsed() < TTL {
+                return label.clone();
+            }
+        }
+    }
+
+    SIDECAR_LABEL_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let sidecar = crate::sidecar::Sidecar::new();
+    let label = Some(format!(
+        "{} \u{00b7} {}",
+        sidecar.backend_name(),
+        sidecar.model_name()
+    ));
+
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((Instant::now(), label.clone()));
+    }
+    label
+}
+
 pub(super) fn gather_memory_info(
     memory_enabled: bool,
     working_dir: Option<String>,
@@ -1273,12 +1324,7 @@ pub(super) fn gather_memory_info(
         None
     };
     let sidecar_model = if memory_enabled && crate::memory::memory_sidecar_enabled() {
-        let sidecar = crate::sidecar::Sidecar::new();
-        Some(format!(
-            "{} · {}",
-            sidecar.backend_name(),
-            sidecar.model_name()
-        ))
+        cached_sidecar_label()
     } else {
         None
     };
