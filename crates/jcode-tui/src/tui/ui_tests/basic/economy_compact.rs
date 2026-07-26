@@ -259,3 +259,94 @@ fn tool_rows_do_not_reintroduce_the_assistant_header() {
             .collect::<Vec<_>>()
     );
 }
+
+fn failing_tool(name: &str) -> DisplayMessage {
+    DisplayMessage::tool(
+        format!("{name}\nError: command failed with exit code 1"),
+        crate::tui::ToolCall {
+            name: name.to_string(),
+            ..Default::default()
+        },
+    )
+}
+
+fn ok_tool(name: &str) -> DisplayMessage {
+    DisplayMessage::tool(
+        format!("{name}\nall good"),
+        crate::tui::ToolCall {
+            name: name.to_string(),
+            ..Default::default()
+        },
+    )
+}
+
+/// Folding is positional, so a failure late in a long tool run used to be
+/// hidden entirely behind "N more tool calls". An error must never be the thing
+/// a summarising affordance swallows.
+#[test]
+fn tool_fold_never_hides_a_failed_tool() {
+    let width = 100;
+    let mut display_messages = vec![DisplayMessage::user("run everything".to_string())];
+    for i in 0..4 {
+        display_messages.push(ok_tool(&format!("ok_tool_{i}")));
+    }
+    // 5th tool in the run fails, well past the positional fold cutoff of 3.
+    display_messages.push(failing_tool("exploding_tool"));
+
+    let state = TestState {
+        display_messages,
+        messages_version: 1,
+        economy_compact_threshold: usize::MAX,
+        ..Default::default()
+    };
+
+    let text: String = prepare_body(&state, width, false)
+        .wrapped_lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        text.contains("exploding_tool"),
+        "a failed tool must stay visible even when folded, got:\n{text}"
+    );
+    assert!(
+        text.contains("contains a failure"),
+        "the fold line must announce that it hides a failure, got:\n{text}"
+    );
+}
+
+/// The calm path must stay calm: an all-successful run keeps the plain fold
+/// summary with no alarming wording.
+#[test]
+fn tool_fold_stays_quiet_when_every_tool_succeeded() {
+    let width = 100;
+    let mut display_messages = vec![DisplayMessage::user("run everything".to_string())];
+    for i in 0..6 {
+        display_messages.push(ok_tool(&format!("ok_tool_{i}")));
+    }
+
+    let state = TestState {
+        display_messages,
+        messages_version: 1,
+        economy_compact_threshold: usize::MAX,
+        ..Default::default()
+    };
+
+    let text: String = prepare_body(&state, width, false)
+        .wrapped_lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        text.contains("more tool calls"),
+        "successful runs should still fold, got:\n{text}"
+    );
+    assert!(
+        !text.contains("contains a failure"),
+        "must not cry wolf on a clean run, got:\n{text}"
+    );
+}
