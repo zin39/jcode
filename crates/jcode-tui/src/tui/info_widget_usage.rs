@@ -99,6 +99,23 @@ pub(super) fn render_usage_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
                     inner.width,
                 ));
             }
+            // Subscription/OAuth plans are not billed per token, so the quota
+            // bars above are the real limit. Users still need to see what the
+            // session consumed, so append the accrued equivalent value. Worded
+            // as "value" because this is not an amount that will be charged.
+            if info.total_cost > 0.0 || info.input_tokens > 0 || info.output_tokens > 0 {
+                lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "~${:.2} value · {} in + {} out",
+                        info.total_cost,
+                        format_tokens(info.input_tokens),
+                        format_tokens(info.output_tokens)
+                    ),
+                    Style::default()
+                        .fg(rgb(140, 140, 150))
+                        .add_modifier(ratatui::style::Modifier::DIM),
+                )]));
+            }
             lines
         }
     }
