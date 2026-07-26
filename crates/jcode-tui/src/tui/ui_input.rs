@@ -3,7 +3,7 @@ use super::selection_highlight::highlight_line_selection;
 use super::tools_ui::{get_tool_activity_detail, summarize_batch_running_tools_compact};
 use super::visual_debug::{self, FrameCaptureBuilder};
 use super::{
-    ProcessingStatus, TuiState, accent_color, ai_color, animated_tool_color, asap_color, dim_color,
+    ProcessingStatus, TuiState, accent_color, ai_color, asap_color, dim_color, tool_color,
     queued_color, user_color,
 };
 use crate::message::ConnectionPhase;
@@ -994,13 +994,17 @@ pub(super) fn build_status_line(
                         }
                     })
                     .collect();
-                let anim_color = animated_tool_color(elapsed);
+                // Calm-by-default: the running-tool readout used to cycle hue
+                // with elapsed time, which made the loudest pixels on screen
+                // also the most restless. Liveness is already carried by the
+                // spinner and the travelling dot, so the colour is now static.
+                let tool_fg = tool_color();
 
                 let mut detail = vec![
                     Span::styled(" ", Style::default()),
-                    Span::styled(left_bar, Style::default().fg(anim_color)),
-                    Span::styled(name.to_string(), Style::default().fg(anim_color).bold()),
-                    Span::styled(right_bar, Style::default().fg(anim_color)),
+                    Span::styled(left_bar, Style::default().fg(dim_color())),
+                    Span::styled(name.to_string(), Style::default().fg(tool_fg)),
+                    Span::styled(right_bar, Style::default().fg(dim_color())),
                 ];
 
                 let batch_prog = app.batch_progress();
@@ -1018,7 +1022,7 @@ pub(super) fn build_status_line(
                 if is_batch {
                     append_batch_progress_spans(
                         &mut detail,
-                        anim_color,
+                        tool_fg,
                         batch_prog,
                         batch_total_initial,
                     );

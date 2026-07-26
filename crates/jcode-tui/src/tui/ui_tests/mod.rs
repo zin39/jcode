@@ -259,7 +259,13 @@ impl crate::tui::TuiState for TestState {
         Vec::new()
     }
     fn elapsed(&self) -> Option<Duration> {
-        None
+        // Driven by `anim_elapsed` so tests can assert that rendering is
+        // time-invariant (no colour cycling) by varying only this value.
+        if self.anim_elapsed > 0.0 {
+            Some(Duration::from_secs_f32(self.anim_elapsed))
+        } else {
+            None
+        }
     }
     fn status(&self) -> ProcessingStatus {
         self.status.clone()

@@ -158,38 +158,6 @@ pub fn blend_color(from: Color, to: Color, t: f32) -> Color {
     )
 }
 
-pub fn rainbow_prompt_color(distance: usize) -> Color {
-    // Rainbow colors (hue progression): red -> orange -> yellow -> green -> cyan -> blue -> violet
-    const RAINBOW: [(u8, u8, u8); 7] = [
-        (255, 80, 80),   // Red (softened)
-        (255, 160, 80),  // Orange
-        (255, 230, 80),  // Yellow
-        (80, 220, 100),  // Green
-        (80, 200, 220),  // Cyan
-        (100, 140, 255), // Blue
-        (180, 100, 255), // Violet
-    ];
-
-    // Gray target (dim_color())
-    const GRAY: (u8, u8, u8) = (80, 80, 80);
-
-    // Exponential decay factor - how quickly we fade to gray
-    // decay = e^(-distance * rate), rate of ~0.4 gives nice falloff
-    let decay = (-0.4 * distance as f32).exp();
-
-    // Select rainbow color based on distance (cycle through)
-    let rainbow_idx = distance.min(RAINBOW.len() - 1);
-    let (r, g, b) = RAINBOW[rainbow_idx];
-
-    // Blend rainbow color with gray based on decay
-    // At distance 0: 100% rainbow, as distance increases: approaches gray
-    let blend = |rainbow: u8, gray: u8| -> u8 {
-        (rainbow as f32 * decay + gray as f32 * (1.0 - decay)) as u8
-    };
-
-    rgb(blend(r, GRAY.0), blend(g, GRAY.1), blend(b, GRAY.2))
-}
-
 pub fn prompt_entry_color(base: Color, t: f32) -> Color {
     let peak = rgb(255, 230, 120);
     // Quick pulse in/out over the animation window.
@@ -213,23 +181,6 @@ pub fn prompt_entry_shimmer_color(base: Color, pos: f32, t: f32) -> Color {
     let pulse = (1.0 - t).powf(0.55);
     let highlight = rgb(255, 248, 210);
     blend_color(base, highlight, shimmer * pulse * 0.7)
-}
-
-/// Generate an animated color that pulses between two colors
-pub fn animated_tool_color(elapsed: f32, enable_decorative_animations: bool) -> Color {
-    if !enable_decorative_animations {
-        return tool_color();
-    }
-
-    // Cycle period of ~1.5 seconds
-    let t = (elapsed * 2.0).sin() * 0.5 + 0.5; // 0.0 to 1.0
-
-    // Interpolate between cyan and purple
-    let r = (80.0 + t * 106.0) as u8; // 80 -> 186
-    let g = (200.0 - t * 61.0) as u8; // 200 -> 139
-    let b = (220.0 + t * 35.0) as u8; // 220 -> 255
-
-    rgb(r, g, b)
 }
 
 #[cfg(test)]
