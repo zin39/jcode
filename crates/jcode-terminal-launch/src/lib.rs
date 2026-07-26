@@ -2,6 +2,47 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// Provider-lock environment variables that should NOT be inherited by
+/// spawned jcode sessions. These vars encode the parent process's provider
+/// routing decisions (e.g. "lock to OpenRouter", "use this provider model")
+/// and must not leak into fresh spawned jcode processes, which should start
+/// with a clean provider state.
+///
+/// When a spawned jcode session inherits these (e.g. JCODE_FORCE_PROVIDER=1,
+/// JCODE_ACTIVE_PROVIDER=openrouter), cross-provider model switches fail:
+/// "Model 'X' targets Anthropic but --provider is locked to OpenRouter".
+///
+/// The vars are scrubbed (removed from the child's environment) at spawn time
+/// via `scrub_provider_lock_env`. Exception: `extra_env` entries win over the
+/// scrub, allowing intentional provider propagation when needed. Headless
+/// in-process agents do not use this scrub (they are out of scope).
+pub const PROVIDER_LOCK_ENV_VARS: &[&str] = &[
+    "JCODE_FORCE_PROVIDER",
+    "JCODE_ACTIVE_PROVIDER",
+    "JCODE_RUNTIME_PROVIDER",
+    "JCODE_OPENROUTER_MODEL",
+    "JCODE_OPENROUTER_TRANSPORT_STATE",
+    "JCODE_OPENROUTER_API_BASE",
+    "JCODE_OPENROUTER_ENV_FILE",
+    "JCODE_OPENROUTER_CACHE_NAMESPACE",
+    "JCODE_OPENROUTER_API_KEY_NAME",
+    "JCODE_OPENROUTER_PROVIDER_FEATURES",
+    "JCODE_OPENROUTER_STATIC_MODELS",
+];
+
+/// Remove provider-lock environment variables from a spawned process's
+/// environment, preventing stale provider routing decisions from the parent
+/// process from leaking into child sessions.
+///
+/// Note: `extra_env` entries passed to spawn construction are applied *after*
+/// this scrub, so explicit provider vars can still be intentionally propagated
+/// when needed (e.g. via `spawn_env("JCODE_ACTIVE_PROVIDER", "...")`).
+fn scrub_provider_lock_env(cmd: &mut Command) {
+    for key in PROVIDER_LOCK_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TerminalCommand {
     pub program: PathBuf,
@@ -586,6 +627,10 @@ pub fn build_hook_spawn_command(
         .expect("parse_hook_command guarantees at least one part");
 
     let mut cmd = Command::new(expand_home(program));
+    // Scrub stale provider-lock vars before setting metadata (so metadata can
+    // intentionally propagate provider vars if needed via extra_env).
+    scrub_provider_lock_env(&mut cmd);
+    
     cmd.args(prefix_args)
         .arg(&command.program)
         .args(&command.args)
@@ -707,6 +752,11 @@ fn build_spawn_command(term: &str, command: &TerminalCommand, cwd: &Path) -> Opt
         _ => return None,
     }
 
+    // Direct-exec terminals inherit our env, so scrub stale provider locks
+    // BEFORE applying spawn metadata: `Command::env` entries set afterwards
+    // (including intentional provider propagation via `extra_env`, which
+    // `spawn_metadata_env` folds in) win over the `env_remove` scrub.
+    scrub_provider_lock_env(&mut cmd);
     // Export spawn metadata to the terminal process so programs running
     // inside (shells, multiplexers) can also see why the window was opened.
     // Note: terminals launched indirectly (macOS `open`/`osascript` paths) do
@@ -1212,5 +1262,80 @@ mod tests {
             env_value(&cmd, "JCODE_SPAWN_SESSION_ID").as_deref(),
             Some("ses_abc")
         );
+    }
+
+    /// True when the command explicitly removes `key` from the child env.
+    fn env_removed(cmd: &Command, key: &str) -> bool {
+        cmd.get_envs()
+            .any(|(k, v)| k.to_string_lossy() == key && v.is_none())
+    }
+
+    #[test]
+    fn builtin_terminal_spawn_scrubs_provider_lock_env() {
+        // Session-local provider locks (e.g. JCODE_FORCE_PROVIDER=1 set by
+        // ProviderActivation::apply_env) must not leak into spawned sessions:
+        // an inherited lock makes every cross-provider /model switch fail.
+        let command = TerminalCommand::new(
+            std::path::PathBuf::from("/usr/local/bin/jcode"),
+            vec![],
+        )
+        .kind("resume")
+        .session_id("ses_scrub");
+
+        let cmd = build_spawn_command("kitty", &command, Path::new("/work/dir"))
+            .expect("kitty spawn command should build");
+        for key in PROVIDER_LOCK_ENV_VARS {
+            assert!(
+                env_removed(&cmd, key),
+                "expected {key} to be scrubbed from the spawned terminal env"
+            );
+        }
+        // Spawn metadata still flows through alongside the scrub.
+        assert_eq!(
+            env_value(&cmd, "JCODE_SPAWN_KIND").as_deref(),
+            Some("resume")
+        );
+    }
+
+    #[test]
+    fn extra_env_provider_var_survives_the_scrub() {
+        // Intentional propagation: an explicit extra_env provider var must win
+        // over the scrub (env() after env_remove() re-adds the key).
+        let command = TerminalCommand::new(
+            std::path::PathBuf::from("/usr/local/bin/jcode"),
+            vec![],
+        )
+        .kind("swarm-agent")
+        .spawn_env("JCODE_ACTIVE_PROVIDER", "openai");
+
+        let cmd = build_spawn_command("kitty", &command, Path::new("/work/dir"))
+            .expect("kitty spawn command should build");
+        assert_eq!(
+            env_value(&cmd, "JCODE_ACTIVE_PROVIDER").as_deref(),
+            Some("openai"),
+            "explicit extra_env provider var must survive the scrub"
+        );
+        // Vars not explicitly propagated stay scrubbed.
+        assert!(env_removed(&cmd, "JCODE_FORCE_PROVIDER"));
+    }
+
+    #[test]
+    fn hook_spawn_command_scrubs_provider_lock_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let command = TerminalCommand::new(
+            std::path::PathBuf::from("/usr/local/bin/jcode"),
+            vec![],
+        )
+        .kind("resume")
+        .session_id("ses_hook_scrub");
+
+        let cmd = build_hook_spawn_command("wezterm start --", &command, Path::new("/work/dir"))
+            .expect("hook spawn command should build");
+        for key in PROVIDER_LOCK_ENV_VARS {
+            assert!(
+                env_removed(&cmd, key),
+                "expected {key} to be scrubbed from the hook spawn env"
+            );
+        }
     }
 }
