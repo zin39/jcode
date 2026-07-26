@@ -120,7 +120,16 @@ impl<'a> ProviderState<'a> {
     }
 
     pub(crate) fn default_model(&self) -> Option<&'a str> {
-        self.config.provider.default_model.as_deref()
+        // Tolerate corrupted configs: a past bug could persist the "unknown"
+        // placeholder (or an empty string) as default_model, which then fails
+        // to apply on every startup ("Unsupported OpenAI model unknown").
+        // Treat those values as no default instead of trying to apply them.
+        self.config
+            .provider
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && *model != "unknown")
     }
 
     pub(crate) fn default_provider_key(&self) -> Option<&'a str> {

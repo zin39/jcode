@@ -129,7 +129,19 @@ impl Config {
 
     /// Update just the default model and provider in the config file.
     /// This reloads, patches, and saves so it doesn't clobber other fields.
+    ///
+    /// Rejects empty or "unknown" model specifications to prevent corrupted config states.
     pub fn set_default_model(model: Option<&str>, provider: Option<&str>) -> anyhow::Result<()> {
+        // Validate that model is not empty or the placeholder "unknown" value
+        if let Some(m) = model {
+            let trimmed = m.trim();
+            if trimmed.is_empty() || trimmed == "unknown" {
+                return Err(anyhow::anyhow!(
+                    "Invalid model spec: cannot save empty or 'unknown' model to config"
+                ));
+            }
+        }
+
         let mut cfg = Self::load();
         cfg.provider.default_model = model.map(|s| s.to_string());
         cfg.provider.default_provider = provider.map(|s| s.to_string());
@@ -647,5 +659,27 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod default_model_guard_tests {
+    use super::Config;
+
+    // The rejection must happen before any config load/save, so these tests
+    // are hermetic: an Err return proves no disk write was attempted.
+    #[test]
+    fn set_default_model_rejects_unknown_placeholder() {
+        let err = Config::set_default_model(Some("unknown"), None)
+            .expect_err("'unknown' must never be persisted as default_model");
+        assert!(err.to_string().contains("unknown"), "{err}");
+    }
+
+    #[test]
+    fn set_default_model_rejects_empty_and_whitespace() {
+        Config::set_default_model(Some(""), None)
+            .expect_err("empty default_model must be rejected");
+        Config::set_default_model(Some("   "), None)
+            .expect_err("whitespace default_model must be rejected");
     }
 }
