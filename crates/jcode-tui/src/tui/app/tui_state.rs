@@ -1263,6 +1263,13 @@ impl crate::tui::TuiState for App {
         }
     }
 
+    fn ambient_info_snapshot(&self) -> Option<crate::tui::info_widget::AmbientWidgetData> {
+        // Reads the TTL-cached gather directly. The default implementation goes
+        // via info_widget_data, which assembles todos, git, usage and swarm
+        // state this caller does not look at.
+        super::helpers::gather_ambient_info(crate::config::config().ambient.enabled)
+    }
+
     fn info_widget_data(&self) -> crate::tui::info_widget::InfoWidgetData {
         let session_id = if self.is_remote {
             self.remote_session_id.as_deref()
