@@ -1075,6 +1075,48 @@ fn route_is_healthy(model: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Cooldowns keyed by PROVIDER rather than model. A dead or unpaid credential is
+/// a property of the whole account, so every model behind it fails identically.
+/// Cooling only the individual model made cheap routing walk through dozens of
+/// sibling models on the same broken key before making progress.
+fn cheap_provider_health() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static HEALTH: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    HEALTH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Cool an entire provider down after a credential-level failure (401 / dead
+/// key), so cheap routing skips all of its models instead of retrying siblings
+/// that share the same broken credential.
+pub fn mark_provider_unhealthy(provider: &str) {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return;
+    }
+    let now = cheap_route_now_unix();
+    let until = now.saturating_add(CHEAP_ROUTE_COOLDOWN_SECS);
+    let mut health = cheap_provider_health()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    health.retain(|_, &mut until| until > now);
+    health.insert(provider.to_string(), until);
+    crate::logging::info(&format!(
+        "Cheap provider '{provider}' marked unhealthy for {CHEAP_ROUTE_COOLDOWN_SECS}s \
+         (dead credential); cheap routing will skip all of its models"
+    ));
+}
+
+fn provider_is_healthy(provider: &str) -> bool {
+    let health = cheap_provider_health()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    health
+        .get(provider)
+        .copied()
+        .map(|until| until <= cheap_route_now_unix())
+        .unwrap_or(true)
+}
+
 /// Inspect a provider error string; if it indicates the route is out of quota,
 /// rate-limited, or unavailable, cool the route down. Quota/payment errors are
 /// the common case (e.g. DeepSeek `402 Payment Required` when the balance is
@@ -1144,7 +1186,7 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
     // banned model.
     let healthy: Vec<CheapRouteCandidate> = ranked
         .iter()
-        .filter(|c| route_is_healthy(&c.route.model))
+        .filter(|c| route_is_healthy(&c.route.model) && provider_is_healthy(&c.route.provider))
         .cloned()
         .collect();
     if healthy.is_empty() { ranked } else { healthy }
@@ -1434,6 +1476,18 @@ impl CheapRouteBackend for ProviderCheapBackend {
                         return Err(err);
                     }
                     mark_route_unhealthy(&model);
+                    // A dead credential takes down the whole account, so cool the
+                    // provider too; otherwise the next-cheapest pick is just a
+                    // sibling model behind the same broken key.
+                    if is_dead_credential_error(&text)
+                        && let Some(provider) = self
+                            .routes()
+                            .into_iter()
+                            .find(|r| r.model == model)
+                            .map(|r| r.provider)
+                    {
+                        mark_provider_unhealthy(&provider);
+                    }
                     last_err = Some(err);
                     let Some((next_model, next_api)) =
                         cheapest_available_model(self.provider.as_ref())
@@ -1765,6 +1819,32 @@ mod tests {
     #[test]
     fn debate_summary_formats() {
         assert_eq!(debate_summary(3, 42, 0.0234), "gold from 3 models in 42s · $0.02");
+    }
+
+    /// A dead credential kills every model on that account, so cooling only the
+    /// failing model made cheap routing walk sibling models behind the same
+    /// broken key (observed: OpenRouter 401 hopping free model to free model).
+    #[test]
+    fn dead_credential_cools_the_whole_provider_not_just_one_model() {
+        let provider = "test-dead-provider";
+        assert!(provider_is_healthy(provider));
+        mark_provider_unhealthy(provider);
+        assert!(!provider_is_healthy(provider));
+
+        // Ranking must skip every route on a cooled provider while it still has
+        // a healthy alternative to offer.
+        let mut dead_a = priced_route("dead-a", 1);
+        dead_a.provider = provider.to_string();
+        let mut dead_b = priced_route("dead-b", 2);
+        dead_b.provider = provider.to_string();
+        let alive = priced_route("alive-model", 9_000);
+        let ranked = ranked_with_preferences(vec![dead_a, dead_b, alive]);
+        let models: Vec<_> = ranked.iter().map(|c| c.route.model.clone()).collect();
+        assert_eq!(
+            models,
+            vec!["alive-model".to_string()],
+            "all routes on a cooled provider must be skipped, not just the one that failed"
+        );
     }
 
     /// A 401 from a permanently-dead credential must cool the route down. It
