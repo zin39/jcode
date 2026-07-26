@@ -1029,6 +1029,11 @@ fn cheap_route_health() -> &'static std::sync::Mutex<std::collections::HashMap<S
 /// around a drained balance or outage, short enough to recover on its own.
 const CHEAP_ROUTE_COOLDOWN_SECS: u64 = 300;
 
+/// How many distinct cheap routes the coordinator will try before giving up on
+/// a coordination call. Bounded so a fully-dead credential set fails fast
+/// instead of grinding through every provider.
+const COORDINATOR_ROUTE_ATTEMPTS: usize = 4;
+
 fn cheap_route_now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1076,9 +1081,25 @@ fn route_is_healthy(model: &str) -> bool {
 /// drained), which previously made every cheap spawn fall back to the expensive
 /// coordinator model instead of the next-cheapest cheap route.
 pub fn note_provider_error(model: &str, error: &str) {
-    if is_rate_or_quota_error(error) {
+    if is_rate_or_quota_error(error) || is_dead_credential_error(error) {
         mark_route_unhealthy(model);
     }
+}
+
+/// Whether a provider error means the route's CREDENTIAL is dead (401 /
+/// `invalid_api_key` / "user not found"), as opposed to a transient quota blip.
+/// A dead key fails identically on every retry, so the route must be cooled down
+/// and routed around. Without this, a single expired key (e.g. an OpenRouter key
+/// whose account was deleted) sat at the top of the cheapest-first ranking and
+/// aborted every cheap-route run on the very first coordinator call.
+pub fn is_dead_credential_error(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("status: 401")
+        || e.contains("status: 407")
+        || e.contains("invalid_api_key")
+        || e.contains("invalid api key")
+        || e.contains("unauthorized")
+        || e.contains("user not found")
 }
 
 /// Whether a provider error looks like a route is out of quota, rate-limited, or
@@ -1390,7 +1411,54 @@ impl ProviderCheapBackend {
 #[async_trait]
 impl CheapRouteBackend for ProviderCheapBackend {
     async fn ask_parent(&self, prompt: &str) -> Result<String> {
-        self.coordinator.complete_simple(prompt, &self.parent_system).await
+        // The coordinator is pinned to the cheapest route, which may be dead
+        // (expired key, drained balance). A single failure used to abort the
+        // whole cheap-route run before any subtask ran. Instead, cool the broken
+        // route down and re-pin to the next-cheapest healthy route, so one bad
+        // credential degrades to the next provider rather than to a hard error.
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..COORDINATOR_ROUTE_ATTEMPTS {
+            match self
+                .coordinator
+                .complete_simple(prompt, &self.parent_system)
+                .await
+            {
+                Ok(reply) => return Ok(reply),
+                Err(err) => {
+                    let text = err.to_string();
+                    let model = self.coordinator.model();
+                    // Only route around failures that are inherent to this route
+                    // (dead key / drained quota). Genuine prompt or network
+                    // errors would fail identically everywhere, so surface them.
+                    if !(is_dead_credential_error(&text) || is_rate_or_quota_error(&text)) {
+                        return Err(err);
+                    }
+                    mark_route_unhealthy(&model);
+                    last_err = Some(err);
+                    let Some((next_model, next_api)) =
+                        cheapest_available_model(self.provider.as_ref())
+                            .filter(|(next, _)| *next != model)
+                    else {
+                        break;
+                    };
+                    let request =
+                        crate::provider::MultiProvider::model_switch_request_for_session_route(
+                            &next_model,
+                            None,
+                            Some(&next_api),
+                        );
+                    if crate::provider::set_model_with_auth_refresh(
+                        self.coordinator.as_ref(),
+                        &request,
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no usable coordinator route for cheap routing")))
     }
 
     async fn run_subtask(
@@ -1697,6 +1765,33 @@ mod tests {
     #[test]
     fn debate_summary_formats() {
         assert_eq!(debate_summary(3, 42, 0.0234), "gold from 3 models in 42s · $0.02");
+    }
+
+    /// A 401 from a permanently-dead credential must cool the route down. It
+    /// previously did not, so a deleted OpenRouter account kept its route at the
+    /// top of the cheapest-first ranking and broke every cheap-route run.
+    #[test]
+    fn dead_credential_errors_are_detected_and_cool_routes_down() {
+        for msg in [
+            "OpenAI-compatible chat request failed status: 401 Unauthorized",
+            "Incorrect API key provided, code invalid_api_key",
+            "{\"error\":{\"message\":\"User not found.\",\"code\":401}}",
+        ] {
+            assert!(is_dead_credential_error(msg), "should be dead cred: {msg}");
+        }
+        // A genuine prompt/validation error must NOT be treated as a dead
+        // credential, otherwise a bad request would cool down healthy routes.
+        assert!(!is_dead_credential_error(
+            "status: 400 invalid_request_error: message too long"
+        ));
+
+        let model = "test-dead-credential-route";
+        assert!(route_is_healthy(model));
+        note_provider_error(model, "status: 401 invalid_api_key");
+        assert!(
+            !route_is_healthy(model),
+            "a dead credential must cool the route down so cheap routing skips it"
+        );
     }
 
     fn priced_route(model: &str, input_micros: u64) -> ModelRoute {

@@ -421,7 +421,33 @@ mod tests {
     #[test]
     fn minimax_profile_uses_official_openai_compatible_configuration() {
         assert_eq!(MINIMAX_PROFILE.api_base, "https://api.minimax.io/v1");
-        assert_eq!(MINIMAX_PROFILE.api_key_env, "OPENAI_API_KEY");
+        // Regression guard: MiniMax must keep a dedicated key env var so it can
+        // never shadow the user's real OpenAI platform key.
+        assert_eq!(MINIMAX_PROFILE.api_key_env, "MINIMAX_API_KEY");
+    }
+
+    /// Two profiles sharing one `api_key_env` means whichever provider the user
+    /// logged into last wins process-wide, silently breaking the other. The
+    /// MiniMax profile once reused `OPENAI_API_KEY`, so a MiniMax login made
+    /// every native OpenAI request fail with a 401 `invalid_api_key`.
+    #[test]
+    fn openai_compatible_profiles_do_not_share_api_key_env_vars() {
+        use std::collections::HashMap;
+        let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+        for profile in openai_compatible_profiles() {
+            owners
+                .entry(profile.api_key_env)
+                .or_default()
+                .push(profile.id);
+        }
+        let collisions: Vec<_> = owners
+            .into_iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "profiles must not share an API key env var: {collisions:?}"
+        );
     }
 
     #[test]

@@ -309,7 +309,11 @@ pub const MINIMAX_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     id: "minimax",
     display_name: "MiniMax",
     api_base: "https://api.minimax.io/v1",
-    api_key_env: "OPENAI_API_KEY",
+    // MiniMax must not squat on `OPENAI_API_KEY`: a MiniMax login used to write
+    // its `sk-cp-`/`sk-` token into `minimax.env` under `OPENAI_API_KEY`, which
+    // then shadowed the real OpenAI platform key and made native OpenAI
+    // requests fail with 401 `invalid_api_key`.
+    api_key_env: "MINIMAX_API_KEY",
     env_file: "minimax.env",
     setup_url: "https://platform.minimax.io/docs/guides/text-generation",
     default_model: Some("MiniMax-M2.7"),
