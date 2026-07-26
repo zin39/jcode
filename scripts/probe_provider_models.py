@@ -51,7 +51,31 @@ def list_models(name):
         print(f"  [{name}] catalog failed: {e}", file=sys.stderr)
         return []
 
+# jcode drives OpenAI through the Responses API, not chat completions, so
+# probing /chat/completions there gives false failures for the pro/codex tiers.
+RESPONSES_API = {"openai"}
+
+
+def probe_responses(name, model):
+    base, key = PROVIDERS[name]
+    payload = {"model": model, "input": "hi", "max_output_tokens": 16}
+    try:
+        json.load(req(base + "/responses", key, payload, timeout=90))
+        return (name, model, "OK", "")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()[:300]
+        try:
+            msg = json.loads(raw)["error"].get("message", raw)
+        except Exception:
+            msg = raw
+        return (name, model, f"FAIL {e.code}", msg.replace("\n", " ")[:130])
+    except Exception as e:
+        return (name, model, "FAIL", str(e)[:130])
+
+
 def probe(name, model):
+    if name in RESPONSES_API:
+        return probe_responses(name, model)
     base, key = PROVIDERS[name]
     payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4}
     try:
