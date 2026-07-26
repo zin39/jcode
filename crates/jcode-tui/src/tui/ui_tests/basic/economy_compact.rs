@@ -154,3 +154,108 @@ fn test_economy_compact_preserves_near_tail_headers() {
         full.wrapped_lines.len()
     );
 }
+
+/// Counts rendered "jcode · <model>" header lines in a prepared body.
+fn assistant_header_count(state: &TestState) -> usize {
+    prepare_body(state, 80, false)
+        .wrapped_lines
+        .iter()
+        .map(line_to_plain)
+        .filter(|line| line.trim_start().starts_with("jcode ·"))
+        .count()
+}
+
+/// A multi-block assistant answer should introduce itself once, not once per
+/// block. Repeating the model name on every consecutive block was the single
+/// loudest source of visual noise in the transcript.
+#[test]
+fn consecutive_assistant_blocks_render_one_model_header() {
+    let width = 80;
+    let state = TestState {
+        display_messages: vec![
+            DisplayMessage::user("one question".to_string()),
+            DisplayMessage::assistant("first block of the answer".to_string()),
+            DisplayMessage::assistant("second block of the same answer".to_string()),
+            DisplayMessage::assistant("third block of the same answer".to_string()),
+        ],
+        messages_version: 1,
+        economy_compact_threshold: usize::MAX,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        assistant_header_count(&state),
+        1,
+        "three consecutive assistant blocks must share a single header, got:\n{:#?}",
+        prepare_body(&state, width, false)
+            .wrapped_lines
+            .iter()
+            .map(line_to_plain)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The header must come back when the user speaks again, otherwise a long
+/// transcript loses track of who is talking.
+#[test]
+fn assistant_header_returns_after_the_user_speaks_again() {
+    let width = 80;
+    let state = TestState {
+        display_messages: vec![
+            DisplayMessage::user("first question".to_string()),
+            DisplayMessage::assistant("first answer".to_string()),
+            DisplayMessage::assistant("still the first answer".to_string()),
+            DisplayMessage::user("second question".to_string()),
+            DisplayMessage::assistant("second answer".to_string()),
+        ],
+        messages_version: 1,
+        economy_compact_threshold: usize::MAX,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        assistant_header_count(&state),
+        2,
+        "each assistant run after a user turn needs its own header, got:\n{:#?}",
+        prepare_body(&state, width, false)
+            .wrapped_lines
+            .iter()
+            .map(line_to_plain)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A tool call is work the assistant did, not a different speaker, so it must
+/// not re-trigger the header mid-answer.
+#[test]
+fn tool_rows_do_not_reintroduce_the_assistant_header() {
+    let width = 80;
+    let state = TestState {
+        display_messages: vec![
+            DisplayMessage::user("do something".to_string()),
+            DisplayMessage::assistant("let me check".to_string()),
+            DisplayMessage::tool(
+                "bash".to_string(),
+                crate::tui::ToolCall {
+                    name: "bash".to_string(),
+                    ..Default::default()
+                },
+            ),
+            DisplayMessage::assistant("here is what I found".to_string()),
+        ],
+        messages_version: 1,
+        economy_compact_threshold: usize::MAX,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        assistant_header_count(&state),
+        1,
+        "a tool row must not split one assistant turn into two headers, got:\n{:#?}",
+        prepare_body(&state, width, false)
+            .wrapped_lines
+            .iter()
+            .map(line_to_plain)
+            .collect::<Vec<_>>()
+    );
+}

@@ -39,6 +39,46 @@ fn tool_status_glyphs(tier: Tier) -> (&'static str, Color, &'static str, Color) 
     }
 }
 
+/// True when this tool row was pushed at call time and has not yet been
+/// replaced with the tool's result.
+///
+/// The local transcript pushes a tool row as soon as the call finishes
+/// streaming (`turn.rs`, `commands.rs`), seeding `content` with the tool's own
+/// name; completion later overwrites `content` with the real output via
+/// `replace_latest_tool_display_message`. So "content is still exactly the tool
+/// name" is precisely the in-flight window. Remote/mirrored transcripts push
+/// tool rows only once the result is known, so they never match here and can
+/// never show a phantom spinner that spins forever.
+pub(crate) fn tool_message_is_running(msg: &DisplayMessage) -> bool {
+    msg.tool_data
+        .as_ref()
+        .is_some_and(|tc| msg.content == tc.name)
+}
+
+/// Animated spinner cell for an in-flight tool row.
+///
+/// Shares the swarm strip's frame table and cadence so every "this is working"
+/// affordance in the UI pulses in lockstep.
+pub(crate) fn running_tool_glyph(tier: Tier, frame: usize) -> &'static str {
+    if tier == Tier::Plain {
+        "[..]"
+    } else {
+        let frames = jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES;
+        frames[frame % frames.len()]
+    }
+}
+
+/// Current spinner frame, derived from wall-clock so it advances even though
+/// `render_tool_message` has no access to app state.
+pub(crate) fn current_spinner_frame() -> usize {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    (start.elapsed().as_millis()
+        / jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAME_MS as u128) as usize
+}
+
 /// Format a duration in seconds to a compact human-readable string.
 fn format_duration_secs(secs: f32) -> String {
     if secs < 1.0 {
@@ -3899,7 +3939,15 @@ pub(crate) fn render_tool_message(
 
     let tier = palette::detect_tier();
     let (done_icon, done_color, error_icon, error_color) = tool_status_glyphs(tier);
-    let (icon, icon_color) = if is_partial_batch {
+    let is_running = tool_message_is_running(msg);
+    let (icon, icon_color) = if is_running {
+        // The row exists but the tool has not returned yet. Showing the done
+        // glyph here previously made in-flight work look already finished.
+        (
+            running_tool_glyph(tier, current_spinner_frame()),
+            palette::role_color(Role::Muted, tier),
+        )
+    } else if is_partial_batch {
         // Partial batch: use warn glyph
         ("⚠", rgb(214, 184, 92))
     } else if is_error {

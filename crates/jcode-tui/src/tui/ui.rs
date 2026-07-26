@@ -918,6 +918,13 @@ struct BodyCacheKey {
     /// WP12: compact threshold used when the body was built; changing the
     /// threshold (e.g. on resize) must invalidate the cached body.
     compact_threshold_msgs: usize,
+    /// Animation frame for in-flight tool rows, or `None` when no tool is
+    /// running. A running tool row renders an animated spinner, but nothing
+    /// else in this key changes while it spins, so without this the cached
+    /// body would pin one frame and the spinner would look frozen. It stays
+    /// `None` whenever no tool is in flight, so idle sessions keep their
+    /// existing cache behavior and pay nothing for this.
+    running_tool_spinner_frame: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -1203,6 +1210,9 @@ struct FullPrepCacheKey {
     /// WP12: compact threshold used when the frame was built; changing the
     /// threshold (e.g. on resize) must invalidate the cached frame.
     compact_threshold_msgs: usize,
+    /// Animation frame for in-flight tool rows; `None` when nothing is
+    /// running. See `BodyCacheKey::running_tool_spinner_frame`.
+    running_tool_spinner_frame: Option<usize>,
 }
 
 #[derive(Clone)]

@@ -2898,3 +2898,100 @@ fn render_empty_todo_tool_result_collapses_to_compact_line() {
     assert!(!plain.contains("No tasks yet"), "{plain}");
     assert!(plain.contains("no tasks"), "{plain}");
 }
+
+// ---------------------------------------------------------------------------
+// Running-tool indicator
+//
+// A tool row is pushed as soon as the call streams in, seeded with the tool's
+// own name, and is only later replaced with the real output. Before this was
+// handled, that in-flight row fell through to the "done" branch and rendered a
+// green checkmark while the tool was still executing, so long-running work
+// looked finished the instant it started.
+// ---------------------------------------------------------------------------
+
+fn tool_row(name: &str, content: &str) -> DisplayMessage {
+    DisplayMessage {
+        role: "tool".to_string(),
+        content: content.to_string(),
+        tool_calls: Vec::new(),
+        duration_secs: None,
+        title: None,
+        tool_data: Some(crate::message::ToolCall {
+            id: "call_run".to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+            intent: Some("do the thing".to_string()),
+            thought_signature: None,
+        }),
+    }
+}
+
+fn rendered_first_line(msg: &DisplayMessage) -> String {
+    render_tool_message(msg, 100, crate::config::DiffDisplayMode::Off)
+        .first()
+        .map(extract_line_text)
+        .unwrap_or_default()
+}
+
+#[test]
+fn running_tool_row_is_detected_while_content_is_still_the_tool_name() {
+    assert!(tool_message_is_running(&tool_row("bash", "bash")));
+    // Once the result lands, content is the output, not the name.
+    assert!(!tool_message_is_running(&tool_row("bash", "hello world")));
+    // A row with no tool metadata is never "running".
+    let mut bare = tool_row("bash", "bash");
+    bare.tool_data = None;
+    assert!(!tool_message_is_running(&bare));
+}
+
+#[test]
+fn running_tool_row_never_renders_the_done_checkmark() {
+    let line = rendered_first_line(&tool_row("bash", "bash"));
+    assert!(
+        !line.contains('✓') && !line.contains("[ok]"),
+        "in-flight tool must not look completed, got: {line}"
+    );
+    assert!(
+        !line.contains('✗') && !line.contains("[x]"),
+        "in-flight tool must not look failed, got: {line}"
+    );
+    let spinner_shown = jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES
+        .iter()
+        .any(|f| line.contains(f))
+        || line.contains("[..]");
+    assert!(spinner_shown, "expected a spinner glyph, got: {line}");
+}
+
+#[test]
+fn completed_and_failed_tool_rows_keep_their_existing_glyphs() {
+    let done = rendered_first_line(&tool_row("bash", "all good"));
+    assert!(
+        done.contains('✓') || done.contains("[ok]"),
+        "completed tool should still show the done glyph, got: {done}"
+    );
+
+    let failed = rendered_first_line(&tool_row("bash", "Error: it broke"));
+    assert!(
+        failed.contains('✗') || failed.contains("[x]"),
+        "failed tool should still show the error glyph, got: {failed}"
+    );
+}
+
+#[test]
+fn running_tool_glyph_advances_across_frames() {
+    let tier = jcode_tui_style::detect_tier();
+    let frames: Vec<&str> = (0..jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAMES.len())
+        .map(|i| running_tool_glyph(tier, i))
+        .collect();
+    if tier == jcode_tui_style::Tier::Plain {
+        // Plain tier has no animation budget; a stable marker is correct there.
+        assert!(frames.iter().all(|f| *f == "[..]"));
+    } else {
+        assert!(
+            frames.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "spinner must actually animate, got: {frames:?}"
+        );
+    }
+    // Frame index wraps instead of panicking.
+    let _ = running_tool_glyph(tier, usize::MAX);
+}

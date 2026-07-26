@@ -12,6 +12,7 @@ fn test_body_cache_state_keeps_multiple_width_entries() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     };
@@ -83,6 +84,7 @@ fn test_body_cache_state_does_not_reuse_a_different_mermaid_aspect_profile() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     };
@@ -117,6 +119,7 @@ fn test_body_cache_state_evicts_oldest_entries() {
             images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
         };
@@ -160,6 +163,7 @@ fn test_body_cache_state_accepts_large_single_entry_within_total_budget() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     };
@@ -191,6 +195,7 @@ fn test_body_cache_state_retains_oversized_hot_entry() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     };
@@ -223,6 +228,7 @@ fn test_body_cache_state_keeps_two_oversized_width_entries_hot() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     };
@@ -262,6 +268,7 @@ fn test_body_cache_state_uses_oversized_hot_entry_as_incremental_base() {
         images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     };
@@ -517,6 +524,7 @@ fn test_full_prep_cache_state_keeps_multiple_width_entries() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     inline_images_visible: true,
@@ -593,6 +601,7 @@ fn test_full_prep_cache_state_does_not_reuse_a_different_mermaid_aspect_profile(
         inline_images_visible: true,
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     };
@@ -628,6 +637,7 @@ fn test_full_prep_cache_state_evicts_oldest_entries() {
         inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
         inline_images_visible: true,
@@ -675,6 +685,7 @@ fn test_full_prep_cache_state_accepts_large_single_entry_within_total_budget() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     inline_images_visible: true,
@@ -709,6 +720,7 @@ fn test_full_prep_cache_state_retains_oversized_hot_entry() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     inline_images_visible: true,
@@ -745,6 +757,7 @@ fn test_full_prep_cache_state_keeps_two_oversized_width_entries_hot() {
     inline_images_signature: (0, 0),
         expanded_images_version: 0,
         swarm_members_signature: 0,
+        running_tool_spinner_frame: None,
             tool_fold_expanded: false,
             compact_threshold_msgs: 50,
     inline_images_visible: true,
