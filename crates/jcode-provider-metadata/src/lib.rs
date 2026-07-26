@@ -560,7 +560,11 @@ mod tests {
         );
         assert_eq!(
             resolve_login_provider("zhipu").map(|provider| provider.id),
-            Some("zai")
+            Some("zhipu")
+        );
+        assert_eq!(
+            resolve_login_provider("bigmodel").map(|provider| provider.id),
+            Some("zhipu")
         );
         assert_eq!(
             resolve_login_provider("kimi").map(|provider| provider.id),

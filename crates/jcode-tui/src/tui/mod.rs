@@ -1821,10 +1821,30 @@ fn govern_redraw_interval_by_draw_cost(requested: Duration) -> Duration {
     /// Don't throttle below this even for pathological frame costs.
     const GOVERNOR_MAX_INTERVAL: Duration = Duration::from_millis(250);
 
+    /// A draw that changed no cells at all cannot have had any visible effect,
+    /// so when most recent draws were futile we back off regardless of how
+    /// cheap they were. Requires a clear majority so that genuinely animating
+    /// UI (spinners, countdowns), which changes a handful of cells every frame,
+    /// is never throttled.
+    const FUTILE_MAJORITY: f64 = 0.75;
+    /// Deliberately below the 250ms cost ceiling: this path is reached only
+    /// when the screen is provably static, and any real change (keypress,
+    /// stream token, resize) wakes the loop immediately rather than waiting
+    /// for this tick.
+    const FUTILE_MAX_INTERVAL: Duration = Duration::from_millis(400);
+
     let Some(avg_ms) = ui::recent_average_draw_cost_ms(GOVERNOR_WINDOW) else {
         return requested;
     };
-    let floor = Duration::from_millis((avg_ms * DUTY_FACTOR) as u64).min(GOVERNOR_MAX_INTERVAL);
+    let mut floor = Duration::from_millis((avg_ms * DUTY_FACTOR) as u64).min(GOVERNOR_MAX_INTERVAL);
+
+    // Cheap frames defeat the cost governor: at ~5.6ms the floor is only 14ms,
+    // so a static screen was still being re-rendered ~2.7 times a second to
+    // produce a byte-identical buffer. Futility is the missing signal.
+    if ui::recent_futile_draw_ratio(GOVERNOR_WINDOW).is_some_and(|r| r >= FUTILE_MAJORITY) {
+        floor = floor.max(FUTILE_MAX_INTERVAL);
+    }
+
     requested.max(floor)
 }
 
@@ -2279,6 +2299,43 @@ mod redraw_governor_tests {
     fn governor_passes_through_without_history() {
         let requested = Duration::from_millis(16);
         assert_eq!(govern_redraw_interval_by_draw_cost(requested), requested);
+    }
+
+    /// End-to-end through the real global history, unlike the sibling tests
+    /// which only replicate the floor arithmetic. This is what pins that the
+    /// futility signal is actually consulted: cheap frames leave the cost floor
+    /// at ~14ms, so without the futility branch a provably static screen keeps
+    /// being redrawn (measured live at 36 of 60 idle draws changing 0 cells).
+    #[test]
+    fn governor_backs_off_when_recent_draws_changed_nothing() {
+        let _guard = crate::tui::ui::draw_call_governor_test_lock();
+        crate::tui::ui::clear_draw_call_history_for_tests();
+
+        for i in 0..12 {
+            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(0));
+        }
+
+        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+        assert!(
+            governed >= Duration::from_millis(400),
+            "a static screen should be throttled hard, but the governor \
+             returned {governed:?}; cheap frames make the cost floor only \
+             ~14ms, so futility must be what triggers the back-off"
+        );
+
+        // A spinner changes a few cells every frame: real work, must not throttle.
+        crate::tui::ui::clear_draw_call_history_for_tests();
+        for i in 0..12 {
+            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(4));
+        }
+        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+        assert!(
+            governed < Duration::from_millis(400),
+            "animating UI was throttled as if futile ({governed:?}), which \
+             would make spinners and countdowns visibly stutter"
+        );
+
+        crate::tui::ui::clear_draw_call_history_for_tests();
     }
 
     #[test]

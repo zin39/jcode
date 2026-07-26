@@ -629,6 +629,7 @@ fn provider_style(provider_id: &str) -> Style {
         | "opencode"
         | "opencode-go"
         | "zai"
+        | "zhipu"
         | "chutes"
         | "cerebras"
         | "alibaba-coding-plan"
