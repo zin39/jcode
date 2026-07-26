@@ -669,6 +669,16 @@ fn save_default_provider_setting(app: &mut App, provider: Option<&str>) {
 }
 
 fn save_default_model_setting(app: &mut App, model: Option<&str>) {
+    // Check for placeholder values before attempting save
+    if let Some(m) = model {
+        if m.trim().is_empty() || m == "unknown" {
+            app.set_status_notice(
+                "Cannot set model as default: model information is still loading".to_string()
+            );
+            return;
+        }
+    }
+
     match crate::config::Config::set_default_model_only(model) {
         Ok(()) => {
             let label = model.unwrap_or("(provider default)");
