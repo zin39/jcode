@@ -570,6 +570,23 @@ pub(super) fn active_batch_progress_hash(app: &dyn TuiState) -> u64 {
     hasher.finish()
 }
 
+/// Spinner frame for in-flight tool rows, or `None` when no tool is running.
+///
+/// Returning `None` in the common case keeps the transcript caches keyed
+/// exactly as before, so sessions with no tool in flight pay nothing for the
+/// running-tool animation.
+fn running_tool_spinner_frame(app: &dyn TuiState) -> Option<usize> {
+    let any_running = app
+        .display_messages()
+        .iter()
+        .rev()
+        // Only the tail of the transcript can hold an in-flight call; scanning
+        // the whole history every frame would be wasteful on long sessions.
+        .take(8)
+        .any(ui::messages::tool_message_is_running);
+    any_running.then(ui::messages::current_spinner_frame)
+}
+
 fn swarm_members_signature(members: &[crate::protocol::SwarmMemberStatus]) -> u64 {
     // Chat only renders a stable one-line identity/status summary. Excluding
     // elapsed time, age, output tails, todos, tool progress, and runtime details
@@ -746,6 +763,7 @@ pub(super) fn prepare_messages(
         inline_images_visible: app.inline_images_visible(),
         expanded_images_version: app.expanded_images_version(),
         swarm_members_signature: swarm_members_signature(&app.swarm_members_for_transcript()),
+        running_tool_spinner_frame: running_tool_spinner_frame(app),
         tool_fold_expanded: ui::tool_fold_expanded(),
         compact_threshold_msgs: app.economy_compact_threshold_msgs(),
     };
@@ -1191,6 +1209,7 @@ fn prepare_body_cached(app: &dyn TuiState, width: u16) -> Arc<PreparedMessages> 
         images_signature: app.side_pane_images_signature(),
         expanded_images_version: app.expanded_images_version(),
         swarm_members_signature: swarm_members_signature(&app.swarm_members_for_transcript()),
+        running_tool_spinner_frame: running_tool_spinner_frame(app),
         tool_fold_expanded: ui::tool_fold_expanded(),
         compact_threshold_msgs: app.economy_compact_threshold_msgs(),
     };
@@ -1444,6 +1463,31 @@ impl BodyAcc {
 /// WP12: whether a message should render in COMPACT mode (far from the live
 /// tail). Messages beyond `compact_threshold_msgs` from the end of the message
 /// list are compacted.
+/// True when this assistant block directly follows another assistant block, so
+/// the "jcode · <model>" header would just repeat what the user already read.
+///
+/// Standard chat-transcript rule: show the speaker once per contiguous run of
+/// blocks from that speaker, and resume the header when another speaker (or a
+/// tool/meta interruption) breaks the run. Tool and meta rows are treated as
+/// part of the assistant's turn, since they are work the assistant performed,
+/// not a different speaker taking the floor.
+fn assistant_header_is_redundant(ctx: &BodyRenderCtx<'_>, msg_global_idx: usize) -> bool {
+    for prev in ctx.messages[..msg_global_idx].iter().rev() {
+        match prev.effective_role() {
+            // The assistant already introduced itself earlier in this run.
+            "assistant" => return true,
+            // Work performed inside the assistant's own turn does not hand the
+            // floor to another speaker, so keep scanning back past it.
+            "tool" | "meta" => continue,
+            // A user (or anyone else) spoke, so this block starts a new run and
+            // must carry the header.
+            _ => return false,
+        }
+    }
+    // Nothing before it: this is the first block in the transcript.
+    false
+}
+
 fn message_is_compact(ctx: &BodyRenderCtx<'_>, msg_global_idx: usize) -> bool {
     let msg_count = ctx.messages.len();
     if msg_count == 0 {
@@ -1537,8 +1581,11 @@ fn render_message_into(
                 render_assistant_message,
             );
 
-            // WP12 compact: omit the per-block header "jcode · <model>" tag
-            if !compact {
+            // WP12 compact: omit the per-block header "jcode · <model>" tag.
+            // Also omit it when the previous speaker was already the assistant,
+            // so a multi-block answer reads as one calm voice instead of
+            // repeating "jcode · <model>" over and over.
+            if !compact && !assistant_header_is_redundant(ctx, msg_global_idx) {
                 let agent_color = role_color(Role::Agent, ctx.tier);
                 let tag_text = format!("jcode · {}", ctx.model_name);
                 acc.raw_plain_lines.push(tag_text.clone());
