@@ -2549,7 +2549,18 @@ pub(crate) fn debug_chat_image_regions_json() -> String {
     .unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Bumped once per frame so per-frame memo caches know their contents are
+/// stale. Keyed on this rather than a timestamp because the point is
+/// "same frame or not", which a clock only approximates.
+pub(crate) static FRAME_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn current_frame_epoch() -> u64 {
+    FRAME_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn draw(frame: &mut Frame, app: &dyn TuiState) {
+    FRAME_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::tui::markdown::with_deferred_mermaid_render_context(|| draw_inner(frame, app))
     })) {
