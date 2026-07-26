@@ -1198,9 +1198,11 @@ fn ranked_with_preferences(routes: Vec<ModelRoute>) -> Vec<CheapRouteCandidate> 
             .filter(|c| provider_is_healthy(&c.route.provider))
             .cloned()
             .collect();
-        // Keep the original list if EVERY provider is credential-cooled, so a
-        // total blackout still degrades to a retry rather than to "no routes".
-        if usable.is_empty() { ranked } else { usable }
+        // When EVERY cheap provider is credential-cooled, return nothing rather
+        // than the dead list. `run_cheap_route` already treats an empty ranking
+        // as "fall through to the parent's current model", which is a route we
+        // know works. Returning the dead list instead guaranteed a 401.
+        usable
     };
     let healthy: Vec<CheapRouteCandidate> = ranked
         .iter()
@@ -1886,6 +1888,23 @@ mod tests {
             models,
             vec!["fallback-alive-model".to_string()],
             "the fallback may retry a rate-cooled model, but must never retry a dead credential"
+        );
+    }
+
+    /// When every cheap provider has a dead credential, ranking must return
+    /// EMPTY so the caller falls through to the parent's known-working model.
+    /// Returning the dead list instead guaranteed a 401 on every attempt.
+    #[test]
+    fn all_providers_credential_cooled_yields_no_routes_instead_of_dead_ones() {
+        let dead_provider = "test-total-blackout-provider";
+        mark_provider_unhealthy(dead_provider);
+        let mut a = priced_route("blackout-a", 1);
+        a.provider = dead_provider.to_string();
+        let mut b = priced_route("blackout-b", 2);
+        b.provider = dead_provider.to_string();
+        assert!(
+            ranked_with_preferences(vec![a, b]).is_empty(),
+            "a total credential blackout must yield no routes so the caller uses its own model"
         );
     }
 
