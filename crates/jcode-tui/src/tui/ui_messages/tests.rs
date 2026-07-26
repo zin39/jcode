@@ -1850,7 +1850,9 @@ fn render_tool_message_shows_token_badge() {
         .find(|span| span.content.contains("1.9k tok"))
         .expect("missing token badge");
 
-    assert_eq!(badge_span.style.fg, Some(rgb(118, 118, 118)));
+    // A normal-sized output is not a signal, so the badge reuses the shared
+    // tool colour rather than inventing a near-identical shade beside it.
+    assert_eq!(badge_span.style.fg, Some(jcode_tui_style::theme::tool_color()));
 }
 
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
