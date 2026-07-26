@@ -1,6 +1,39 @@
 use super::*;
 
 impl Agent {
+    /// Drop stale inline images from the transcript before every provider
+    /// request, oldest-first, down to
+    /// [`PROACTIVE_IMAGE_CHAR_BUDGET`](crate::compaction::PROACTIVE_IMAGE_CHAR_BUDGET).
+    ///
+    /// Inline base64 images are re-sent on every subsequent request for the rest
+    /// of the session, and the token-budget accounting deliberately undercounts
+    /// them (see `IMAGE_TOKEN_COST`), so they never trigger normal compaction.
+    /// The existing 413 path only fires once a request is already too large,
+    /// which never happens for a transcript that idles below the provider cap.
+    /// That combination let screenshots dominate real sessions. Pruning here
+    /// keeps only a small recent working set of images.
+    ///
+    /// Stripping mutates the persisted transcript, so it invalidates the prompt
+    /// prefix. We therefore only act when something actually changed, and reset
+    /// the provider cache/session so the next request is consistent.
+    pub(super) fn prune_stale_inline_images(&mut self) {
+        let stripped = self
+            .session
+            .strip_oversized_images(crate::compaction::PROACTIVE_IMAGE_CHAR_BUDGET);
+        if stripped == 0 {
+            return;
+        }
+
+        logging::info(&format!(
+            "Pruned {} stale inline image(s) above the proactive image budget",
+            stripped
+        ));
+
+        // The transcript changed, so the cached prompt prefix no longer matches.
+        self.note_compaction_applied();
+        self.persist_session_best_effort("proactive image prune");
+    }
+
     pub(super) fn note_compaction_applied(&mut self) {
         self.cache_tracker.reset();
         self.locked_tools = None;

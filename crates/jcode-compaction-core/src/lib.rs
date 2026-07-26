@@ -281,6 +281,24 @@ pub const EMERGENCY_IMAGE_MAX_CHARS: usize = 1024;
 /// under the hard provider cap so a single retry reliably fits.
 pub const PAYLOAD_IMAGE_CHAR_BUDGET: usize = 12 * 1024 * 1024;
 
+/// Budget (in base64 characters) for inline images applied *proactively*, on
+/// every turn, rather than only when a provider rejects an oversized request.
+///
+/// [`PAYLOAD_IMAGE_CHAR_BUDGET`] exists to make a failed request succeed on
+/// retry, so it sits just under the provider's hard cap. That makes it useless
+/// as a cost control: a transcript can idle at ~12 MB of base64 screenshots
+/// forever without ever tripping a 413, and every one of those images is
+/// re-sent on every subsequent request for the rest of the session. Measured on
+/// real local sessions, inline images accounted for ~82% of all transcript
+/// content, and stale images (everything but the two most recent) accounted for
+/// ~530M re-sent tokens across 25 sessions.
+///
+/// Stale screenshots are also low-value: they describe UI state that has since
+/// changed, and the surrounding tool text plus the on-disk screenshot path is
+/// usually enough to recover context. So we keep a small recent-image working
+/// set and let older ones degrade to text markers.
+pub const PROACTIVE_IMAGE_CHAR_BUDGET: usize = 1024 * 1024;
+
 /// Approximate chars per token for estimation
 pub const CHARS_PER_TOKEN: usize = 4;
 
