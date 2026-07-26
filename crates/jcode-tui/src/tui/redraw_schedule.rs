@@ -354,10 +354,30 @@ pub(crate) fn govern_redraw_interval_by_draw_cost(requested: Duration) -> Durati
     /// Don't throttle below this even for pathological frame costs.
     const GOVERNOR_MAX_INTERVAL: Duration = Duration::from_millis(250);
 
+    /// A draw that changed no cells at all cannot have had any visible effect,
+    /// so when most recent draws were futile we back off regardless of how
+    /// cheap they were. Requires a clear majority so that genuinely animating
+    /// UI (spinners, countdowns), which changes a handful of cells every frame,
+    /// is never throttled.
+    const FUTILE_MAJORITY: f64 = 0.75;
+    /// Deliberately below the 250ms cost ceiling: this path is reached only
+    /// when the screen is provably static, and any real change (keypress,
+    /// stream token, resize) wakes the loop immediately rather than waiting
+    /// for this tick.
+    const FUTILE_MAX_INTERVAL: Duration = Duration::from_millis(400);
+
     let Some(avg_ms) = ui::recent_average_draw_cost_ms(GOVERNOR_WINDOW) else {
         return requested;
     };
-    let floor = Duration::from_millis((avg_ms * DUTY_FACTOR) as u64).min(GOVERNOR_MAX_INTERVAL);
+    let mut floor = Duration::from_millis((avg_ms * DUTY_FACTOR) as u64).min(GOVERNOR_MAX_INTERVAL);
+
+    // Cheap frames defeat the cost governor: at ~5.6ms the floor is only 14ms,
+    // so a static screen was still being re-rendered ~2.7 times a second to
+    // produce a byte-identical buffer. Futility is the missing signal.
+    if ui::recent_futile_draw_ratio(GOVERNOR_WINDOW).is_some_and(|r| r >= FUTILE_MAJORITY) {
+        floor = floor.max(FUTILE_MAX_INTERVAL);
+    }
+
     requested.max(floor)
 }
 

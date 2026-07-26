@@ -1924,6 +1924,43 @@ mod redraw_governor_tests {
         assert_eq!(govern_redraw_interval_by_draw_cost(requested), requested);
     }
 
+    /// End-to-end through the real global history, unlike the sibling tests
+    /// which only replicate the floor arithmetic. This is what pins that the
+    /// futility signal is actually consulted: cheap frames leave the cost floor
+    /// at ~14ms, so without the futility branch a provably static screen keeps
+    /// being redrawn (measured live at 36 of 60 idle draws changing 0 cells).
+    #[test]
+    fn governor_backs_off_when_recent_draws_changed_nothing() {
+        let _guard = crate::tui::ui::draw_call_governor_test_lock();
+        crate::tui::ui::clear_draw_call_history_for_tests();
+
+        for i in 0..12 {
+            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(0));
+        }
+
+        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+        assert!(
+            governed >= Duration::from_millis(400),
+            "a static screen should be throttled hard, but the governor \
+             returned {governed:?}; cheap frames make the cost floor only \
+             ~14ms, so futility must be what triggers the back-off"
+        );
+
+        // A spinner changes a few cells every frame: real work, must not throttle.
+        crate::tui::ui::clear_draw_call_history_for_tests();
+        for i in 0..12 {
+            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(4));
+        }
+        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+        assert!(
+            governed < Duration::from_millis(400),
+            "animating UI was throttled as if futile ({governed:?}), which \
+             would make spinners and countdowns visibly stutter"
+        );
+
+        crate::tui::ui::clear_draw_call_history_for_tests();
+    }
+
     #[test]
     fn governor_floor_math_caps_expensive_frames() {
         // 60ms frames at DUTY_FACTOR 2.5 -> 150ms floor; 16ms request becomes 150ms.
@@ -1937,5 +1974,42 @@ mod redraw_governor_tests {
         // Pathological 500ms frames clamp at the 250ms max, keeping the UI responsive.
         let patho = Duration::from_millis((500.0_f64 * 2.5) as u64).min(Duration::from_millis(250));
         assert_eq!(patho, Duration::from_millis(250));
+    }
+
+    /// End-to-end through the real global history, unlike the sibling tests
+    /// which only replicate the floor arithmetic. This is what pins that the
+    /// futility signal is actually consulted: cheap frames leave the cost floor
+    /// at ~14ms, so without the futility branch a provably static screen keeps
+    /// being redrawn (measured live at 36 of 60 idle draws changing 0 cells).
+    #[test]
+    fn governor_backs_off_when_recent_draws_changed_nothing() {
+        let _guard = crate::tui::ui::draw_call_governor_test_lock();
+        crate::tui::ui::clear_draw_call_history_for_tests();
+
+        for i in 0..12 {
+            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(0));
+        }
+
+        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+        assert!(
+            governed >= Duration::from_millis(400),
+            "a static screen should be throttled hard, but the governor \
+             returned {governed:?}; cheap frames make the cost floor only \
+             ~14ms, so futility must be what triggers the back-off"
+        );
+
+        // A spinner changes a few cells every frame: real work, must not throttle.
+        crate::tui::ui::clear_draw_call_history_for_tests();
+        for i in 0..12 {
+            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(4));
+        }
+        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
+        assert!(
+            governed < Duration::from_millis(400),
+            "animating UI was throttled as if futile ({governed:?}), which \
+             would make spinners and countdowns visibly stutter"
+        );
+
+        crate::tui::ui::clear_draw_call_history_for_tests();
     }
 }

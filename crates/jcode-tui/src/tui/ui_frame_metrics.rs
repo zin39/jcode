@@ -167,12 +167,74 @@ pub(crate) fn record_draw_call_attribution(sample: DrawCallAttribution) {
     }
 }
 
+/// Test-only handle on the draw history so the redraw governor can be driven
+/// end-to-end rather than by replicating its arithmetic in the test.
+#[cfg(test)]
+pub(crate) fn clear_draw_call_history_for_tests() {
+    draw_call_history()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+#[cfg(test)]
+pub(crate) fn record_draw_call_attribution_for_tests(
+    timestamp_ms: u64,
+    render_ms: f64,
+    changed_cells: Option<usize>,
+) {
+    record_draw_call_attribution(DrawCallAttribution {
+        timestamp_ms,
+        total_ms: render_ms + 1.0,
+        render_ms,
+        backend_flush_ms: 1.0,
+        changed_cells,
+        total_cells: Some(1000),
+        force_full_redraw: false,
+        input: FrameInputAttribution::default(),
+    });
+}
+
+/// The draw history is process-global, so governor tests must not interleave.
+#[cfg(test)]
+pub(crate) fn draw_call_governor_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const DRAW_CALL_HISTORY_MAX_SAMPLES: usize = 240;
 
 static DRAW_CALL_HISTORY: OnceLock<Mutex<VecDeque<DrawCallAttribution>>> = OnceLock::new();
 
 fn draw_call_history() -> &'static Mutex<VecDeque<DrawCallAttribution>> {
     DRAW_CALL_HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// How many of the most recent draws changed nothing at all on screen.
+///
+/// The cost governor alone cannot see this. Once frames became cheap (~5.6ms)
+/// it happily allowed ~2.7 draws/sec, but a live measurement showed 36 of 60
+/// idle draws wrote ZERO cells: the full render pipeline ran and produced a
+/// buffer identical to the one already displayed. Those draws cost CPU and
+/// battery and by definition cannot have any visible effect, so they are the
+/// one category of work that is always safe to slow down.
+pub(crate) fn recent_futile_draw_ratio(window: usize) -> Option<f64> {
+    let history = draw_call_history()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if history.is_empty() || window == 0 {
+        return None;
+    }
+    let n = history.len().min(window);
+    let futile = history
+        .iter()
+        .rev()
+        .take(n)
+        .filter(|s| s.changed_cells == Some(0))
+        .count();
+    Some(futile as f64 / n as f64)
 }
 
 /// Average wall-clock cost of the most recent full draws, in milliseconds.
@@ -1309,6 +1371,49 @@ pub(crate) fn clear_flicker_frame_history_for_tests() {
 mod draw_call_tests {
     use super::*;
 
+    /// The cost governor is blind to futility. Once the info-widget fix cut
+    /// frames to ~5.6ms, its floor was only ~14ms, so a completely static
+    /// screen was still re-rendered ~2.7 times a second to produce a
+    /// byte-identical buffer: measured live at 36 of 60 idle draws changing
+    /// ZERO cells.
+    #[test]
+    fn draws_that_change_no_cells_are_reported_as_futile() {
+        let _guard = draw_call_test_lock();
+        clear_draw_call_history();
+
+        for i in 0..8 {
+            record_draw_call_attribution(sample(i, 5.0, Some(0)));
+        }
+
+        assert_eq!(
+            recent_futile_draw_ratio(8),
+            Some(1.0),
+            "eight consecutive zero-cell draws should read as entirely futile"
+        );
+    }
+
+    /// The counterpart, and the reason the governor requires a clear majority:
+    /// animating UI (spinners, countdowns, streaming text) changes only a
+    /// handful of cells per frame, and must never be mistaken for futile work
+    /// or the animation would visibly stutter.
+    #[test]
+    fn draws_that_change_a_few_cells_are_not_futile() {
+        let _guard = draw_call_test_lock();
+        clear_draw_call_history();
+
+        for i in 0..8 {
+            // A spinner glyph plus an elapsed-time counter.
+            record_draw_call_attribution(sample(i, 5.0, Some(4)));
+        }
+
+        assert_eq!(
+            recent_futile_draw_ratio(8),
+            Some(0.0),
+            "a spinner changing 4 cells per frame is real visible work, not \
+             futile, and throttling it would make the animation stutter"
+        );
+    }
+
     fn sample(timestamp_ms: u64, render_ms: f64, changed: Option<usize>) -> DrawCallAttribution {
         DrawCallAttribution {
             timestamp_ms,
@@ -1320,6 +1425,16 @@ mod draw_call_tests {
             force_full_redraw: false,
             input: FrameInputAttribution::default(),
         }
+    }
+
+    /// The draw-call history is a process-global, so tests that clear it and
+    /// then assert on its contents must not interleave. Existing tests in this
+    /// module get away without a lock only by luck.
+    fn draw_call_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn clear_draw_call_history() {

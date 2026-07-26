@@ -47,6 +47,20 @@ pub const KIMI_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     requires_api_key: true,
 };
 
+/// Zhipu AI's open platform (bigmodel.cn). This is the endpoint that accepts
+/// Zhipu/BigModel API keys, distinct from the Z.AI coding-plan gateway above:
+/// keys issued on open.bigmodel.cn are rejected by `api.z.ai/api/coding/paas`.
+pub const ZHIPU_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "zhipu",
+    display_name: "Zhipu BigModel",
+    api_base: "https://open.bigmodel.cn/api/paas/v4",
+    api_key_env: "ZHIPU_BIGMODEL_API_KEY",
+    env_file: "zhipu.env",
+    setup_url: "https://open.bigmodel.cn/usercenter/apikeys",
+    default_model: Some("glm-4.7"),
+    requires_api_key: true,
+};
+
 pub const AI302_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     id: "302ai",
     display_name: "302.AI",
@@ -440,6 +454,7 @@ pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 37] = [
     OPENCODE_PROFILE,
     OPENCODE_GO_PROFILE,
     ZAI_PROFILE,
+    ZHIPU_PROFILE,
     KIMI_PROFILE,
     CHUTES_PROFILE,
     CEREBRAS_PROFILE,
@@ -630,11 +645,24 @@ pub const ZAI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor 
     auth_kind: LoginProviderAuthKind::ApiKey,
     auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
     auth_status_method: "API key",
-    aliases: &["z.ai", "z-ai", "zai-coding", "zhipu"],
+    aliases: &["z.ai", "z-ai", "zai-coding"],
     menu_detail: "API key",
     recommended: false,
     target: LoginProviderTarget::OpenAiCompatible(ZAI_PROFILE),
     order: LoginProviderSurfaceOrder::new(Some(7), Some(6), Some(7), Some(6), Some(6)),
+};
+
+pub const ZHIPU_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "zhipu",
+    display_name: "Zhipu BigModel",
+    auth_kind: LoginProviderAuthKind::ApiKey,
+    auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
+    auth_status_method: "API key",
+    aliases: &["bigmodel", "open.bigmodel.cn", "zhipuai", "glm"],
+    menu_detail: "API key, open.bigmodel.cn platform",
+    recommended: false,
+    target: LoginProviderTarget::OpenAiCompatible(ZHIPU_PROFILE),
+    order: LoginProviderSurfaceOrder::new(Some(39), Some(39), Some(39), Some(39), Some(39)),
 };
 
 pub const KIMI_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
@@ -1129,6 +1157,7 @@ pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 48] = [
     OPENCODE_LOGIN_PROVIDER,
     OPENCODE_GO_LOGIN_PROVIDER,
     ZAI_LOGIN_PROVIDER,
+    ZHIPU_LOGIN_PROVIDER,
     KIMI_LOGIN_PROVIDER,
     CHUTES_LOGIN_PROVIDER,
     CEREBRAS_LOGIN_PROVIDER,
