@@ -452,7 +452,7 @@ fn append_openai_compatible_profile_routes(
             continue;
         }
         let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
-        let api_method = format!("openai-compatible:{}", resolved.id);
+        let api_method = crate::provider_catalog::openai_compatible_api_method(&resolved.id);
 
         // The active OpenRouter/OpenAI-compatible provider contributes its own
         // live memory/disk catalog below. Do not preempt it with the generic
@@ -473,7 +473,7 @@ fn append_openai_compatible_profile_routes(
     // back to that profile, even when the profile is not the active provider
     // (issue #444).
     for (profile_name, profile_config) in &crate::config::config().providers {
-        let api_method = format!("openai-compatible:{}", profile_name);
+        let api_method = crate::provider_catalog::openai_compatible_api_method(profile_name);
         // The active runtime already contributes this profile's models (with
         // live-catalog freshness) via the OpenRouter slot path.
         if active_direct_openai_compatible_api_method.as_deref() == Some(api_method.as_str()) {
@@ -514,7 +514,7 @@ fn named_provider_profile_routes(
         models.push(default_model.to_string());
     }
 
-    let api_method = format!("openai-compatible:{}", profile_name);
+    let api_method = crate::provider_catalog::openai_compatible_api_method(profile_name);
     let detail = if profile_config.base_url.trim().is_empty() {
         "configured provider profile".to_string()
     } else {
@@ -1149,7 +1149,7 @@ pub fn remote_current_openai_compatible_route_for_model(
     Some(ModelRoute {
         model: model.to_string(),
         provider: resolved.display_name,
-        api_method: format!("openai-compatible:{}", resolved.id),
+        api_method: crate::provider_catalog::openai_compatible_api_method(&resolved.id),
         available: true,
         detail: resolved.api_base,
         cheapness: None,
@@ -1190,7 +1190,7 @@ pub fn remote_openai_compatible_route_for_model(model: &str) -> Option<ModelRout
         return Some(ModelRoute {
             model: model.to_string(),
             provider: resolved.display_name,
-            api_method: format!("openai-compatible:{}", resolved.id),
+            api_method: crate::provider_catalog::openai_compatible_api_method(&resolved.id),
             available: true,
             detail,
             cheapness: None,

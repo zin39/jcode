@@ -118,7 +118,7 @@ impl AuthUxStateSpaceProvider {
             routes.push(crate::provider::ModelRoute {
                 model: (*model).to_string(),
                 provider: self.provider_label.to_string(),
-                api_method: format!("openai-compatible:{}", self.provider_id),
+                api_method: crate::provider_catalog::openai_compatible_api_method(self.provider_id),
                 available: authed,
                 detail: if authed {
                     "fresh catalog route".to_string()

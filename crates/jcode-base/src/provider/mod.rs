@@ -205,7 +205,7 @@ fn direct_openai_compatible_profile_routes(
     };
 
     let provider = resolved.display_name.clone();
-    let api_method = format!("openai-compatible:{}", resolved.id);
+    let api_method = crate::provider_catalog::openai_compatible_api_method(&resolved.id);
     let detail = if from_live_catalog {
         resolved.api_base.clone()
     } else if resolved.api_base.trim().is_empty() {
@@ -969,7 +969,7 @@ impl MultiProvider {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Unknown provider profile '{}'", profile_name))?;
 
-        let expected_api_method = format!("openai-compatible:{}", profile_name);
+        let expected_api_method = crate::provider_catalog::openai_compatible_api_method(profile_name);
         let registry = ProviderRegistry::new(self);
         let provider = {
             let existing = registry

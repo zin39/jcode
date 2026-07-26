@@ -2943,7 +2943,8 @@ impl App {
                 match result {
                     Ok(_summary) => {
                         let routes = provider.model_routes();
-                        let expected_api_method = format!("openai-compatible:{}", provider_id);
+                        let expected_api_method =
+                            crate::provider_catalog::openai_compatible_api_method(&provider_id);
                         let route_matches_profile = |route: &crate::provider::ModelRoute| {
                             route.available
                                 && crate::provider::is_listable_model_name(&route.model)

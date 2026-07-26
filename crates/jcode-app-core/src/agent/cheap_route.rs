@@ -803,7 +803,7 @@ fn build_named_provider_routes(
     key_present: bool,
     price: impl Fn(&str, &str) -> Option<jcode_provider_core::RouteCheapnessEstimate>,
 ) -> Vec<ModelRoute> {
-    let api_method = format!("openai-compatible:{name}");
+    let api_method = jcode_base::provider_catalog::openai_compatible_api_method(name);
     let mut seen = std::collections::HashSet::new();
     let mut routes = Vec::new();
     for id in static_ids.iter().chain(cached_ids.iter()) {
