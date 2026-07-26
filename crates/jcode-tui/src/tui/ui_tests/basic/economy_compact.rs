@@ -350,3 +350,44 @@ fn tool_fold_stays_quiet_when_every_tool_succeeded() {
         "must not cry wolf on a clean run, got:\n{text}"
     );
 }
+
+/// A calm tool row must not have colours competing for attention.
+///
+/// Reviewers independently flagged tool rows as visually noisy. The worst
+/// offender was invisible rather than garish: the "normal output size" token
+/// badge used rgb(118,118,118) while the tool name beside it used
+/// rgb(120,120,120). Two points apart is indistinguishable to the eye, so it
+/// bought no information while still making the row a three-colour object.
+///
+/// The budget is two: one for the row's own text, one for the dim separators.
+/// Genuine signals (Warning/Danger output sizes, failures) are still allowed
+/// to add a colour, because those are worth an interruption.
+#[test]
+fn a_routine_tool_row_stays_within_its_colour_budget() {
+    use std::collections::BTreeSet;
+    let mut tool = crate::tui::ToolCall::default();
+    tool.name = "Bash".to_string();
+    tool.input = serde_json::json!({"command": "cargo test --all"});
+
+    let state = TestState {
+        display_messages: vec![DisplayMessage::tool("Bash".to_string(), tool)],
+        messages_version: 1,
+        ..Default::default()
+    };
+
+    let prepared = crate::tui::ui::prepare::prepare_body(&state, 100, false);
+    for line in prepared.wrapped_lines.iter() {
+        let colors: BTreeSet<String> = line
+            .spans
+            .iter()
+            .filter(|span| !span.content.trim().is_empty())
+            .map(|span| format!("{:?}", span.style.fg))
+            .collect();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            colors.len() <= 2,
+            "a routine tool row should use at most 2 colours, found {} in {text:?}: {colors:?}",
+            colors.len()
+        );
+    }
+}
