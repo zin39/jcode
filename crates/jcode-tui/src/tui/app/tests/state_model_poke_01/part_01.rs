@@ -1243,9 +1243,9 @@ fn test_proactive_image_budget_prunes_what_payload_budget_ignores() {
     let build = || {
         let mut app = create_test_app();
         app.session.replace_messages(Vec::new());
-        // 10 x 400 KiB screenshots = ~4 MiB total: under the 12 MiB 413 budget,
+        // 10 x 1 MiB screenshots = ~10 MiB total: under the 12 MiB 413 budget,
         // but far above a sane per-turn working set.
-        let img = "a".repeat(400 * 1024);
+        let img = "a".repeat(1024 * 1024);
         for _ in 0..10 {
             app.session.add_message(
                 Role::User,
@@ -1300,5 +1300,37 @@ fn test_proactive_image_budget_prunes_what_payload_budget_ignores() {
         first_kept,
         10 - remaining,
         "kept images must be the newest suffix"
+    );
+}
+
+/// Quality guard for the proactive image budget. Real screenshots in this repo
+/// measure ~0.7-3.5 MiB of base64 each, so a budget set too low would strip the
+/// screenshot the model just captured and silently break vision workflows. The
+/// budget must always leave the most recent large screenshot intact.
+#[test]
+fn test_proactive_image_budget_never_strips_the_newest_screenshot() {
+    use crate::message::ContentBlock;
+    let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
+
+    // Largest realistic single screenshot observed locally.
+    let img = "a".repeat(3_500 * 1024);
+    for _ in 0..4 {
+        app.session.add_message(
+            Role::User,
+            vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: img.clone(),
+            }],
+        );
+    }
+
+    app.session
+        .strip_oversized_images(crate::compaction::PROACTIVE_IMAGE_CHAR_BUDGET);
+
+    let last = &app.session.messages.last().expect("messages").content[0];
+    assert!(
+        matches!(last, ContentBlock::Image { .. }),
+        "the newest screenshot must survive pruning, else vision workflows break"
     );
 }
