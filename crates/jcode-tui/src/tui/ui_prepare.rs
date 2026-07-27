@@ -1559,12 +1559,17 @@ fn assistant_header_is_redundant(ctx: &BodyRenderCtx<'_>, msg_global_idx: usize)
         match prev.effective_role() {
             // The assistant already introduced itself earlier in this run.
             "assistant" => return true,
-            // Work performed inside the assistant's own turn does not hand the
-            // floor to another speaker, so keep scanning back past it.
-            "tool" | "meta" => continue,
-            // A user (or anyone else) spoke, so this block starts a new run and
-            // must carry the header.
-            _ => return false,
+            // The floor changed hands: the user spoke, or an external event
+            // (background task, swarm message) woke the agent for a new run,
+            // so this block starts a new run and must carry the header.
+            "user" | "background_task" | "swarm" => return false,
+            // Everything else (tool calls, reasoning, todo cards, usage cards,
+            // meta rows, ...) is work or chrome inside the assistant's own
+            // turn. It does not hand the floor to another speaker, so keep
+            // scanning back past it. Reasoning models emit a "reasoning" block
+            // before nearly every assistant block; treating it as a speaker
+            // change repeated "jcode · <model>" on almost every message.
+            _ => continue,
         }
     }
     // Nothing before it: this is the first block in the transcript.

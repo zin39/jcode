@@ -260,6 +260,44 @@ fn tool_rows_do_not_reintroduce_the_assistant_header() {
     );
 }
 
+/// Reasoning models interleave a "reasoning" block before nearly every
+/// assistant block. Those blocks are the assistant thinking, not a new
+/// speaker, so they must not re-trigger the "jcode · <model>" header. This
+/// was the single loudest regression users saw: the model tag repeated on
+/// almost every message.
+#[test]
+fn reasoning_blocks_do_not_reintroduce_the_assistant_header() {
+    let width = 80;
+    let mut reasoning = DisplayMessage::system(String::new());
+    reasoning.role = "reasoning".to_string();
+    reasoning.content = "thinking about the problem".to_string();
+    let mut reasoning2 = reasoning.clone();
+    reasoning2.content = "thinking some more".to_string();
+    let state = TestState {
+        display_messages: vec![
+            DisplayMessage::user("one question".to_string()),
+            reasoning,
+            DisplayMessage::assistant("first block".to_string()),
+            reasoning2,
+            DisplayMessage::assistant("second block".to_string()),
+        ],
+        messages_version: 1,
+        economy_compact_threshold: usize::MAX,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        assistant_header_count(&state),
+        1,
+        "reasoning blocks must not split one assistant turn into repeated headers, got:\n{:#?}",
+        prepare_body(&state, width, false)
+            .wrapped_lines
+            .iter()
+            .map(line_to_plain)
+            .collect::<Vec<_>>()
+    );
+}
+
 fn failing_tool(name: &str) -> DisplayMessage {
     DisplayMessage::tool(
         format!("{name}\nError: command failed with exit code 1"),
