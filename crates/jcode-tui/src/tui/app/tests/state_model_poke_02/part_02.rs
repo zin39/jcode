@@ -311,3 +311,74 @@ fn test_model_picker_preview_arrows_cycle_effort_not_cursor() {
         "Right must not move the composer cursor while the model picker is open"
     );
 }
+
+/// Effort cycling must wrap at both ends and Enter must stage the dialed
+/// effort into the switch request, or the ladder is decorative.
+#[test]
+fn test_model_picker_effort_wraps_and_enter_stages_choice() {
+    let mut app = create_test_app();
+    // Real hydrated routes: with only placeholder "remote-catalog" routes,
+    // Enter starts a catalog refresh instead of staging a switch.
+    configure_test_remote_models_with_openai_recommendations(&mut app);
+
+    for c in "/model g55".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    app.wait_for_model_picker_routes_for_tests();
+
+    // Wrap forward: cycling len(available) times returns to the start.
+    let (start_effort, n) = {
+        let picker = app.inline_interactive_state.as_ref().unwrap();
+        let idx = picker.filtered[picker.selected];
+        (
+            picker.entries[idx].effort.clone(),
+            picker.entries[idx].available_efforts.len(),
+        )
+    };
+    assert!(n >= 2, "need at least two efforts to test wrap");
+    for _ in 0..n {
+        app.handle_key(KeyCode::Right, KeyModifiers::empty()).unwrap();
+    }
+    {
+        let picker = app.inline_interactive_state.as_ref().unwrap();
+        let idx = picker.filtered[picker.selected];
+        assert_eq!(
+            picker.entries[idx].effort, start_effort,
+            "cycling through all efforts must wrap back to the start"
+        );
+    }
+
+    // Left is the inverse of Right: one step back from the start effort.
+    app.handle_key(KeyCode::Left, KeyModifiers::empty()).unwrap();
+    let dialed = {
+        let picker = app.inline_interactive_state.as_ref().unwrap();
+        let idx = picker.filtered[picker.selected];
+        let e = picker.entries[idx].effort.clone().expect("effort dialed");
+        let ladder = &picker.entries[idx].available_efforts;
+        let start_idx = ladder
+            .iter()
+            .position(|a| Some(a) == start_effort.as_ref())
+            .expect("start effort on ladder");
+        let expected = &ladder[(start_idx + ladder.len() - 1) % ladder.len()];
+        assert_eq!(
+            &e, expected,
+            "Left must step one back on the ladder (wrapping at the ends)"
+        );
+        e
+    };
+
+    // Enter stages the dialed effort.
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty()).unwrap();
+    assert!(
+        app.pending_model_switch.is_some() || app.pending_reasoning_effort.is_some(),
+        "Enter should stage a switch"
+    );
+    assert_eq!(
+        app.pending_reasoning_effort.as_deref(),
+        Some(dialed.as_str()),
+        "staged switch should carry the dialed effort, got model={:?} effort={:?}",
+        app.pending_model_switch,
+        app.pending_reasoning_effort
+    );
+}
