@@ -1496,6 +1496,15 @@ impl App {
             config.provider.model_picker_providers.as_deref(),
             &current_model,
         );
+        // Filter out non-coding/dead models, but always keep the current model
+        // even if it would otherwise be filtered (user should see what they're running).
+        let routes: Vec<_> = routes
+            .into_iter()
+            .filter(|route| {
+                route.model == current_model
+                    || crate::provider::is_selectable_coding_model(&route.model)
+            })
+            .collect();
 
         if routes.is_empty() {
             self.inline_interactive_state = None;

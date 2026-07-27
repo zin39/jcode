@@ -15,6 +15,7 @@ mod fingerprint;
 pub mod gemini;
 mod image_clamp;
 pub mod jcode;
+pub mod model_filter;
 pub mod models;
 mod multi_provider;
 pub mod openai;
@@ -69,6 +70,7 @@ pub use jcode_provider_core::{
     pick_next_fallback_route_with_options,
 };
 pub use jcode_provider_core::{ProviderFailoverPrompt, parse_failover_prompt_message};
+pub use model_filter::is_selectable_coding_model;
 pub use route_builders::{
     build_anthropic_oauth_route, build_chatgpt_web_route, build_copilot_route,
     build_openai_api_key_route, build_openai_oauth_route, build_openrouter_auto_route,
