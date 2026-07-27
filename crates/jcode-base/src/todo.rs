@@ -34,8 +34,10 @@ pub const TODO_INTENT_UNDERSTANDING_CONTINUATION_MESSAGE: &str = "Your understan
 const OWNERSHIP_MSG_PREFIX: &str = "Your end-to-end ownership is not high enough to complete this goal. Take ownership of the full user outcome, not just the immediate implementation. Follow the work through every relevant integration and runtime path, resolve consequential gaps, validate the complete workflow, and finish the necessary follow-through.";
 
 /// Model-facing continuation for the private end-to-end ownership check. Names the
-/// assessment category without disclosing the score or threshold.
-pub const TODO_OWNERSHIP_CONTINUATION_MESSAGE: &str = OWNERSHIP_MSG_PREFIX;
+/// assessment category without disclosing the score or threshold, names the field a
+/// caller must raise, and discloses that the write was rejected so the caller does
+/// not read the gate as a stuck tool and retry the same payload indefinitely.
+pub const TODO_OWNERSHIP_CONTINUATION_MESSAGE: &str = "Your end-to-end ownership is not high enough to complete this goal. Take ownership of the full user outcome, not just the immediate implementation. Follow the work through every relevant integration and runtime path, resolve consequential gaps, validate the complete workflow, and finish the necessary follow-through. Then call the todo tool again, setting a higher `end_to_end_ownership` on the goal for this group; until that field is raised the write is rejected and the stored todo list is left unchanged.";
 
 /// Prefix of the hill-climbability continuation message, used by `is_auto_poke_message`
 /// to detect synthetic continuations. The full message appends the submitted score and
@@ -50,7 +52,7 @@ pub const TODO_HILL_CLIMBABILITY_CONTINUATION_MESSAGE: &str = HILL_CLIMBABILITY_
 pub fn build_ownership_continuation_message(submitted: u8) -> String {
     format!(
         "{} (submitted end_to_end_ownership: {}; required: >= {})",
-        OWNERSHIP_MSG_PREFIX, submitted, QUALITY_GATE_THRESHOLD
+        TODO_OWNERSHIP_CONTINUATION_MESSAGE, submitted, QUALITY_GATE_THRESHOLD
     )
 }
 
