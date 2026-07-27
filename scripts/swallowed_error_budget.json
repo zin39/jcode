@@ -1,15 +1,20 @@
 {
-  "total": 3187,
+  "total": 3236,
   "totals_by_pattern": {
-    "dot_ok": 1170,
-    "let_underscore": 1183,
-    "unwrap_or_default": 834
+    "dot_ok": 1180,
+    "let_underscore": 1209,
+    "unwrap_or_default": 847
   },
   "tracked_files": {
     "crates/jcode-app-core/src/agent.rs": {
       "dot_ok": 2,
       "let_underscore": 0,
       "unwrap_or_default": 2
+    },
+    "crates/jcode-app-core/src/agent/cheap_route.rs": {
+      "dot_ok": 1,
+      "let_underscore": 4,
+      "unwrap_or_default": 3
     },
     "crates/jcode-app-core/src/agent/inline_tail.rs": {
       "dot_ok": 0,
@@ -38,7 +43,7 @@
     },
     "crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs": {
       "dot_ok": 0,
-      "let_underscore": 49,
+      "let_underscore": 50,
       "unwrap_or_default": 3
     },
     "crates/jcode-app-core/src/agent/utils.rs": {
@@ -401,6 +406,11 @@
       "let_underscore": 1,
       "unwrap_or_default": 3
     },
+    "crates/jcode-app-core/src/tool/cheap_route_tool.rs": {
+      "dot_ok": 1,
+      "let_underscore": 0,
+      "unwrap_or_default": 0
+    },
     "crates/jcode-app-core/src/tool/communicate.rs": {
       "dot_ok": 0,
       "let_underscore": 4,
@@ -533,8 +543,8 @@
     },
     "crates/jcode-app-core/src/tool/websearch.rs": {
       "dot_ok": 1,
-      "let_underscore": 0,
-      "unwrap_or_default": 3
+      "let_underscore": 3,
+      "unwrap_or_default": 8
     },
     "crates/jcode-app-core/src/tool/write.rs": {
       "dot_ok": 1,
@@ -622,7 +632,7 @@
       "unwrap_or_default": 0
     },
     "crates/jcode-base/src/auth/mod.rs": {
-      "dot_ok": 4,
+      "dot_ok": 5,
       "let_underscore": 0,
       "unwrap_or_default": 4
     },
@@ -942,8 +952,8 @@
       "unwrap_or_default": 0
     },
     "crates/jcode-base/src/session/maintenance.rs": {
-      "dot_ok": 0,
-      "let_underscore": 1,
+      "dot_ok": 2,
+      "let_underscore": 2,
       "unwrap_or_default": 0
     },
     "crates/jcode-base/src/session/persistence.rs": {
@@ -955,6 +965,11 @@
       "dot_ok": 0,
       "let_underscore": 0,
       "unwrap_or_default": 1
+    },
+    "crates/jcode-base/src/session/task_state.rs": {
+      "dot_ok": 2,
+      "let_underscore": 2,
+      "unwrap_or_default": 0
     },
     "crates/jcode-base/src/session_metrics.rs": {
       "dot_ok": 1,
@@ -1086,10 +1101,20 @@
       "let_underscore": 0,
       "unwrap_or_default": 0
     },
+    "crates/jcode-compaction-core/src/lib.rs": {
+      "dot_ok": 0,
+      "let_underscore": 0,
+      "unwrap_or_default": 1
+    },
     "crates/jcode-config-types/src/lib.rs": {
       "dot_ok": 0,
       "let_underscore": 0,
       "unwrap_or_default": 1
+    },
+    "crates/jcode-core/src/env.rs": {
+      "dot_ok": 2,
+      "let_underscore": 0,
+      "unwrap_or_default": 0
     },
     "crates/jcode-core/src/stdin_detect.rs": {
       "dot_ok": 3,
@@ -1464,7 +1489,7 @@
     "crates/jcode-provider-anthropic/src/lib.rs": {
       "dot_ok": 0,
       "let_underscore": 0,
-      "unwrap_or_default": 1
+      "unwrap_or_default": 2
     },
     "crates/jcode-provider-antigravity-runtime/src/lib.rs": {
       "dot_ok": 2,
@@ -1708,7 +1733,7 @@
     },
     "crates/jcode-storage/src/lib.rs": {
       "dot_ok": 0,
-      "let_underscore": 13,
+      "let_underscore": 14,
       "unwrap_or_default": 1
     },
     "crates/jcode-swarm-core/src/lib.rs": {
@@ -1717,8 +1742,8 @@
       "unwrap_or_default": 1
     },
     "crates/jcode-telemetry-core/src/lib.rs": {
-      "dot_ok": 7,
-      "let_underscore": 10,
+      "dot_ok": 9,
+      "let_underscore": 14,
       "unwrap_or_default": 3
     },
     "crates/jcode-telemetry-core/src/lifecycle.rs": {
@@ -1862,13 +1887,13 @@
       "unwrap_or_default": 1
     },
     "crates/jcode-tui/src/tui/app.rs": {
-      "dot_ok": 1,
+      "dot_ok": 0,
       "let_underscore": 0,
       "unwrap_or_default": 2
     },
     "crates/jcode-tui/src/tui/app/auth.rs": {
       "dot_ok": 7,
-      "let_underscore": 3,
+      "let_underscore": 5,
       "unwrap_or_default": 12
     },
     "crates/jcode-tui/src/tui/app/auth_account_commands.rs": {
@@ -1967,9 +1992,9 @@
       "unwrap_or_default": 1
     },
     "crates/jcode-tui/src/tui/app/inline_interactive.rs": {
-      "dot_ok": 6,
-      "let_underscore": 11,
-      "unwrap_or_default": 4
+      "dot_ok": 7,
+      "let_underscore": 16,
+      "unwrap_or_default": 5
     },
     "crates/jcode-tui/src/tui/app/inline_interactive/helpers.rs": {
       "dot_ok": 0,
@@ -1983,7 +2008,7 @@
     },
     "crates/jcode-tui/src/tui/app/input.rs": {
       "dot_ok": 8,
-      "let_underscore": 2,
+      "let_underscore": 3,
       "unwrap_or_default": 0
     },
     "crates/jcode-tui/src/tui/app/local.rs": {
@@ -2252,7 +2277,7 @@
       "unwrap_or_default": 1
     },
     "crates/jcode-tui/src/tui/ui_header.rs": {
-      "dot_ok": 2,
+      "dot_ok": 0,
       "let_underscore": 0,
       "unwrap_or_default": 3
     },
@@ -2268,7 +2293,7 @@
     },
     "crates/jcode-tui/src/tui/ui_input.rs": {
       "dot_ok": 3,
-      "let_underscore": 0,
+      "let_underscore": 1,
       "unwrap_or_default": 2
     },
     "crates/jcode-tui/src/tui/ui_messages.rs": {
@@ -2285,6 +2310,11 @@
       "dot_ok": 1,
       "let_underscore": 1,
       "unwrap_or_default": 0
+    },
+    "crates/jcode-tui/src/tui/ui_prepare.rs": {
+      "dot_ok": 0,
+      "let_underscore": 0,
+      "unwrap_or_default": 2
     },
     "crates/jcode-tui/src/tui/ui_status.rs": {
       "dot_ok": 1,
@@ -2402,13 +2432,13 @@
       "unwrap_or_default": 0
     },
     "src/cli/startup.rs": {
-      "dot_ok": 3,
+      "dot_ok": 4,
       "let_underscore": 0,
       "unwrap_or_default": 0
     },
     "src/cli/terminal.rs": {
       "dot_ok": 2,
-      "let_underscore": 10,
+      "let_underscore": 11,
       "unwrap_or_default": 0
     },
     "src/cli/tui_launch.rs": {

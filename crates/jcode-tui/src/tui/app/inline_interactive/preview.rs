@@ -193,9 +193,7 @@ impl App {
         let first_entry_pos = self
             .inline_interactive_state
             .as_ref()
-            .and_then(|picker| {
-                picker.display_rows.iter().position(|r| !r.is_header())
-            });
+            .and_then(|picker| picker.display_rows.iter().position(|r| !r.is_header()));
         if self
             .inline_interactive_state
             .as_ref()

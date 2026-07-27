@@ -699,7 +699,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
     for vi in start..end {
         let row = &picker.display_rows[vi];
         let is_row_selected = vi == selected;
-        
+
         // Handle section headers
         match row {
             crate::tui::PickerDisplayRow::RecentHeader { count } => {
@@ -719,7 +719,10 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
                 } else {
                     Style::default().fg(rgb(140, 140, 160))
                 };
-                lines.push(Line::from(Span::styled(format!("   {}", header_text), style)));
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", header_text),
+                    style,
+                )));
                 continue;
             }
             crate::tui::PickerDisplayRow::Entry { entry_index } => {
@@ -744,227 +747,231 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
                         Style::default().fg(dim_color())
                     },
                 ));
-        let display_name = picker_entry_display_name(entry);
-        let account_action_color = match &entry.action {
-            crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Add { .. }) => {
-                Some(rgb(140, 220, 170))
-            }
-            crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Replace {
-                ..
-            }) => Some(rgb(240, 200, 120)),
-            crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::OpenCenter {
-                ..
-            }) => Some(rgb(150, 190, 255)),
-            _ => None,
-        };
-        let primary_style = if unavailable {
-            Style::default().fg(rgb(80, 80, 80))
-        } else if is_row_selected && col == 0 {
-            Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
-        } else if let Some(color) = account_action_color {
-            Style::default().fg(color).bold()
-        } else if entry.is_current {
-            Style::default().fg(accent_color())
-        } else if entry.is_favorite {
-            Style::default().fg(rgb(255, 160, 210)).bold()
-        } else if entry.recommended {
-            Style::default().fg(rgb(255, 220, 120))
-        } else if entry.old {
-            Style::default().fg(rgb(120, 120, 130))
-        } else {
-            Style::default().fg(rgb(200, 200, 220))
-        };
+                let display_name = picker_entry_display_name(entry);
+                let account_action_color = match &entry.action {
+                    crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Add {
+                        ..
+                    }) => Some(rgb(140, 220, 170)),
+                    crate::tui::PickerAction::Account(
+                        crate::tui::AccountPickerAction::Replace { .. },
+                    ) => Some(rgb(240, 200, 120)),
+                    crate::tui::PickerAction::Account(
+                        crate::tui::AccountPickerAction::OpenCenter { .. },
+                    ) => Some(rgb(150, 190, 255)),
+                    _ => None,
+                };
+                let primary_style = if unavailable {
+                    Style::default().fg(rgb(80, 80, 80))
+                } else if is_row_selected && col == 0 {
+                    Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
+                } else if let Some(color) = account_action_color {
+                    Style::default().fg(color).bold()
+                } else if entry.is_current {
+                    Style::default().fg(accent_color())
+                } else if entry.is_favorite {
+                    Style::default().fg(rgb(255, 160, 210)).bold()
+                } else if entry.recommended {
+                    Style::default().fg(rgb(255, 220, 120))
+                } else if entry.old {
+                    Style::default().fg(rgb(120, 120, 130))
+                } else {
+                    Style::default().fg(rgb(200, 200, 220))
+                };
 
-        if is_account_picker {
-            let (title_text, title_prefix_chars) =
-                account_picker_entry_title(entry, show_account_provider_badge);
-            let padded_title = pad_left_display(title_text.as_str(), account_title_width);
-            let state_label = account_inline_interactive_state_label(entry);
-            let state_display = format!(
-                " {}",
-                pad_left_display(state_label, account_state_width.saturating_sub(1))
-            );
-            let match_positions = if !picker.filter.is_empty() {
-                fuzzy_match_positions(&picker.filter, &entry.name)
-                    .into_iter()
-                    .map(|p| p + title_prefix_chars)
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            let title_spans: Vec<Span> = if match_positions.is_empty() || unavailable {
-                vec![Span::styled(padded_title, primary_style)]
-            } else {
-                let title_chars: Vec<char> = padded_title.chars().collect();
-                let highlight_style = primary_style.underlined();
-                let mut result = Vec::new();
-                let mut run_start = 0;
-                let mut is_match_run = !title_chars.is_empty() && match_positions.contains(&0);
-                for ci in 1..=title_chars.len() {
-                    let cur_is_match = ci < title_chars.len() && match_positions.contains(&ci);
-                    if cur_is_match != is_match_run || ci == title_chars.len() {
-                        let chunk: String = title_chars[run_start..ci].iter().collect();
-                        result.push(Span::styled(
-                            chunk,
-                            if is_match_run {
-                                highlight_style
-                            } else {
-                                primary_style
-                            },
-                        ));
-                        run_start = ci;
-                        is_match_run = cur_is_match;
-                    }
-                }
-                result
-            };
+                if is_account_picker {
+                    let (title_text, title_prefix_chars) =
+                        account_picker_entry_title(entry, show_account_provider_badge);
+                    let padded_title = pad_left_display(title_text.as_str(), account_title_width);
+                    let state_label = account_inline_interactive_state_label(entry);
+                    let state_display = format!(
+                        " {}",
+                        pad_left_display(state_label, account_state_width.saturating_sub(1))
+                    );
+                    let match_positions = if !picker.filter.is_empty() {
+                        fuzzy_match_positions(&picker.filter, &entry.name)
+                            .into_iter()
+                            .map(|p| p + title_prefix_chars)
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    let title_spans: Vec<Span> = if match_positions.is_empty() || unavailable {
+                        vec![Span::styled(padded_title, primary_style)]
+                    } else {
+                        let title_chars: Vec<char> = padded_title.chars().collect();
+                        let highlight_style = primary_style.underlined();
+                        let mut result = Vec::new();
+                        let mut run_start = 0;
+                        let mut is_match_run =
+                            !title_chars.is_empty() && match_positions.contains(&0);
+                        for ci in 1..=title_chars.len() {
+                            let cur_is_match =
+                                ci < title_chars.len() && match_positions.contains(&ci);
+                            if cur_is_match != is_match_run || ci == title_chars.len() {
+                                let chunk: String = title_chars[run_start..ci].iter().collect();
+                                result.push(Span::styled(
+                                    chunk,
+                                    if is_match_run {
+                                        highlight_style
+                                    } else {
+                                        primary_style
+                                    },
+                                ));
+                                run_start = ci;
+                                is_match_run = cur_is_match;
+                            }
+                        }
+                        result
+                    };
 
-            let state_style = if unavailable {
-                Style::default().fg(rgb(80, 80, 80))
-            } else if is_row_selected {
-                Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
-            } else if entry.is_current {
-                Style::default().fg(accent_color()).bold()
-            } else if let Some(color) = account_action_color {
-                Style::default().fg(color)
-            } else {
-                Style::default().fg(dim_color())
-            };
-
-            spans.extend(title_spans);
-            spans.push(Span::styled(state_display, state_style));
-            if let Some(route) = route
-                && let Some(detail_text) = route_detail_display_text(&route.detail, unavailable)
-                && detail_width > 0
-            {
-                spans.push(Span::styled(
-                    format!("  {}", truncate_display(detail_text.as_str(), detail_width)),
-                    if unavailable {
-                        Style::default().fg(rgb(180, 120, 120)).italic()
+                    let state_style = if unavailable {
+                        Style::default().fg(rgb(80, 80, 80))
+                    } else if is_row_selected {
+                        Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
+                    } else if entry.is_current {
+                        Style::default().fg(accent_color()).bold()
+                    } else if let Some(color) = account_action_color {
+                        Style::default().fg(color)
                     } else {
                         Style::default().fg(dim_color())
-                    },
-                ));
-            }
+                    };
 
-            lines.push(Line::from(spans));
-            continue;
-        }
+                    spans.extend(title_spans);
+                    spans.push(Span::styled(state_display, state_style));
+                    if let Some(route) = route
+                        && let Some(detail_text) =
+                            route_detail_display_text(&route.detail, unavailable)
+                        && detail_width > 0
+                    {
+                        spans.push(Span::styled(
+                            format!("  {}", truncate_display(detail_text.as_str(), detail_width)),
+                            if unavailable {
+                                Style::default().fg(rgb(180, 120, 120)).italic()
+                            } else {
+                                Style::default().fg(dim_color())
+                            },
+                        ));
+                    }
 
-        let padded_model = if is_preview {
-            format!(
-                " {}",
-                pad_left_display(display_name.as_str(), model_width.saturating_sub(1))
-            )
-        } else {
-            pad_left_display(display_name.as_str(), model_width)
-        };
+                    lines.push(Line::from(spans));
+                    continue;
+                }
 
-        let match_positions = if !picker.filter.is_empty() {
-            let raw = fuzzy_match_positions(&picker.filter, display_name.as_str());
-            if is_preview && !raw.is_empty() {
-                // Account for the single leading space in the preview model column.
-                raw.into_iter().map(|p| p + 1).collect()
-            } else {
-                raw
-            }
-        } else {
-            Vec::new()
-        };
-        let model_spans: Vec<Span> = if match_positions.is_empty() || unavailable {
-            vec![Span::styled(padded_model, primary_style)]
-        } else {
-            let model_chars: Vec<char> = padded_model.chars().collect();
-            let highlight_style = primary_style.underlined();
-            let mut result = Vec::new();
-            let mut run_start = 0;
-            let mut is_match_run = !model_chars.is_empty() && match_positions.contains(&0);
-            for ci in 1..=model_chars.len() {
-                let cur_is_match = ci < model_chars.len() && match_positions.contains(&ci);
-                if cur_is_match != is_match_run || ci == model_chars.len() {
-                    let chunk: String = model_chars[run_start..ci].iter().collect();
-                    result.push(Span::styled(
-                        chunk,
-                        if is_match_run {
-                            highlight_style
+                let padded_model = if is_preview {
+                    format!(
+                        " {}",
+                        pad_left_display(display_name.as_str(), model_width.saturating_sub(1))
+                    )
+                } else {
+                    pad_left_display(display_name.as_str(), model_width)
+                };
+
+                let match_positions = if !picker.filter.is_empty() {
+                    let raw = fuzzy_match_positions(&picker.filter, display_name.as_str());
+                    if is_preview && !raw.is_empty() {
+                        // Account for the single leading space in the preview model column.
+                        raw.into_iter().map(|p| p + 1).collect()
+                    } else {
+                        raw
+                    }
+                } else {
+                    Vec::new()
+                };
+                let model_spans: Vec<Span> = if match_positions.is_empty() || unavailable {
+                    vec![Span::styled(padded_model, primary_style)]
+                } else {
+                    let model_chars: Vec<char> = padded_model.chars().collect();
+                    let highlight_style = primary_style.underlined();
+                    let mut result = Vec::new();
+                    let mut run_start = 0;
+                    let mut is_match_run = !model_chars.is_empty() && match_positions.contains(&0);
+                    for ci in 1..=model_chars.len() {
+                        let cur_is_match = ci < model_chars.len() && match_positions.contains(&ci);
+                        if cur_is_match != is_match_run || ci == model_chars.len() {
+                            let chunk: String = model_chars[run_start..ci].iter().collect();
+                            result.push(Span::styled(
+                                chunk,
+                                if is_match_run {
+                                    highlight_style
+                                } else {
+                                    primary_style
+                                },
+                            ));
+                            run_start = ci;
+                            is_match_run = cur_is_match;
+                        }
+                    }
+                    result
+                };
+
+                let route_count = entry.option_count();
+                let provider_raw = route
+                    .map(|r| route_provider_display(&r.provider, &r.api_method))
+                    .unwrap_or_else(|| "-".to_string());
+                let provider_label = if col == 0 && route_count > 1 {
+                    format!("{} ({})", provider_raw, route_count)
+                } else {
+                    provider_raw
+                };
+                let pw = provider_width.saturating_sub(1);
+                let provider_display =
+                    format!(" {}", pad_left_display(provider_label.as_str(), pw));
+                let provider_style = if unavailable {
+                    Style::default().fg(rgb(80, 80, 80))
+                } else if is_row_selected && col == 1 {
+                    Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
+                } else {
+                    Style::default().fg(rgb(140, 180, 255))
+                };
+
+                let via_raw = route
+                    .map(|r| api_method_display(&r.api_method))
+                    .unwrap_or_else(|| "-".to_string());
+                let vw = via_width.saturating_sub(1);
+                let via_display = format!(" {}", pad_left_display(via_raw.as_str(), vw));
+                let via_style = if unavailable {
+                    Style::default().fg(rgb(80, 80, 80))
+                } else if is_row_selected && col == 2 {
+                    Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
+                } else if is_usage_picker {
+                    Style::default().fg(rgb(196, 170, 255))
+                } else {
+                    Style::default().fg(rgb(220, 190, 120))
+                };
+
+                if is_preview && !is_account_picker {
+                    spans.push(Span::styled(provider_display, provider_style));
+                    spans.extend(model_spans);
+                    // Add inline effort ladder for model rows
+                    if let Some(effort_ladder) = format_effort_ladder(entry, is_row_selected) {
+                        spans.extend(effort_ladder);
+                    }
+                    spans.push(Span::styled(via_display, via_style));
+                } else {
+                    spans.extend(model_spans);
+                    // Add inline effort ladder for model rows
+                    if let Some(effort_ladder) = format_effort_ladder(entry, is_row_selected) {
+                        spans.extend(effort_ladder);
+                    }
+                    spans.push(Span::styled(provider_display, provider_style));
+                    spans.push(Span::styled(via_display, via_style));
+                }
+
+                if let Some(route) = route
+                    && let Some(detail_text) = route_detail_display_text(&route.detail, unavailable)
+                    && detail_width > 0
+                {
+                    spans.push(Span::styled(
+                        format!("  {}", truncate_display(detail_text.as_str(), detail_width)),
+                        if unavailable {
+                            Style::default().fg(rgb(180, 120, 120)).italic()
                         } else {
-                            primary_style
+                            Style::default().fg(dim_color())
                         },
                     ));
-                    run_start = ci;
-                    is_match_run = cur_is_match;
                 }
-            }
-            result
-        };
 
-        let route_count = entry.option_count();
-        let provider_raw = route
-            .map(|r| route_provider_display(&r.provider, &r.api_method))
-            .unwrap_or_else(|| "-".to_string());
-        let provider_label = if col == 0 && route_count > 1 {
-            format!("{} ({})", provider_raw, route_count)
-        } else {
-            provider_raw
-        };
-        let pw = provider_width.saturating_sub(1);
-        let provider_display = format!(" {}", pad_left_display(provider_label.as_str(), pw));
-        let provider_style = if unavailable {
-            Style::default().fg(rgb(80, 80, 80))
-        } else if is_row_selected && col == 1 {
-            Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
-        } else {
-            Style::default().fg(rgb(140, 180, 255))
-        };
-
-        let via_raw = route
-            .map(|r| api_method_display(&r.api_method))
-            .unwrap_or_else(|| "-".to_string());
-        let vw = via_width.saturating_sub(1);
-        let via_display = format!(" {}", pad_left_display(via_raw.as_str(), vw));
-        let via_style = if unavailable {
-            Style::default().fg(rgb(80, 80, 80))
-        } else if is_row_selected && col == 2 {
-            Style::default().fg(Color::White).bg(rgb(60, 60, 80)).bold()
-        } else if is_usage_picker {
-            Style::default().fg(rgb(196, 170, 255))
-        } else {
-            Style::default().fg(rgb(220, 190, 120))
-        };
-
-        if is_preview && !is_account_picker {
-            spans.push(Span::styled(provider_display, provider_style));
-            spans.extend(model_spans);
-            // Add inline effort ladder for model rows
-            if let Some(effort_ladder) = format_effort_ladder(entry, is_row_selected) {
-                spans.extend(effort_ladder);
-            }
-            spans.push(Span::styled(via_display, via_style));
-        } else {
-            spans.extend(model_spans);
-            // Add inline effort ladder for model rows
-            if let Some(effort_ladder) = format_effort_ladder(entry, is_row_selected) {
-                spans.extend(effort_ladder);
-            }
-            spans.push(Span::styled(provider_display, provider_style));
-            spans.push(Span::styled(via_display, via_style));
-        }
-
-        if let Some(route) = route
-            && let Some(detail_text) = route_detail_display_text(&route.detail, unavailable)
-            && detail_width > 0
-        {
-            spans.push(Span::styled(
-                format!("  {}", truncate_display(detail_text.as_str(), detail_width)),
-                if unavailable {
-                    Style::default().fg(rgb(180, 120, 120)).italic()
-                } else {
-                    Style::default().fg(dim_color())
-                },
-            ));
-        }
-
-        lines.push(Line::from(spans));
+                lines.push(Line::from(spans));
             }
         }
     }

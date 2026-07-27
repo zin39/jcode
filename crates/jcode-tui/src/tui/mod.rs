@@ -108,7 +108,10 @@ pub enum PickerDisplayRow {
 
 impl PickerDisplayRow {
     pub fn is_header(&self) -> bool {
-        matches!(self, PickerDisplayRow::RecentHeader { .. } | PickerDisplayRow::ProviderHeader { .. })
+        matches!(
+            self,
+            PickerDisplayRow::RecentHeader { .. } | PickerDisplayRow::ProviderHeader { .. }
+        )
     }
 
     pub fn is_provider_header(&self) -> bool {
@@ -1675,12 +1678,12 @@ impl InlineInteractiveState {
 
     /// Get the entry index for a display row, if it's an Entry row.
     pub fn entry_index_for_display_row(&self, display_row: usize) -> Option<usize> {
-        self.display_rows.get(display_row).and_then(|row| {
-            match row {
+        self.display_rows
+            .get(display_row)
+            .and_then(|row| match row {
                 PickerDisplayRow::Entry { entry_index } => Some(*entry_index),
                 _ => None,
-            }
-        })
+            })
     }
 
     /// Get the filtered index for the currently selected display row.

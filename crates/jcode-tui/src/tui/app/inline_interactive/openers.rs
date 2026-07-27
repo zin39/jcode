@@ -68,7 +68,8 @@ impl App {
         });
         // Initialize display rows for agents picker (no headers needed for short list)
         if let Some(ref mut picker) = self.inline_interactive_state {
-            picker.display_rows = picker.entries
+            picker.display_rows = picker
+                .entries
                 .iter()
                 .enumerate()
                 .map(|(i, _)| crate::tui::PickerDisplayRow::Entry { entry_index: i })
@@ -193,7 +194,8 @@ impl App {
         });
         // Initialize display rows for login picker (no headers needed)
         if let Some(ref mut picker) = self.inline_interactive_state {
-            picker.display_rows = picker.entries
+            picker.display_rows = picker
+                .entries
                 .iter()
                 .enumerate()
                 .map(|(i, _)| crate::tui::PickerDisplayRow::Entry { entry_index: i })
