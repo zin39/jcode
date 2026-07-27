@@ -264,3 +264,50 @@ fn test_model_picker_preview_enter_selects_model() {
     assert!(app.input().is_empty());
     assert_eq!(app.cursor_pos(), 0);
 }
+
+/// Left/Right in the PREVIEW picker (the state while "/model" is still in the
+/// composer) must dial the focused row's effort, not move the composer cursor.
+/// This was the live regression: the hint said "←/→ effort" but the keys just
+/// wandered through the typed text.
+#[test]
+fn test_model_picker_preview_arrows_cycle_effort_not_cursor() {
+    let mut app = create_test_app();
+    configure_test_remote_models(&mut app);
+
+    for c in "/model g55".chars() {
+        app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+            .unwrap();
+    }
+    app.wait_for_model_picker_routes_for_tests();
+
+    let cursor_before = app.cursor_pos;
+    let effort_before = {
+        let picker = app
+            .inline_interactive_state
+            .as_ref()
+            .expect("preview picker open");
+        assert!(picker.preview);
+        let idx = picker.filtered[picker.selected];
+        assert!(
+            !picker.entries[idx].available_efforts.is_empty(),
+            "focused row should support efforts for this test"
+        );
+        picker.entries[idx].effort.clone()
+    };
+
+    app.handle_key(KeyCode::Right, KeyModifiers::empty()).unwrap();
+
+    let picker = app
+        .inline_interactive_state
+        .as_ref()
+        .expect("picker still open");
+    let idx = picker.filtered[picker.selected];
+    assert_ne!(
+        picker.entries[idx].effort, effort_before,
+        "Right must cycle the focused row's effort"
+    );
+    assert_eq!(
+        app.cursor_pos, cursor_before,
+        "Right must not move the composer cursor while the model picker is open"
+    );
+}

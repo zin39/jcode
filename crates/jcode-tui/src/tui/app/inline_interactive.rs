@@ -2261,6 +2261,56 @@ impl App {
                 }
                 Ok(true)
             }
+            // Left/Right cycle effort on the focused model row even in preview
+            // mode. Without this the keys fall through to the composer and just
+            // move the cursor inside the typed "/model" text, which reads as
+            // the picker ignoring the advertised `←/→ effort` hint. Editing the
+            // filter text mid-string is a far rarer need than dialing effort;
+            // typing and backspace still work for the filter.
+            KeyCode::Left => {
+                if let Some(picker) = self.inline_interactive_state.as_mut()
+                    && picker.kind == PickerKind::Model
+                {
+                    if let Some(&idx) = picker.filtered.get(picker.selected) {
+                        let entry = &mut picker.entries[idx];
+                        if !entry.available_efforts.is_empty() {
+                            let current_idx = entry
+                                .effort
+                                .as_ref()
+                                .and_then(|e| entry.available_efforts.iter().position(|a| a == e))
+                                .unwrap_or(0);
+                            let new_idx = if current_idx == 0 {
+                                entry.available_efforts.len() - 1
+                            } else {
+                                current_idx - 1
+                            };
+                            entry.effort = Some(entry.available_efforts[new_idx].clone());
+                        }
+                    }
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            KeyCode::Right => {
+                if let Some(picker) = self.inline_interactive_state.as_mut()
+                    && picker.kind == PickerKind::Model
+                {
+                    if let Some(&idx) = picker.filtered.get(picker.selected) {
+                        let entry = &mut picker.entries[idx];
+                        if !entry.available_efforts.is_empty() {
+                            let current_idx = entry
+                                .effort
+                                .as_ref()
+                                .and_then(|e| entry.available_efforts.iter().position(|a| a == e))
+                                .unwrap_or(0);
+                            let new_idx = (current_idx + 1) % entry.available_efforts.len();
+                            entry.effort = Some(entry.available_efforts[new_idx].clone());
+                        }
+                    }
+                    return Ok(true);
+                }
+                Ok(false)
+            }
             KeyCode::Enter => {
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.filtered.is_empty() {

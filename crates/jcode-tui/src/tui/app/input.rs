@@ -2807,6 +2807,15 @@ impl App {
                 KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                     return self.handle_inline_interactive_key(code, modifiers);
                 }
+                // Left/Right dial the focused row's effort in the model picker
+                // (preview handler claims them and returns true); for other
+                // pickers the handler returns false and the keys fall through
+                // to normal composer cursor movement.
+                KeyCode::Left | KeyCode::Right => {
+                    if self.handle_inline_interactive_preview_key(&code, modifiers)? {
+                        return Ok(());
+                    }
+                }
                 _ => {}
             }
         }
