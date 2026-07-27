@@ -23,6 +23,37 @@ fn idle_animation_state(anim_elapsed: f32) -> TestState {
     }
 }
 
+/// Pin the idle animation ON for the duration of a test.
+///
+/// WP9 made the decorative donut opt-in (`display.idle_animation` defaults to
+/// false), so these fast-path tests must enable it explicitly instead of
+/// inheriting whatever the developer's real config says. The env override is
+/// process-global, which is safe here because every test in this file already
+/// serializes on the shared render lock.
+struct IdleAnimationPinned {
+    _env: std::sync::MutexGuard<'static, ()>,
+}
+
+impl IdleAnimationPinned {
+    fn new() -> Self {
+        // Hold the shared env lock for the whole test: the pin mutates the
+        // process-global environment and config cache, which other tests
+        // (config summaries, settings pickers) read concurrently. Lock order:
+        // env lock BEFORE the render lock (see storage::lock_test_env docs).
+        let env = crate::storage::lock_test_env();
+        crate::env::set_var("JCODE_IDLE_ANIMATION", "1");
+        crate::config::invalidate_config_cache();
+        Self { _env: env }
+    }
+}
+
+impl Drop for IdleAnimationPinned {
+    fn drop(&mut self) {
+        crate::env::remove_var("JCODE_IDLE_ANIMATION");
+        crate::config::invalidate_config_cache();
+    }
+}
+
 fn render_full(state: &TestState, width: u16, height: u16) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal
@@ -33,6 +64,7 @@ fn render_full(state: &TestState, width: u16, height: u16) -> Terminal<TestBacke
 
 #[test]
 fn draw_publishes_the_animated_rows_only_when_the_animation_rendered() {
+    let _anim = IdleAnimationPinned::new();
     let _lock = viewport_snapshot_test_lock();
     clear_flicker_frame_history_for_tests();
 
@@ -64,6 +96,7 @@ fn draw_publishes_the_animated_rows_only_when_the_animation_rendered() {
 
 #[test]
 fn partial_repaint_matches_a_full_frame_at_the_same_animation_time() {
+    let _anim = IdleAnimationPinned::new();
     let _lock = viewport_snapshot_test_lock();
     clear_flicker_frame_history_for_tests();
 
@@ -111,6 +144,7 @@ fn advancing_the_animation_actually_changes_the_animated_rows() {
     // Guards against the partial-repaint test passing vacuously: if the
     // animation were static, "matches a full frame" would be trivially true and
     // the fast path could silently freeze the animation.
+    let _anim = IdleAnimationPinned::new();
     let _lock = viewport_snapshot_test_lock();
     clear_flicker_frame_history_for_tests();
 
@@ -145,6 +179,7 @@ fn advancing_the_animation_actually_changes_the_animated_rows() {
 fn idle_animation_is_excluded_from_the_full_frame_redraw_signal() {
     // `handle_tick` uses the excluding variant so an animation-only tick does
     // not force a full frame; the animation still drives the tick cadence.
+    let _anim = IdleAnimationPinned::new();
     let _lock = viewport_snapshot_test_lock();
     clear_flicker_frame_history_for_tests();
 
@@ -175,6 +210,7 @@ fn partial_repaint_does_no_layout_or_transcript_work() {
     // structurally rather than by timing (which varies by build profile): a full
     // frame republishes layout/viewport bookkeeping, a partial repaint must
     // touch none of it and must not resize or relayout anything.
+    let _anim = IdleAnimationPinned::new();
     let _lock = viewport_snapshot_test_lock();
     clear_flicker_frame_history_for_tests();
 

@@ -123,7 +123,11 @@ fn test_alignment_status_shows_current_and_saved_defaults() {
         );
         assert!(last.content.contains("Saved default: left-aligned."));
         assert!(last.content.contains("/alignment centered"));
-        assert!(last.content.contains("Alt+C"));
+        // The Alt label is platform-dependent ("⌥" on macOS, "Alt" elsewhere).
+        assert!(
+            last.content
+                .contains(&jcode_tui_core::keybind::alt_chord("C"))
+        );
     });
 }
 

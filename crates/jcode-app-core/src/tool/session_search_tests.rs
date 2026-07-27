@@ -311,6 +311,10 @@ fn system_reminders_are_hidden_by_default_and_opt_in_searchable() {
     with_temp_home(|home| {
         let mut session = Session::create_with_id("system-session".to_string(), None, None);
         session.working_dir = Some("/tmp/project".to_string());
+        // Husk suppression skips persisting sessions whose only content is
+        // system-displayed, so anchor the session with one ordinary visible
+        // message; the assertions below only ever query the system needles.
+        session.add_message(Role::User, vec![text("ordinary visible anchor message")]);
         session.add_message(
             Role::User,
             vec![text(

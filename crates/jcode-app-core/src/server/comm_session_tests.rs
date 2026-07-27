@@ -384,7 +384,11 @@ fn prepare_visible_spawn_session_persists_and_launches_provider_key_for_openrout
 
     assert!(launched);
     let session = crate::session::Session::load(&session_id).expect("prepared session should save");
-    assert_eq!(session.model.as_deref(), Some("openai/gpt-5.4@OpenAI"));
+    // The spawn persists a route-pinned switch request (auth route preserved).
+    assert_eq!(
+        session.model.as_deref(),
+        Some("openrouter:openai/gpt-5.4@OpenAI")
+    );
     assert_eq!(session.provider_key.as_deref(), Some("openrouter"));
 
     crate::env::remove_var("JCODE_HOME");
@@ -411,7 +415,9 @@ fn prepare_visible_spawn_session_persists_requested_effort() {
 
     assert!(launched);
     let session = crate::session::Session::load(&session_id).expect("prepared session should save");
-    assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
+    // The spawn persists a route-pinned switch request (auth route preserved),
+    // not the bare name; the provider key is guessed from the model family.
+    assert_eq!(session.model.as_deref(), Some("openai-oauth:gpt-5.5"));
     assert_eq!(
         session.reasoning_effort.as_deref(),
         Some("low"),
@@ -445,7 +451,9 @@ fn prepare_visible_spawn_session_prefers_parent_provider_key_over_model_guess() 
 
     assert!(launched);
     let session = crate::session::Session::load(&session_id).expect("prepared session should save");
-    assert_eq!(session.model.as_deref(), Some("gpt-5.4"));
+    // The spawn persists a route-pinned switch request carrying the parent's
+    // provider key.
+    assert_eq!(session.model.as_deref(), Some("ollama:gpt-5.4"));
     assert_eq!(session.provider_key.as_deref(), Some("ollama"));
 
     crate::env::remove_var("JCODE_HOME");

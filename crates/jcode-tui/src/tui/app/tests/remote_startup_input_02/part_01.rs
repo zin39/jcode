@@ -242,6 +242,16 @@ fn test_remote_placeholder_only_openai_routes_are_replaced_with_real_routes() {
 
         app.open_model_picker();
 
+        // The picker now opens instantly with the placeholder routes and
+        // upgrades them off-thread; pump the background load to completion
+        // the way the run loop would.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.pending_model_picker_load.is_some() && std::time::Instant::now() < deadline {
+            if !app.poll_model_picker_load() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
         crate::env::remove_var("OPENAI_API_KEY");
         crate::auth::AuthStatus::invalidate_cache();
 

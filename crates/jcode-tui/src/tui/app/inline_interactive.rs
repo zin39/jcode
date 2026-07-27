@@ -583,6 +583,10 @@ fn extend_remote_routes_for_uncovered_models_impl(
             .filter(|model| match methods_by_model.get(model.as_str()) {
                 None => true,
                 Some(methods) => {
+                    // Poisoned caches pin models to placeholder rows forever;
+                    // see inline_interactive_placeholder_routes.rs.
+                    let placeholder_only =
+                        placeholder_routes::methods_are_placeholder_only(methods.iter());
                     let missing_anthropic_method = crate::provider::provider_for_model(model)
                         == Some("claude")
                         && !model.contains('/')
@@ -591,7 +595,7 @@ fn extend_remote_routes_for_uncovered_models_impl(
                     let missing_bedrock_method = bedrock_available
                         && crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model)
                         && !methods.contains("bedrock");
-                    missing_anthropic_method || missing_bedrock_method
+                    placeholder_only || missing_anthropic_method || missing_bedrock_method
                 }
             })
             .cloned()

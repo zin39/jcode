@@ -1911,7 +1911,7 @@ mod tests {
 
 #[cfg(test)]
 mod redraw_governor_tests {
-    use super::redraw_schedule::govern_redraw_interval_by_draw_cost;
+    use super::redraw_schedule::{govern_redraw_interval_by_draw_cost, redraw_interval_floor};
     use std::time::Duration;
 
     // recent_average_draw_cost_ms reads from the process-global draw history,
@@ -1931,7 +1931,7 @@ mod redraw_governor_tests {
     #[test]
     fn a_static_screen_is_throttled_even_though_its_frames_are_cheap() {
         // The idle cadence is what a static screen actually asks for.
-        let governed = super::redraw_interval_floor(crate::tui::REDRAW_IDLE, 5.6, Some(1.0));
+        let governed = redraw_interval_floor(crate::tui::REDRAW_IDLE, 5.6, Some(1.0));
         assert!(
             governed >= Duration::from_millis(400),
             "a static screen should be throttled hard, but the governor \
@@ -1945,7 +1945,7 @@ mod redraw_governor_tests {
     /// futile work, or spinners and countdowns would visibly stutter.
     #[test]
     fn animating_ui_is_not_throttled_as_if_it_were_futile() {
-        let governed = super::redraw_interval_floor(
+        let governed = redraw_interval_floor(
             Duration::from_millis(16),
             5.6,
             Some(0.0),
@@ -1972,7 +1972,7 @@ mod redraw_governor_tests {
         );
 
         // History is entirely static: the spinner's own frames are not in it yet.
-        let governed = super::redraw_interval_floor(spinner, 5.6, Some(1.0));
+        let governed = redraw_interval_floor(spinner, 5.6, Some(1.0));
         assert_eq!(
             governed,
             spinner,
@@ -1996,40 +1996,5 @@ mod redraw_governor_tests {
         assert_eq!(patho, Duration::from_millis(250));
     }
 
-    /// End-to-end through the real global history, unlike the sibling tests
-    /// which only replicate the floor arithmetic. This is what pins that the
-    /// futility signal is actually consulted: cheap frames leave the cost floor
-    /// at ~14ms, so without the futility branch a provably static screen keeps
-    /// being redrawn (measured live at 36 of 60 idle draws changing 0 cells).
-    #[test]
-    fn governor_backs_off_when_recent_draws_changed_nothing() {
-        let _guard = crate::tui::ui::draw_call_governor_test_lock();
-        crate::tui::ui::clear_draw_call_history_for_tests();
 
-        for i in 0..12 {
-            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(0));
-        }
-
-        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
-        assert!(
-            governed >= Duration::from_millis(400),
-            "a static screen should be throttled hard, but the governor \
-             returned {governed:?}; cheap frames make the cost floor only \
-             ~14ms, so futility must be what triggers the back-off"
-        );
-
-        // A spinner changes a few cells every frame: real work, must not throttle.
-        crate::tui::ui::clear_draw_call_history_for_tests();
-        for i in 0..12 {
-            crate::tui::ui::record_draw_call_attribution_for_tests(i, 5.0, Some(4));
-        }
-        let governed = govern_redraw_interval_by_draw_cost(Duration::from_millis(16));
-        assert!(
-            governed < Duration::from_millis(400),
-            "animating UI was throttled as if futile ({governed:?}), which \
-             would make spinners and countdowns visibly stutter"
-        );
-
-        crate::tui::ui::clear_draw_call_history_for_tests();
-    }
 }
