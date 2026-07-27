@@ -520,11 +520,13 @@ fn test_model_picker_preserves_recommendation_priority_order() {
 
     let model_names: Vec<&str> = picker.entries.iter().map(|m| m.name.as_str()).collect();
 
+    // NEW DESIGN: One row per model (no effort suffix in name)
+    // Each model has all its routes as switchable options
     let gpt55 = picker
         .entries
         .iter()
         .position(|model| {
-            model.name == "gpt-5.5 (high)"
+            model.name == "gpt-5.5"
                 && model
                     .options
                     .iter()
@@ -534,72 +536,50 @@ fn test_model_picker_preserves_recommendation_priority_order() {
     let gpt54 = picker
         .entries
         .iter()
-        .position(|model| model.name.starts_with("gpt-5.4 "))
+        .position(|model| model.name == "gpt-5.4")
         .expect("gpt-5.4 should be present");
     let gpt54_pro = picker
         .entries
         .iter()
-        .position(|model| model.name.starts_with("gpt-5.4-pro "))
+        .position(|model| model.name == "gpt-5.4-pro")
         .expect("gpt-5.4-pro should be present");
-    let claude_oauth = picker
+    // Claude has both oauth and api-key routes merged into one entry
+    let claude = picker
         .entries
         .iter()
         .position(|model| {
-            model.name == "claude-opus-4-8 (high)"
-                && model
-                    .options
-                    .iter()
-                    .any(|route| route.api_method == "claude-oauth")
+            model.name == "claude-opus-4-8"
+                && model.options.iter().any(|route| route.api_method == "claude-oauth")
         })
-        .expect("claude-opus-4-8 oauth should be present");
-    let claude_api = picker
-        .entries
-        .iter()
-        .position(|model| {
-            model.name == "claude-opus-4-8 (high)"
-                && model
-                    .options
-                    .iter()
-                    .any(|route| route.api_method == "claude-api")
-        })
-        .expect("claude-opus-4-8 api key should be present");
+        .expect("claude-opus-4-8 should be present");
     let spark = picker
         .entries
         .iter()
-        .position(|model| model.name.starts_with("gpt-5.3-codex-spark "))
+        .position(|model| model.name == "gpt-5.3-codex-spark")
         .expect("gpt-5.3-codex-spark should be present");
     let codex = picker
         .entries
         .iter()
-        .position(|model| model.name.starts_with("gpt-5.3-codex "))
+        .position(|model| model.name == "gpt-5.3-codex")
         .expect("gpt-5.3-codex should be present");
 
     assert!(
-        gpt55 < claude_oauth,
+        gpt55 < claude,
         "gpt-5.5 should rank ahead of claude-opus-4-8, got {:?}",
         model_names
     );
     assert!(
-        claude_oauth < gpt54,
+        claude < gpt54,
         "claude-opus-4-8 should rank ahead of unrecommended gpt-5.4, got {:?}",
         model_names
     );
     assert!(
-        claude_api < gpt54_pro,
-        "claude-opus-4-8 api key should rank ahead of unrecommended gpt-5.4-pro, got {:?}",
-        model_names
-    );
-    assert!(
         picker.entries[gpt55].recommended,
-        "gpt-5.5 high over OpenAI OAuth should be recommended"
+        "gpt-5.5 should be recommended"
     );
     assert!(
-        picker.entries[claude_oauth].recommended,
-        "claude-opus-4-8 oauth should be recommended"
-    );
-    assert!(
-        picker.entries[claude_api].recommended,
-        "claude-opus-4-8 api key should be recommended"
+        picker.entries[claude].recommended,
+        "claude-opus-4-8 should be recommended"
     );
     assert!(
         !picker.entries[gpt54].recommended,
@@ -617,9 +597,8 @@ fn test_model_picker_preserves_recommendation_priority_order() {
         !picker.entries[codex].recommended,
         "gpt-5.3-codex should not be recommended"
     );
-    // Merged rows: each recommended model appears once, carrying all of its
-    // provider routes as column-switchable options.
-    let recommended_routes: Vec<_> = picker
+    // NEW DESIGN: Each model appears once with all its routes as options
+    let recommended_models: Vec<_> = picker
         .entries
         .iter()
         .filter(|entry| entry.recommended)
@@ -634,12 +613,12 @@ fn test_model_picker_preserves_recommendation_priority_order() {
         })
         .collect();
     assert_eq!(
-        recommended_routes,
+        recommended_models,
         vec![
-            ("gpt-5.5 (high)", vec!["openai-oauth"]),
-            ("claude-opus-4-8 (high)", vec!["claude-api", "claude-oauth"]),
+            ("gpt-5.5", vec!["openai-oauth"]),
+            ("claude-opus-4-8", vec!["claude-api", "claude-oauth"]),
         ],
         "only the exact requested routes should be recommended; got {:?}",
-        recommended_routes
+        recommended_models
     );
 }

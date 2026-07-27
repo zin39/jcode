@@ -1742,23 +1742,45 @@ fn test_model_picker_effort_variant_selection_stages_effort_in_remote_mode() {
         .as_ref()
         .expect("model picker should be open");
 
+    // NEW DESIGN: One row per model with available_efforts
     let entry_idx = picker
         .entries
         .iter()
-        .position(|m| m.name == "gpt-5.5 (high)")
-        .expect("gpt-5.5 (high) should be in picker");
-    assert_eq!(
-        picker.entries[entry_idx].effort.as_deref(),
-        Some("high"),
-        "effort variant rows must carry their effort"
+        .position(|m| m.name == "gpt-5.5")
+        .expect("gpt-5.5 should be in picker");
+    
+    // Check that available_efforts contains expected values
+    assert!(
+        picker.entries[entry_idx].available_efforts.contains(&"high".to_string()),
+        "gpt-5.5 should support high effort, got efforts: {:?}",
+        picker.entries[entry_idx].available_efforts
+    );
+    
+    // Pre-selected effort should be set (defaults to 'high' or first available)
+    assert!(
+        picker.entries[entry_idx].effort.is_some(),
+        "gpt-5.5 entry should have a pre-selected effort"
     );
 
     let filtered_pos = picker
         .filtered
         .iter()
         .position(|&i| i == entry_idx)
-        .expect("gpt-5.5 (high) should be in filtered list");
+        .expect("gpt-5.5 should be in filtered list");
     app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+    
+    // Cycle effort to 'high' using Right key (new design: Left/Right cycle effort)
+    // The entry already has effort set, but we ensure it's 'high' for the test
+    if app.inline_interactive_state.as_ref().unwrap().entries[entry_idx].effort.as_deref() != Some("high") {
+        // Cycle through available efforts until we reach 'high'
+        // (in practice the default should already be 'high' or first available)
+        for _ in 0..10 {
+            app.handle_key(KeyCode::Right, KeyModifiers::empty()).unwrap();
+            if app.inline_interactive_state.as_ref().unwrap().entries[entry_idx].effort.as_deref() == Some("high") {
+                break;
+            }
+        }
+    }
 
     app.handle_key(KeyCode::Enter, KeyModifiers::empty())
         .unwrap();
@@ -1833,17 +1855,20 @@ fn test_model_picker_effort_variants_follow_each_route_vocabulary() {
 #[test]
 fn test_model_picker_plain_selection_stages_no_effort_in_remote_mode() {
     let mut app = create_test_app();
-    configure_test_remote_models_with_openai_recommendations(&mut app);
-    // A Copilot-backed route cannot apply per-request reasoning effort, so it
-    // must render as a plain row (issue #458 route gating).
-    app.remote_model_options.push(crate::provider::ModelRoute {
+    // Start fresh - don't use configure_test_remote_models_with_openai_recommendations
+    // because that adds effort-capable routes.
+    app.is_remote = true;
+    app.remote_provider_model = Some("some-model".to_string());
+    // Add ONLY a Copilot route that doesn't support effort
+    app.remote_available_entries = vec!["claude-opus-4-8".to_string()];
+    app.remote_model_options = vec![crate::provider::ModelRoute {
         model: "claude-opus-4-8".to_string(),
         provider: "Copilot".to_string(),
         api_method: "copilot".to_string(),
         available: true,
         detail: String::new(),
         cheapness: None,
-    });
+    }];
 
     app.open_model_picker();
     app.wait_for_model_picker_routes_for_tests();
@@ -1853,11 +1878,22 @@ fn test_model_picker_plain_selection_stages_no_effort_in_remote_mode() {
         .as_ref()
         .expect("model picker should be open");
 
+    // NEW DESIGN: One row per model. Copilot routes don't support effort,
+    // so available_efforts should be empty and effort should be None.
     let entry_idx = picker
         .entries
         .iter()
-        .position(|m| m.name == "claude-opus-4-8" && m.effort.is_none())
-        .expect("claude-opus-4-8 should be in picker without an effort variant");
+        .position(|m| {
+            m.name == "claude-opus-4-8"
+                && m.available_efforts.is_empty()
+        })
+        .expect("claude-opus-4-8 with only Copilot route should have no effort support");
+
+    // The entry should have no effort selected
+    assert!(
+        picker.entries[entry_idx].effort.is_none(),
+        "Copilot-only entry should not have effort pre-selected"
+    );
 
     let filtered_pos = picker
         .filtered

@@ -175,6 +175,88 @@ fn selected_route_notice_text(
     None
 }
 
+/// Format the inline effort ladder for model picker rows.
+/// Focused row shows all available efforts: `[none] [low] >[med]< [high]`
+/// Unfocused rows show just the selected effort as dim text.
+fn format_effort_ladder(
+    entry: &crate::tui::PickerEntry,
+    is_row_selected: bool,
+) -> Option<Vec<Span<'static>>> {
+    // Only for model entries with effort support
+    if !matches!(
+        entry.action,
+        crate::tui::PickerAction::Model | crate::tui::PickerAction::AgentModelChoice { .. }
+    ) {
+        return None;
+    }
+
+    if entry.available_efforts.is_empty() {
+        return None;
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    if is_row_selected {
+        // Focused row: show full ladder with selected effort highlighted
+        let selected_effort = entry.effort.as_deref().unwrap_or("");
+
+        spans.push(Span::styled("  ", Style::default()));
+
+        for (i, effort) in entry.available_efforts.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" ", Style::default().fg(dim_color())));
+            }
+
+            let is_selected = effort == selected_effort;
+            let label = short_effort_label(effort);
+
+            if is_selected {
+                // Selected effort wrapped in >< and highlighted
+                spans.push(Span::styled(
+                    format!(">[{}]<", label),
+                    Style::default().fg(rgb(255, 220, 120)).bold(),
+                ));
+            } else {
+                // Unselected efforts are dim
+                spans.push(Span::styled(
+                    format!("[{}]", label),
+                    Style::default().fg(rgb(100, 100, 120)),
+                ));
+            }
+        }
+    } else {
+        // Unfocused row: just show the selected effort dimly
+        if let Some(ref effort) = entry.effort {
+            let label = short_effort_label(effort);
+            spans.push(Span::styled(
+                format!(" {}", label),
+                Style::default().fg(rgb(100, 100, 120)),
+            ));
+        }
+    }
+
+    if spans.is_empty() { None } else { Some(spans) }
+}
+
+/// Short effort label for the inline ladder (none, low, med, high, xhigh, max, minimal).
+/// Returns a static string for known efforts, or formats unknown ones.
+fn short_effort_label(effort: &str) -> String {
+    match effort {
+        "none" => "none".to_string(),
+        "minimal" => "min".to_string(),
+        "low" => "low".to_string(),
+        "medium" => "med".to_string(),
+        "high" => "high".to_string(),
+        "xhigh" => "xhigh".to_string(),
+        "max" => "max".to_string(),
+        other => other.to_string(), // fallback to the raw string
+    }
+}
+
+fn dim_color() -> Color {
+    rgb(100, 100, 120)
+}
+
 fn model_picker_top_hint(picker: &crate::tui::InlineInteractiveState) -> Option<&'static str> {
     let is_swarm_agent_model_picker = picker.kind == crate::tui::PickerKind::Model
         && picker.entries.iter().any(|entry| {
@@ -826,9 +908,17 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         if is_preview && !is_account_picker {
             spans.push(Span::styled(provider_display, provider_style));
             spans.extend(model_spans);
+            // Add inline effort ladder for model rows
+            if let Some(effort_ladder) = format_effort_ladder(entry, is_row_selected) {
+                spans.extend(effort_ladder);
+            }
             spans.push(Span::styled(via_display, via_style));
         } else {
             spans.extend(model_spans);
+            // Add inline effort ladder for model rows
+            if let Some(effort_ladder) = format_effort_ladder(entry, is_row_selected) {
+                spans.extend(effort_ladder);
+            }
             spans.push(Span::styled(provider_display, provider_style));
             spans.push(Span::styled(via_display, via_style));
         }
@@ -848,6 +938,15 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         }
 
         lines.push(Line::from(spans));
+    }
+
+    // Add footer hint line for model picker (not account picker)
+    if !is_account_picker && picker.kind == crate::tui::PickerKind::Model && !lines.is_empty() {
+        let footer_hint = " ←/→ effort · Tab route · Enter select ";
+        lines.push(Line::from(Span::styled(
+            footer_hint,
+            Style::default().fg(rgb(80, 80, 100)).italic(),
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -948,9 +1047,9 @@ mod tests {
             old: false,
             created_date: None,
             effort: None,
-                available_efforts: Vec::new(),
-                provider_group: None,
-                is_recent: false,
+            available_efforts: Vec::new(),
+            provider_group: None,
+            is_recent: false,
         }];
 
         if mixed_providers {

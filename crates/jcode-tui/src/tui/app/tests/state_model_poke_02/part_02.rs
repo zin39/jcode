@@ -236,11 +236,13 @@ fn test_model_picker_preview_stays_open_and_updates_filter() {
         .expect("model picker preview should be open");
     assert!(picker.preview);
     assert_eq!(picker.filter, "g55");
+    // NEW DESIGN: One row per model, no effort suffix
     assert!(
         picker
             .filtered
             .iter()
-            .any(|&i| picker.entries[i].name.starts_with("gpt-5.5 ("))
+            .any(|&i| picker.entries[i].name == "gpt-5.5"),
+        "gpt-5.5 should match filter g55"
     );
     assert_eq!(app.input(), "/model g55");
 }
