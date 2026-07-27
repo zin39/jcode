@@ -25,6 +25,44 @@ use helpers::{
 
 /// Auto-collapse provider groups with more than 20 models.
 /// Called once when the picker is first opened.
+/// Preselect the current model entry in the picker.
+///
+/// Finds the entry with `is_current: true`, expands its collapsed group if needed,
+/// and sets the selection to that entry's display row.
+fn preselect_current_model_entry(picker: &mut InlineInteractiveState) {
+    // Find the entry with is_current: true
+    let current_entry_idx = picker.entries.iter().position(|e| e.is_current);
+    if current_entry_idx.is_none() {
+        return;
+    }
+    let current_idx = current_entry_idx.unwrap();
+
+    // Check if this entry is in the filtered list
+    let filtered_pos = picker.filtered.iter().position(|&i| i == current_idx);
+    if filtered_pos.is_none() {
+        return;
+    }
+
+    // Check if the entry's provider group is collapsed - if so, expand it
+    let provider_group = picker.entries[current_idx].provider_group.clone();
+    if let Some(ref group) = provider_group
+        && picker.collapse_state.collapsed.contains(group)
+    {
+        picker.collapse_state.collapsed.remove(group);
+        picker.rebuild_display_rows();
+    }
+
+    // Find the display row for this entry
+    for (row_idx, row) in picker.display_rows.iter().enumerate() {
+        if let PickerDisplayRow::Entry { entry_index } = row
+            && *entry_index == current_idx
+        {
+            picker.selected = row_idx;
+            return;
+        }
+    }
+}
+
 fn compute_initial_collapse_state(
     entries: &[PickerEntry],
     filtered: &[usize],
@@ -1010,7 +1048,9 @@ impl App {
             picker.collapse_state =
                 compute_initial_collapse_state(&picker.entries, &picker.filtered);
             picker.rebuild_display_rows();
-            // Ensure selected points to a selectable entry, not a header
+            // Preselect the current model row, expanding its group if needed
+            preselect_current_model_entry(picker);
+            // Fallback: ensure selected points to a selectable entry, not a header
             if !picker.display_rows.is_empty() && picker.display_rows[0].is_header() {
                 if let Some(first_entry) = picker.next_selectable_row(0) {
                     picker.selected = first_entry;
@@ -2040,7 +2080,9 @@ impl App {
             picker.collapse_state =
                 compute_initial_collapse_state(&picker.entries, &picker.filtered);
             picker.rebuild_display_rows();
-            // Ensure selected points to a selectable entry, not a header
+            // Preselect the current model row, expanding its group if needed
+            preselect_current_model_entry(picker);
+            // Fallback: ensure selected points to a selectable entry, not a header
             if !picker.display_rows.is_empty() && picker.display_rows[0].is_header() {
                 if let Some(first_entry) = picker.next_selectable_row(0) {
                     picker.selected = first_entry;

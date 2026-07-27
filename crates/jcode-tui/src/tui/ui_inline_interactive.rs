@@ -59,26 +59,36 @@ fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
         .options
         .iter()
         .any(|option| option.detail.contains("recently added"));
+    // Current model gets a visible marker (but not for account picker)
+    let current_marker = if entry.is_current
+        && matches!(
+            entry.action,
+            crate::tui::PickerAction::Model | crate::tui::PickerAction::AgentModelChoice { .. }
+        ) {
+        " ●"
+    } else {
+        ""
+    };
     let suffix = if is_new && !entry.is_current {
-        format!(" new{}", default_marker)
+        format!(" new{}{}", default_marker, current_marker)
     } else if entry.is_favorite {
-        format!(" ♥{}", default_marker)
+        format!(" ♥{}{}", default_marker, current_marker)
     } else if entry.recommended {
-        format!(" ★{}", default_marker)
+        format!(" ★{}{}", default_marker, current_marker)
     } else if entry.old && !entry.is_current {
         if let Some(ref date) = entry.created_date {
-            format!(" {}{}", date, default_marker)
+            format!(" {}{}{}", date, default_marker, current_marker)
         } else {
-            format!(" old{}", default_marker)
+            format!(" old{}{}", default_marker, current_marker)
         }
     } else if let Some(ref date) = entry.created_date {
         if !entry.is_current {
-            format!(" {}{}", date, default_marker)
+            format!(" {}{}{}", date, default_marker, current_marker)
         } else {
-            default_marker.to_string()
+            format!("{}{}", default_marker, current_marker)
         }
     } else {
-        default_marker.to_string()
+        format!("{}{}", default_marker, current_marker)
     };
 
     format!("{}{}", base, suffix)

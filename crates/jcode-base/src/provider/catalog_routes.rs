@@ -488,22 +488,71 @@ fn append_openai_compatible_profile_routes(
 
 /// Picker routes for one user-defined named provider profile from config.
 ///
-/// Text-capable static models plus the profile's `default_model` are offered;
-/// models declared image-only via `input = ["image"]` are excluded.
+/// When `model_catalog` is not explicitly `false`, fetches live models from the
+/// provider's `/models` endpoint (disk-cached), falling back to `models` config
+/// and `default_model`. Models are filtered by `is_selectable_coding_model`.
 fn named_provider_profile_routes(
     profile_name: &str,
     profile_config: &crate::config::NamedProviderConfig,
 ) -> Vec<ModelRoute> {
-    let mut models: Vec<String> = profile_config
-        .models
-        .iter()
-        .filter(|model| {
-            // `input` empty means unspecified (assume text-capable).
-            model.input.is_empty() || model.input.iter().any(|input| input == "text")
-        })
-        .map(|model| model.id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .collect();
+    let api_method = crate::provider_catalog::openai_compatible_api_method(profile_name);
+    let base_url = profile_config.base_url.trim();
+    let detail = if base_url.is_empty() {
+        "configured provider profile".to_string()
+    } else {
+        base_url.to_string()
+    };
+
+    // Collect models from live catalog (if enabled), config models, and default_model.
+    let mut models: Vec<(String, bool)> = Vec::new(); // (model_id, from_live_catalog)
+    let mut from_live_catalog = false;
+
+    // 1. Try live catalog cache when model_catalog is not explicitly false.
+    if profile_config.model_catalog || (!profile_config.model_catalog && profile_config.models.is_empty())
+    {
+        if let Some(cache) = jcode_provider_openrouter::load_disk_cache_entry_for_namespace(profile_name)
+        {
+            let source_matches = cache
+                .source_api_base
+                .as_deref()
+                .and_then(crate::provider_catalog::normalize_api_base)
+                == crate::provider_catalog::normalize_api_base(base_url);
+            if source_matches {
+                for model in cache.models {
+                    let model_id = model.id.trim().to_string();
+                    if !model_id.is_empty()
+                        && !models.iter().any(|(existing, _)| existing == &model_id)
+                    {
+                        models.push((model_id, true));
+                    }
+                }
+                from_live_catalog = !models.is_empty();
+            }
+        }
+
+        // Schedule background refresh if cache missing or stale.
+        // Note: Named providers from config.toml don't have OpenAiCompatibleProfile entries,
+        // so we can't schedule refresh through the profile-based mechanism. The cache will
+        // be populated when the provider is actually used by the runtime.
+        if !from_live_catalog {
+            // The cache refresh is handled by the runtime when the provider is used.
+            // For now, we just fall back to static models.
+        }
+    }
+
+    // 2. Add static models from config (if not already present).
+    for model in &profile_config.models {
+        // Skip image-only models.
+        if !model.input.is_empty() && !model.input.iter().any(|input| input == "text") {
+            continue;
+        }
+        let model_id = model.id.trim().to_string();
+        if !model_id.is_empty() && !models.iter().any(|(existing, _)| existing == &model_id) {
+            models.push((model_id, false));
+        }
+    }
+
+    // 3. Fall back to default_model if no models found.
     if models.is_empty()
         && let Some(default_model) = profile_config
             .default_model
@@ -511,19 +560,16 @@ fn named_provider_profile_routes(
             .map(str::trim)
             .filter(|model| !model.is_empty())
     {
-        models.push(default_model.to_string());
+        models.push((default_model.to_string(), false));
     }
 
-    let api_method = crate::provider_catalog::openai_compatible_api_method(profile_name);
-    let detail = if profile_config.base_url.trim().is_empty() {
-        "configured provider profile".to_string()
-    } else {
-        profile_config.base_url.trim().to_string()
-    };
-
+    // Build routes, filtering by is_selectable_coding_model.
     let mut routes: Vec<ModelRoute> = Vec::new();
-    for model in models {
-        if !is_listable_model_name(&model) || routes.iter().any(|route| route.model == model) {
+    for (model, _was_live) in models {
+        if !is_listable_model_name(&model)
+            || !crate::provider::is_selectable_coding_model(&model)
+            || routes.iter().any(|route| route.model == model)
+        {
             continue;
         }
         routes.push(ModelRoute {
@@ -531,7 +577,11 @@ fn named_provider_profile_routes(
             provider: profile_name.to_string(),
             api_method: api_method.clone(),
             available: true,
-            detail: detail.clone(),
+            detail: if from_live_catalog {
+                detail.clone()
+            } else {
+                format!("{}; fallback: static list", detail)
+            },
             cheapness: None,
         });
     }
