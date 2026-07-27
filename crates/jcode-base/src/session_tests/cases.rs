@@ -2477,6 +2477,43 @@ fn test_zero_message_session_persisted_for_handoff() -> Result<()> {
 }
 
 #[test]
+fn test_session_with_custom_title_persists_without_visible_messages() -> Result<()> {
+    // Regression test: renaming a session is an explicit user action expressing
+    // intent to keep it, so it must persist even without visible messages.
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-session-custom-title-persist-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let mut session = Session::create_with_id(
+        "session_custom_title_persist".to_string(),
+        None,
+        None,
+    );
+    // Simulate the context message added by Agent::new
+    session.ensure_initial_session_context_message();
+    assert!(!session.has_any_visible_messages());
+
+    // Rename the session — this should trigger persistence
+    session.rename_title(Some("My important session".to_string()));
+    session.save()?;
+
+    assert!(
+        session_path("session_custom_title_persist").is_ok_and(|p| p.exists()),
+        "session with custom_title must be persisted even without visible messages"
+    );
+
+    let loaded = Session::load("session_custom_title_persist")?;
+    assert_eq!(
+        loaded.custom_title.as_deref(),
+        Some("My important session")
+    );
+    Ok(())
+}
+
+#[test]
 fn test_resume_works_after_guard() -> Result<()> {
     let _env_lock = lock_env();
     let temp_home = tempfile::Builder::new()

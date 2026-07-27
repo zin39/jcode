@@ -1010,6 +1010,23 @@ async fn mark_closed_persists_soft_interrupts_for_restore_after_reload() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
     let mut agent = Agent::new(provider.clone(), registry.clone());
+    // Agent::new() creates a session whose only message is the system-displayed
+    // session-context block, which husk suppression skips. Add a visible user
+    // message so save() actually persists the session.
+    agent
+        .session
+        .append_stored_message(crate::session::StoredMessage {
+            id: "msg_mark_closed_persist".to_string(),
+            role: crate::message::Role::User,
+            content: vec![ContentBlock::Text {
+                text: "initialize session".to_string(),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
     let session_id = agent.session_id().to_string();
     agent.session.save().expect("save active session");
     agent.queue_soft_interrupt(

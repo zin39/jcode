@@ -314,7 +314,15 @@ impl Session {
         // normally for inter-process coordination. Debug/canary markers are
         // inter-process coordination state, so save() must persist when
         // is_debug or is_canary is set even without visible messages.
-        if !self.persist_state.snapshot_exists && !self.messages.is_empty() && !self.has_any_visible_messages() && !self.is_debug && !self.is_canary {
+        // A custom_title indicates user intent to keep the session (renaming
+        // is an explicit action), so persist those even without visible messages.
+        if !self.persist_state.snapshot_exists
+            && !self.messages.is_empty()
+            && !self.has_any_visible_messages()
+            && !self.is_debug
+            && !self.is_canary
+            && self.custom_title.is_none()
+        {
             return Ok(());
         }
         self.updated_at = Utc::now();

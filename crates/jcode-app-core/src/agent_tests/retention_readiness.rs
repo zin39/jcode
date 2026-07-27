@@ -130,8 +130,13 @@ impl Provider for RetentionReadinessProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(transcript.clone());
 
-        let latest = transcript.last().cloned().unwrap_or_default();
-        if latest.contains("D7_RECOVER")
+        let last_user_message = transcript
+            .iter()
+            .rev()
+            .find(|text| !text.starts_with("<system-reminder>"))
+            .cloned()
+            .unwrap_or_default();
+        if last_user_message.contains("D7_RECOVER")
             && self
                 .fail_d7_once
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -143,11 +148,11 @@ impl Provider for RetentionReadinessProvider {
         let has_d0_value = transcript.iter().any(|text| text.contains("VALUE_D0"));
         let has_d1 = transcript.iter().any(|text| text.contains("D1_RETURN"));
         let has_d1_value = transcript.iter().any(|text| text.contains("CONTINUITY_D1"));
-        let answer = if latest.contains("D0_ACTIVATE") {
+        let answer = if last_user_message.contains("D0_ACTIVATE") {
             "VALUE_D0"
-        } else if latest.contains("D1_RETURN") && has_d0 && has_d0_value {
+        } else if last_user_message.contains("D1_RETURN") && has_d0 && has_d0_value {
             "CONTINUITY_D1"
-        } else if latest.contains("D7_RECOVER") && has_d0 && has_d0_value && has_d1 && has_d1_value
+        } else if last_user_message.contains("D7_RECOVER") && has_d0 && has_d0_value && has_d1 && has_d1_value
         {
             "COMPOUNDED_D7"
         } else {
