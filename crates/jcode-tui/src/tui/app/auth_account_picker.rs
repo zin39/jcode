@@ -539,6 +539,9 @@ impl App {
                 old: false,
                 created_date: None,
                 effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
             });
         }
 
@@ -588,6 +591,9 @@ impl App {
                 old: false,
                 created_date: None,
                 effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
             });
         }
 
@@ -613,6 +619,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         models.push(crate::tui::PickerEntry {
@@ -637,6 +646,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         let replace_claude = claude_accounts
@@ -672,6 +684,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         let replace_openai = openai_accounts
@@ -707,6 +722,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         models.push(crate::tui::PickerEntry {
@@ -733,6 +751,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         if models.is_empty() {
@@ -797,6 +818,9 @@ impl App {
                 old: false,
                 created_date: None,
                 effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
             });
         }
 
@@ -822,6 +846,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         let replace_target = accounts
@@ -857,6 +884,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         models.push(crate::tui::PickerEntry {
@@ -883,6 +913,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         if accounts.is_empty() {
@@ -947,6 +980,9 @@ impl App {
                 old: false,
                 created_date: None,
                 effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
             });
         }
 
@@ -972,6 +1008,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         let replace_target = accounts
@@ -1007,6 +1046,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         models.push(crate::tui::PickerEntry {
@@ -1033,6 +1075,9 @@ impl App {
             old: false,
             created_date: None,
             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
         });
 
         if accounts.is_empty() {

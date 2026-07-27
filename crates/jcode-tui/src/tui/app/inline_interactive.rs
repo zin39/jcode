@@ -64,6 +64,73 @@ struct ModelPickerFavoritesStore {
     favorites: HashSet<String>,
 }
 
+/// MRU list of recently used model IDs for the "Recent" section in picker.
+const MODEL_PICKER_RECENT_FILE: &str = "model-picker-recent.json";
+const MODEL_PICKER_RECENT_VERSION: u8 = 1;
+const MODEL_PICKER_RECENT_MAX: usize = 8;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ModelPickerRecentStore {
+    version: u8,
+    /// Model IDs in MRU order (most recent first).
+    models: Vec<String>,
+}
+
+fn model_picker_recent_path() -> Option<std::path::PathBuf> {
+    crate::storage::app_config_dir()
+        .ok()
+        .map(|dir| dir.join(MODEL_PICKER_RECENT_FILE))
+}
+
+fn load_model_picker_recent_store() -> ModelPickerRecentStore {
+    let Some(path) = model_picker_recent_path() else {
+        return ModelPickerRecentStore::default();
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return ModelPickerRecentStore::default();
+    };
+    let Ok(mut store) = serde_json::from_slice::<ModelPickerRecentStore>(&bytes) else {
+        return ModelPickerRecentStore::default();
+    };
+    if store.version != MODEL_PICKER_RECENT_VERSION {
+        return ModelPickerRecentStore::default();
+    }
+    // Cap at max
+    store.models.truncate(MODEL_PICKER_RECENT_MAX);
+    store
+}
+
+fn save_model_picker_recent_store(store: &ModelPickerRecentStore) {
+    let Some(path) = model_picker_recent_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(store) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn record_model_picker_recent(model_id: &str) {
+    if model_id.trim().is_empty() || model_id == "unknown" {
+        return;
+    }
+    let mut store = load_model_picker_recent_store();
+    store.version = MODEL_PICKER_RECENT_VERSION;
+    // Remove existing entry if present
+    store.models.retain(|m| m != model_id);
+    // Insert at front
+    store.models.insert(0, model_id.to_string());
+    // Cap at max
+    store.models.truncate(MODEL_PICKER_RECENT_MAX);
+    save_model_picker_recent_store(&store);
+}
+
+fn get_recent_model_ids() -> Vec<String> {
+    load_model_picker_recent_store().models
+}
+
 fn model_picker_usage_path() -> Option<std::path::PathBuf> {
     crate::storage::app_config_dir()
         .ok()
@@ -1206,6 +1273,9 @@ impl App {
                 old: false,
                 created_date: None,
                 effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
             }],
             selected: 0,
             column: 0,
@@ -1626,13 +1696,13 @@ impl App {
                 }
             }
 
-            // Expand each route only across the effort ladder its runtime can
-            // actually apply. The same model can be reachable through native
-            // OpenAI (where `max` is real) and OpenRouter (where `max` aliases
-            // `xhigh`), so model-id-only inference over-advertises values.
-            let mut effort_routes = Vec::new();
-            let mut plain_routes = Vec::new();
-            let mut model_efforts = Vec::new();
+            // NEW DESIGN: One row per model with all routes and effort ladder.
+            // Previously: one row per model+effort combination.
+            // Now: collapse to one row, store available_efforts for inline ladder.
+            let mut all_routes: Vec<PickerOption> = Vec::new();
+            let mut model_efforts: Vec<String> = Vec::new();
+
+            // Collect all routes and their supported efforts
             for route in entry_routes {
                 let efforts = if route_supports_reasoning_effort(&route.api_method) {
                     inferred_reasoning_efforts(Some(&route.api_method), Some(name))
@@ -1640,141 +1710,105 @@ impl App {
                     Vec::new()
                 };
                 if efforts.is_empty() {
-                    plain_routes.push(route);
+                    // Route doesn't support effort - add to routes but no effort tracking
+                    all_routes.push(route);
                 } else {
                     for effort in &efforts {
-                        if !model_efforts.contains(effort) {
-                            model_efforts.push(*effort);
+                        // Skip swarm modes - they're orchestration, not reasoning variants
+                        if crate::prompt::is_swarm_mode_effort(effort) {
+                            continue;
+                        }
+                        if !model_efforts.contains(&effort.to_string()) {
+                            model_efforts.push(effort.to_string());
                         }
                     }
-                    effort_routes.push((route, efforts));
+                    all_routes.push(route);
                 }
             }
 
-            if !effort_routes.is_empty() {
-                for effort in &model_efforts {
-                    // Swarm modes (swarm / swarm-deep) are orchestration rungs on
-                    // the effort ladder, not per-model reasoning variants. They
-                    // must not generate `model (swarm)` picker rows.
-                    if crate::prompt::is_swarm_mode_effort(effort) {
-                        continue;
-                    }
-                    let effort_label = match *effort {
-                        "xhigh" => "xhigh",
-                        "max" => "max",
-                        "high" => "high",
-                        "medium" => "med",
-                        "low" => "low",
-                        "none" => "none",
-                        other => other,
-                    };
-                    let display_name = format!("{} ({})", name, effort_label);
-                    let effort_matches_current =
-                        *name == current_model && current_effort.as_deref() == Some(*effort);
-                    let or_created = openrouter_created_timestamp(name);
-                    // One row per model+effort with every supporting route as a
-                    // switchable option (column navigation), instead of one row
-                    // per route. Models served by many OpenRouter endpoints
-                    // previously flooded the picker with duplicate rows, burying
-                    // direct provider routes ("all models showing openrouter").
-                    let routes_for_effort: Vec<_> = effort_routes
-                        .iter()
-                        .filter(|(_, route_efforts)| route_efforts.contains(effort))
-                        .map(|(route, _)| route.clone())
-                        .collect();
-                    if routes_for_effort.is_empty() {
-                        continue;
-                    }
-                    let current_option = routes_for_effort.iter().position(|route| {
-                        effort_matches_current
-                            && model_picker_route_is_current(
-                                name,
-                                route,
-                                &current_model,
-                                &current_provider,
-                            )
-                    });
-                    let recommended = *effort == "high"
-                        && routes_for_effort
-                            .iter()
-                            .any(|route| model_picker_route_is_recommended(name, route));
-                    let usage_score = routes_for_effort
-                        .iter()
-                        .map(|route| {
-                            model_picker_usage_score(&usage_store, name, route, Some(effort))
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    let is_favorite = routes_for_effort.iter().any(|route| {
-                        model_picker_is_favorite(&favorites_store, name, route, Some(effort))
-                    });
-                    let is_default = routes_for_effort
-                        .iter()
-                        .any(|route| is_config_default(name, route));
-                    entries.push(PickerEntry {
-                        name: display_name.clone(),
-                        selected_option: current_option.unwrap_or(0),
-                        options: routes_for_effort,
-                        action: PickerAction::Model,
-                        is_current: current_option.is_some(),
-                        recommended,
-                        recommendation_rank: model_picker_recommendation_rank(name),
-                        usage_score,
-                        old: old_threshold_secs > 0
-                            && or_created.map(|t| t < old_threshold_secs).unwrap_or(false),
-                        created_date: or_created.map(format_created),
-                        effort: Some(effort.to_string()),
-                        is_default,
-                        is_favorite,
-                    });
-                }
+            if all_routes.is_empty() {
+                continue;
             }
-            {
-                let or_created = openrouter_created_timestamp(name);
-                let is_old = old_threshold_secs > 0
-                    && or_created.map(|t| t < old_threshold_secs).unwrap_or(false);
-                // One row per model with all its routes as switchable options,
-                // matching the effort-expanded branch above.
-                if !plain_routes.is_empty() {
-                    let current_option = plain_routes.iter().position(|route| {
-                        model_picker_route_is_current(name, route, &current_model, &current_provider)
-                    });
-                    let is_recommended = plain_routes
-                        .iter()
-                        .any(|route| model_picker_route_is_recommended(name, route));
-                    let usage_score = plain_routes
-                        .iter()
-                        .map(|route| model_picker_usage_score(&usage_store, name, route, None))
-                        .max()
-                        .unwrap_or(0);
-                    let is_default = plain_routes
-                        .iter()
-                        .any(|route| is_config_default(name, route));
-                    let is_favorite = plain_routes
-                        .iter()
-                        .any(|route| model_picker_is_favorite(&favorites_store, name, route, None));
-                    entries.push(PickerEntry {
-                        name: name.clone(),
-                        selected_option: current_option.unwrap_or(0),
-                        options: plain_routes,
-                        action: PickerAction::Model,
-                        is_current: current_option.is_some(),
-                        recommended: is_recommended,
-                        recommendation_rank: model_picker_recommendation_rank(name),
-                        usage_score,
-                        old: is_old,
-                        created_date: or_created.map(format_created),
-                        effort: None,
-                        is_default,
-                        is_favorite,
-                    });
-                }
-            }
+
+            let or_created = openrouter_created_timestamp(name);
+            let is_old = old_threshold_secs > 0
+                && or_created.map(|t| t < old_threshold_secs).unwrap_or(false);
+
+            // Determine current selection state
+            let current_effort_value = if *name == current_model {
+                current_effort.clone()
+            } else {
+                None
+            };
+
+            // Pre-select effort: use current if matching, otherwise prefer 'high' or first available
+            let selected_effort = current_effort_value.clone().or_else(|| {
+                model_efforts.iter().find(|e| **e == "high").cloned()
+                    .or_else(|| model_efforts.first().cloned())
+            });
+
+            // Find current route for this model
+            let current_option = all_routes.iter().position(|route| {
+                model_picker_route_is_current(name, route, &current_model, &current_provider)
+            });
+
+            let is_recommended = all_routes
+                .iter()
+                .any(|route| model_picker_route_is_recommended(name, route));
+            let usage_score = all_routes
+                .iter()
+                .map(|route| {
+                    // Usage score considers effort when available
+                    model_picker_usage_score(&usage_store, name, route, selected_effort.as_deref())
+                })
+                .max()
+                .unwrap_or(0);
+            let is_default = all_routes
+                .iter()
+                .any(|route| is_config_default(name, route));
+            let is_favorite = all_routes
+                .iter()
+                .any(|route| model_picker_is_favorite(&favorites_store, name, route, selected_effort.as_deref()));
+
+            // Determine provider group for tiered sections
+            let provider_group = all_routes
+                .first()
+                .map(|r| r.provider.clone())
+                .unwrap_or_default();
+
+            entries.push(PickerEntry {
+                name: name.clone(),
+                selected_option: current_option.unwrap_or(0),
+                options: all_routes,
+                action: PickerAction::Model,
+                is_current: current_option.is_some(),
+                recommended: is_recommended,
+                recommendation_rank: model_picker_recommendation_rank(name),
+                usage_score,
+                old: is_old,
+                created_date: or_created.map(format_created),
+                effort: selected_effort,
+                available_efforts: model_efforts,
+                provider_group: Some(provider_group),
+                is_recent: false, // Will be updated after loading recent models
+                is_default,
+                is_favorite,
+            });
+        }
+
+        // Mark recent models
+        let recent_models = get_recent_model_ids();
+        for entry in &mut entries {
+            let base_name = model_entry_base_name(entry);
+            entry.is_recent = recent_models.contains(&base_name);
         }
 
         entries.sort_by(|a, b| {
             let a_current = if a.is_current { 0u8 } else { 1 };
             let b_current = if b.is_current { 0u8 } else { 1 };
+            // MRU recent models come first (after current)
+            let a_mru = if a.is_recent { 0u8 } else { 1 };
+            let b_mru = if b.is_recent { 0u8 } else { 1 };
             let a_recent = if a
                 .options
                 .iter()
@@ -1823,6 +1857,7 @@ impl App {
             let b_old = if b.old { 1u8 } else { 0 };
             a_current
                 .cmp(&b_current)
+                .then(a_mru.cmp(&b_mru))
                 .then(a_favorite.cmp(&b_favorite))
                 .then(a_recent.cmp(&b_recent))
                 .then(a_usage.cmp(&b_usage))
@@ -3201,12 +3236,54 @@ impl App {
                     }
                 }
             }
-            KeyCode::Right => {
+            KeyCode::Left => {
+                // NEW DESIGN: Left cycles effort level on focused row
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.uses_compact_navigation() {
                         return Ok(());
                     }
-                    if picker.column < picker.max_navigable_column()
+                    if picker.column == 0 {
+                        // Cycle effort on focused model row
+                        if let Some(&idx) = picker.filtered.get(picker.selected) {
+                            let entry = &mut picker.entries[idx];
+                            if !entry.available_efforts.is_empty() {
+                                // Find current effort index and decrement
+                                let current_idx = entry.effort.as_ref().and_then(|e| {
+                                    entry.available_efforts.iter().position(|a| a == e)
+                                }).unwrap_or(0);
+                                let new_idx = if current_idx == 0 {
+                                    entry.available_efforts.len() - 1
+                                } else {
+                                    current_idx - 1
+                                };
+                                entry.effort = Some(entry.available_efforts[new_idx].clone());
+                            }
+                        }
+                    } else {
+                        picker.column -= 1;
+                    }
+                }
+            }
+            KeyCode::Right => {
+                // NEW DESIGN: Right cycles effort level on focused row
+                if let Some(ref mut picker) = self.inline_interactive_state {
+                    if picker.uses_compact_navigation() {
+                        return Ok(());
+                    }
+                    if picker.column == 0 {
+                        // Cycle effort on focused model row
+                        if let Some(&idx) = picker.filtered.get(picker.selected) {
+                            let entry = &mut picker.entries[idx];
+                            if !entry.available_efforts.is_empty() {
+                                // Find current effort index and increment
+                                let current_idx = entry.effort.as_ref().and_then(|e| {
+                                    entry.available_efforts.iter().position(|a| a == e)
+                                }).unwrap_or(0);
+                                let new_idx = (current_idx + 1) % entry.available_efforts.len();
+                                entry.effort = Some(entry.available_efforts[new_idx].clone());
+                            }
+                        }
+                    } else if picker.column < picker.max_navigable_column()
                         && let Some(&idx) = picker.filtered.get(picker.selected)
                         && (picker.entries[idx].options.len() > 1 || picker.column > 0)
                     {
@@ -3215,6 +3292,7 @@ impl App {
                 }
             }
             KeyCode::BackTab => {
+                // NEW DESIGN: BackTab cycles route options (previous route)
                 if self
                     .inline_interactive_state
                     .as_ref()
@@ -3228,33 +3306,30 @@ impl App {
                     if picker.uses_compact_navigation() {
                         return Ok(());
                     }
-                    if picker.column > 0 {
-                        picker.column -= 1;
-                    }
-                }
-            }
-            KeyCode::Left => {
-                if let Some(ref mut picker) = self.inline_interactive_state {
-                    if picker.uses_compact_navigation() {
-                        return Ok(());
-                    }
-                    if picker.column > 0 {
-                        picker.column -= 1;
+                    // Cycle route option on focused row
+                    if let Some(&idx) = picker.filtered.get(picker.selected) {
+                        let entry = &mut picker.entries[idx];
+                        if entry.options.len() > 1 {
+                            entry.selected_option = entry.selected_option.saturating_sub(1);
+                        }
                     }
                 }
             }
             KeyCode::Tab => {
+                // NEW DESIGN: Tab cycles route options (next route)
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.uses_compact_navigation() {
                         return Ok(());
                     }
                     if picker.column == 0 && !picker.filter.is_empty() {
                         Self::tab_complete_inline_interactive_filter(picker);
-                    } else if picker.column < picker.max_navigable_column()
-                        && let Some(&idx) = picker.filtered.get(picker.selected)
-                        && (picker.entries[idx].options.len() > 1 || picker.column > 0)
-                    {
-                        picker.column += 1;
+                    } else if let Some(&idx) = picker.filtered.get(picker.selected) {
+                        let entry = &mut picker.entries[idx];
+                        if entry.options.len() > 1 {
+                            // Cycle to next route option
+                            let max = entry.options.len().saturating_sub(1);
+                            entry.selected_option = (entry.selected_option + 1).min(max);
+                        }
                     }
                 }
             }
@@ -3468,6 +3543,8 @@ impl App {
 
                         let effort = entry.effort.clone();
                         record_model_picker_selection(&bare_name, route, effort.as_deref());
+                        // Record MRU for "Recent" section
+                        record_model_picker_recent(&bare_name);
                         let method_label =
                             crate::provider::ModelRouteApiMethod::parse(&route.api_method)
                                 .display_label();
@@ -3745,6 +3822,9 @@ mod tests {
             old: false,
             created_date: None,
             effort: None,
+            available_efforts: Vec::new(),
+            provider_group: None,
+            is_recent: false,
         }
     }
 

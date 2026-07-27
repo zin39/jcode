@@ -47,6 +47,9 @@ impl App {
                 old: false,
                 created_date: None,
                 effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
             }
         })
         .collect();
@@ -128,6 +131,9 @@ impl App {
                     old: false,
                     created_date: None,
                     effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -156,6 +162,9 @@ impl App {
                     old: false,
                     created_date: None,
                     effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
                 },
             );
         }
@@ -241,6 +250,9 @@ impl App {
                             old: false,
                             created_date: None,
                             effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
                         },
                     );
                 }
@@ -271,6 +283,9 @@ impl App {
                     old: false,
                     created_date: None,
                     effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
                 },
             );
 

@@ -1236,6 +1236,12 @@ pub enum PickerAction {
     },
 }
 
+impl Default for PickerAction {
+    fn default() -> Self {
+        PickerAction::Model
+    }
+}
+
 /// Unified inline picker with three columns.
 #[derive(Debug, Clone)]
 pub struct InlineInteractiveState {
@@ -1477,7 +1483,7 @@ impl InlineInteractiveState {
 }
 
 /// A reusable picker entry with one or more available actions/options.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PickerEntry {
     pub name: String,
     pub options: Vec<PickerOption>,
@@ -1492,7 +1498,16 @@ pub struct PickerEntry {
     pub old: bool,
     /// Human-readable created date (e.g. "Jan 2026") for OpenRouter models
     pub created_date: Option<String>,
+    /// Selected effort level for this entry (none/low/medium/high/xhigh/max).
+    /// Only set for model entries that support reasoning effort.
     pub effort: Option<String>,
+    /// All effort levels supported by the routes for this model.
+    /// Populated during entry building for inline effort ladder display.
+    pub available_efforts: Vec<String>,
+    /// For tiered sections: which provider group this entry belongs to.
+    pub provider_group: Option<String>,
+    /// For tiered sections: whether this is a recent model (MRU).
+    pub is_recent: bool,
 }
 
 impl PickerEntry {
@@ -1522,7 +1537,7 @@ impl PickerEntry {
 }
 
 /// A single available option for a picker entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PickerOption {
     pub provider: String,
     pub api_method: String,

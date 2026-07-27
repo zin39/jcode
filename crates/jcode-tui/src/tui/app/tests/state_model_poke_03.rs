@@ -1175,14 +1175,14 @@ fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration
         );
     }
 
-    // Models with reasoning-effort support expand into effort rows (issue
-    // #458); the hydrated route must be preserved on each variant.
+    // NEW DESIGN: One row per model, not one per model+effort.
+    // Models with reasoning-effort support have available_efforts populated.
     assert_eq!(
-        routes_by_model.get("gpt-5.5 (high)"),
+        routes_by_model.get("gpt-5.5"),
         Some(&("OpenAI".to_string(), "openai-oauth".to_string()))
     );
     assert_eq!(
-        routes_by_model.get("claude-opus-4-6 (high)"),
+        routes_by_model.get("claude-opus-4-6"),
         Some(&("Anthropic".to_string(), "claude-oauth".to_string()))
     );
     assert_eq!(
@@ -1190,7 +1190,7 @@ fn test_model_picker_state_space_preserves_provider_labels_after_route_hydration
         Some(&("Chutes".to_string(), "openai-compatible:chutes".to_string()))
     );
     assert_eq!(
-        routes_by_model.get("deepseek/deepseek-v4-pro (high)"),
+        routes_by_model.get("deepseek/deepseek-v4-pro"),
         Some(&("auto".to_string(), "openrouter".to_string()))
     );
 
@@ -2002,6 +2002,9 @@ fn test_model_picker_filter_text_includes_provider_and_method() {
         old: false,
         created_date: None,
         effort: None,
+                available_efforts: Vec::new(),
+                provider_group: None,
+                is_recent: false,
     };
 
     let filter_text = crate::tui::PickerKind::Model.filter_text(&entry);

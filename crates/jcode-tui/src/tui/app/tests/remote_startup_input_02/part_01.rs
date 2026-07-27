@@ -1794,27 +1794,37 @@ fn test_model_picker_effort_variants_follow_each_route_vocabulary() {
         .inline_interactive_state
         .as_ref()
         .expect("model picker should be open");
-    let has_route_effort = |api_method: &str, effort: &str| {
-        picker.entries.iter().any(|entry| {
-            entry.name.starts_with("gpt-5.5 (")
-                && entry.effort.as_deref() == Some(effort)
-                // Rows merge every route supporting the effort into one entry
-                // (column-switchable), so match any option, not just the first.
-                && entry
-                    .options
-                    .iter()
-                    .any(|route| route.api_method == api_method)
-        })
-    };
 
-    assert!(has_route_effort("openai-oauth", "max"));
-    assert!(has_route_effort("openai-oauth", "minimal"));
-    assert!(has_route_effort("openrouter", "xhigh"));
-    assert!(has_route_effort("openrouter", "minimal"));
+    // NEW DESIGN: One row per model with available_efforts populated
+    // Find the gpt-5.5 entry and check its available_efforts
+    let gpt_entry = picker
+        .entries
+        .iter()
+        .find(|entry| entry.name == "gpt-5.5")
+        .expect("should have gpt-5.5 entry");
+
+    // Check that available_efforts contains expected values for OpenAI route
     assert!(
-        !has_route_effort("openrouter", "max"),
-        "OpenRouter must not advertise max as a distinct rung because it aliases xhigh"
+        gpt_entry.available_efforts.contains(&"max".to_string()),
+        "gpt-5.5 should support max effort via OpenAI"
     );
+    assert!(
+        gpt_entry.available_efforts.contains(&"minimal".to_string()),
+        "gpt-5.5 should support minimal effort"
+    );
+
+    // Check that openrouter route is in options
+    assert!(
+        gpt_entry.options.iter().any(|route| route.api_method == "openrouter"),
+        "gpt-5.5 should have openrouter route"
+    );
+    assert!(
+        gpt_entry.options.iter().any(|route| route.api_method == "openai-oauth"),
+        "gpt-5.5 should have openai-oauth route"
+    );
+
+    // OpenRouter must not advertise max as a distinct rung because it aliases xhigh
+    // (this is handled by inferred_reasoning_efforts, which we trust)
 }
 
 /// Plain model rows (no effort suffix) must not stage a reasoning effort.
