@@ -491,7 +491,7 @@ fn append_openai_compatible_profile_routes(
 /// When `model_catalog` is not explicitly `false`, fetches live models from the
 /// provider's `/models` endpoint (disk-cached), falling back to `models` config
 /// and `default_model`. Models are filtered by `is_selectable_coding_model`.
-fn named_provider_profile_routes(
+pub fn named_provider_profile_routes(
     profile_name: &str,
     profile_config: &crate::config::NamedProviderConfig,
 ) -> Vec<ModelRoute> {
@@ -584,6 +584,16 @@ fn named_provider_profile_routes(
             },
             cheapness: None,
         });
+    }
+    routes
+}
+
+/// Collect routes from all named provider profiles in config.toml.
+/// Used by remote picker to include siliconflow/modelscope/dashscope etc.
+pub fn all_named_provider_profile_routes() -> Vec<ModelRoute> {
+    let mut routes = Vec::new();
+    for (profile_name, profile_config) in &crate::config::config().providers {
+        routes.extend(named_provider_profile_routes(profile_name, profile_config));
     }
     routes
 }

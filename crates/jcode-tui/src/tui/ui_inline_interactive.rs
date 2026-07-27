@@ -207,12 +207,14 @@ fn format_effort_ladder(
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     if is_row_selected {
-        // Focused row: show full ladder with selected effort highlighted
+        // Focused row: show full ladder with selected effort bracketed and highlighted
         let selected_effort = entry.effort.as_deref().unwrap_or("");
 
         spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled("‹", Style::default().fg(dim_color())));
 
         for (i, effort) in entry.available_efforts.iter().enumerate() {
+            // Add space separator between efforts
             if i > 0 {
                 spans.push(Span::styled(" ", Style::default().fg(dim_color())));
             }
@@ -221,19 +223,23 @@ fn format_effort_ladder(
             let label = short_effort_label(effort);
 
             if is_selected {
-                // Selected effort wrapped in >< and highlighted
-                spans.push(Span::styled(
-                    format!(">[{}]<", label),
-                    Style::default().fg(rgb(255, 220, 120)).bold(),
-                ));
-            } else {
-                // Unselected efforts are dim
+                // Selected effort: bracketed like [med] with accent color
                 spans.push(Span::styled(
                     format!("[{}]", label),
-                    Style::default().fg(rgb(100, 100, 120)),
+                    Style::default()
+                        .fg(rgb(255, 200, 100))
+                        .bold(),
+                ));
+            } else {
+                // Unselected efforts are dim, no brackets
+                spans.push(Span::styled(
+                    label,
+                    Style::default().fg(dim_color()),
                 ));
             }
         }
+
+        spans.push(Span::styled("›", Style::default().fg(dim_color())));
     } else {
         // Unfocused row: just show the selected effort dimly
         if let Some(ref effort) = entry.effort {
@@ -1008,6 +1014,50 @@ mod tests {
         assert_eq!(format_elapsed(1.2), "1s");
         assert_eq!(format_elapsed(59.9), "59s");
         assert_eq!(format_elapsed(61.2), "1m 1s");
+    }
+
+    #[test]
+    fn effort_ladder_brackets_selected_effort_on_focused_row() {
+        let mut picker = sample_picker();
+        picker.entries[0].available_efforts = vec![
+            "none".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+        ];
+        picker.entries[0].effort = Some("medium".to_string());
+
+        // Focused row should have bracketed selected effort
+        let spans = format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
+
+        // Find the span containing [med]
+        let has_bracketed_med = spans.iter().any(|span| {
+            span.content.as_ref().contains("[med]")
+        });
+        assert!(has_bracketed_med, "focused row should have [med] bracketed, got: {:?}", spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>());
+
+        // Unfocused row should not have brackets
+        let unfocused_spans = format_effort_ladder(&picker.entries[0], false).expect("should render effort ladder for unfocused");
+        let unfocused_text: String = unfocused_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!unfocused_text.contains("["), "unfocused row should not have brackets, got: {}", unfocused_text);
+    }
+
+    #[test]
+    fn effort_ladder_shows_ladder_with_chevrons_on_focused_row() {
+        let mut picker = sample_picker();
+        picker.entries[0].available_efforts = vec![
+            "none".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+        ];
+        picker.entries[0].effort = Some("low".to_string());
+
+        let spans = format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
+
+        // Should start with ‹ and end with ›
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('‹'), "should have ‹ chevron, got: {}", text);
+        assert!(text.contains('›'), "should have › chevron, got: {}", text);
     }
 
     #[test]

@@ -4,7 +4,7 @@ pub mod activation;
 pub mod anthropic;
 pub mod antigravity;
 pub mod bedrock;
-mod catalog_routes;
+pub mod catalog_routes;
 pub mod claude;
 pub mod copilot;
 pub mod cursor;

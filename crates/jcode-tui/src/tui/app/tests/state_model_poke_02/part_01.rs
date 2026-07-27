@@ -1359,3 +1359,43 @@ fn test_agent_model_picker_inherit_row_uses_provider_default_when_inherited_mode
         ));
     });
 }
+
+#[test]
+fn test_remote_model_picker_includes_named_provider_profile_models() {
+    // Unit test: verify all_named_provider_profile_routes returns routes from config
+    // This is called by extend_remote_routes_for_uncovered_models_impl in remote mode
+    use std::io::Write;
+
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _scoped_home = crate::storage::scoped_test_home(temp.path());
+
+    // Create a config.toml with a named provider profile
+    let config_path = temp.path().join("config.toml");
+    let config_content = r#"
+[providers.test-siliconflow]
+api_base = "https://api.siliconflow.cn/v1"
+api_key_env = "SILICONFLOW_API_KEY"
+models = [{ id = "Qwen/Qwen2.5-72B-Instruct" }]
+default_model = "Qwen/Qwen2.5-72B-Instruct"
+"#;
+    let mut file = std::fs::File::create(&config_path).expect("create config");
+    file.write_all(config_content.as_bytes()).expect("write config");
+
+    // Invalidate config cache to pick up new config
+    crate::config::invalidate_config_cache();
+
+    // Call the function directly
+    let routes = crate::provider::catalog_routes::all_named_provider_profile_routes();
+
+    // Should have routes for test-siliconflow
+    let has_named_provider_model = routes.iter().any(|r| {
+        r.provider == "test-siliconflow" && r.model.contains("Qwen")
+    });
+
+    assert!(
+        has_named_provider_model,
+        "all_named_provider_profile_routes should include named provider models, got: {:?}",
+        routes.iter().map(|r| (&r.model, &r.provider)).take(10).collect::<Vec<_>>()
+    );
+}

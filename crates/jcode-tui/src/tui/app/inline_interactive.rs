@@ -759,6 +759,20 @@ fn extend_remote_routes_for_uncovered_models_impl(
     // authority for managed subscription entitlements. Do not hide newly
     // launched subscription models behind a stale remote names snapshot.
     append_jcode_subscription_routes_impl(routes, true, false, remote_available_entries);
+
+    // Include named provider profiles from config.toml (siliconflow/modelscope/dashscope etc.)
+    // These are local config entries that should appear in the picker even in remote mode.
+    let named_routes = crate::provider::catalog_routes::all_named_provider_profile_routes();
+    for route in named_routes {
+        // De-dupe: only add if not already present
+        if !routes.iter().any(|r| {
+            r.model == route.model
+                && r.provider == route.provider
+                && r.api_method == route.api_method
+        }) {
+            routes.push(route);
+        }
+    }
 }
 
 impl App {
