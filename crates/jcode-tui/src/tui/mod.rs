@@ -94,6 +94,88 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
+/// Display row for the picker: either a section header or an entry.
+/// Headers are non-selectable; navigation skips over them.
+#[derive(Debug, Clone)]
+pub enum PickerDisplayRow {
+    /// Section header for "Recent" models (always expanded).
+    RecentHeader { count: usize },
+    /// Section header for a provider group (may be collapsed).
+    ProviderHeader { provider: String, count: usize },
+    /// An actual model entry (reference into InlineInteractiveState::entries).
+    Entry { entry_index: usize },
+}
+
+impl PickerDisplayRow {
+    pub fn is_header(&self) -> bool {
+        matches!(self, PickerDisplayRow::RecentHeader { .. } | PickerDisplayRow::ProviderHeader { .. })
+    }
+
+    pub fn is_provider_header(&self) -> bool {
+        matches!(self, PickerDisplayRow::ProviderHeader { .. })
+    }
+
+    pub fn provider_name(&self) -> Option<&str> {
+        match self {
+            PickerDisplayRow::ProviderHeader { provider, .. } => Some(provider),
+            _ => None,
+        }
+    }
+}
+
+/// Tracks which provider groups are collapsed in the model picker.
+/// Stored per-picker to persist across filter toggles.
+#[derive(Debug, Clone, Default)]
+pub struct CollapseState {
+    /// Provider names that are currently collapsed.
+    collapsed: std::collections::HashSet<String>,
+    /// Snapshot of collapse state before a filter was applied.
+    /// Restored when filter clears.
+    pre_filter_snapshot: Option<std::collections::HashSet<String>>,
+}
+
+impl CollapseState {
+    pub fn is_collapsed(&self, provider: &str) -> bool {
+        self.collapsed.contains(provider)
+    }
+
+    pub fn toggle(&mut self, provider: &str) {
+        if self.collapsed.contains(provider) {
+            self.collapsed.remove(provider);
+        } else {
+            self.collapsed.insert(provider.to_string());
+        }
+    }
+
+    pub fn collapse(&mut self, provider: &str) {
+        self.collapsed.insert(provider.to_string());
+    }
+
+    pub fn expand(&mut self, provider: &str) {
+        self.collapsed.remove(provider);
+    }
+
+    pub fn expand_all(&mut self) {
+        self.collapsed.clear();
+    }
+
+    /// Save current collapse state before filter applies (force-expand).
+    pub fn snapshot_for_filter(&mut self) {
+        self.pre_filter_snapshot = Some(self.collapsed.clone());
+    }
+
+    /// Restore collapse state after filter clears.
+    pub fn restore_after_filter(&mut self) {
+        if let Some(snapshot) = self.pre_filter_snapshot.take() {
+            self.collapsed = snapshot;
+        }
+    }
+
+    pub fn in_filter_mode(&self) -> bool {
+        self.pre_filter_snapshot.is_some()
+    }
+}
+
 /// Tracks whether the Kitty keyboard protocol is currently active.
 ///
 /// Key *decoding* depends on this. Legacy terminals collapse several distinct
@@ -1259,6 +1341,12 @@ pub struct InlineInteractiveState {
     pub filter: String,
     /// Preview mode: picker is visible but input stays in main text box
     pub preview: bool,
+    /// Display rows: section headers and entry references.
+    /// Computed from `entries` and `filtered` by `rebuild_display_rows`.
+    /// Headers are non-selectable; navigation skips over them.
+    pub display_rows: Vec<PickerDisplayRow>,
+    /// Tracks which provider groups are collapsed (>20 models auto-collapse).
+    pub collapse_state: CollapseState,
 }
 
 impl InlineInteractiveState {
@@ -1479,6 +1567,128 @@ impl InlineInteractiveState {
 
     pub fn shows_default_shortcut_hint(&self) -> bool {
         self.schema().shows_default_shortcut_hint
+    }
+
+    /// Rebuild display_rows from entries and filtered indices.
+    /// Adds section headers and respects collapse state.
+    /// Call this after filtering or when collapse state changes.
+    pub fn rebuild_display_rows(&mut self) {
+        use std::collections::HashMap;
+
+        // Group filtered entries by provider_group
+        let mut recent_entries: Vec<usize> = Vec::new();
+        let mut provider_groups: HashMap<String, Vec<usize>> = HashMap::new();
+        // Entries with no provider group (login/account/usage pickers, or
+        // model entries built by paths that don't set provider_group) must
+        // still render; dropping them made Enter a no-op on those pickers.
+        let mut ungrouped_entries: Vec<usize> = Vec::new();
+
+        for &idx in &self.filtered {
+            let entry = &self.entries[idx];
+            if entry.is_recent {
+                recent_entries.push(idx);
+            } else if let Some(ref provider) = entry.provider_group {
+                provider_groups
+                    .entry(provider.clone())
+                    .or_default()
+                    .push(idx);
+            } else {
+                ungrouped_entries.push(idx);
+            }
+        }
+
+        // Build display rows: Recent header + entries, then provider headers + entries
+        let mut rows: Vec<PickerDisplayRow> = Vec::new();
+
+        // Ungrouped entries render first, with no section header: pickers that
+        // don't use grouping (login, account, usage) keep their flat list.
+        for idx in ungrouped_entries {
+            rows.push(PickerDisplayRow::Entry { entry_index: idx });
+        }
+
+        // Recent section (always expanded, no collapse)
+        if !recent_entries.is_empty() {
+            rows.push(PickerDisplayRow::RecentHeader {
+                count: recent_entries.len(),
+            });
+            for idx in recent_entries {
+                rows.push(PickerDisplayRow::Entry { entry_index: idx });
+            }
+        }
+
+        // Provider groups (sorted by name for consistency)
+        let mut providers: Vec<_> = provider_groups.into_iter().collect();
+        providers.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (provider, indices) in providers {
+            let count = indices.len();
+            let collapsed = self.collapse_state.is_collapsed(&provider);
+
+            rows.push(PickerDisplayRow::ProviderHeader {
+                provider: provider.clone(),
+                count,
+            });
+
+            // If collapsed, don't add entries under this header
+            // Exception: when filter is active, force-expand
+            let force_expand = !self.filter.is_empty() && self.collapse_state.in_filter_mode();
+            if !collapsed || force_expand {
+                for idx in indices {
+                    rows.push(PickerDisplayRow::Entry { entry_index: idx });
+                }
+            }
+        }
+
+        self.display_rows = rows;
+    }
+
+    /// Find the next selectable row (non-header) from current position.
+    /// Returns the display row index or None if at end.
+    pub fn next_selectable_row(&self, from: usize) -> Option<usize> {
+        let mut pos = from.saturating_add(1);
+        while pos < self.display_rows.len() {
+            if !self.display_rows[pos].is_header() {
+                return Some(pos);
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    /// Find the previous selectable row (non-header) from current position.
+    /// Returns the display row index or None if at start.
+    pub fn prev_selectable_row(&self, from: usize) -> Option<usize> {
+        if from == 0 {
+            return None;
+        }
+        let mut pos = from.saturating_sub(1);
+        loop {
+            if !self.display_rows[pos].is_header() {
+                return Some(pos);
+            }
+            if pos == 0 {
+                return None;
+            }
+            pos -= 1;
+        }
+    }
+
+    /// Get the entry index for a display row, if it's an Entry row.
+    pub fn entry_index_for_display_row(&self, display_row: usize) -> Option<usize> {
+        self.display_rows.get(display_row).and_then(|row| {
+            match row {
+                PickerDisplayRow::Entry { entry_index } => Some(*entry_index),
+                _ => None,
+            }
+        })
+    }
+
+    /// Get the filtered index for the currently selected display row.
+    /// Returns the position in `filtered` for the selected entry.
+    /// Note: This is for backward-compatibility with tests that use `filtered[selected_idx]`.
+    pub fn filtered_index_for_selection(&self) -> Option<usize> {
+        let entry_idx = self.entry_index_for_display_row(self.selected)?;
+        self.filtered.iter().position(|&idx| idx == entry_idx)
     }
 }
 

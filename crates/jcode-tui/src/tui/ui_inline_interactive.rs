@@ -684,39 +684,66 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         return;
     }
 
+    // Use display_rows for rendering (includes section headers)
+    let display_count = picker.display_rows.len();
     let half = list_height / 2;
     let start = if selected <= half {
         0
-    } else if selected + list_height - half > filtered_count {
-        filtered_count.saturating_sub(list_height)
+    } else if selected + list_height - half > display_count {
+        display_count.saturating_sub(list_height)
     } else {
         selected - half
     };
-    let end = (start + list_height).min(filtered_count);
+    let end = (start + list_height).min(display_count);
 
     for vi in start..end {
-        let model_idx = picker.filtered[vi];
-        let entry = &picker.entries[model_idx];
+        let row = &picker.display_rows[vi];
         let is_row_selected = vi == selected;
-        let route = entry.active_option();
-        let unavailable = route.map(|r| !r.available).unwrap_or(true);
+        
+        // Handle section headers
+        match row {
+            crate::tui::PickerDisplayRow::RecentHeader { count } => {
+                let header_text = format!("★ Recent ({})", count);
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", header_text),
+                    Style::default().fg(rgb(255, 220, 120)).bold(),
+                )));
+                continue;
+            }
+            crate::tui::PickerDisplayRow::ProviderHeader { provider, count } => {
+                let collapsed = picker.collapse_state.is_collapsed(provider);
+                let expand_marker = if collapsed { "▸" } else { "▾" };
+                let header_text = format!("{} {} ({})", expand_marker, provider, count);
+                let style = if is_row_selected {
+                    Style::default().fg(rgb(200, 200, 220)).bg(rgb(50, 50, 70))
+                } else {
+                    Style::default().fg(rgb(140, 140, 160))
+                };
+                lines.push(Line::from(Span::styled(format!("   {}", header_text), style)));
+                continue;
+            }
+            crate::tui::PickerDisplayRow::Entry { entry_index } => {
+                let model_idx = *entry_index;
+                let entry = &picker.entries[model_idx];
+                let route = entry.active_option();
+                let unavailable = route.map(|r| !r.available).unwrap_or(true);
 
-        let limited = route
-            .map(|r| r.available && route_detail_is_limited(&r.detail))
-            .unwrap_or(false);
-        let marker = picker_row_marker(is_row_selected, unavailable, limited);
+                let limited = route
+                    .map(|r| r.available && route_detail_is_limited(&r.detail))
+                    .unwrap_or(false);
+                let marker = picker_row_marker(is_row_selected, unavailable, limited);
 
-        let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled(
-            format!(" {} ", marker),
-            if unavailable {
-                Style::default().fg(rgb(180, 120, 120)).bold()
-            } else if is_row_selected {
-                Style::default().fg(Color::White).bold()
-            } else {
-                Style::default().fg(dim_color())
-            },
-        ));
+                let mut spans: Vec<Span> = Vec::new();
+                spans.push(Span::styled(
+                    format!(" {} ", marker),
+                    if unavailable {
+                        Style::default().fg(rgb(180, 120, 120)).bold()
+                    } else if is_row_selected {
+                        Style::default().fg(Color::White).bold()
+                    } else {
+                        Style::default().fg(dim_color())
+                    },
+                ));
         let display_name = picker_entry_display_name(entry);
         let account_action_color = match &entry.action {
             crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Add { .. }) => {
@@ -938,6 +965,8 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         }
 
         lines.push(Line::from(spans));
+            }
+        }
     }
 
     // Add footer hint line for model picker (not account picker)
@@ -996,6 +1025,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: vec![crate::tui::PickerDisplayRow::Entry { entry_index: 0 }],
+            collapse_state: crate::tui::CollapseState::default(),
             entries: vec![crate::tui::PickerEntry {
                 name: "gpt-5.4".to_string(),
                 options: vec![crate::tui::PickerOption {
@@ -1091,6 +1122,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: crate::tui::CollapseState::default(),
             entries: models,
         }
     }
@@ -1103,6 +1136,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: vec![crate::tui::PickerDisplayRow::Entry { entry_index: 0 }],
+            collapse_state: crate::tui::CollapseState::default(),
             entries: vec![crate::tui::PickerEntry {
                 name: "Swarm / subagent".to_string(),
                 options: vec![crate::tui::PickerOption {

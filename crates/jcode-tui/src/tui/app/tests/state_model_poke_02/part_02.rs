@@ -5,29 +5,39 @@ fn test_agents_review_picker_saves_config_override() {
         configure_test_remote_models(&mut app);
         app.open_agent_model_picker(crate::tui::AgentModelTarget::Review);
 
-        let selected = app
+        // Find the entry with the AgentModelChoice action
+        let (display_row, entry_idx) = app
             .inline_interactive_state
             .as_ref()
             .and_then(|picker| {
-                picker.filtered.iter().position(|&idx| {
-                    matches!(
-                        picker.entries[idx].action,
-                        crate::tui::PickerAction::AgentModelChoice {
-                            target: crate::tui::AgentModelTarget::Review,
-                            clear_override: false,
+                picker.display_rows.iter().enumerate().find_map(|(row_idx, row)| {
+                    match row {
+                        crate::tui::PickerDisplayRow::Entry { entry_index } => {
+                            let entry = &picker.entries[*entry_index];
+                            if matches!(
+                                entry.action,
+                                crate::tui::PickerAction::AgentModelChoice {
+                                    target: crate::tui::AgentModelTarget::Review,
+                                    clear_override: false,
+                                }
+                            ) {
+                                Some((row_idx, *entry_index))
+                            } else {
+                                None
+                            }
                         }
-                    )
+                        _ => None,
+                    }
                 })
             })
             .expect("review picker should include at least one model option");
-        app.inline_interactive_state.as_mut().unwrap().selected = selected;
-        let selected_model_idx = app.inline_interactive_state.as_ref().unwrap().filtered[selected];
-        app.inline_interactive_state.as_mut().unwrap().entries[selected_model_idx].options[0]
+        app.inline_interactive_state.as_mut().unwrap().selected = display_row;
+        app.inline_interactive_state.as_mut().unwrap().entries[entry_idx].options[0]
             .available = true;
 
         let expected = {
             let picker = app.inline_interactive_state.as_ref().unwrap();
-            let entry = &picker.entries[picker.filtered[selected]];
+            let entry = &picker.entries[entry_idx];
             let base = if entry.effort.is_some() {
                 entry
                     .name
@@ -287,12 +297,14 @@ fn test_model_picker_preview_arrows_cycle_effort_not_cursor() {
             .as_ref()
             .expect("preview picker open");
         assert!(picker.preview);
-        let idx = picker.filtered[picker.selected];
+        let entry_idx = picker
+            .entry_index_for_display_row(picker.selected)
+            .expect("selected row should be an entry");
         assert!(
-            !picker.entries[idx].available_efforts.is_empty(),
+            !picker.entries[entry_idx].available_efforts.is_empty(),
             "focused row should support efforts for this test"
         );
-        picker.entries[idx].effort.clone()
+        picker.entries[entry_idx].effort.clone()
     };
 
     app.handle_key(KeyCode::Right, KeyModifiers::empty()).unwrap();
@@ -301,9 +313,11 @@ fn test_model_picker_preview_arrows_cycle_effort_not_cursor() {
         .inline_interactive_state
         .as_ref()
         .expect("picker still open");
-    let idx = picker.filtered[picker.selected];
+    let entry_idx = picker
+        .entry_index_for_display_row(picker.selected)
+        .expect("selected row should be an entry");
     assert_ne!(
-        picker.entries[idx].effort, effort_before,
+        picker.entries[entry_idx].effort, effort_before,
         "Right must cycle the focused row's effort"
     );
     assert_eq!(
@@ -330,10 +344,12 @@ fn test_model_picker_effort_wraps_and_enter_stages_choice() {
     // Wrap forward: cycling len(available) times returns to the start.
     let (start_effort, n) = {
         let picker = app.inline_interactive_state.as_ref().unwrap();
-        let idx = picker.filtered[picker.selected];
+        let entry_idx = picker
+            .entry_index_for_display_row(picker.selected)
+            .expect("selected row should be an entry");
         (
-            picker.entries[idx].effort.clone(),
-            picker.entries[idx].available_efforts.len(),
+            picker.entries[entry_idx].effort.clone(),
+            picker.entries[entry_idx].available_efforts.len(),
         )
     };
     assert!(n >= 2, "need at least two efforts to test wrap");
@@ -342,9 +358,11 @@ fn test_model_picker_effort_wraps_and_enter_stages_choice() {
     }
     {
         let picker = app.inline_interactive_state.as_ref().unwrap();
-        let idx = picker.filtered[picker.selected];
+        let entry_idx = picker
+            .entry_index_for_display_row(picker.selected)
+            .expect("selected row should be an entry");
         assert_eq!(
-            picker.entries[idx].effort, start_effort,
+            picker.entries[entry_idx].effort, start_effort,
             "cycling through all efforts must wrap back to the start"
         );
     }
@@ -353,9 +371,11 @@ fn test_model_picker_effort_wraps_and_enter_stages_choice() {
     app.handle_key(KeyCode::Left, KeyModifiers::empty()).unwrap();
     let dialed = {
         let picker = app.inline_interactive_state.as_ref().unwrap();
-        let idx = picker.filtered[picker.selected];
-        let e = picker.entries[idx].effort.clone().expect("effort dialed");
-        let ladder = &picker.entries[idx].available_efforts;
+        let entry_idx = picker
+            .entry_index_for_display_row(picker.selected)
+            .expect("selected row should be an entry");
+        let e = picker.entries[entry_idx].effort.clone().expect("effort dialed");
+        let ladder = &picker.entries[entry_idx].available_efforts;
         let start_idx = ladder
             .iter()
             .position(|a| Some(a) == start_effort.as_ref())

@@ -316,6 +316,8 @@ fn test_inline_ui_gap_height_only_when_inline_ui_visible() {
         column: 0,
         filter: String::new(),
         preview: false,
+        display_rows: vec![],
+        collapse_state: crate::tui::CollapseState::default(),
     };
     let state_with_picker = TestState {
         inline_interactive_state: Some(inline_interactive_state),

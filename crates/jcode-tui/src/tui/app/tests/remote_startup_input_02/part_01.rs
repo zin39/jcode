@@ -19,14 +19,18 @@ fn test_model_picker_copilot_selection_prefixes_model() {
         .expect("grok-code-fast-1 should be in picker");
 
     // Navigate to it and select
-    let filtered_pos = picker
-        .filtered
+    let display_row = picker
+        .display_rows
         .iter()
-        .position(|&i| i == grok_idx)
-        .expect("grok-code-fast-1 should be in filtered list");
+        .position(|r| {
+            matches!(
+                r,
+                crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == grok_idx
+            )
+        })
+        .expect("grok-code-fast-1 should be in display rows");
 
-    // Set the selected position to grok's position
-    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+    app.inline_interactive_state.as_mut().unwrap().selected = display_row;
 
     // Press Enter to select
     app.handle_key(KeyCode::Enter, KeyModifiers::empty())
@@ -92,13 +96,19 @@ fn test_model_picker_cursor_selection_prefixes_model() {
         .position(|m| m.name == "composer-2-fast")
         .expect("composer-2-fast should be in picker");
 
-    let filtered_pos = picker
-        .filtered
+    // Find the display row for this entry
+    let display_row = picker
+        .display_rows
         .iter()
-        .position(|&i| i == composer_idx)
-        .expect("composer-2-fast should be in filtered list");
+        .position(|row| {
+            matches!(
+                row,
+                crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == composer_idx
+            )
+        })
+        .expect("composer-2-fast should be in display rows");
 
-    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+    app.inline_interactive_state.as_mut().unwrap().selected = display_row;
 
     app.handle_key(KeyCode::Enter, KeyModifiers::empty())
         .unwrap();
@@ -136,13 +146,20 @@ fn test_model_picker_bedrock_selection_prefixes_model() {
         .iter()
         .position(|m| m.name == "amazon.nova-pro-v1:0")
         .expect("Bedrock model should be in picker");
-    let filtered_pos = picker
-        .filtered
+    
+    // Find the display row for this entry
+    let display_row = picker
+        .display_rows
         .iter()
-        .position(|&i| i == model_idx)
-        .expect("Bedrock model should be in filtered list");
+        .position(|r| {
+            matches!(
+                r,
+                crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == model_idx
+            )
+        })
+        .expect("Bedrock model should be in display rows");
 
-    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+    app.inline_interactive_state.as_mut().unwrap().selected = display_row;
     app.handle_key(KeyCode::Enter, KeyModifiers::empty())
         .unwrap();
 
@@ -180,13 +197,20 @@ fn test_model_picker_bedrock_arn_selection_prefixes_model() {
         .iter()
         .position(|m| m.name == model)
         .expect("Bedrock ARN should be in picker");
-    let filtered_pos = picker
-        .filtered
+    
+    // Find the display row for this entry
+    let display_row = picker
+        .display_rows
         .iter()
-        .position(|&i| i == model_idx)
-        .expect("Bedrock ARN should be in filtered list");
+        .position(|r| {
+            matches!(
+                r,
+                crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == model_idx
+            )
+        })
+        .expect("Bedrock ARN should be in display rows");
 
-    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+    app.inline_interactive_state.as_mut().unwrap().selected = display_row;
     app.handle_key(KeyCode::Enter, KeyModifiers::empty())
         .unwrap();
 
@@ -811,12 +835,19 @@ fn test_model_picker_ctrl_b_bedrock_selection_saves_bedrock_default() {
             .iter()
             .position(|m| m.name == "amazon.nova-pro-v1:0")
             .expect("Bedrock model should be in picker");
-        let filtered_pos = picker
-            .filtered
+        
+        // Find the display row for this entry
+        let display_row = picker
+            .display_rows
             .iter()
-            .position(|&i| i == model_idx)
-            .expect("Bedrock model should be in filtered list");
-        app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+            .position(|r| {
+                matches!(
+                    r,
+                    crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == model_idx
+                )
+            })
+            .expect("Bedrock model should be in display rows");
+        app.inline_interactive_state.as_mut().unwrap().selected = display_row;
 
         // Ctrl+O replaced Ctrl+B so the picker no longer steals tmux's prefix.
         app.handle_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
@@ -1762,12 +1793,18 @@ fn test_model_picker_effort_variant_selection_stages_effort_in_remote_mode() {
         "gpt-5.5 entry should have a pre-selected effort"
     );
 
-    let filtered_pos = picker
-        .filtered
+    // Find the display row for this entry
+    let display_row = picker
+        .display_rows
         .iter()
-        .position(|&i| i == entry_idx)
-        .expect("gpt-5.5 should be in filtered list");
-    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+        .position(|r| {
+            matches!(
+                r,
+                crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == entry_idx
+            )
+        })
+        .expect("gpt-5.5 should be in display rows");
+    app.inline_interactive_state.as_mut().unwrap().selected = display_row;
     
     // Cycle effort to 'high' using Right key (new design: Left/Right cycle effort)
     // The entry already has effort set, but we ensure it's 'high' for the test
@@ -1895,12 +1932,18 @@ fn test_model_picker_plain_selection_stages_no_effort_in_remote_mode() {
         "Copilot-only entry should not have effort pre-selected"
     );
 
-    let filtered_pos = picker
-        .filtered
+    // Find the display row for this entry
+    let display_row = picker
+        .display_rows
         .iter()
-        .position(|&i| i == entry_idx)
-        .expect("claude-opus-4-8 should be in filtered list");
-    app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
+        .position(|r| {
+            matches!(
+                r,
+                crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == entry_idx
+            )
+        })
+        .expect("claude-opus-4-8 should be in display rows");
+    app.inline_interactive_state.as_mut().unwrap().selected = display_row;
 
     app.handle_key(KeyCode::Enter, KeyModifiers::empty())
         .unwrap();
@@ -1954,17 +1997,21 @@ fn test_model_switch_notice_omits_placeholder_route_details() {
                 })
                 .expect("a placeholder route option should be present")
         };
-        let filtered_pos = app
+        // `selected` is a display-row index now (headers occupy rows), so
+        // resolve the entry's display row instead of its `filtered` position.
+        let display_pos = app
             .inline_interactive_state
             .as_ref()
             .unwrap()
-            .filtered
+            .display_rows
             .iter()
-            .position(|&i| i == entry_idx)
-            .expect("placeholder entry should be in the filtered list");
+            .position(|row| {
+                matches!(row, crate::tui::PickerDisplayRow::Entry { entry_index } if *entry_index == entry_idx)
+            })
+            .expect("placeholder entry should have a display row");
         {
             let picker = app.inline_interactive_state.as_mut().unwrap();
-            picker.selected = filtered_pos;
+            picker.selected = display_pos;
             picker.entries[entry_idx].selected_option = option_idx;
         }
 

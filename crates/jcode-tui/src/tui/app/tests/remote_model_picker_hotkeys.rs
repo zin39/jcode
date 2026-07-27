@@ -36,6 +36,8 @@ fn remote_model_picker_preview_state() -> crate::tui::InlineInteractiveState {
         column: 0,
         filter: String::new(),
         preview: true,
+        display_rows: vec![crate::tui::PickerDisplayRow::Entry { entry_index: 0 }],
+        collapse_state: crate::tui::CollapseState::default(),
     }
 }
 

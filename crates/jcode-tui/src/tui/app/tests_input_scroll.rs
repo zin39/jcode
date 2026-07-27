@@ -149,8 +149,14 @@ fn test_disconnected_key_handler_runs_model_picker_locally() {
         .inline_interactive_state
         .as_ref()
         .expect("model picker should open");
-    assert!(!picker.entries.is_empty());
-    let selected = &picker.entries[picker.selected];
+    assert!(!picker.display_rows.is_empty());
+    
+    // Get the entry at the selected display row
+    let entry_idx = picker
+        .entry_index_for_display_row(picker.selected)
+        .expect("selected row should be an entry");
+    let selected = &picker.entries[entry_idx];
+    
     // NEW DESIGN: entry name is just the model name without effort suffix
     assert_eq!(selected.name, "gpt-5.3-codex");
     assert!(selected.is_current, "current model should be preselected");

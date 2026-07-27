@@ -62,6 +62,8 @@ fn model_picker_state() -> TestState {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: vec![crate::tui::PickerDisplayRow::Entry { entry_index: 0 }],
+            collapse_state: crate::tui::CollapseState::default(),
             entries: vec![model_picker_entry()],
         }),
         ..Default::default()

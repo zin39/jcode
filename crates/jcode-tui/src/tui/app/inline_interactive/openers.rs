@@ -63,7 +63,17 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: crate::tui::CollapseState::default(),
         });
+        // Initialize display rows for agents picker (no headers needed for short list)
+        if let Some(ref mut picker) = self.inline_interactive_state {
+            picker.display_rows = picker.entries
+                .iter()
+                .enumerate()
+                .map(|(i, _)| crate::tui::PickerDisplayRow::Entry { entry_index: i })
+                .collect();
+        }
         self.input.clear();
         self.cursor_pos = 0;
     }
@@ -178,7 +188,17 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: crate::tui::CollapseState::default(),
         });
+        // Initialize display rows for login picker (no headers needed)
+        if let Some(ref mut picker) = self.inline_interactive_state {
+            picker.display_rows = picker.entries
+                .iter()
+                .enumerate()
+                .map(|(i, _)| crate::tui::PickerDisplayRow::Entry { entry_index: i })
+                .collect();
+        }
         self.input.clear();
         self.cursor_pos = 0;
     }
@@ -297,6 +317,14 @@ impl App {
                 .unwrap_or(0);
             picker.column = 0;
             picker.filter.clear();
+            // Rebuild display rows after modifying entries
+            picker.rebuild_display_rows();
+            // Ensure selected points to a selectable entry
+            if !picker.display_rows.is_empty() && picker.display_rows[0].is_header() {
+                if let Some(first_entry) = picker.next_selectable_row(0) {
+                    picker.selected = first_entry;
+                }
+            }
         }
     }
 }

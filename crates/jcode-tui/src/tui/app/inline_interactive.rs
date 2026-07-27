@@ -1,8 +1,8 @@
 use super::*;
 use crate::tui::session_picker::{self, OverlayAction, PickerResult, ResumeTarget, SessionPicker};
 use crate::tui::{
-    AccountPickerAction, InlineInteractiveState, PickerAction, PickerEntry, PickerKind,
-    PickerOption,
+    AccountPickerAction, CollapseState, InlineInteractiveState, PickerAction, PickerDisplayRow,
+    PickerEntry, PickerKind, PickerOption,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -22,6 +22,32 @@ use helpers::{
     openrouter_route_model_id, picker_route_model_spec, picker_route_selection,
     save_agent_model_override,
 };
+
+/// Auto-collapse provider groups with more than 20 models.
+/// Called once when the picker is first opened.
+fn compute_initial_collapse_state(entries: &[PickerEntry], filtered: &[usize]) -> crate::tui::CollapseState {
+    use std::collections::HashSet;
+    
+    let mut provider_counts: HashMap<String, usize> = HashMap::new();
+    for &idx in filtered {
+        let entry = &entries[idx];
+        if let Some(ref provider) = entry.provider_group {
+            *provider_counts.entry(provider.clone()).or_default() += 1;
+        }
+    }
+    
+    let mut collapsed: HashSet<String> = HashSet::new();
+    for (provider, count) in provider_counts {
+        if count > 20 {
+            collapsed.insert(provider);
+        }
+    }
+    
+    crate::tui::CollapseState {
+        collapsed,
+        pre_filter_snapshot: None,
+    }
+}
 
 const REMOTE_MODEL_CATALOG_CACHE_FILE: &str = "remote_model_catalog_cache.json";
 const REMOTE_MODEL_CATALOG_CACHE_VERSION: u8 = 3;
@@ -972,7 +998,21 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: CollapseState::default(),
         });
+        // Rebuild display rows with headers
+        if let Some(ref mut picker) = self.inline_interactive_state {
+            // Auto-collapse provider groups with >20 models
+            picker.collapse_state = compute_initial_collapse_state(&picker.entries, &picker.filtered);
+            picker.rebuild_display_rows();
+            // Ensure selected points to a selectable entry, not a header
+            if !picker.display_rows.is_empty() && picker.display_rows[0].is_header() {
+                if let Some(first_entry) = picker.next_selectable_row(0) {
+                    picker.selected = first_entry;
+                }
+            }
+        }
         if !preserve_input {
             self.input.clear();
             self.cursor_pos = 0;
@@ -1275,6 +1315,8 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: vec![PickerDisplayRow::Entry { entry_index: 0 }],
+            collapse_state: CollapseState::default(),
         });
         self.set_status_notice("Updating model list…");
     }
@@ -1985,7 +2027,21 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: CollapseState::default(),
         });
+
+        // Initialize collapse state and display rows
+        if let Some(ref mut picker) = self.inline_interactive_state {
+            picker.collapse_state = compute_initial_collapse_state(&picker.entries, &picker.filtered);
+            picker.rebuild_display_rows();
+            // Ensure selected points to a selectable entry, not a header
+            if !picker.display_rows.is_empty() && picker.display_rows[0].is_header() {
+                if let Some(first_entry) = picker.next_selectable_row(0) {
+                    picker.selected = first_entry;
+                }
+            }
+        }
 
         if let Some((preview, filter, selected, column)) = previous_picker
             && let Some(ref mut picker) = self.inline_interactive_state
@@ -2224,40 +2280,63 @@ impl App {
         match code {
             KeyCode::Down => {
                 if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    let max = picker.filtered.len().saturating_sub(1);
-                    picker.selected = (picker.selected + 1).min(max);
+                    if let Some(next) = picker.next_selectable_row(picker.selected) {
+                        picker.selected = next;
+                    }
                 }
                 Ok(true)
             }
             KeyCode::Up => {
                 if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    picker.selected = picker.selected.saturating_sub(1);
+                    if let Some(prev) = picker.prev_selectable_row(picker.selected) {
+                        picker.selected = prev;
+                    }
                 }
                 Ok(true)
             }
             KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    let max = picker.filtered.len().saturating_sub(1);
-                    picker.selected = (picker.selected + 1).min(max);
+                    if let Some(next) = picker.next_selectable_row(picker.selected) {
+                        picker.selected = next;
+                    }
                 }
                 Ok(true)
             }
             KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    picker.selected = picker.selected.saturating_sub(1);
+                    if let Some(prev) = picker.prev_selectable_row(picker.selected) {
+                        picker.selected = prev;
+                    }
                 }
                 Ok(true)
             }
             KeyCode::PageDown => {
                 if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    let max = picker.filtered.len().saturating_sub(1);
-                    picker.selected = (picker.selected + 5).min(max);
+                    // Skip multiple rows
+                    let mut pos = picker.selected;
+                    for _ in 0..5 {
+                        if let Some(next) = picker.next_selectable_row(pos) {
+                            pos = next;
+                        } else {
+                            break;
+                        }
+                    }
+                    picker.selected = pos;
                 }
                 Ok(true)
             }
             KeyCode::PageUp => {
                 if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    picker.selected = picker.selected.saturating_sub(5);
+                    // Skip multiple rows back
+                    let mut pos = picker.selected;
+                    for _ in 0..5 {
+                        if let Some(prev) = picker.prev_selectable_row(pos) {
+                            pos = prev;
+                        } else {
+                            break;
+                        }
+                    }
+                    picker.selected = pos;
                 }
                 Ok(true)
             }
@@ -2271,8 +2350,8 @@ impl App {
                 if let Some(picker) = self.inline_interactive_state.as_mut()
                     && picker.kind == PickerKind::Model
                 {
-                    if let Some(&idx) = picker.filtered.get(picker.selected) {
-                        let entry = &mut picker.entries[idx];
+                    if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected) {
+                        let entry = &mut picker.entries[entry_idx];
                         if !entry.available_efforts.is_empty() {
                             let current_idx = entry
                                 .effort
@@ -2295,8 +2374,8 @@ impl App {
                 if let Some(picker) = self.inline_interactive_state.as_mut()
                     && picker.kind == PickerKind::Model
                 {
-                    if let Some(&idx) = picker.filtered.get(picker.selected) {
-                        let entry = &mut picker.entries[idx];
+                    if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected) {
+                        let entry = &mut picker.entries[entry_idx];
                         if !entry.available_efforts.is_empty() {
                             let current_idx = entry
                                 .effort
@@ -2323,9 +2402,14 @@ impl App {
                     // first provider's login flow. Without a filter or an
                     // explicit selection there is no clear user choice yet, so
                     // activate the picker and let them pick deliberately.
+                    // Check if we're at the first entry (not a header)
+                    let first_entry_pos = picker
+                        .display_rows
+                        .iter()
+                        .position(|r| !r.is_header());
                     if picker.kind == PickerKind::Login
                         && picker.filter.is_empty()
-                        && picker.selected == 0
+                        && first_entry_pos == Some(picker.selected)
                     {
                         picker.preview = false;
                         picker.column = 0;
@@ -3249,7 +3333,10 @@ impl App {
                 }
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.column == 0 {
-                        picker.selected = picker.selected.saturating_sub(1);
+                        // Navigate using display_rows, skipping headers
+                        if let Some(prev) = picker.prev_selectable_row(picker.selected) {
+                            picker.selected = prev;
+                        }
                     } else if let Some(&idx) = picker.filtered.get(picker.selected) {
                         let entry = &mut picker.entries[idx];
                         entry.selected_option = entry.selected_option.saturating_sub(1);
@@ -3274,8 +3361,10 @@ impl App {
                 }
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.column == 0 {
-                        let max = picker.filtered.len().saturating_sub(1);
-                        picker.selected = (picker.selected + 1).min(max);
+                        // Navigate using display_rows, skipping headers
+                        if let Some(next) = picker.next_selectable_row(picker.selected) {
+                            picker.selected = next;
+                        }
                     } else if let Some(&idx) = picker.filtered.get(picker.selected) {
                         let entry = &mut picker.entries[idx];
                         let max = entry.options.len().saturating_sub(1);
@@ -3284,15 +3373,25 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                // NEW DESIGN: Left cycles effort level on focused row
+                // NEW DESIGN: Left cycles effort level on focused row, or collapses header
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.uses_compact_navigation() {
                         return Ok(());
                     }
                     if picker.column == 0 {
+                        // Check if on a provider header - collapse it
+                        if let Some(row) = picker.display_rows.get(picker.selected) {
+                            if let crate::tui::PickerDisplayRow::ProviderHeader { provider, .. } = row {
+                                if !picker.collapse_state.is_collapsed(provider) {
+                                    picker.collapse_state.collapse(provider);
+                                    picker.rebuild_display_rows();
+                                    return Ok(());
+                                }
+                            }
+                        }
                         // Cycle effort on focused model row
-                        if let Some(&idx) = picker.filtered.get(picker.selected) {
-                            let entry = &mut picker.entries[idx];
+                        if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected) {
+                            let entry = &mut picker.entries[entry_idx];
                             if !entry.available_efforts.is_empty() {
                                 // Find current effort index and decrement
                                 let current_idx = entry
@@ -3316,15 +3415,25 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                // NEW DESIGN: Right cycles effort level on focused row
+                // NEW DESIGN: Right cycles effort level on focused row, or expands header
                 if let Some(ref mut picker) = self.inline_interactive_state {
                     if picker.uses_compact_navigation() {
                         return Ok(());
                     }
                     if picker.column == 0 {
+                        // Check if on a provider header - expand it
+                        if let Some(row) = picker.display_rows.get(picker.selected) {
+                            if let crate::tui::PickerDisplayRow::ProviderHeader { provider, .. } = row {
+                                if picker.collapse_state.is_collapsed(provider) {
+                                    picker.collapse_state.expand(provider);
+                                    picker.rebuild_display_rows();
+                                    return Ok(());
+                                }
+                            }
+                        }
                         // Cycle effort on focused model row
-                        if let Some(&idx) = picker.filtered.get(picker.selected) {
-                            let entry = &mut picker.entries[idx];
+                        if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected) {
+                            let entry = &mut picker.entries[entry_idx];
                             if !entry.available_efforts.is_empty() {
                                 // Find current effort index and increment
                                 let current_idx = entry
@@ -3339,8 +3448,8 @@ impl App {
                             }
                         }
                     } else if picker.column < picker.max_navigable_column()
-                        && let Some(&idx) = picker.filtered.get(picker.selected)
-                        && (picker.entries[idx].options.len() > 1 || picker.column > 0)
+                        && let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected)
+                        && (picker.entries[entry_idx].options.len() > 1 || picker.column > 0)
                     {
                         picker.column += 1;
                     }
@@ -3362,8 +3471,8 @@ impl App {
                         return Ok(());
                     }
                     // Cycle route option on focused row
-                    if let Some(&idx) = picker.filtered.get(picker.selected) {
-                        let entry = &mut picker.entries[idx];
+                    if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected) {
+                        let entry = &mut picker.entries[entry_idx];
                         if entry.options.len() > 1 {
                             entry.selected_option = entry.selected_option.saturating_sub(1);
                         }
@@ -3378,8 +3487,8 @@ impl App {
                     }
                     if picker.column == 0 && !picker.filter.is_empty() {
                         Self::tab_complete_inline_interactive_filter(picker);
-                    } else if let Some(&idx) = picker.filtered.get(picker.selected) {
-                        let entry = &mut picker.entries[idx];
+                    } else if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected) {
+                        let entry = &mut picker.entries[entry_idx];
                         if entry.options.len() > 1 {
                             // Cycle to next route option
                             let max = entry.options.len().saturating_sub(1);
@@ -3395,11 +3504,15 @@ impl App {
                     if !picker_is_runtime_model_picker(picker) {
                         return Ok(());
                     }
-                    if picker.filtered.is_empty() {
+                    if picker.display_rows.is_empty() {
                         return Ok(());
                     }
-                    let idx = picker.filtered[picker.selected];
-                    let entry = &picker.entries[idx];
+                    // Get entry from display_rows
+                    let entry_idx = match picker.entry_index_for_display_row(picker.selected) {
+                        Some(idx) => idx,
+                        None => return Ok(()),
+                    };
+                    let entry = &picker.entries[entry_idx];
                     if !matches!(entry.action, PickerAction::Model) {
                         return Ok(());
                     }
@@ -3444,7 +3557,7 @@ impl App {
                                 for entry in &mut picker.entries {
                                     entry.is_default = false;
                                 }
-                                if let Some(entry) = picker.entries.get_mut(idx) {
+                                if let Some(entry) = picker.entries.get_mut(entry_idx) {
                                     entry.is_default = true;
                                 }
                             }
@@ -3468,11 +3581,29 @@ impl App {
                 let Some(ref mut picker) = self.inline_interactive_state else {
                     return Ok(());
                 };
-                if picker.filtered.is_empty() {
-                    return Ok(());
+                
+                // Check if we're on a header row
+                if let Some(row) = picker.display_rows.get(picker.selected) {
+                    match row {
+                        crate::tui::PickerDisplayRow::RecentHeader { .. } => {
+                            // Recent header does nothing on Enter (always expanded)
+                            return Ok(());
+                        }
+                        crate::tui::PickerDisplayRow::ProviderHeader { provider, .. } => {
+                            // Toggle collapse state for this provider
+                            picker.collapse_state.toggle(provider);
+                            picker.rebuild_display_rows();
+                            return Ok(());
+                        }
+                        crate::tui::PickerDisplayRow::Entry { .. } => {}
+                    }
                 }
-                let idx = picker.filtered[picker.selected];
-                let entry = picker.entries[idx].clone();
+                
+                // Get the entry index from display_rows
+                let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected) else {
+                    return Ok(());
+                };
+                let entry = picker.entries[entry_idx].clone();
 
                 if matches!(entry.action, PickerAction::Model) {
                     if picker.column == 0 && entry.options.len() > 1 {
@@ -3764,7 +3895,22 @@ impl App {
     }
 
     pub(super) fn apply_inline_interactive_filter(picker: &mut InlineInteractiveState) {
+        let had_filter = !picker.filter.is_empty();
+        
+        // When starting to filter, snapshot collapse state
+        if !had_filter && picker.filter.is_empty() {
+            // No change needed
+        } else if had_filter && !picker.collapse_state.in_filter_mode() {
+            // Starting a filter - snapshot current collapse state
+            picker.collapse_state.snapshot_for_filter();
+            picker.collapse_state.expand_all();
+        }
+        
         if picker.filter.is_empty() {
+            // Filter cleared - restore collapse state
+            if picker.collapse_state.in_filter_mode() {
+                picker.collapse_state.restore_after_filter();
+            }
             picker.filtered = (0..picker.entries.len()).collect();
         } else {
             let query = picker.filter.trim();
@@ -3804,6 +3950,24 @@ impl App {
             picker.selected = 0;
         } else {
             picker.selected = picker.selected.min(picker.filtered.len() - 1);
+        }
+        
+        // Rebuild display rows after filtering
+        picker.rebuild_display_rows();
+        
+        // Ensure selected row is a selectable entry (not a header)
+        if !picker.display_rows.is_empty() {
+            let current_row = picker.selected;
+            if let Some(row) = picker.display_rows.get(current_row) {
+                if row.is_header() {
+                    // Try to find next selectable row
+                    if let Some(next) = picker.next_selectable_row(current_row) {
+                        picker.selected = next;
+                    } else if let Some(prev) = picker.prev_selectable_row(current_row) {
+                        picker.selected = prev;
+                    }
+                }
+            }
         }
     }
 
@@ -3916,6 +4080,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: vec![crate::tui::PickerDisplayRow::Entry { entry_index: 0 }],
+            collapse_state: crate::tui::CollapseState::default(),
         };
         let mut agent_entry = picker_entry("Swarm / subagent", "gpt-5 default", 0);
         agent_entry.action = PickerAction::AgentTarget(AgentModelTarget::Swarm);
@@ -3927,6 +4093,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: vec![crate::tui::PickerDisplayRow::Entry { entry_index: 0 }],
+            collapse_state: crate::tui::CollapseState::default(),
         };
 
         assert!(picker_is_runtime_model_picker(&runtime));
@@ -3946,6 +4114,8 @@ mod tests {
             column: 0,
             filter: "opus".to_string(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: crate::tui::CollapseState::default(),
         };
 
         App::apply_inline_interactive_filter(&mut picker);
@@ -3966,6 +4136,8 @@ mod tests {
             column: 0,
             filter: "codxe".to_string(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: crate::tui::CollapseState::default(),
         };
 
         App::apply_inline_interactive_filter(&mut picker);
@@ -3986,6 +4158,8 @@ mod tests {
             column: 0,
             filter: "gpt-5".to_string(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: crate::tui::CollapseState::default(),
         };
 
         App::apply_inline_interactive_filter(&mut picker);

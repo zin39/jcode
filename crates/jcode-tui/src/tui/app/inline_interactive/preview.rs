@@ -190,11 +190,19 @@ impl App {
         // `/login` + immediate Enter must not silently start the first
         // provider's login flow. With no filter and no explicit selection,
         // just focus the picker so the user chooses deliberately.
+        let first_entry_pos = self
+            .inline_interactive_state
+            .as_ref()
+            .and_then(|picker| {
+                picker.display_rows.iter().position(|r| !r.is_header())
+            });
         if self
             .inline_interactive_state
             .as_ref()
             .map(|picker| {
-                picker.kind == PickerKind::Login && picker.filter.is_empty() && picker.selected == 0
+                picker.kind == PickerKind::Login
+                    && picker.filter.is_empty()
+                    && first_entry_pos == Some(picker.selected)
             })
             .unwrap_or(false)
         {

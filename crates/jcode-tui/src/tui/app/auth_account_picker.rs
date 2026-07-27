@@ -423,7 +423,17 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            display_rows: Vec::new(),
+            collapse_state: crate::tui::CollapseState::default(),
         });
+        // Initialize display rows for account picker (no headers needed)
+        if let Some(ref mut picker) = self.inline_interactive_state {
+            picker.display_rows = picker.entries
+                .iter()
+                .enumerate()
+                .map(|(i, _)| crate::tui::PickerDisplayRow::Entry { entry_index: i })
+                .collect();
+        }
         self.input.clear();
         self.cursor_pos = 0;
         self.set_status_notice(format!(
