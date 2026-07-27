@@ -695,7 +695,7 @@ impl App {
             routes,
             require_credentials,
             require_remote_advertisement,
-            &self.remote_available_entries,
+            remote_available_entries,
         );
     }
 
@@ -725,8 +725,8 @@ impl App {
         }
         extend_remote_routes_for_uncovered_models_impl(
             routes,
-            self.remote_provider_name.as_deref(),
-            &self.remote_available_entries,
+            remote_provider_name,
+            remote_available_entries,
         );
     }
 
