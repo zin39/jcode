@@ -151,12 +151,10 @@ fn render_file_diff_row(row: &FileDiffDisplayRow, file_ext: Option<&str>) -> Lin
             }
             Line::from(spans)
         }
-        FileDiffDisplayRowKind::HunkSeparator => {
-            Line::from(Span::styled(
-                row.text.clone(),
-                Style::default().fg(dim_color()),
-            ))
-        }
+        FileDiffDisplayRowKind::HunkSeparator => Line::from(Span::styled(
+            row.text.clone(),
+            Style::default().fg(dim_color()),
+        )),
     }
 }
 
@@ -598,7 +596,11 @@ pub(super) fn draw_file_diff_view(
     }
     if hunk_count > 0 {
         title_parts.push(Span::styled(
-            format!(" {hunk_count}/{} hunk{}", hunk_count, if hunk_count == 1 { "" } else { "s" }),
+            format!(
+                " {hunk_count}/{} hunk{}",
+                hunk_count,
+                if hunk_count == 1 { "" } else { "s" }
+            ),
             Style::default().fg(dim_color()),
         ));
     }
@@ -829,7 +831,11 @@ mod tests {
         );
 
         // The Agent role maps to LightGreen at plain tier; Error maps to LightRed.
-        assert_eq!(add, Color::LightGreen, "plain add should be LightGreen (Agent)");
+        assert_eq!(
+            add,
+            Color::LightGreen,
+            "plain add should be LightGreen (Agent)"
+        );
         assert_eq!(del, Color::LightRed, "plain del should be LightRed (Error)");
     }
 }

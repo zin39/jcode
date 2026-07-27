@@ -252,8 +252,8 @@ fn strip_system_reminders(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::message::{ContentBlock, Role};
-    use jcode_session_types::{StoredDisplayRole, StoredMessage};
     use chrono::Utc;
+    use jcode_session_types::{StoredDisplayRole, StoredMessage};
 
     fn msg(role: Role, text: &str) -> StoredMessage {
         StoredMessage {
@@ -291,7 +291,9 @@ mod tests {
 
     #[test]
     fn selfdev_by_content() {
-        let msgs = vec![user("modify jcode to add a new feature in crates/jcode-base")];
+        let msgs = vec![user(
+            "modify jcode to add a new feature in crates/jcode-base",
+        )];
         assert_eq!(
             classify_session(Some("some task"), &msgs),
             Some("selfdev".into())
@@ -310,15 +312,14 @@ mod tests {
     #[test]
     fn testing_cargo_test() {
         let msgs = vec![user("cargo test -p jcode-base session")];
-        assert_eq!(
-            classify_session(None, &msgs),
-            Some("testing".into())
-        );
+        assert_eq!(classify_session(None, &msgs), Some("testing".into()));
     }
 
     #[test]
     fn automation_log_distiller() {
-        let msgs = vec![user("You are a log distiller. Parse this log file and output only the errors.")];
+        let msgs = vec![user(
+            "You are a log distiller. Parse this log file and output only the errors.",
+        )];
         assert_eq!(
             classify_session(Some("log parsing"), &msgs),
             Some("automation".into())
@@ -328,10 +329,7 @@ mod tests {
     #[test]
     fn automation_reply_with_exactly() {
         let msgs = vec![user("Reply with exactly: hello world, no preamble")];
-        assert_eq!(
-            classify_session(None, &msgs),
-            Some("automation".into())
-        );
+        assert_eq!(classify_session(None, &msgs), Some("automation".into()));
     }
 
     #[test]
@@ -345,7 +343,9 @@ mod tests {
 
     #[test]
     fn troubleshooting_by_bug() {
-        let msgs = vec![user("my code doesn't work, there is a crash when I call this function")];
+        let msgs = vec![user(
+            "my code doesn't work, there is a crash when I call this function",
+        )];
         assert_eq!(
             classify_session(Some("fix bug"), &msgs),
             Some("troubleshooting".into())
@@ -373,10 +373,7 @@ mod tests {
     #[test]
     fn research_by_vs() {
         let msgs = vec![user("compare rust vs go for web servers")];
-        assert_eq!(
-            classify_session(None, &msgs),
-            Some("research".into())
-        );
+        assert_eq!(classify_session(None, &msgs), Some("research".into()));
     }
 
     #[test]
@@ -391,10 +388,7 @@ mod tests {
     #[test]
     fn ops_by_docker() {
         let msgs = vec![user("docker compose up for the ci/cd pipeline")];
-        assert_eq!(
-            classify_session(None, &msgs),
-            Some("ops".into())
-        );
+        assert_eq!(classify_session(None, &msgs), Some("ops".into()));
     }
 
     #[test]
@@ -418,19 +412,13 @@ mod tests {
     #[test]
     fn chitchat_by_hello() {
         let msgs = vec![user("hello how are you today")];
-        assert_eq!(
-            classify_session(None, &msgs),
-            Some("chitchat".into())
-        );
+        assert_eq!(classify_session(None, &msgs), Some("chitchat".into()));
     }
 
     #[test]
     fn chitchat_by_thanks() {
         let msgs = vec![user("thank you for all the help")];
-        assert_eq!(
-            classify_session(None, &msgs),
-            Some("chitchat".into())
-        );
+        assert_eq!(classify_session(None, &msgs), Some("chitchat".into()));
     }
 
     #[test]
@@ -445,10 +433,7 @@ mod tests {
     #[test]
     fn coding_by_refactor() {
         let msgs = vec![user("refactor the authentication module")];
-        assert_eq!(
-            classify_session(None, &msgs),
-            Some("coding".into())
-        );
+        assert_eq!(classify_session(None, &msgs), Some("coding".into()));
     }
 
     #[test]
@@ -467,7 +452,7 @@ mod tests {
     #[test]
     fn strips_system_reminders() {
         let msgs = vec![user(
-            "<system-reminder>\nSystem context\n</system-reminder>\nactual user question"
+            "<system-reminder>\nSystem context\n</system-reminder>\nactual user question",
         )];
         let text = first_visible_user_text(&msgs);
         assert_eq!(text, Some("actual user question".into()));
@@ -476,7 +461,7 @@ mod tests {
     #[test]
     fn strips_multiple_reminders() {
         let msgs = vec![user(
-            "<system-reminder>A</system-reminder>\nhello\n<system-reminder>B</system-reminder>\nworld"
+            "<system-reminder>A</system-reminder>\nhello\n<system-reminder>B</system-reminder>\nworld",
         )];
         let text = first_visible_user_text(&msgs);
         assert_eq!(text, Some("hello\n\nworld".into()));
@@ -510,10 +495,7 @@ mod tests {
 
     #[test]
     fn skips_assistant_messages() {
-        let msgs = vec![
-            assistant("I'll help you with that"),
-            user("real question"),
-        ];
+        let msgs = vec![assistant("I'll help you with that"), user("real question")];
         let text = first_visible_user_text(&msgs);
         assert_eq!(text, Some("real question".into()));
     }

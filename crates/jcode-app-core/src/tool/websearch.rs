@@ -460,7 +460,10 @@ impl WebSearchTool {
         let total = ordered.len();
         let mut last_error: Option<anyhow::Error> = None;
         for (idx, api_key) in ordered.into_iter().enumerate() {
-            match self.search_tavily_once(query, num_results, depth, &api_key).await {
+            match self
+                .search_tavily_once(query, num_results, depth, &api_key)
+                .await
+            {
                 Ok(results) => return Ok(results),
                 Err(err) => {
                     // Only fail over across keys for auth/quota-class failures;
@@ -729,8 +732,8 @@ impl WebSearchTool {
         // Ask each leg for extra results so the merged/verified set is rich.
         let leg_results = num_results.saturating_mul(2).max(num_results);
 
-        let deep_enabled =
-            config.websearch.last30days_enabled && locate_last30days_script(&config.websearch).is_some();
+        let deep_enabled = config.websearch.last30days_enabled
+            && locate_last30days_script(&config.websearch).is_some();
         // Seed the live side-panel page so the user can open it and watch each
         // engine leg resolve in real time.
         write_websearch_panel(
@@ -760,7 +763,8 @@ impl WebSearchTool {
             self.search_perplexity(query, leg_results),
         );
 
-        let timeout = std::time::Duration::from_secs(config.websearch.last30days_timeout_secs.max(1));
+        let timeout =
+            std::time::Duration::from_secs(config.websearch.last30days_timeout_secs.max(1));
 
         let (fast_res, perplexity_res, deep_res) = if deep_enabled {
             let deep = tokio::time::timeout(timeout, self.search_last30days(query, leg_results));
@@ -967,10 +971,9 @@ fn resolve_tavily_keys(cfg: &crate::config::WebSearchConfig) -> Vec<String> {
     if let Some(raw) = cfg.tavily_api_key.as_deref() {
         split_keys(raw, &mut keys);
     }
-    if let Some(raw) = jcode_provider_env::load_env_value_from_env_or_config(
-        &cfg.tavily_api_key_env,
-        "tavily.env",
-    ) {
+    if let Some(raw) =
+        jcode_provider_env::load_env_value_from_env_or_config(&cfg.tavily_api_key_env, "tavily.env")
+    {
         split_keys(&raw, &mut keys);
     }
     keys
@@ -1016,7 +1019,11 @@ impl TavilyKeyError {
 /// the global (`~/.jcode/skills`) and project-local (`./.jcode/skills`) skill
 /// install locations.
 fn locate_last30days_script(cfg: &crate::config::WebSearchConfig) -> Option<std::path::PathBuf> {
-    if let Some(path) = cfg.last30days_script.as_deref().filter(|p| !p.trim().is_empty()) {
+    if let Some(path) = cfg
+        .last30days_script
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
         let p = std::path::PathBuf::from(path);
         if p.exists() {
             return Some(p);
@@ -1062,10 +1069,7 @@ fn normalize_url(url: &str) -> String {
 /// - Cross-engine agreement: a URL returned by more than one independent engine
 ///   gets a large boost, because independent corroboration is the strongest
 ///   available quality signal ("verify both, choose the great ones").
-fn merge_and_rank(
-    legs: Vec<(String, Vec<SearchResult>)>,
-    num_results: usize,
-) -> Vec<SearchResult> {
+fn merge_and_rank(legs: Vec<(String, Vec<SearchResult>)>, num_results: usize) -> Vec<SearchResult> {
     use std::collections::HashMap;
 
     struct Merged {
@@ -1313,17 +1317,11 @@ struct Last30daysItem {
 /// `local_rank_score` (0..1) is carried through as the relevance score, and the
 /// social container/source is folded into the snippet so the model sees where a
 /// result came from (e.g. "r/OpenAI" or "Hacker News").
-fn parse_last30days_results(
-    response: Last30daysResponse,
-    num_results: usize,
-) -> Vec<SearchResult> {
+fn parse_last30days_results(response: Last30daysResponse, num_results: usize) -> Vec<SearchResult> {
     let mut items = response.ranked_candidates;
     if items.is_empty() {
-        let mut flattened: Vec<Last30daysItem> = response
-            .items_by_source
-            .into_values()
-            .flatten()
-            .collect();
+        let mut flattened: Vec<Last30daysItem> =
+            response.items_by_source.into_values().flatten().collect();
         flattened.sort_by(|a, b| {
             b.local_rank_score
                 .partial_cmp(&a.local_rank_score)
@@ -1728,7 +1726,10 @@ mod tests {
 
     #[test]
     fn websearch_engine_parses_new_engines() {
-        assert_eq!(WebSearchEngine::parse("tavily"), Some(WebSearchEngine::Tavily));
+        assert_eq!(
+            WebSearchEngine::parse("tavily"),
+            Some(WebSearchEngine::Tavily)
+        );
         assert_eq!(
             WebSearchEngine::parse("last30days"),
             Some(WebSearchEngine::Last30days)
@@ -1737,8 +1738,14 @@ mod tests {
             WebSearchEngine::parse("l30d"),
             Some(WebSearchEngine::Last30days)
         );
-        assert_eq!(WebSearchEngine::parse("hybrid"), Some(WebSearchEngine::Hybrid));
-        assert_eq!(WebSearchEngine::parse("both"), Some(WebSearchEngine::Hybrid));
+        assert_eq!(
+            WebSearchEngine::parse("hybrid"),
+            Some(WebSearchEngine::Hybrid)
+        );
+        assert_eq!(
+            WebSearchEngine::parse("both"),
+            Some(WebSearchEngine::Hybrid)
+        );
         assert_eq!(WebSearchEngine::Tavily.as_str(), "tavily");
         assert_eq!(WebSearchEngine::Last30days.as_str(), "last30days");
         assert_eq!(WebSearchEngine::Hybrid.as_str(), "hybrid");
@@ -1781,7 +1788,11 @@ mod tests {
         let mut starts = std::collections::HashSet::new();
         for _ in 0..keys.len() * 2 {
             let ordered = tavily_keys_for_call(&keys);
-            assert_eq!(ordered.len(), keys.len(), "every key is available for failover");
+            assert_eq!(
+                ordered.len(),
+                keys.len(),
+                "every key is available for failover"
+            );
             let mut sorted = ordered.clone();
             sorted.sort();
             assert_eq!(sorted, {
@@ -1797,7 +1808,10 @@ mod tests {
         );
 
         // Single key / empty are passthrough.
-        assert_eq!(tavily_keys_for_call(&["only".to_string()]), vec!["only".to_string()]);
+        assert_eq!(
+            tavily_keys_for_call(&["only".to_string()]),
+            vec!["only".to_string()]
+        );
         assert!(tavily_keys_for_call(&[]).is_empty());
     }
 
@@ -1877,10 +1891,19 @@ mod tests {
             normalize_url("https://www.Example.com/Path/?q=1#frag"),
             "example.com/path"
         );
-        assert_eq!(normalize_url("http://example.com/path/"), "example.com/path");
-        assert_eq!(normalize_url("https://example.com/path"), "example.com/path");
+        assert_eq!(
+            normalize_url("http://example.com/path/"),
+            "example.com/path"
+        );
+        assert_eq!(
+            normalize_url("https://example.com/path"),
+            "example.com/path"
+        );
         // Different pages stay distinct.
-        assert_ne!(normalize_url("https://a.com/x"), normalize_url("https://a.com/y"));
+        assert_ne!(
+            normalize_url("https://a.com/x"),
+            normalize_url("https://a.com/y")
+        );
     }
 
     #[test]
@@ -1921,22 +1944,26 @@ mod tests {
         ];
 
         let merged = merge_and_rank(
-            vec![
-                ("tavily".into(), tavily),
-                ("last30days".into(), last30),
-            ],
+            vec![("tavily".into(), tavily), ("last30days".into(), last30)],
             10,
         );
 
         // Shared result deduped into one entry, verified by both engines, ranked first.
         assert_eq!(merged[0].url, "https://shared.com/topic");
-        assert_eq!(merged[0].engines.len(), 2, "should be verified by 2 engines");
+        assert_eq!(
+            merged[0].engines.len(),
+            2,
+            "should be verified by 2 engines"
+        );
         assert!(merged[0].engines.contains(&"tavily".to_string()));
         assert!(merged[0].engines.contains(&"last30days".to_string()));
         // Richer snippet retained.
         assert!(merged[0].snippet.contains("richer snippet"));
         // No duplicate shared entries.
-        let shared_count = merged.iter().filter(|r| r.url.contains("shared.com")).count();
+        let shared_count = merged
+            .iter()
+            .filter(|r| r.url.contains("shared.com"))
+            .count();
         assert_eq!(shared_count, 1);
         assert_eq!(merged.len(), 3);
     }
@@ -1948,6 +1975,9 @@ mod tests {
         r.engines = vec!["tavily".into()];
         assert_eq!(render_result_badge(&r), "  _[tavily]_");
         r.engines = vec!["tavily".into(), "last30days".into()];
-        assert_eq!(render_result_badge(&r), "  _[✓ verified · tavily+last30days]_");
+        assert_eq!(
+            render_result_badge(&r),
+            "  _[✓ verified · tavily+last30days]_"
+        );
     }
 }

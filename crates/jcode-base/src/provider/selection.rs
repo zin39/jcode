@@ -591,7 +591,10 @@ fn closest_route_suggestions(
     scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     scored.dedup_by(|a, b| a.0 == b.0);
     scored.truncate(max_suggestions);
-    scored.into_iter().map(|(name, _)| name.to_string()).collect()
+    scored
+        .into_iter()
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1002,9 +1005,18 @@ mod tests {
         ];
         let err = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Ambiguous"), "expected Ambiguous error, got: {msg}");
-        assert!(msg.contains("openrouter:glm-5"), "expected openrouter candidate, got: {msg}");
-        assert!(msg.contains("zai:glm-5"), "expected zai candidate, got: {msg}");
+        assert!(
+            msg.contains("Ambiguous"),
+            "expected Ambiguous error, got: {msg}"
+        );
+        assert!(
+            msg.contains("openrouter:glm-5"),
+            "expected openrouter candidate, got: {msg}"
+        );
+        assert!(
+            msg.contains("zai:glm-5"),
+            "expected zai candidate, got: {msg}"
+        );
     }
 
     #[test]
@@ -1016,7 +1028,10 @@ mod tests {
         ];
         let err = resolve_bare_model_to_route_pinned("glm-5", &routes).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Unknown model"), "expected Unknown model error, got: {msg}");
+        assert!(
+            msg.contains("Unknown model"),
+            "expected Unknown model error, got: {msg}"
+        );
         assert!(
             msg.contains("glm-5-flash") || msg.contains("glm-5-pro"),
             "expected suggestion with prefix match, got: {msg}"
@@ -1025,12 +1040,13 @@ mod tests {
 
     #[test]
     fn bare_model_unknown_no_similar_routes() {
-        let routes = vec![
-            make_route("gpt-5.5", "openai-api", true),
-        ];
+        let routes = vec![make_route("gpt-5.5", "openai-api", true)];
         let err = resolve_bare_model_to_route_pinned("xyz-unknown", &routes).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Unknown model"), "expected Unknown model error, got: {msg}");
+        assert!(
+            msg.contains("Unknown model"),
+            "expected Unknown model error, got: {msg}"
+        );
         assert!(
             msg.contains("no matching or similar"),
             "expected no-similar message, got: {msg}"

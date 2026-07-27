@@ -649,7 +649,6 @@ async fn graceful_shutdown_sessions_times_out_on_partial_checkpoint() {
     );
 }
 
-
 /// Scoped env var override for the reload env-resync tests. Mirrors the guard
 /// used elsewhere in this crate's test modules.
 struct ReloadEnvGuard {

@@ -122,11 +122,19 @@ pub fn activity_indicator(
     no_animation: bool,
 ) -> &'static str {
     if no_animation {
-        SPINNER_FRAMES_ASCII
-            [activity_indicator_frame_index(elapsed, fps, enable_decorative_animations, no_animation)]
+        SPINNER_FRAMES_ASCII[activity_indicator_frame_index(
+            elapsed,
+            fps,
+            enable_decorative_animations,
+            no_animation,
+        )]
     } else {
-        SPINNER_FRAMES
-            [activity_indicator_frame_index(elapsed, fps, enable_decorative_animations, no_animation)]
+        SPINNER_FRAMES[activity_indicator_frame_index(
+            elapsed,
+            fps,
+            enable_decorative_animations,
+            no_animation,
+        )]
     }
 }
 

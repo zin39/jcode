@@ -678,7 +678,7 @@ fn save_default_model_setting(app: &mut App, model: Option<&str>) {
     if let Some(m) = model {
         if m.trim().is_empty() || m == "unknown" {
             app.set_status_notice(
-                "Cannot set model as default: model information is still loading".to_string()
+                "Cannot set model as default: model information is still loading".to_string(),
             );
             return;
         }

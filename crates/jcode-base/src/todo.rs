@@ -134,14 +134,23 @@ pub fn newly_completed_groups_have_sufficient_ownership(
             .and_then(|goal| goal.end_to_end_ownership)
         {
             if score < QUALITY_GATE_THRESHOLD {
-                return OwnershipGateResult { passed: false, failing_score: Some(score) };
+                return OwnershipGateResult {
+                    passed: false,
+                    failing_score: Some(score),
+                };
             }
         } else {
             // No ownership score set means it fails the gate
-            return OwnershipGateResult { passed: false, failing_score: None };
+            return OwnershipGateResult {
+                passed: false,
+                failing_score: None,
+            };
         }
     }
-    OwnershipGateResult { passed: true, failing_score: None }
+    OwnershipGateResult {
+        passed: true,
+        failing_score: None,
+    }
 }
 
 /// Completed todos whose final confidence increase was abrupt rather than
@@ -338,8 +347,12 @@ mod tests {
         ));
         assert!(is_auto_poke_message(LEGACY_TODO_CONFIDENCE_SUMMARY_PREFIX));
         // Builder functions produce messages with numbers that are still detected
-        assert!(is_auto_poke_message(&build_ownership_continuation_message(93)));
-        assert!(is_auto_poke_message(&build_hill_climbability_continuation_message(85)));
+        assert!(is_auto_poke_message(&build_ownership_continuation_message(
+            93
+        )));
+        assert!(is_auto_poke_message(
+            &build_hill_climbability_continuation_message(85)
+        ));
     }
 
     #[test]
@@ -489,17 +502,23 @@ mod tests {
         let completed = vec![todo("work", "completed", Some("ship"))];
 
         for ownership in [None, Some(0), Some(95)] {
-            assert!(!newly_completed_groups_have_sufficient_ownership(
+            assert!(
+                !newly_completed_groups_have_sufficient_ownership(
+                    &previous,
+                    &completed,
+                    &[ownership_goal(Some("ship"), ownership)],
+                )
+                .passed
+            );
+        }
+        assert!(
+            newly_completed_groups_have_sufficient_ownership(
                 &previous,
                 &completed,
-                &[ownership_goal(Some("ship"), ownership)],
-            ).passed);
-        }
-        assert!(newly_completed_groups_have_sufficient_ownership(
-            &previous,
-            &completed,
-            &[ownership_goal(Some("ship"), Some(96))],
-        ).passed);
+                &[ownership_goal(Some("ship"), Some(96))],
+            )
+            .passed
+        );
     }
 
     #[test]
@@ -507,30 +526,34 @@ mod tests {
         let previous = vec![todo("work", "pending", Some("ship"))];
         let in_progress = vec![todo("work", "in_progress", Some("ship"))];
 
-        assert!(newly_completed_groups_have_sufficient_ownership(
-            &previous,
-            &in_progress,
-            &[],
-        ).passed);
+        assert!(
+            newly_completed_groups_have_sufficient_ownership(&previous, &in_progress, &[],).passed
+        );
     }
 
     #[test]
     fn ownership_gate_normalizes_groups_and_supports_ungrouped_work() {
         let previous = vec![todo("work", "in_progress", Some(" ship "))];
         let completed = vec![todo("work", "completed", Some("ship"))];
-        assert!(newly_completed_groups_have_sufficient_ownership(
-            &previous,
-            &completed,
-            &[ownership_goal(Some(" ship"), Some(96))],
-        ).passed);
+        assert!(
+            newly_completed_groups_have_sufficient_ownership(
+                &previous,
+                &completed,
+                &[ownership_goal(Some(" ship"), Some(96))],
+            )
+            .passed
+        );
 
         let previous = vec![todo("work", "in_progress", None)];
         let completed = vec![todo("work", "completed", None)];
-        assert!(newly_completed_groups_have_sufficient_ownership(
-            &previous,
-            &completed,
-            &[ownership_goal(None, Some(96))],
-        ).passed);
+        assert!(
+            newly_completed_groups_have_sufficient_ownership(
+                &previous,
+                &completed,
+                &[ownership_goal(None, Some(96))],
+            )
+            .passed
+        );
     }
 
     /// The rejection is silent about *how* to clear it unless the message names
@@ -559,11 +582,9 @@ mod tests {
     #[test]
     fn ownership_gate_grandfathers_preexisting_completed_groups() {
         let completed = vec![todo("legacy", "completed", Some("legacy"))];
-        assert!(newly_completed_groups_have_sufficient_ownership(
-            &completed,
-            &completed,
-            &[],
-        ).passed);
+        assert!(
+            newly_completed_groups_have_sufficient_ownership(&completed, &completed, &[],).passed
+        );
     }
 
     #[test]

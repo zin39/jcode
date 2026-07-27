@@ -983,8 +983,11 @@ impl Agent {
                             title: None,
                         }));
 
-                        let sdk_content =
-                            cap_sdk_tool_content_for_history(&tc.name, &self.session.id, sdk_content);
+                        let sdk_content = cap_sdk_tool_content_for_history(
+                            &tc.name,
+                            &self.session.id,
+                            sdk_content,
+                        );
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
@@ -1049,7 +1052,8 @@ impl Agent {
 
                 match result {
                     Ok(output) => {
-                        let output = cap_tool_output_for_history(&tc.name, &self.session.id, output);
+                        let output =
+                            cap_tool_output_for_history(&tc.name, &self.session.id, output);
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),

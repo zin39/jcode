@@ -245,7 +245,11 @@ pub fn purge_resolved_error_results(messages: &mut [Message]) -> usize {
                 let Some(name) = tool_name_by_id.get(tool_use_id.as_str()) else {
                     continue;
                 };
-                if last_success_by_tool.get(name).copied().is_some_and(|si| si > mi) {
+                if last_success_by_tool
+                    .get(name)
+                    .copied()
+                    .is_some_and(|si| si > mi)
+                {
                     *content = format!(
                         "{}; a later {} call succeeded: {} chars removed]",
                         RESOLVED_ERROR_MARKER_PREFIX,
@@ -448,18 +452,17 @@ pub fn build_compaction_prompt(
         SUMMARY_PROMPT
     };
     let overhead = prompt_template.len() + summary_prefix.len() + marker.len() + 50;
-    let conversation_text = if messages_text.len() + overhead > max_prompt_chars
-        && max_prompt_chars > overhead
-    {
-        let budget = max_prompt_chars - overhead;
-        let mut start = messages_text.len() - budget;
-        while start < messages_text.len() && !messages_text.is_char_boundary(start) {
-            start += 1;
-        }
-        format!("{}{}{}", summary_prefix, marker, &messages_text[start..])
-    } else {
-        format!("{}{}", summary_prefix, messages_text)
-    };
+    let conversation_text =
+        if messages_text.len() + overhead > max_prompt_chars && max_prompt_chars > overhead {
+            let budget = max_prompt_chars - overhead;
+            let mut start = messages_text.len() - budget;
+            while start < messages_text.len() && !messages_text.is_char_boundary(start) {
+                start += 1;
+            }
+            format!("{}{}{}", summary_prefix, marker, &messages_text[start..])
+        } else {
+            format!("{}{}", summary_prefix, messages_text)
+        };
     format!("{}\n\n---\n\n{}", conversation_text, prompt_template)
 }
 
@@ -489,7 +492,9 @@ pub fn build_compaction_conversation_text(
                 ContentBlock::ToolUse { name, input, .. } => {
                     conversation_text.push_str(&format!("[Tool: {} - {}]\n", name, input));
                 }
-                ContentBlock::ToolResult { content, is_error, .. } => {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
                     if *is_error == Some(true) {
                         // Failed tool results carry noisy stack traces that pollute the
                         // summary. Keep only a marker so the model knows an attempt
@@ -1181,9 +1186,16 @@ mod tests {
 
     #[test]
     fn successful_tool_result_payload_kept() {
-        let messages = vec![Message::tool_result("t2", "build succeeded: ok-payload", false)];
+        let messages = vec![Message::tool_result(
+            "t2",
+            "build succeeded: ok-payload",
+            false,
+        )];
         let text = build_compaction_conversation_text(&messages, None);
-        assert!(text.contains("ok-payload"), "successful result must be kept");
+        assert!(
+            text.contains("ok-payload"),
+            "successful result must be kept"
+        );
     }
 
     #[test]
@@ -1651,10 +1663,7 @@ mod tests {
     fn edge_dedup_different_files_not_deduped() {
         let a = "a".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
         let b = "b".repeat(MIN_CLEARABLE_TOOL_RESULT_CHARS + 5);
-        let mut messages = vec![
-            tool_result_message("t1", &a),
-            tool_result_message("t2", &b),
-        ];
+        let mut messages = vec![tool_result_message("t1", &a), tool_result_message("t2", &b)];
         for i in 0..RECENT_TURNS_TO_KEEP + 2 {
             messages.push(Message::user(&format!("pad {i}")));
         }

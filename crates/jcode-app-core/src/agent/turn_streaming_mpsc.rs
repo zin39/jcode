@@ -1313,7 +1313,11 @@ impl Agent {
                 if let Some((sdk_content, sdk_is_error)) = sdk_tool_results.remove(&tc.id) {
                     // For native tools, ignore SDK errors and execute locally
                     if !(is_native_tool && sdk_is_error) {
-                        let sdk_content = cap_sdk_tool_content_for_history(&tc.name, &self.session.id, sdk_content);
+                        let sdk_content = cap_sdk_tool_content_for_history(
+                            &tc.name,
+                            &self.session.id,
+                            sdk_content,
+                        );
                         self.add_message(
                             Role::User,
                             vec![ContentBlock::ToolResult {
@@ -1429,7 +1433,8 @@ impl Agent {
 
                     match result {
                         Ok(output) => {
-                            let output = cap_tool_output_for_history(&tc.name, &self.session.id, output);
+                            let output =
+                                cap_tool_output_for_history(&tc.name, &self.session.id, output);
                             let _ = event_tx.send(ServerEvent::ToolDone {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),

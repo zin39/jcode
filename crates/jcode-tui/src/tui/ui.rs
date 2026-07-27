@@ -159,10 +159,9 @@ use viewport::draw_messages;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use viewport::{
-    copy_badge_reserved_width, expand_badge_reserved_width, pick_copy_badge_line,
-    reserve_copy_badge_margins, truncate_line_for_copy_badge,
+    COPY_BADGE_ALT_LABEL, copy_badge_reserved_width, expand_badge_reserved_width,
+    pick_copy_badge_line, reserve_copy_badge_margins, truncate_line_for_copy_badge,
     truncate_line_in_place_to_width as truncate_copy_badge_line_to_width,
-    COPY_BADGE_ALT_LABEL,
 };
 /// Last known max scroll value from the renderer. Updated each frame.
 /// Scroll handlers use this to clamp scroll_offset and prevent overshoot.
@@ -529,10 +528,10 @@ use status_support::{
 };
 use theme_support::{
     accent_color, activity_indicator, activity_indicator_frame_index, ai_color, ai_text,
-    asap_color, blend_color, dim_color, file_link_color, header_icon_color,
-    header_name_color, header_session_color, pending_color, prompt_entry_bg_color,
-    prompt_entry_color, prompt_entry_shimmer_color, queued_color,
-    system_message_color, tool_color, user_bg, user_color, user_text,
+    asap_color, blend_color, dim_color, file_link_color, header_icon_color, header_name_color,
+    header_session_color, pending_color, prompt_entry_bg_color, prompt_entry_color,
+    prompt_entry_shimmer_color, queued_color, system_message_color, tool_color, user_bg,
+    user_color, user_text,
 };
 
 // ── Tool-fold state (WP4) ────────────────────────────────────────────────
@@ -1393,8 +1392,8 @@ use frame_metrics::{
 };
 pub(crate) use frame_metrics::{
     DrawCallAttribution, FrameInputAttribution, frame_input_attribution_snapshot,
-    recent_average_draw_cost_ms, recent_futile_draw_ratio, record_draw_call_attribution, set_frame_input_attribution,
-    wall_clock_ms,
+    recent_average_draw_cost_ms, recent_futile_draw_ratio, record_draw_call_attribution,
+    set_frame_input_attribution, wall_clock_ms,
 };
 pub(crate) use frame_metrics::{
     debug_draw_call_history, debug_flicker_frame_history, debug_slow_frame_history,
@@ -2572,8 +2571,7 @@ pub(crate) fn debug_chat_image_regions_json() -> String {
 /// Bumped once per frame so per-frame memo caches know their contents are
 /// stale. Keyed on this rather than a timestamp because the point is
 /// "same frame or not", which a clock only approximates.
-pub(crate) static FRAME_EPOCH: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FRAME_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn current_frame_epoch() -> u64 {
     FRAME_EPOCH.load(std::sync::atomic::Ordering::Relaxed)

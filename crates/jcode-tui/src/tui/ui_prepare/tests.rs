@@ -48,14 +48,36 @@ fn prepare_body_preserves_multiline_user_prompt_lines() {
     // Line 3: " │ "              (gutter + blank)
     // Line 4: " │ third line"    (gutter + body)
     assert_eq!(plain.len(), 5, "expected 5 lines: header + 4 body lines");
-    assert!(plain[0].contains("1 › testuser"), "header line: {:?}", plain[0]);
-    assert!(plain[1].contains("first line"), "body line 1: {:?}", plain[1]);
-    assert!(plain[2].contains("second line"), "body line 2: {:?}", plain[2]);
-    assert!(plain[4].contains("third line"), "body line 4: {:?}", plain[4]);
+    assert!(
+        plain[0].contains("1 › testuser"),
+        "header line: {:?}",
+        plain[0]
+    );
+    assert!(
+        plain[1].contains("first line"),
+        "body line 1: {:?}",
+        plain[1]
+    );
+    assert!(
+        plain[2].contains("second line"),
+        "body line 2: {:?}",
+        plain[2]
+    );
+    assert!(
+        plain[4].contains("third line"),
+        "body line 4: {:?}",
+        plain[4]
+    );
 
     assert_eq!(
         raw_plain_lines,
-        vec!["1 › testuser", "first line", "second line", "", "third line"]
+        vec![
+            "1 › testuser",
+            "first line",
+            "second line",
+            "",
+            "third line"
+        ]
     );
     // user_line_indices now points to the line immediately after the header.
     assert_eq!(user_line_indices, vec![1]);
@@ -138,17 +160,25 @@ fn snapshot_user_and_assistant_format_at_varying_widths() {
 
             // User message 1
             push_user_prompt_lines(
-                &mut lines, &mut raw, &mut overrides, &mut copy_offsets,
-                &mut user_indices, 1,
+                &mut lines,
+                &mut raw,
+                &mut overrides,
+                &mut copy_offsets,
+                &mut user_indices,
+                1,
                 "Explain the retry backoff logic in src/app.rs",
                 ratatui::layout::Alignment::Left,
-                tier, "testuser",
+                tier,
+                "testuser",
             );
 
             // Assistant message 1 (body only, model tag is added by render_message_into)
             let assistant1 = render_assistant_message(
-                &DisplayMessage::assistant("I'll trace through the reconnect path.\n\nThe machine has 4 states: Idle, Connecting, Streaming, Blocked."),
-                width.saturating_sub(4), crate::config::DiffDisplayMode::Off,
+                &DisplayMessage::assistant(
+                    "I'll trace through the reconnect path.\n\nThe machine has 4 states: Idle, Connecting, Streaming, Blocked.",
+                ),
+                width.saturating_sub(4),
+                crate::config::DiffDisplayMode::Off,
             );
             // Prepend model tag (mimicking what render_message_into does)
             let agent_color = role_color(Role::Agent, tier);
@@ -160,17 +190,29 @@ fn snapshot_user_and_assistant_format_at_varying_widths() {
                 .alignment(ratatui::layout::Alignment::Left),
             );
             raw.push("jcode · mock-model".to_string());
-            overrides.push(Some(WrappedLineMap { raw_line: raw.len() - 1, start_col: 0, end_col: 0 }));
+            overrides.push(Some(WrappedLineMap {
+                raw_line: raw.len() - 1,
+                start_col: 0,
+                end_col: 0,
+            }));
             copy_offsets.push(0);
             // blank line between blocks
             lines.push(Line::from(""));
             raw.push(String::new());
-            overrides.push(Some(WrappedLineMap { raw_line: raw.len() - 1, start_col: 0, end_col: 0 }));
+            overrides.push(Some(WrappedLineMap {
+                raw_line: raw.len() - 1,
+                start_col: 0,
+                end_col: 0,
+            }));
             copy_offsets.push(0);
             for line in assistant1 {
                 lines.push(line);
                 raw.push(String::new());
-                overrides.push(Some(WrappedLineMap { raw_line: raw.len() - 1, start_col: 0, end_col: 0 }));
+                overrides.push(Some(WrappedLineMap {
+                    raw_line: raw.len() - 1,
+                    start_col: 0,
+                    end_col: 0,
+                }));
                 copy_offsets.push(0);
             }
 
@@ -206,9 +248,12 @@ fn snapshot_user_and_assistant_format_at_varying_widths() {
 
             // ---- Render to buffer and check for full-width backgrounds ----
             let total_height = lines.len().max(1) as u16;
-            let mut buffer = ratatui::buffer::Buffer::empty(
-                ratatui::layout::Rect::new(0, 0, width, total_height),
-            );
+            let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
+                0,
+                0,
+                width,
+                total_height,
+            ));
             for (y, line) in lines.iter().enumerate() {
                 let x_offset = match line.alignment {
                     Some(ratatui::layout::Alignment::Center) => {

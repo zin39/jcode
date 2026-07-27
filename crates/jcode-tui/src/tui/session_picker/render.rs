@@ -179,15 +179,20 @@ impl SessionPicker {
             // Spinner glyph is the same across tiers (braille pattern).
             (ch, role_color(Role::Warn, tier))
         } else if self.session_is_live(session) {
-            (if tier == Tier::Plain { "*" } else { "●" }, role_color(Role::Agent, tier))
+            (
+                if tier == Tier::Plain { "*" } else { "●" },
+                role_color(Role::Agent, tier),
+            )
         } else {
             match &session.status {
-                SessionStatus::Active => {
-                    (if tier == Tier::Plain { "*" } else { "●" }, role_color(Role::Agent, tier))
-                }
-                _ => {
-                    (if tier == Tier::Plain { "o" } else { "○" }, role_color(Role::Muted, tier))
-                }
+                SessionStatus::Active => (
+                    if tier == Tier::Plain { "*" } else { "●" },
+                    role_color(Role::Agent, tier),
+                ),
+                _ => (
+                    if tier == Tier::Plain { "o" } else { "○" },
+                    role_color(Role::Muted, tier),
+                ),
             }
         }
     }

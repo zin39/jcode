@@ -548,7 +548,6 @@ fn model_picker_route_is_default(
     default_model == model_name
 }
 
-
 /// Free-function core of [`App::append_jcode_subscription_routes`]: kept
 /// `self`-free so the off-thread model-picker route build can run it without
 /// borrowing the `App` (the synchronous build froze `/model` for seconds).
@@ -579,8 +578,7 @@ fn append_jcode_subscription_routes_impl(
                 && !existing.contains(model.id)
                 && (!require_remote_advertisement
                     || remote_available_entries.iter().any(|available| {
-                        crate::subscription_catalog::canonical_model_id(available)
-                            == Some(model.id)
+                        crate::subscription_catalog::canonical_model_id(available) == Some(model.id)
                     }))
         })
     {
@@ -604,101 +602,97 @@ fn extend_remote_routes_for_uncovered_models_impl(
     remote_provider_name: Option<&str>,
     remote_available_entries: &[String],
 ) {
-        // Jcode subscription routes are a complete, server-managed catalog.
-        // Do not mix in locally configured Anthropic/OpenAI credentials merely
-        // because a curated model also belongs to one of those upstreams.
-        let provider_is_jcode_subscription =
-            remote_provider_name.is_some_and(|name| {
-                name.eq_ignore_ascii_case(crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME)
-            });
-        if provider_is_jcode_subscription {
-            routes.clear();
-            append_jcode_subscription_routes_impl(routes, false, false, remote_available_entries);
-            return;
-        }
-        let poisoned_by_jcode_subscription = !routes.is_empty()
-            && routes.iter().all(|route| {
-                route
-                    .api_method
-                    .eq_ignore_ascii_case(crate::subscription_catalog::JCODE_ROUTE_API_METHOD)
-            });
-        if poisoned_by_jcode_subscription {
-            // Version 1 could turn a mixed provider catalog into all-Jcode rows
-            // after seeing just one managed subscription route. Rebuild ordinary
-            // routes from the names catalog, then append only the current tier's
-            // actual subscription entitlements.
-            *routes = crate::provider::remote_model_routes_fallback(
-                remote_provider_name,
-                remote_available_entries,
-            );
-            append_jcode_subscription_routes_impl(routes, false, true, remote_available_entries);
-            return;
-        }
-        let mut methods_by_model: std::collections::HashMap<&str, HashSet<&str>> =
-            std::collections::HashMap::new();
-        for route in routes.iter() {
-            methods_by_model
-                .entry(route.model.as_str())
-                .or_default()
-                .insert(route.api_method.as_str());
-        }
-        let auth = crate::auth::AuthStatus::check_fast();
-        let bedrock_available = auth.bedrock != crate::auth::AuthState::NotConfigured
-            || crate::provider::bedrock::BedrockProvider::has_credentials();
-        let missing: Vec<String> = remote_available_entries
+    // Jcode subscription routes are a complete, server-managed catalog.
+    // Do not mix in locally configured Anthropic/OpenAI credentials merely
+    // because a curated model also belongs to one of those upstreams.
+    let provider_is_jcode_subscription = remote_provider_name.is_some_and(|name| {
+        name.eq_ignore_ascii_case(crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME)
+    });
+    if provider_is_jcode_subscription {
+        routes.clear();
+        append_jcode_subscription_routes_impl(routes, false, false, remote_available_entries);
+        return;
+    }
+    let poisoned_by_jcode_subscription = !routes.is_empty()
+        && routes.iter().all(|route| {
+            route
+                .api_method
+                .eq_ignore_ascii_case(crate::subscription_catalog::JCODE_ROUTE_API_METHOD)
+        });
+    if poisoned_by_jcode_subscription {
+        // Version 1 could turn a mixed provider catalog into all-Jcode rows
+        // after seeing just one managed subscription route. Rebuild ordinary
+        // routes from the names catalog, then append only the current tier's
+        // actual subscription entitlements.
+        *routes = crate::provider::remote_model_routes_fallback(
+            remote_provider_name,
+            remote_available_entries,
+        );
+        append_jcode_subscription_routes_impl(routes, false, true, remote_available_entries);
+        return;
+    }
+    let mut methods_by_model: std::collections::HashMap<&str, HashSet<&str>> =
+        std::collections::HashMap::new();
+    for route in routes.iter() {
+        methods_by_model
+            .entry(route.model.as_str())
+            .or_default()
+            .insert(route.api_method.as_str());
+    }
+    let auth = crate::auth::AuthStatus::check_fast();
+    let bedrock_available = auth.bedrock != crate::auth::AuthState::NotConfigured
+        || crate::provider::bedrock::BedrockProvider::has_credentials();
+    let missing: Vec<String> = remote_available_entries
+        .iter()
+        .filter(|model| match methods_by_model.get(model.as_str()) {
+            None => true,
+            Some(methods) => {
+                // Poisoned caches pin models to placeholder rows forever;
+                // see inline_interactive_placeholder_routes.rs.
+                let placeholder_only =
+                    placeholder_routes::methods_are_placeholder_only(methods.iter());
+                let missing_anthropic_method = crate::provider::provider_for_model(model)
+                    == Some("claude")
+                    && !model.contains('/')
+                    && ((auth.anthropic.has_api_key && !methods.contains("claude-api"))
+                        || (auth.anthropic.has_oauth && !methods.contains("claude-oauth")));
+                let missing_bedrock_method = bedrock_available
+                    && crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model)
+                    && !methods.contains("bedrock");
+                placeholder_only || missing_anthropic_method || missing_bedrock_method
+            }
+        })
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let existing: HashSet<(String, String, String)> = routes
             .iter()
-            .filter(|model| match methods_by_model.get(model.as_str()) {
-                None => true,
-                Some(methods) => {
-                    // Poisoned caches pin models to placeholder rows forever;
-                    // see inline_interactive_placeholder_routes.rs.
-                    let placeholder_only =
-                        placeholder_routes::methods_are_placeholder_only(methods.iter());
-                    let missing_anthropic_method = crate::provider::provider_for_model(model)
-                        == Some("claude")
-                        && !model.contains('/')
-                        && ((auth.anthropic.has_api_key && !methods.contains("claude-api"))
-                            || (auth.anthropic.has_oauth && !methods.contains("claude-oauth")));
-                    let missing_bedrock_method = bedrock_available
-                        && crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model)
-                        && !methods.contains("bedrock");
-                    placeholder_only || missing_anthropic_method || missing_bedrock_method
-                }
-            })
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            let existing: HashSet<(String, String, String)> = routes
-                .iter()
-                .map(|route| {
-                    (
-                        route.model.clone(),
-                        route.provider.clone(),
-                        route.api_method.clone(),
-                    )
-                })
-                .collect();
-            for route in crate::provider::remote_model_routes_fallback(
-                remote_provider_name,
-                &missing,
-            ) {
-                if !existing.contains(&(
+            .map(|route| {
+                (
                     route.model.clone(),
                     route.provider.clone(),
                     route.api_method.clone(),
-                )) {
-                    routes.push(route);
-                }
+                )
+            })
+            .collect();
+        for route in crate::provider::remote_model_routes_fallback(remote_provider_name, &missing) {
+            if !existing.contains(&(
+                route.model.clone(),
+                route.provider.clone(),
+                route.api_method.clone(),
+            )) {
+                routes.push(route);
             }
         }
-        // Detailed provider hydration describes ordinary configured routes. A
-        // signed-in Jcode subscriber still needs the managed route for each
-        // entitled curated model alongside those Anthropic/OpenAI/etc. rows.
-        // The curated client catalog is versioned with the backend and is the
-        // authority for managed subscription entitlements. Do not hide newly
-        // launched subscription models behind a stale remote names snapshot.
-        append_jcode_subscription_routes_impl(routes, true, false, remote_available_entries);
     }
+    // Detailed provider hydration describes ordinary configured routes. A
+    // signed-in Jcode subscriber still needs the managed route for each
+    // entitled curated model alongside those Anthropic/OpenAI/etc. rows.
+    // The curated client catalog is versioned with the backend and is the
+    // authority for managed subscription entitlements. Do not hide newly
+    // launched subscription models behind a stale remote names snapshot.
+    append_jcode_subscription_routes_impl(routes, true, false, remote_available_entries);
+}
 
 impl App {
     pub(super) fn remote_model_catalog_snapshot(
@@ -1743,7 +1737,10 @@ impl App {
 
             // Pre-select effort: use current if matching, otherwise prefer 'high' or first available
             let selected_effort = current_effort_value.clone().or_else(|| {
-                model_efforts.iter().find(|e| **e == "high").cloned()
+                model_efforts
+                    .iter()
+                    .find(|e| **e == "high")
+                    .cloned()
                     .or_else(|| model_efforts.first().cloned())
             });
 
@@ -1766,9 +1763,9 @@ impl App {
             let is_default = all_routes
                 .iter()
                 .any(|route| is_config_default(name, route));
-            let is_favorite = all_routes
-                .iter()
-                .any(|route| model_picker_is_favorite(&favorites_store, name, route, selected_effort.as_deref()));
+            let is_favorite = all_routes.iter().any(|route| {
+                model_picker_is_favorite(&favorites_store, name, route, selected_effort.as_deref())
+            });
 
             // Determine provider group for tiered sections
             let provider_group = all_routes
@@ -3248,9 +3245,13 @@ impl App {
                             let entry = &mut picker.entries[idx];
                             if !entry.available_efforts.is_empty() {
                                 // Find current effort index and decrement
-                                let current_idx = entry.effort.as_ref().and_then(|e| {
-                                    entry.available_efforts.iter().position(|a| a == e)
-                                }).unwrap_or(0);
+                                let current_idx = entry
+                                    .effort
+                                    .as_ref()
+                                    .and_then(|e| {
+                                        entry.available_efforts.iter().position(|a| a == e)
+                                    })
+                                    .unwrap_or(0);
                                 let new_idx = if current_idx == 0 {
                                     entry.available_efforts.len() - 1
                                 } else {
@@ -3276,9 +3277,13 @@ impl App {
                             let entry = &mut picker.entries[idx];
                             if !entry.available_efforts.is_empty() {
                                 // Find current effort index and increment
-                                let current_idx = entry.effort.as_ref().and_then(|e| {
-                                    entry.available_efforts.iter().position(|a| a == e)
-                                }).unwrap_or(0);
+                                let current_idx = entry
+                                    .effort
+                                    .as_ref()
+                                    .and_then(|e| {
+                                        entry.available_efforts.iter().position(|a| a == e)
+                                    })
+                                    .unwrap_or(0);
                                 let new_idx = (current_idx + 1) % entry.available_efforts.len();
                                 entry.effort = Some(entry.available_efforts[new_idx].clone());
                             }
@@ -3355,7 +3360,8 @@ impl App {
                     // Check for placeholder values before attempting save
                     if bare_name.trim().is_empty() || bare_name == "unknown" {
                         self.set_status_notice(
-                            "Cannot set model as default: model information is still loading".to_string()
+                            "Cannot set model as default: model information is still loading"
+                                .to_string(),
                         );
                         return Ok(());
                     }

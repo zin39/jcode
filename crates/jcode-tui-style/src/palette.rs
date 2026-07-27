@@ -90,12 +90,18 @@ pub fn detect_tier() -> Tier {
     }
 
     // 2. NO_COLOR → plain tier (no-colour.org convention).
-    if std::env::var("NO_COLOR").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+    if std::env::var("NO_COLOR")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
         return Tier::Plain;
     }
 
     // 3. TERM=dumb → plain tier.
-    if std::env::var("TERM").map(|v| v.trim().eq_ignore_ascii_case("dumb")).unwrap_or(false) {
+    if std::env::var("TERM")
+        .map(|v| v.trim().eq_ignore_ascii_case("dumb"))
+        .unwrap_or(false)
+    {
         return Tier::Plain;
     }
 
@@ -103,7 +109,7 @@ pub fn detect_tier() -> Tier {
     //    macOS glyph-atlas workaround in color.rs – see #330).
     match color_capability() {
         ColorCapability::TrueColor => Tier::Rich,
-        ColorCapability::Color256  => Tier::Ansi256,
+        ColorCapability::Color256 => Tier::Ansi256,
     }
 }
 
@@ -112,9 +118,9 @@ pub fn detect_tier() -> Tier {
 /// Return the [`Color`] for a semantic [`Role`] at a given [`Tier`].
 pub fn role_color(role: Role, tier: Tier) -> Color {
     match tier {
-        Tier::Rich    => role_truecolor(role),
+        Tier::Rich => role_truecolor(role),
         Tier::Ansi256 => role_ansi256(role),
-        Tier::Plain   => role_plain(role),
+        Tier::Plain => role_plain(role),
     }
 }
 
@@ -122,52 +128,52 @@ pub fn role_color(role: Role, tier: Tier) -> Color {
 
 fn role_truecolor(role: Role) -> Color {
     match role {
-        Role::TextPrimary   => Color::Rgb(245, 245, 255), // #F5F5FF
+        Role::TextPrimary => Color::Rgb(245, 245, 255), // #F5F5FF
         Role::TextSecondary => Color::Rgb(220, 220, 215), // #DCDCD7
-        Role::Muted         => Color::Rgb(120, 120, 120), // #787878
-        Role::Faint         => Color::Rgb( 80,  80,  80), // #505050
-        Role::Surface1      => Color::Rgb( 35,  40,  50), // #232832
-        Role::Surface2      => Color::Rgb( 23,  27,  35), // #171B23
-        Role::Accent        => Color::Rgb(186, 139, 255), // #BA8BFF
-        Role::SelfRole      => Color::Rgb(138, 180, 248), // #8AB4F8
-        Role::Agent         => Color::Rgb(129, 199, 132), // #81C784
-        Role::Warn          => Color::Rgb(255, 193,   7), // #FFC107
-        Role::Error         => Color::Rgb(255, 138, 128), // #FF8A80
-        Role::Info          => Color::Rgb(110, 210, 255), // #6ED2FF
+        Role::Muted => Color::Rgb(120, 120, 120),       // #787878
+        Role::Faint => Color::Rgb(80, 80, 80),          // #505050
+        Role::Surface1 => Color::Rgb(35, 40, 50),       // #232832
+        Role::Surface2 => Color::Rgb(23, 27, 35),       // #171B23
+        Role::Accent => Color::Rgb(186, 139, 255),      // #BA8BFF
+        Role::SelfRole => Color::Rgb(138, 180, 248),    // #8AB4F8
+        Role::Agent => Color::Rgb(129, 199, 132),       // #81C784
+        Role::Warn => Color::Rgb(255, 193, 7),          // #FFC107
+        Role::Error => Color::Rgb(255, 138, 128),       // #FF8A80
+        Role::Info => Color::Rgb(110, 210, 255),        // #6ED2FF
     }
 }
 
 fn role_ansi256(role: Role) -> Color {
     match role {
-        Role::TextPrimary   => Color::Indexed(255),
+        Role::TextPrimary => Color::Indexed(255),
         Role::TextSecondary => Color::Indexed(253),
-        Role::Muted         => Color::Indexed(243),
-        Role::Faint         => Color::Indexed(239),
-        Role::Surface1      => Color::Indexed(235),
-        Role::Surface2      => Color::Indexed(234),
-        Role::Accent        => Color::Indexed(141),
-        Role::SelfRole      => Color::Indexed(111),
-        Role::Agent         => Color::Indexed(114),
-        Role::Warn          => Color::Indexed(214),
-        Role::Error         => Color::Indexed(210),
-        Role::Info          => Color::Indexed( 81),
+        Role::Muted => Color::Indexed(243),
+        Role::Faint => Color::Indexed(239),
+        Role::Surface1 => Color::Indexed(235),
+        Role::Surface2 => Color::Indexed(234),
+        Role::Accent => Color::Indexed(141),
+        Role::SelfRole => Color::Indexed(111),
+        Role::Agent => Color::Indexed(114),
+        Role::Warn => Color::Indexed(214),
+        Role::Error => Color::Indexed(210),
+        Role::Info => Color::Indexed(81),
     }
 }
 
 fn role_plain(role: Role) -> Color {
     match role {
-        Role::TextPrimary   => Color::White,        // Bright White (15)
-        Role::TextSecondary => Color::Gray,          // White (7)
-        Role::Muted         => Color::DarkGray,      // Bright Black (8)
-        Role::Faint         => Color::DarkGray,      // Bright Black + dim (caller adds DIM)
-        Role::Surface1      => Color::Reset,         // default bg
-        Role::Surface2      => Color::Reset,         // default bg
-        Role::Accent        => Color::LightMagenta,  // Bright Magenta (13)
-        Role::SelfRole      => Color::LightBlue,     // Bright Blue (12)
-        Role::Agent         => Color::LightGreen,    // Bright Green (10)
-        Role::Warn          => Color::LightYellow,   // Bright Yellow (11)
-        Role::Error         => Color::LightRed,      // Bright Red (9)
-        Role::Info          => Color::LightCyan,     // Bright Cyan (14)
+        Role::TextPrimary => Color::White,   // Bright White (15)
+        Role::TextSecondary => Color::Gray,  // White (7)
+        Role::Muted => Color::DarkGray,      // Bright Black (8)
+        Role::Faint => Color::DarkGray,      // Bright Black + dim (caller adds DIM)
+        Role::Surface1 => Color::Reset,      // default bg
+        Role::Surface2 => Color::Reset,      // default bg
+        Role::Accent => Color::LightMagenta, // Bright Magenta (13)
+        Role::SelfRole => Color::LightBlue,  // Bright Blue (12)
+        Role::Agent => Color::LightGreen,    // Bright Green (10)
+        Role::Warn => Color::LightYellow,    // Bright Yellow (11)
+        Role::Error => Color::LightRed,      // Bright Red (9)
+        Role::Info => Color::LightCyan,      // Bright Cyan (14)
     }
 }
 
@@ -178,24 +184,24 @@ fn role_plain(role: Role) -> Color {
 /// Hand-rolled to avoid adding a serde dependency.
 pub fn debug_palette_json() -> String {
     let roles: &[(Role, &str)] = &[
-        (Role::TextPrimary,   "text-primary"),
+        (Role::TextPrimary, "text-primary"),
         (Role::TextSecondary, "text-secondary"),
-        (Role::Muted,         "muted"),
-        (Role::Faint,         "faint"),
-        (Role::Surface1,      "surface-1"),
-        (Role::Surface2,      "surface-2"),
-        (Role::Accent,        "accent"),
-        (Role::SelfRole,      "self"),
-        (Role::Agent,         "agent"),
-        (Role::Warn,          "warn"),
-        (Role::Error,         "error"),
-        (Role::Info,          "info"),
+        (Role::Muted, "muted"),
+        (Role::Faint, "faint"),
+        (Role::Surface1, "surface-1"),
+        (Role::Surface2, "surface-2"),
+        (Role::Accent, "accent"),
+        (Role::SelfRole, "self"),
+        (Role::Agent, "agent"),
+        (Role::Warn, "warn"),
+        (Role::Error, "error"),
+        (Role::Info, "info"),
     ];
 
     let tiers: &[(Tier, &str)] = &[
-        (Tier::Rich,    "Rich"),
+        (Tier::Rich, "Rich"),
         (Tier::Ansi256, "Ansi256"),
-        (Tier::Plain,   "Plain"),
+        (Tier::Plain, "Plain"),
     ];
 
     let mut json = String::from("{\"roles\":[");
@@ -282,68 +288,44 @@ mod tests {
 
     #[test]
     fn error_ansi256_is_210() {
-        assert_eq!(
-            role_color(Role::Error, Tier::Ansi256),
-            Color::Indexed(210),
-        );
+        assert_eq!(role_color(Role::Error, Tier::Ansi256), Color::Indexed(210),);
     }
 
     #[test]
     fn warn_ansi256_is_214() {
-        assert_eq!(
-            role_color(Role::Warn, Tier::Ansi256),
-            Color::Indexed(214),
-        );
+        assert_eq!(role_color(Role::Warn, Tier::Ansi256), Color::Indexed(214),);
     }
 
     #[test]
     fn agent_ansi256_is_114() {
-        assert_eq!(
-            role_color(Role::Agent, Tier::Ansi256),
-            Color::Indexed(114),
-        );
+        assert_eq!(role_color(Role::Agent, Tier::Ansi256), Color::Indexed(114),);
     }
 
     #[test]
     fn info_ansi256_is_81() {
-        assert_eq!(
-            role_color(Role::Info, Tier::Ansi256),
-            Color::Indexed(81),
-        );
+        assert_eq!(role_color(Role::Info, Tier::Ansi256), Color::Indexed(81),);
     }
 
     // ── Plain / ANSI-16 spot-checks ─────────────────────────────────
 
     #[test]
     fn self_role_plain_is_light_blue() {
-        assert_eq!(
-            role_color(Role::SelfRole, Tier::Plain),
-            Color::LightBlue,
-        );
+        assert_eq!(role_color(Role::SelfRole, Tier::Plain), Color::LightBlue,);
     }
 
     #[test]
     fn agent_plain_is_light_green() {
-        assert_eq!(
-            role_color(Role::Agent, Tier::Plain),
-            Color::LightGreen,
-        );
+        assert_eq!(role_color(Role::Agent, Tier::Plain), Color::LightGreen,);
     }
 
     #[test]
     fn error_plain_is_light_red() {
-        assert_eq!(
-            role_color(Role::Error, Tier::Plain),
-            Color::LightRed,
-        );
+        assert_eq!(role_color(Role::Error, Tier::Plain), Color::LightRed,);
     }
 
     #[test]
     fn info_plain_is_light_cyan() {
-        assert_eq!(
-            role_color(Role::Info, Tier::Plain),
-            Color::LightCyan,
-        );
+        assert_eq!(role_color(Role::Info, Tier::Plain), Color::LightCyan,);
     }
 
     #[test]
@@ -393,7 +375,10 @@ mod tests {
         for role in all_roles() {
             let c = role_color(role, Tier::Plain);
             // These two pairs are intentional aliases at Plain tier.
-            if matches!(role, Role::Surface1 | Role::Surface2 | Role::Muted | Role::Faint) {
+            if matches!(
+                role,
+                Role::Surface1 | Role::Surface2 | Role::Muted | Role::Faint
+            ) {
                 continue;
             }
             assert!(
@@ -403,7 +388,11 @@ mod tests {
         }
         // 8 remaining roles (TextPrimary, TextSecondary, Accent, SelfRole,
         // Agent, Warn, Error, Info) should all be distinct.
-        assert_eq!(seen.len(), 8, "expected 8 distinct non-aliased plain colours");
+        assert_eq!(
+            seen.len(),
+            8,
+            "expected 8 distinct non-aliased plain colours"
+        );
     }
 
     // ── Cross-tier invariants ───────────────────────────────────────
@@ -444,20 +433,23 @@ mod tests {
     fn debug_palette_json_contains_all_roles_and_tiers() {
         let json = debug_palette_json();
         for name in &[
-            "text-primary", "text-secondary", "muted", "faint",
-            "surface-1", "surface-2", "accent", "self", "agent",
-            "warn", "error", "info",
+            "text-primary",
+            "text-secondary",
+            "muted",
+            "faint",
+            "surface-1",
+            "surface-2",
+            "accent",
+            "self",
+            "agent",
+            "warn",
+            "error",
+            "info",
         ] {
-            assert!(
-                json.contains(name),
-                "debug json missing role: {name}"
-            );
+            assert!(json.contains(name), "debug json missing role: {name}");
         }
         for tier in &["Rich", "Ansi256", "Plain"] {
-            assert!(
-                json.contains(tier),
-                "debug json missing tier: {tier}"
-            );
+            assert!(json.contains(tier), "debug json missing tier: {tier}");
         }
         let trimmed = json.trim();
         assert!(trimmed.starts_with('{'), "not a JSON object");

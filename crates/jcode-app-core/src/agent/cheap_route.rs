@@ -3,9 +3,9 @@
 //! subagents do the work. See
 //! docs/superpowers/specs/2026-06-24-cheap-routing-mode-design.md.
 
+use crate::agent::debate_status::{DebatePhase, DebateStatusReporter};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use crate::agent::debate_status::{DebatePhase, DebateStatusReporter};
 use futures::future::join_all;
 use jcode_provider_core::ModelRoute;
 use jcode_provider_core::selection::{CheapRouteCandidate, rank_routes_by_cost};
@@ -100,11 +100,13 @@ impl RouteBreaker {
 
     /// Whether this route is currently tripped and should be skipped.
     fn is_tripped(&self, route_key: &str) -> bool {
-        self.map.get(route_key).map_or(false, |s| match s.last_failure_kind {
-            Some(BreakerFailureKind::ConfigError) => s.consecutive_failures >= 1,
-            Some(BreakerFailureKind::Timeout) => s.consecutive_failures >= 2,
-            None => false,
-        })
+        self.map
+            .get(route_key)
+            .map_or(false, |s| match s.last_failure_kind {
+                Some(BreakerFailureKind::ConfigError) => s.consecutive_failures >= 1,
+                Some(BreakerFailureKind::Timeout) => s.consecutive_failures >= 2,
+                None => false,
+            })
     }
 
     /// Filter `candidates` through the breaker. Returns the survivors.
@@ -196,11 +198,17 @@ pub trait CheapRouteBackend: Send + Sync {
         run_verify_command(command).await
     }
     /// Run the STRONG model for one-shot text (used for debate aggregate). Default delegates to ask_parent.
-    async fn ask_strong(&self, prompt: &str) -> Result<String> { self.ask_parent(prompt).await }
+    async fn ask_strong(&self, prompt: &str) -> Result<String> {
+        self.ask_parent(prompt).await
+    }
     /// Whether this backend runs gold-mode debates. Default false. Production impl reads session+config.
-    fn gold_mode(&self) -> bool { false }
+    fn gold_mode(&self) -> bool {
+        false
+    }
     /// Number of distinct proposers for a gold debate. Default 3. Prod impl reads config.
-    fn gold_k(&self) -> usize { 3 }
+    fn gold_k(&self) -> usize {
+        3
+    }
     /// Debate status reporter. Default returns a static no-op so test backends
     /// need not implement this method.
     fn reporter(&self) -> &dyn crate::agent::debate_status::DebateStatusReporter {
@@ -310,11 +318,8 @@ pub fn parse_subtasks(text: &str) -> Result<Vec<Subtask>> {
             let start = json.find('[');
             let end = json.rfind(']');
             match (start, end) {
-                (Some(start), Some(end)) if start < end => {
-                    serde_json::from_str(&json[start..=end]).map_err(|e| {
-                        anyhow!("failed to parse subtasks JSON: {e}; raw: {json}")
-                    })?
-                }
+                (Some(start), Some(end)) if start < end => serde_json::from_str(&json[start..=end])
+                    .map_err(|e| anyhow!("failed to parse subtasks JSON: {e}; raw: {json}"))?,
                 _ => {
                     return Err(anyhow!(
                         "failed to parse subtasks JSON: {first_err}; raw: {json}"
@@ -493,9 +498,7 @@ async fn verify_and_maybe_repair(
                 new_output,
                 format!("[verify: `{verify_cmd}` still failing after one repair attempt] "),
             ),
-            VerifyOutcome::Unavailable(msg) => {
-                (new_output, format!("[verify re-check: {msg}] "))
-            }
+            VerifyOutcome::Unavailable(msg) => (new_output, format!("[verify re-check: {msg}] ")),
         },
         Ok(Err(e)) => (
             output,
@@ -604,7 +607,9 @@ pub async fn run_cheap_route(
     // the parent's own (main) model — so the expensive model only spends on
     // complex work. Trivial subtasks stay on the cheapest-first list. Captured
     // before current_model is moved into the candidate list below.
-    let difficulty_threshold = crate::config::config().agents.cheap_route_difficulty_threshold;
+    let difficulty_threshold = crate::config::config()
+        .agents
+        .cheap_route_difficulty_threshold;
     let strong_model = crate::config::config()
         .agents
         .cheap_route_strong_model
@@ -648,7 +653,14 @@ pub async fn run_cheap_route(
                 .take(backend.gold_k().max(2))
                 .collect();
             if proposers.len() >= 2 {
-                if let Ok(output) = run_debate(backend, subtask, &proposers, backend.gold_k(), backend.reporter()).await
+                if let Ok(output) = run_debate(
+                    backend,
+                    subtask,
+                    &proposers,
+                    backend.gold_k(),
+                    backend.reporter(),
+                )
+                .await
                 {
                     results.push(SubtaskResult {
                         description: subtask.description.clone(),
@@ -672,7 +684,12 @@ pub async fn run_cheap_route(
                 // the last-resort entry).
                 let mut tiered = Vec::with_capacity(candidates.len() + 1);
                 tiered.push((strong_model.clone(), strong_api.clone()));
-                tiered.extend(candidates.iter().filter(|(m, _)| m != &strong_model).cloned());
+                tiered.extend(
+                    candidates
+                        .iter()
+                        .filter(|(m, _)| m != &strong_model)
+                        .cloned(),
+                );
                 tiered
             } else {
                 candidates.clone()
@@ -712,12 +729,20 @@ pub async fn run_cheap_route(
                 Ok(Err(err)) => {
                     let kind = classify_failure(&err);
                     let tripped = breaker.record_failure(model, kind);
-                    let suffix = if tripped { " (circuit breaker tripped)" } else { "" };
+                    let suffix = if tripped {
+                        " (circuit breaker tripped)"
+                    } else {
+                        ""
+                    };
                     errors.push(format!("{model}: {err}{suffix}"));
                 }
                 Err(_) => {
                     let tripped = breaker.record_failure(model, BreakerFailureKind::Timeout);
-                    let suffix = if tripped { " (circuit breaker tripped)" } else { "" };
+                    let suffix = if tripped {
+                        " (circuit breaker tripped)"
+                    } else {
+                        ""
+                    };
                     errors.push(format!(
                         "{model}: timed out after {}s{suffix}",
                         attempt_timeout.as_secs()
@@ -750,7 +775,10 @@ pub async fn run_cheap_route(
         // with the failure fed back (see `verify_and_maybe_repair`). No command
         // configured => no-op, preserving prior behavior.
         let mut verify_note = String::new();
-        if let Some(cmd) = crate::config::config().agents.cheap_route_verify_cmd.clone()
+        if let Some(cmd) = crate::config::config()
+            .agents
+            .cheap_route_verify_cmd
+            .clone()
             && !cmd.trim().is_empty()
         {
             let (new_output, note) = verify_and_maybe_repair(
@@ -768,7 +796,10 @@ pub async fn run_cheap_route(
 
         // Review is best-effort: a parent-review error must not discard a
         // subtask that already completed successfully.
-        let review = match backend.ask_parent(&build_review_prompt(subtask, &output)).await {
+        let review = match backend
+            .ask_parent(&build_review_prompt(subtask, &output))
+            .await
+        {
             Ok(review) => format!("{verify_note}{review}"),
             Err(err) => format!("{verify_note}(review unavailable: {err})"),
         };
@@ -842,9 +873,10 @@ fn absolute_env_file_has_key(env_key: Option<&str>, env_file: Option<&str>) -> b
         return false;
     };
     let prefix = format!("{env_key}=");
-    content
-        .lines()
-        .any(|line| line.strip_prefix(&prefix).is_some_and(|v| !v.trim().is_empty()))
+    content.lines().any(|line| {
+        line.strip_prefix(&prefix)
+            .is_some_and(|v| !v.trim().is_empty())
+    })
 }
 
 /// Build a metered cheapness estimate from a user-configured per-million-token
@@ -870,8 +902,7 @@ fn configured_named_provider_routes() -> Vec<ModelRoute> {
     let cfg = crate::config::config();
     let mut routes = Vec::new();
     for (name, provider_cfg) in &cfg.providers {
-        let static_ids: Vec<String> =
-            provider_cfg.models.iter().map(|m| m.id.clone()).collect();
+        let static_ids: Vec<String> = provider_cfg.models.iter().map(|m| m.id.clone()).collect();
         let cached_ids: Vec<String> =
             crate::provider::openrouter::load_disk_cache_entry_for_namespace(name)
                 .map(|cache| cache.models.iter().map(|m| m.id.clone()).collect())
@@ -906,12 +937,14 @@ fn configured_named_provider_routes() -> Vec<ModelRoute> {
         let price_hints: std::collections::HashMap<String, (f64, f64)> = provider_cfg
             .models
             .iter()
-            .filter_map(|m| match (m.price_input_per_mtok, m.price_output_per_mtok) {
-                (Some(input), Some(output)) if input >= 0.0 && output >= 0.0 => {
-                    Some((m.id.clone(), (input, output)))
-                }
-                _ => None,
-            })
+            .filter_map(
+                |m| match (m.price_input_per_mtok, m.price_output_per_mtok) {
+                    (Some(input), Some(output)) if input >= 0.0 && output >= 0.0 => {
+                        Some((m.id.clone(), (input, output)))
+                    }
+                    _ => None,
+                },
+            )
             .collect();
         routes.extend(build_named_provider_routes(
             name,
@@ -1288,37 +1321,36 @@ pub fn resolve_worker_route(
     route_already_pinned: bool,
 ) -> anyhow::Result<(String, Option<String>)> {
     let provider_model = provider.model();
-    let (model, route_api): (String, Option<String>) =
-        if requested_model.eq_ignore_ascii_case(CHEAPEST_SENTINEL) {
-            // "cheapest": pick the dynamically-cheapest available route.
-            match cheapest_available_model(provider) {
-                Some((m, api)) => (m, Some(api)),
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "no cheap route available for a 'cheapest' worker; refusing to fall back to the coordinator's model"
-                    ));
-                }
+    let (model, route_api): (String, Option<String>) = if requested_model
+        .eq_ignore_ascii_case(CHEAPEST_SENTINEL)
+    {
+        // "cheapest": pick the dynamically-cheapest available route.
+        match cheapest_available_model(provider) {
+            Some((m, api)) => (m, Some(api)),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "no cheap route available for a 'cheapest' worker; refusing to fall back to the coordinator's model"
+                ));
             }
-        } else if !route_already_pinned
-            && !requested_model.eq_ignore_ascii_case(&provider_model)
-        {
-            // An EXPLICIT model that isn't the coordinator's own (e.g.
-            // "deepseek/deepseek-chat"): resolve and PIN its route so the forked
-            // coordinator provider actually switches backend.
-            match resolve_model_route(provider, requested_model) {
-                Some((m, api)) => (m, Some(api)),
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "subagent model '{}' has no resolvable provider route; refusing to fall back to the coordinator's model",
-                        requested_model
-                    ));
-                }
+        }
+    } else if !route_already_pinned && !requested_model.eq_ignore_ascii_case(&provider_model) {
+        // An EXPLICIT model that isn't the coordinator's own (e.g.
+        // "deepseek/deepseek-chat"): resolve and PIN its route so the forked
+        // coordinator provider actually switches backend.
+        match resolve_model_route(provider, requested_model) {
+            Some((m, api)) => (m, Some(api)),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "subagent model '{}' has no resolvable provider route; refusing to fall back to the coordinator's model",
+                    requested_model
+                ));
             }
-        } else {
-            // Inherit: model is the coordinator's own and/or a route is already
-            // pinned. Keep the existing route; the ban gate below still applies.
-            (requested_model.to_string(), None)
-        };
+        }
+    } else {
+        // Inherit: model is the coordinator's own and/or a route is already
+        // pinned. Keep the existing route; the ban gate below still applies.
+        (requested_model.to_string(), None)
+    };
 
     // THE single backend gate. Whatever path resolved the model, it must not be
     // excluded by cheap_route_ban (e.g. Claude). Fail loudly instead of billing.
@@ -1340,13 +1372,24 @@ pub const CHEAPEST_SENTINEL: &str = "cheapest";
 /// that bloats the prompt and stalls cheap models. Overridable via
 /// `agents.cheap_route_tools`. Names are intersected with the live registry.
 const CHEAP_SUBAGENT_TOOLS: &[&str] = &[
-    "read", "write", "edit", "multiedit", "apply_patch", "bash", "grep", "glob", "ls",
-    "websearch", "webfetch",
+    "read",
+    "write",
+    "edit",
+    "multiedit",
+    "apply_patch",
+    "bash",
+    "grep",
+    "glob",
+    "ls",
+    "websearch",
+    "webfetch",
 ];
 
 /// Resolve the cheap-subagent tool allowlist: the configured
 /// `agents.cheap_route_tools` if non-empty, else [`CHEAP_SUBAGENT_TOOLS`].
-fn cheap_subagent_tool_allowlist(registry_tools: &std::collections::HashSet<String>) -> std::collections::HashSet<String> {
+fn cheap_subagent_tool_allowlist(
+    registry_tools: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
     let configured = &crate::config::config().agents.cheap_route_tools;
     let wanted: Vec<String> = if configured.is_empty() {
         CHEAP_SUBAGENT_TOOLS.iter().map(|t| t.to_string()).collect()
@@ -1440,12 +1483,11 @@ impl ProviderCheapBackend {
         // slow-with-tools model opens fast for these small text calls.
         let coordinator = provider.fork();
         if let Some((model, route_api_method)) = cheapest_available_model(provider.as_ref()) {
-            let request =
-                crate::provider::MultiProvider::model_switch_request_for_session_route(
-                    &model,
-                    None,
-                    Some(&route_api_method),
-                );
+            let request = crate::provider::MultiProvider::model_switch_request_for_session_route(
+                &model,
+                None,
+                Some(&route_api_method),
+            );
             let _ = crate::provider::set_model_with_auth_refresh(coordinator.as_ref(), &request);
         }
         Self {
@@ -1634,15 +1676,15 @@ impl CheapRouteBackend for ProviderCheapBackend {
             .map(|r| r.api_method.clone());
 
         let strong_provider = self.provider.fork();
-        let request =
-            crate::provider::MultiProvider::model_switch_request_for_session_route(
-                &strong_model,
-                None,
-                strong_api.as_deref(),
-            );
-        let _ =
-            crate::provider::set_model_with_auth_refresh(strong_provider.as_ref(), &request);
-        strong_provider.complete_simple(prompt, &self.parent_system).await
+        let request = crate::provider::MultiProvider::model_switch_request_for_session_route(
+            &strong_model,
+            None,
+            strong_api.as_deref(),
+        );
+        let _ = crate::provider::set_model_with_auth_refresh(strong_provider.as_ref(), &request);
+        strong_provider
+            .complete_simple(prompt, &self.parent_system)
+            .await
     }
 
     fn reporter(&self) -> &dyn crate::agent::debate_status::DebateStatusReporter {
@@ -1655,7 +1697,11 @@ impl CheapRouteBackend for ProviderCheapBackend {
 #[allow(dead_code)]
 fn consensus(candidates: &[String]) -> Option<String> {
     fn norm(s: &str) -> String {
-        strip_code_fence(s).split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+        strip_code_fence(s)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
     }
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
@@ -1671,8 +1717,13 @@ fn consensus(candidates: &[String]) -> Option<String> {
 /// Keep the last `max` chars (tail holds the conclusion), with a marker when truncated.
 #[allow(dead_code)]
 fn truncate_tail(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { return s.to_string(); }
-    let tail: String = { let v: Vec<char> = s.chars().collect(); v[v.len()-max..].iter().collect() };
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let tail: String = {
+        let v: Vec<char> = s.chars().collect();
+        v[v.len() - max..].iter().collect()
+    };
     format!("…(trimmed)\n{tail}")
 }
 
@@ -1680,7 +1731,24 @@ fn truncate_tail(s: &str, max: usize) -> String {
 /// Debate is skipped for code (verify+repair is the stronger signal).
 fn is_code_subtask(s: &Subtask) -> bool {
     let t = format!("{} {}", s.description, s.prompt).to_ascii_lowercase();
-    const CODE_HINTS: &[&str] = &["edit","write","modify","implement","refactor","fix the","function","```",".rs",".ts",".py",".go",".js","src/","compile","cargo"];
+    const CODE_HINTS: &[&str] = &[
+        "edit",
+        "write",
+        "modify",
+        "implement",
+        "refactor",
+        "fix the",
+        "function",
+        "```",
+        ".rs",
+        ".ts",
+        ".py",
+        ".go",
+        ".js",
+        "src/",
+        "compile",
+        "cargo",
+    ];
     CODE_HINTS.iter().any(|h| t.contains(h))
 }
 
@@ -1719,7 +1787,14 @@ pub async fn run_gold_debate(backend: &dyn CheapRouteBackend, task: &str) -> Res
     };
 
     if proposers.len() >= 2 {
-        match run_debate(backend, &subtask, &proposers, backend.gold_k(), backend.reporter()).await
+        match run_debate(
+            backend,
+            &subtask,
+            &proposers,
+            backend.gold_k(),
+            backend.reporter(),
+        )
+        .await
         {
             Ok(output) => return Ok(output),
             Err(e) => {
@@ -1767,7 +1842,11 @@ async fn run_debate(
 
     // Emit Done/Failed per proposer, aligned by index.
     for ((model, _), result) in proposer_models[..k].iter().zip(raw.iter()) {
-        let phase = if matches!(result, Ok(Ok(_))) { DebatePhase::Done } else { DebatePhase::Failed };
+        let phase = if matches!(result, Ok(Ok(_))) {
+            DebatePhase::Done
+        } else {
+            DebatePhase::Failed
+        };
         reporter.proposer(model, phase);
     }
 
@@ -1776,7 +1855,9 @@ async fn run_debate(
         .filter_map(|r| r.ok().and_then(|inner| inner.ok()))
         .collect();
     if candidates.len() < 2 {
-        let result = backend.ask_strong(&build_debate_single_prompt(subtask)).await?;
+        let result = backend
+            .ask_strong(&build_debate_single_prompt(subtask))
+            .await?;
         reporter.gold(&result);
         return Ok(result);
     }
@@ -1806,7 +1887,10 @@ async fn run_debate(
 
 #[allow(dead_code)]
 fn build_debate_single_prompt(s: &Subtask) -> String {
-    format!("Complete this task as best you can.\n\nTASK: {}\n", s.prompt)
+    format!(
+        "Complete this task as best you can.\n\nTASK: {}\n",
+        s.prompt
+    )
 }
 
 #[allow(dead_code)]
@@ -1827,7 +1911,10 @@ fn build_debate_aggregate_prompt(s: &Subtask, candidates: &[String]) -> String {
 /// Format a one-line run summary for a completed gold debate.
 /// Example: `"gold from 3 models in 42s · $0.02"`
 pub fn debate_summary(models: usize, elapsed_secs: u64, usd: f64) -> String {
-    format!("gold from {} models in {}s · ${:.2}", models, elapsed_secs, usd)
+    format!(
+        "gold from {} models in {}s · ${:.2}",
+        models, elapsed_secs, usd
+    )
 }
 
 #[cfg(test)]
@@ -1849,7 +1936,10 @@ mod tests {
 
     #[test]
     fn debate_summary_formats() {
-        assert_eq!(debate_summary(3, 42, 0.0234), "gold from 3 models in 42s · $0.02");
+        assert_eq!(
+            debate_summary(3, 42, 0.0234),
+            "gold from 3 models in 42s · $0.02"
+        );
     }
 
     /// A dead credential kills every model on that account, so cooling only the
@@ -2031,15 +2121,24 @@ mod tests {
     #[test]
     fn parse_recommended_model_matches_listed_else_falls_back_to_cheapest() {
         let menu = build_menu(
-            vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
+            vec![
+                priced_route("cheapo", 100_000),
+                priced_route("pricey", 9_000_000),
+            ],
             MAX_MENU,
         );
         // cheapest first
         assert_eq!(menu[0].route.model, "cheapo");
         // explicit mention wins
-        assert_eq!(parse_recommended_model("use pricey please", &menu).unwrap(), "pricey");
+        assert_eq!(
+            parse_recommended_model("use pricey please", &menu).unwrap(),
+            "pricey"
+        );
         // unparseable -> cheapest fallback
-        assert_eq!(parse_recommended_model("hmm not sure", &menu).unwrap(), "cheapo");
+        assert_eq!(
+            parse_recommended_model("hmm not sure", &menu).unwrap(),
+            "cheapo"
+        );
     }
 
     struct FakeBackend {
@@ -2090,16 +2189,21 @@ mod tests {
         ]"#;
         let backend = FakeBackend {
             parent_responses: Mutex::new(VecDeque::from(vec![
-                decompose.to_string(),  // decompose
+                decompose.to_string(),    // decompose
                 "use cheapo".to_string(), // recommend
                 "OK".to_string(),         // review subtask 1
                 "OK".to_string(),         // review subtask 2
             ])),
-            routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
+            routes: vec![
+                priced_route("cheapo", 100_000),
+                priced_route("pricey", 9_000_000),
+            ],
             subtask_calls: Mutex::new(Vec::new()),
         };
 
-        let outcome = run_cheap_route(&backend, "refactor auth + tests").await.unwrap();
+        let outcome = run_cheap_route(&backend, "refactor auth + tests")
+            .await
+            .unwrap();
 
         assert_eq!(outcome.recommended_model, "cheapo");
         assert_eq!(outcome.subtasks.len(), 2);
@@ -2198,7 +2302,9 @@ mod tests {
         assert_eq!(out, "orig");
         assert!(note.contains("passed"), "note was: {note}");
         assert_eq!(
-            backend.subtask_calls.load(std::sync::atomic::Ordering::SeqCst),
+            backend
+                .subtask_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
             0,
             "no repair attempt when verify passes"
         );
@@ -2226,7 +2332,9 @@ mod tests {
         assert_eq!(out, "repaired-output", "output replaced by repaired result");
         assert!(note.contains("repaired, now passes"), "note was: {note}");
         assert_eq!(
-            backend.subtask_calls.load(std::sync::atomic::Ordering::SeqCst),
+            backend
+                .subtask_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "exactly one repair attempt"
         );
@@ -2254,7 +2362,9 @@ mod tests {
         assert_eq!(out, "repaired");
         assert!(note.contains("still failing"), "note was: {note}");
         assert_eq!(
-            backend.subtask_calls.load(std::sync::atomic::Ordering::SeqCst),
+            backend
+                .subtask_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
     }
@@ -2282,7 +2392,12 @@ mod tests {
     #[async_trait]
     impl CheapRouteBackend for FallbackBackend {
         async fn ask_parent(&self, _prompt: &str) -> Result<String> {
-            Ok(self.parent_responses.lock().unwrap().pop_front().unwrap_or_default())
+            Ok(self
+                .parent_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
         }
 
         async fn run_subtask(
@@ -2318,7 +2433,10 @@ mod tests {
                 "use cheapo".to_string(), // recommend the dead one
                 "OK".to_string(),         // review
             ])),
-            routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
+            routes: vec![
+                priced_route("cheapo", 100_000),
+                priced_route("pricey", 9_000_000),
+            ],
             dead_models: ["cheapo".to_string()].into_iter().collect(),
             attempts: Mutex::new(Vec::new()),
             current: "qwen-current".to_string(),
@@ -2343,8 +2461,13 @@ mod tests {
                 r#"[{"description":"do x","prompt":"p","difficulty":1}]"#.to_string(),
                 "use cheapo".to_string(),
             ])),
-            routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
-            dead_models: ["cheapo".to_string(), "pricey".to_string()].into_iter().collect(),
+            routes: vec![
+                priced_route("cheapo", 100_000),
+                priced_route("pricey", 9_000_000),
+            ],
+            dead_models: ["cheapo".to_string(), "pricey".to_string()]
+                .into_iter()
+                .collect(),
             attempts: Mutex::new(Vec::new()),
             current: String::new(), // no last-resort model available
         };
@@ -2359,10 +2482,10 @@ mod tests {
         let routes = build_named_provider_routes(
             "modelscope",
             "https://api-inference.modelscope.cn/v1",
-            &["deepseek-v4-flash".to_string()],   // static (config) ids
+            &["deepseek-v4-flash".to_string()], // static (config) ids
             &["qwen-x".to_string(), "deepseek-v4-flash".to_string()], // discovered (cache) ids
-            true,                                  // key present -> available
-            |_source, _model| None,                // pricing lookup stub
+            true,                               // key present -> available
+            |_source, _model| None,             // pricing lookup stub
         );
 
         let models: std::collections::BTreeSet<&str> =
@@ -2372,7 +2495,11 @@ mod tests {
         assert!(models.contains("qwen-x"));
         assert_eq!(routes.len(), 2);
         // all carry the named-provider api_method + availability + base url detail
-        assert!(routes.iter().all(|r| r.api_method == "openai-compatible:modelscope"));
+        assert!(
+            routes
+                .iter()
+                .all(|r| r.api_method == "openai-compatible:modelscope")
+        );
         assert!(routes.iter().all(|r| r.available));
         assert!(routes.iter().all(|r| r.detail.contains("modelscope")));
     }
@@ -2400,10 +2527,16 @@ mod tests {
         drop(file);
         let abs = path.to_str().unwrap();
 
-        assert!(absolute_env_file_has_key(Some("DEEPSEEK_API_KEY"), Some(abs)));
+        assert!(absolute_env_file_has_key(
+            Some("DEEPSEEK_API_KEY"),
+            Some(abs)
+        ));
         assert!(!absolute_env_file_has_key(Some("MISSING_KEY"), Some(abs)));
         // relative path is not handled here (config-dir helper covers those)
-        assert!(!absolute_env_file_has_key(Some("DEEPSEEK_API_KEY"), Some("rel.env")));
+        assert!(!absolute_env_file_has_key(
+            Some("DEEPSEEK_API_KEY"),
+            Some("rel.env")
+        ));
         // missing args
         assert!(!absolute_env_file_has_key(None, Some(abs)));
 
@@ -2420,8 +2553,13 @@ mod tests {
                 "use cheapo".to_string(),
                 "OK".to_string(),
             ])),
-            routes: vec![priced_route("cheapo", 100_000), priced_route("pricey", 9_000_000)],
-            dead_models: ["cheapo".to_string(), "pricey".to_string()].into_iter().collect(),
+            routes: vec![
+                priced_route("cheapo", 100_000),
+                priced_route("pricey", 9_000_000),
+            ],
+            dead_models: ["cheapo".to_string(), "pricey".to_string()]
+                .into_iter()
+                .collect(),
             attempts: Mutex::new(Vec::new()),
             current: "qwen-live".to_string(),
         };
@@ -2434,7 +2572,11 @@ mod tests {
         let attempts = backend.attempts.lock().unwrap();
         assert_eq!(
             *attempts,
-            vec!["cheapo".to_string(), "pricey".to_string(), "qwen-live".to_string()]
+            vec![
+                "cheapo".to_string(),
+                "pricey".to_string(),
+                "qwen-live".to_string()
+            ]
         );
     }
 
@@ -2572,7 +2714,8 @@ mod tests {
             _resume_session_id: Option<&str>,
         ) -> Result<crate::provider::EventStream> {
             let reply = self.reply.clone();
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<jcode_message_types::StreamEvent>>(8);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<jcode_message_types::StreamEvent>>(8);
             tokio::spawn(async move {
                 let _ = tx
                     .send(Ok(jcode_message_types::StreamEvent::TextDelta(reply)))
@@ -2642,7 +2785,10 @@ mod tests {
     #[test]
     fn unhealthy_route_is_skipped_then_recovers() {
         let model = "zzz-health-test-model";
-        assert!(route_is_healthy(model), "unknown route is healthy by default");
+        assert!(
+            route_is_healthy(model),
+            "unknown route is healthy by default"
+        );
         mark_route_unhealthy(model);
         assert!(!route_is_healthy(model), "cooled-down route is unhealthy");
         // Simulate an expired cooldown (until in the past) -> healthy again.
@@ -2660,12 +2806,18 @@ mod tests {
             h.remove(model);
         }
         note_provider_error(model, "some transient network blip");
-        assert!(route_is_healthy(model), "non-quota errors must not cool a route");
+        assert!(
+            route_is_healthy(model),
+            "non-quota errors must not cool a route"
+        );
         note_provider_error(
             model,
             "OpenAI-compatible chat request failed status: 402 Payment Required",
         );
-        assert!(!route_is_healthy(model), "402 Payment Required must cool the route");
+        assert!(
+            !route_is_healthy(model),
+            "402 Payment Required must cool the route"
+        );
     }
 
     #[test]
@@ -2676,7 +2828,10 @@ mod tests {
         }
         let routes = vec![priced_route(model, 100), priced_route("other-cheap", 200)];
         let before = ranked_with_preferences(routes.clone());
-        assert!(before.iter().any(|c| c.route.model == model), "healthy route present");
+        assert!(
+            before.iter().any(|c| c.route.model == model),
+            "healthy route present"
+        );
         mark_route_unhealthy(model);
         let after = ranked_with_preferences(routes);
         assert!(
@@ -2755,7 +2910,10 @@ mod tests {
     fn route_matches_preference_handles_model_and_composite() {
         let route = priced_route("deepseek-chat", 100); // provider "prov-deepseek-chat"
         assert!(route_matches_preference(&route, "deepseek-chat"));
-        assert!(route_matches_preference(&route, "prov-deepseek-chat/deepseek-chat"));
+        assert!(route_matches_preference(
+            &route,
+            "prov-deepseek-chat/deepseek-chat"
+        ));
         assert!(!route_matches_preference(&route, "gpt-5-nano"));
         assert!(!route_matches_preference(&route, ""));
     }
@@ -2770,7 +2928,12 @@ mod tests {
         #[async_trait]
         impl CheapRouteBackend for HangBackend {
             async fn ask_parent(&self, _p: &str) -> Result<String> {
-                Ok(self.responses.lock().unwrap().pop_front().unwrap_or_default())
+                Ok(self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default())
             }
             async fn run_subtask(
                 &self,
@@ -2824,7 +2987,12 @@ mod tests {
         #[async_trait]
         impl CheapRouteBackend for RouteRecordingBackend {
             async fn ask_parent(&self, _p: &str) -> Result<String> {
-                Ok(self.responses.lock().unwrap().pop_front().unwrap_or_default())
+                Ok(self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_default())
             }
             async fn run_subtask(
                 &self,
@@ -2832,7 +3000,10 @@ mod tests {
                 _m: &str,
                 route_api_method: Option<&str>,
             ) -> Result<String> {
-                self.seen.lock().unwrap().push(route_api_method.map(str::to_string));
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(route_api_method.map(str::to_string));
                 Ok("done".to_string())
             }
             fn routes(&self) -> Vec<ModelRoute> {
@@ -2877,15 +3048,29 @@ mod tests {
 
     #[test]
     fn is_code_subtask_detects_code() {
-        let code = Subtask { description: "edit main.rs".into(), prompt: "modify src/main.rs".into(), difficulty: 4, index: 0 };
-        let reason = Subtask { description: "design the api".into(), prompt: "what is the best architecture for X".into(), difficulty: 4, index: 0 };
+        let code = Subtask {
+            description: "edit main.rs".into(),
+            prompt: "modify src/main.rs".into(),
+            difficulty: 4,
+            index: 0,
+        };
+        let reason = Subtask {
+            description: "design the api".into(),
+            prompt: "what is the best architecture for X".into(),
+            difficulty: 4,
+            index: 0,
+        };
         assert!(is_code_subtask(&code));
         assert!(!is_code_subtask(&reason));
     }
 
     #[test]
     fn consensus_matches_on_fence_and_case() {
-        let c = vec!["```\nFoo Bar\n```".to_string(), "foo bar".to_string(), "other".to_string()];
+        let c = vec![
+            "```\nFoo Bar\n```".to_string(),
+            "foo bar".to_string(),
+            "other".to_string(),
+        ];
         assert_eq!(consensus(&c).as_deref(), Some("```\nFoo Bar\n```"));
     }
 
@@ -2938,12 +3123,14 @@ mod tests {
         }
         /// Script a per-model run_subtask reply (builder).
         fn subtask(mut self, model: &str, reply: &str) -> Self {
-            self.subtask_replies.insert(model.to_string(), reply.to_string());
+            self.subtask_replies
+                .insert(model.to_string(), reply.to_string());
             self
         }
         /// Script a per-model run_subtask error (builder).
         fn subtask_error(mut self, model: &str, msg: &str) -> Self {
-            self.subtask_errors.insert(model.to_string(), msg.to_string());
+            self.subtask_errors
+                .insert(model.to_string(), msg.to_string());
             self
         }
         /// Script a per-model run_subtask sleep delay in seconds (builder).
@@ -2998,7 +3185,10 @@ mod tests {
             String::new()
         }
         async fn ask_strong(&self, prompt: &str) -> Result<String> {
-            self.strong_prompts_log.lock().unwrap().push(prompt.to_string());
+            self.strong_prompts_log
+                .lock()
+                .unwrap()
+                .push(prompt.to_string());
             if self.strong_error {
                 return Err(anyhow!("scripted strong error"));
             }
@@ -3011,7 +3201,9 @@ mod tests {
         // DebateBackend::routes() is empty → 0 distinct proposers (< 2) → the
         // deterministic gold path must still return a single strong answer.
         let b = DebateBackend::new().strong("the gold answer");
-        let out = run_gold_debate(&b, "which approach is best?").await.unwrap();
+        let out = run_gold_debate(&b, "which approach is best?")
+            .await
+            .unwrap();
         assert_eq!(out, "the gold answer");
         let prompts = b.strong_prompts();
         assert_eq!(prompts.len(), 1, "exactly one strong call");
@@ -3052,7 +3244,9 @@ mod tests {
             ("m2".to_string(), None),
             ("m3".to_string(), None),
         ];
-        let gold = run_debate(&b, &st, &models, 3, &NoopDebateReporter).await.unwrap();
+        let gold = run_debate(&b, &st, &models, 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(gold, "GOLD");
         let strong = b.strong_prompts();
         assert_eq!(strong.len(), 1); // ONE strong call
@@ -3067,11 +3261,20 @@ mod tests {
     // --- helpers shared by run_debate exhaustive tests ---
 
     fn debate_st() -> Subtask {
-        Subtask { description: "d".into(), prompt: "p".into(), difficulty: 5, index: 0 }
+        Subtask {
+            description: "d".into(),
+            prompt: "p".into(),
+            difficulty: 5,
+            index: 0,
+        }
     }
 
     fn models3() -> Vec<(String, Option<String>)> {
-        vec![("m1".into(), None), ("m2".into(), None), ("m3".into(), None)]
+        vec![
+            ("m1".into(), None),
+            ("m2".into(), None),
+            ("m3".into(), None),
+        ]
     }
 
     // === Fallback / survivor ===
@@ -3084,10 +3287,15 @@ mod tests {
             .subtask_error("m2", "boom")
             .subtask_error("m3", "boom")
             .strong("S");
-        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(result, "S");
         let prompts = b.strong_prompts();
-        assert!(!prompts.is_empty(), "ask_strong must be called for single survivor");
+        assert!(
+            !prompts.is_empty(),
+            "ask_strong must be called for single survivor"
+        );
         assert!(
             !prompts[0].contains("--- candidate"),
             "single-survivor path uses single_prompt (no candidate blocks); prompt was:\n{}",
@@ -3103,9 +3311,15 @@ mod tests {
             .subtask("m2", "y")
             .strong("GOLD");
         let models = vec![("m1".into(), None), ("m2".into(), None)];
-        let result = run_debate(&b, &debate_st(), &models, 2, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models, 2, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(result, "GOLD");
-        assert_eq!(b.strong_prompts().len(), 1, "exactly one strong call for two distinct candidates");
+        assert_eq!(
+            b.strong_prompts().len(),
+            1,
+            "exactly one strong call for two distinct candidates"
+        );
     }
 
     #[tokio::test]
@@ -3116,12 +3330,20 @@ mod tests {
             .subtask("m2", "y")
             .subtask("m3", "z")
             .strong("GOLD");
-        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(result, "GOLD");
         assert_eq!(b.strong_prompts().len(), 1);
         let prompt = &b.strong_prompts()[0];
-        assert!(prompt.contains("y"), "m2 reply must appear in aggregate prompt");
-        assert!(prompt.contains("z"), "m3 reply must appear in aggregate prompt");
+        assert!(
+            prompt.contains("y"),
+            "m2 reply must appear in aggregate prompt"
+        );
+        assert!(
+            prompt.contains("z"),
+            "m3 reply must appear in aggregate prompt"
+        );
     }
 
     #[tokio::test]
@@ -3132,10 +3354,15 @@ mod tests {
             .subtask_error("m2", "boom")
             .subtask_error("m3", "boom")
             .strong("FALLBACK");
-        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(result, "FALLBACK");
         let prompts = b.strong_prompts();
-        assert!(!prompts.is_empty(), "ask_strong must be called with zero survivors");
+        assert!(
+            !prompts.is_empty(),
+            "ask_strong must be called with zero survivors"
+        );
         assert!(
             !prompts[0].contains("--- candidate"),
             "zero-survivor path uses single_prompt, not aggregate"
@@ -3150,8 +3377,13 @@ mod tests {
             .subtask("m2", "y")
             .subtask("m3", "z")
             .strong_err();
-        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
-        assert_eq!(result, "x", "aggregate error must return candidates[0] ('x')");
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
+        assert_eq!(
+            result, "x",
+            "aggregate error must return candidates[0] ('x')"
+        );
     }
 
     // === Consensus / truncation / single-call ===
@@ -3164,13 +3396,18 @@ mod tests {
             .subtask("m2", "same")
             .subtask("m3", "Other")
             .strong("SHOULD_NOT_BE_CALLED");
-        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(
             result.to_ascii_lowercase(),
             "same",
             "must return one of the agreeing originals; got: {result}"
         );
-        assert!(b.strong_prompts().is_empty(), "consensus path must not call ask_strong");
+        assert!(
+            b.strong_prompts().is_empty(),
+            "consensus path must not call ask_strong"
+        );
     }
 
     #[tokio::test]
@@ -3181,8 +3418,14 @@ mod tests {
             .subtask("m2", "beta")
             .subtask("m3", "gamma")
             .strong("GOLD");
-        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
-        assert_eq!(b.strong_prompts().len(), 1, "exactly one strong call for 3 distinct candidates");
+        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
+        assert_eq!(
+            b.strong_prompts().len(),
+            1,
+            "exactly one strong call for 3 distinct candidates"
+        );
     }
 
     #[tokio::test]
@@ -3195,7 +3438,9 @@ mod tests {
             .subtask("m2", "b")
             .subtask("m3", "c")
             .strong("GOLD");
-        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         let prompts = b.strong_prompts();
         assert!(!prompts.is_empty());
         assert!(
@@ -3216,12 +3461,17 @@ mod tests {
         // max(30,5,3)=30s; sequential would take 38s. Assert < 40s to verify no
         // hang while documenting the concurrent-execution contract.
         let b = DebateBackend::new()
-            .subtask("m1", "alpha").subtask_delay("m1", 30)
-            .subtask("m2", "beta").subtask_delay("m2", 5)
-            .subtask("m3", "gamma").subtask_delay("m3", 3)
+            .subtask("m1", "alpha")
+            .subtask_delay("m1", 30)
+            .subtask("m2", "beta")
+            .subtask_delay("m2", 5)
+            .subtask("m3", "gamma")
+            .subtask_delay("m3", 3)
             .strong("GOLD");
         let t0 = tokio::time::Instant::now();
-        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         let elapsed = t0.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(40),
@@ -3235,15 +3485,22 @@ mod tests {
         // m2 and m3 complete instantly; the aggregate path is taken over y and z.
         // Total virtual time ≈ 60s (the timeout), not 90s.
         let b = DebateBackend::new()
-            .subtask("m1", "x").subtask_delay("m1", 90)
+            .subtask("m1", "x")
+            .subtask_delay("m1", 90)
             .subtask("m2", "y")
             .subtask("m3", "z")
             .strong("GOLD");
         let t0 = tokio::time::Instant::now();
-        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         let elapsed = t0.elapsed();
         assert_eq!(result, "GOLD");
-        assert_eq!(b.strong_prompts().len(), 1, "surviving m2+m3 → one aggregate strong call");
+        assert_eq!(
+            b.strong_prompts().len(),
+            1,
+            "surviving m2+m3 → one aggregate strong call"
+        );
         let prompt = &b.strong_prompts()[0];
         assert!(prompt.contains("y"), "m2 reply must appear in aggregate");
         assert!(prompt.contains("z"), "m3 reply must appear in aggregate");
@@ -3269,7 +3526,9 @@ mod tests {
             .subtask("m2", "other")
             .strong("GOLD");
         let models = vec![("m1".into(), None), ("m2".into(), None)];
-        run_debate(&b, &debate_st(), &models, 2, &NoopDebateReporter).await.unwrap();
+        run_debate(&b, &debate_st(), &models, 2, &NoopDebateReporter)
+            .await
+            .unwrap();
         let prompts = b.strong_prompts();
         assert!(!prompts.is_empty());
         assert!(
@@ -3286,9 +3545,14 @@ mod tests {
             .subtask("m2", "Same")
             .subtask("m3", "Same")
             .strong("SHOULD_NOT_BE_CALLED");
-        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models3(), 3, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(result, "Same");
-        assert!(b.strong_prompts().is_empty(), "no strong call when all candidates are identical");
+        assert!(
+            b.strong_prompts().is_empty(),
+            "no strong call when all candidates are identical"
+        );
     }
 
     #[tokio::test]
@@ -3300,9 +3564,15 @@ mod tests {
             .subtask("m2", "y")
             .strong("GOLD");
         let models = vec![("m1".into(), None), ("m2".into(), None)];
-        let result = run_debate(&b, &debate_st(), &models, 5, &NoopDebateReporter).await.unwrap();
+        let result = run_debate(&b, &debate_st(), &models, 5, &NoopDebateReporter)
+            .await
+            .unwrap();
         assert_eq!(result, "GOLD");
-        assert_eq!(b.strong_prompts().len(), 1, "2 distinct candidates → one strong call");
+        assert_eq!(
+            b.strong_prompts().len(),
+            1,
+            "2 distinct candidates → one strong call"
+        );
     }
 
     // --- GoldFakeBackend: fake CheapRouteBackend with gold_mode=true for gate tests ---
@@ -3323,7 +3593,12 @@ mod tests {
     #[async_trait]
     impl CheapRouteBackend for GoldFakeBackend {
         async fn ask_parent(&self, _prompt: &str) -> Result<String> {
-            Ok(self.parent_responses.lock().unwrap().pop_front().unwrap_or_default())
+            Ok(self
+                .parent_responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
         }
 
         async fn run_subtask(
@@ -3346,7 +3621,10 @@ mod tests {
         }
 
         async fn ask_strong(&self, prompt: &str) -> Result<String> {
-            self.strong_prompts_log.lock().unwrap().push(prompt.to_string());
+            self.strong_prompts_log
+                .lock()
+                .unwrap()
+                .push(prompt.to_string());
             Ok(self.strong_reply.clone())
         }
 
@@ -3381,7 +3659,10 @@ mod tests {
 
         assert_eq!(out.results.len(), 3, "all 3 subtasks produced results");
         // The reasoning subtask was debated → model_used is "debate(2)".
-        assert_eq!(out.results[0].model_used, "debate(2)", "reasoning subtask debated");
+        assert_eq!(
+            out.results[0].model_used, "debate(2)",
+            "reasoning subtask debated"
+        );
         // Code subtask and trivial subtask were NOT debated.
         assert!(
             !out.results[1].model_used.starts_with("debate"),
@@ -3408,19 +3689,14 @@ mod tests {
     struct BreakerScriptedBackend {
         parent_responses: Mutex<VecDeque<String>>,
         routes: Vec<ModelRoute>,
-        subtask_queue:
-            Mutex<std::collections::HashMap<String, VecDeque<Result<String, String>>>>,
+        subtask_queue: Mutex<std::collections::HashMap<String, VecDeque<Result<String, String>>>>,
         attempts: Mutex<Vec<(String, String)>>, // (model, subtask description)
         sleep_models: std::collections::HashSet<String>,
         current: String,
     }
 
     impl BreakerScriptedBackend {
-        fn new(
-            parent_responses: Vec<String>,
-            routes: Vec<ModelRoute>,
-            current: &str,
-        ) -> Self {
+        fn new(parent_responses: Vec<String>, routes: Vec<ModelRoute>, current: &str) -> Self {
             Self {
                 parent_responses: Mutex::new(VecDeque::from(parent_responses)),
                 routes,
@@ -3432,11 +3708,7 @@ mod tests {
         }
 
         /// Register a queue of `Ok(output)` / `Err(msg)` results for `model`.
-        fn queue(
-            self,
-            model: &str,
-            results: Vec<Result<String, String>>,
-        ) -> Self {
+        fn queue(self, model: &str, results: Vec<Result<String, String>>) -> Self {
             self.subtask_queue
                 .lock()
                 .unwrap()
@@ -3521,8 +3793,14 @@ mod tests {
             breaker_test_routes(),
             "",
         )
-        .queue("route-a", vec![Err("status: 400 invalid_request".to_string())])
-        .queue("route-b", vec![Ok("done-b".to_string()), Ok("done-b2".to_string())]);
+        .queue(
+            "route-a",
+            vec![Err("status: 400 invalid_request".to_string())],
+        )
+        .queue(
+            "route-b",
+            vec![Ok("done-b".to_string()), Ok("done-b2".to_string())],
+        );
 
         let outcome = run_cheap_route(&backend, "task").await.unwrap();
 
@@ -3568,11 +3846,14 @@ mod tests {
             "",
         )
         .hang("route-a") // every call to route-a hangs → timeout
-        .queue("route-b", vec![
-            Ok("done-b1".to_string()),
-            Ok("done-b2".to_string()),
-            Ok("done-b3".to_string()),
-        ]);
+        .queue(
+            "route-b",
+            vec![
+                Ok("done-b1".to_string()),
+                Ok("done-b2".to_string()),
+                Ok("done-b3".to_string()),
+            ],
+        );
 
         let outcome = run_cheap_route(&backend, "task").await.unwrap();
 
@@ -3636,7 +3917,10 @@ mod tests {
                 Err("status: 403 unauthorized".to_string()),
             ],
         )
-        .queue("route-c", vec![Ok("done-c1".to_string()), Ok("done-c2".to_string())]);
+        .queue(
+            "route-c",
+            vec![Ok("done-c1".to_string()), Ok("done-c2".to_string())],
+        );
 
         let outcome = run_cheap_route(&backend, "task").await.unwrap();
 
@@ -3687,10 +3971,7 @@ mod tests {
         b.record_failure("a", BreakerFailureKind::ConfigError);
         b.record_failure("b", BreakerFailureKind::ConfigError);
 
-        let candidates = vec![
-            ("a".to_string(), None),
-            ("b".to_string(), None),
-        ];
+        let candidates = vec![("a".to_string(), None), ("b".to_string(), None)];
         let filtered = b.filter_candidates(&candidates);
         // Both tripped → fallback returns full list.
         assert_eq!(filtered, candidates);
@@ -3702,10 +3983,7 @@ mod tests {
         b.record_failure("a", BreakerFailureKind::ConfigError);
         // b is not tripped.
 
-        let candidates = vec![
-            ("a".to_string(), None),
-            ("b".to_string(), None),
-        ];
+        let candidates = vec![("a".to_string(), None), ("b".to_string(), None)];
         let filtered = b.filter_candidates(&candidates);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, "b");

@@ -946,7 +946,9 @@ fn test_prepare_messages_tool_row_refreshes_after_message_version_bump() {
     assert!(
         refreshed_rendered
             .iter()
-            .any(|line| line.contains("  ⚙ read src/main.rs") && line.contains("✓") && line.contains("1.9k tok")),
+            .any(|line| line.contains("  ⚙ read src/main.rs")
+                && line.contains("✓")
+                && line.contains("1.9k tok")),
         "expected refreshed tool row summary in final render: {refreshed_rendered:?}"
     );
 }

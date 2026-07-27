@@ -32,11 +32,7 @@ pub(super) fn cap_tool_output_for_history(
         let head = crate::util::truncate_str(&output.output, head_chars);
         let tail = tail_str(&output.output, tail_chars);
 
-        let truncated_path = save_truncated_output(
-            session_id,
-            tool_name,
-            &output.output,
-        );
+        let truncated_path = save_truncated_output(session_id, tool_name, &output.output);
 
         output.output = format!(
             "{head}\n\n[...truncated {dropped} chars; full output saved to {path}]\n\n{tail}",
@@ -50,8 +46,7 @@ pub(super) fn cap_tool_output_for_history(
     // --- hard protocol ceiling ---
     if output.output.chars().count() > MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY {
         let original_chars = output.output.chars().count();
-        let kept =
-            crate::util::truncate_str(&output.output, MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY);
+        let kept = crate::util::truncate_str(&output.output, MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY);
         output.output = format!(
             "{}\n\n[Tool output truncated by jcode: tool `{}` produced {} chars; kept first {} chars to protect the remote protocol, session history, and prompt cache. Redirect large logs to a file and read targeted sections.]",
             kept, tool_name, original_chars, MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY,
@@ -79,11 +74,7 @@ pub(super) fn cap_sdk_tool_content_for_history(
         let head = crate::util::truncate_str(&content, head_chars);
         let tail = tail_str(&content, tail_chars);
 
-        let truncated_path = save_truncated_output(
-            session_id,
-            tool_name,
-            &content,
-        );
+        let truncated_path = save_truncated_output(session_id, tool_name, &content);
 
         return format!(
             "{head}\n\n[...truncated {dropped} chars; full output saved to {path}]\n\n{tail}",
@@ -123,9 +114,7 @@ fn tail_str(s: &str, max_chars: usize) -> &str {
 fn save_truncated_output(session_id: &str, tool_name: &str, full_output: &str) -> String {
     let write_result: anyhow::Result<String> = (|| -> anyhow::Result<String> {
         let jcode_dir = crate::storage::jcode_dir()?;
-        let dir = jcode_dir
-            .join("sessions")
-            .join("truncated_outputs");
+        let dir = jcode_dir.join("sessions").join("truncated_outputs");
         std::fs::create_dir_all(&dir)?;
 
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");

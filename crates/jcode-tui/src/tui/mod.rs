@@ -1960,11 +1960,7 @@ mod redraw_governor_tests {
     /// futile work, or spinners and countdowns would visibly stutter.
     #[test]
     fn animating_ui_is_not_throttled_as_if_it_were_futile() {
-        let governed = redraw_interval_floor(
-            Duration::from_millis(16),
-            5.6,
-            Some(0.0),
-        );
+        let governed = redraw_interval_floor(Duration::from_millis(16), 5.6, Some(0.0));
         assert_eq!(
             governed,
             Duration::from_millis(16),
@@ -1989,8 +1985,7 @@ mod redraw_governor_tests {
         // History is entirely static: the spinner's own frames are not in it yet.
         let governed = redraw_interval_floor(spinner, 5.6, Some(1.0));
         assert_eq!(
-            governed,
-            spinner,
+            governed, spinner,
             "a just-started spinner was throttled on the strength of the static \
              frames that preceded it, so its first frames would stutter"
         );
@@ -2005,11 +2000,12 @@ mod redraw_governor_tests {
         assert_eq!(Duration::from_millis(16).max(floor), floor);
         // 4ms frames -> 10ms floor; the 16ms request wins (no slowdown for cheap frames).
         let cheap_floor = Duration::from_millis((4.0_f64 * 2.5) as u64);
-        assert_eq!(Duration::from_millis(16).max(cheap_floor), Duration::from_millis(16));
+        assert_eq!(
+            Duration::from_millis(16).max(cheap_floor),
+            Duration::from_millis(16)
+        );
         // Pathological 500ms frames clamp at the 250ms max, keeping the UI responsive.
         let patho = Duration::from_millis((500.0_f64 * 2.5) as u64).min(Duration::from_millis(250));
         assert_eq!(patho, Duration::from_millis(250));
     }
-
-
 }

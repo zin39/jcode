@@ -317,10 +317,7 @@ impl Agent {
     /// this callback receives the rolling tail on every throttled update so the
     /// cheap-route orchestrator can render it live in the side panel. Setting a
     /// sink implicitly enables the tap.
-    pub fn set_inline_tail_sink(
-        &mut self,
-        sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
-    ) {
+    pub fn set_inline_tail_sink(&mut self, sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
         self.inline_tail_sink = Some(sink);
         self.inline_output_tap = true;
     }

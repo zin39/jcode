@@ -1877,7 +1877,9 @@ impl App {
                 return true;
             }
             match code {
-                KeyCode::Char('h') | KeyCode::Char('j') | KeyCode::Char('k')
+                KeyCode::Char('h')
+                | KeyCode::Char('j')
+                | KeyCode::Char('k')
                 | KeyCode::Char('l') => {
                     if let KeyCode::Char(dir) = code {
                         self.focus_pane_directional(dir);
@@ -2019,9 +2021,9 @@ impl App {
 /// Kitty keyboard protocol is active, or it hijacks a genuine `Ctrl+]`.
 #[cfg(test)]
 mod ctrl_bracket_decoding_tests {
+    use crate::tui::KeyboardEnhancementTestGuard as EnhancementGuard;
     use crate::tui::app::App;
     use crate::tui::app::helpers::ctrl_bracket_fallback_to_esc;
-    use crate::tui::KeyboardEnhancementTestGuard as EnhancementGuard;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     /// Mirror the real key pipeline: decode fallback first, then resolve a rank

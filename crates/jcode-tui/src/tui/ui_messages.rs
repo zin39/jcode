@@ -75,8 +75,8 @@ pub(crate) fn current_spinner_frame() -> usize {
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    (start.elapsed().as_millis()
-        / jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAME_MS as u128) as usize
+    (start.elapsed().as_millis() / jcode_tui_render::swarm_gallery::STRIP_SPINNER_FRAME_MS as u128)
+        as usize
 }
 
 /// Format a duration in seconds to a compact human-readable string.

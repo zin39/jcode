@@ -2315,8 +2315,7 @@ impl SessionPicker {
             Span::styled("?", Style::default().fg(accent)),
             Span::styled(" keys", Style::default().fg(muted)),
         ]);
-        let paragraph = Paragraph::new(footer_line)
-            .style(Style::default().bg(rgb(20, 24, 30)));
+        let paragraph = Paragraph::new(footer_line).style(Style::default().bg(rgb(20, 24, 30)));
         frame.render_widget(paragraph, area);
     }
 

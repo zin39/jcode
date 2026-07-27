@@ -1,6 +1,6 @@
 use super::*;
 use crate::tui::ui::{self, WrappedLineMap};
-use jcode_tui_style::{Tier, detect_tier, role_color, Role};
+use jcode_tui_style::{Role, Tier, detect_tier, role_color};
 
 /// Auxiliary render data for an assistant message that is otherwise recomputed
 /// by re-parsing markdown on every body rebuild. Building the body misses its
@@ -414,10 +414,7 @@ fn push_user_prompt_lines(
         } else {
             Style::default().fg(text_color)
         };
-        let gutter_span = Span::styled(
-            format!("{body_gutter} "),
-            Style::default().fg(self_color),
-        );
+        let gutter_span = Span::styled(format!("{body_gutter} "), Style::default().fg(self_color));
         let text_span = Span::styled(content_line.to_string(), body_style);
 
         lines.push(Line::from(vec![gutter_span, text_span]).alignment(align));
@@ -457,10 +454,7 @@ fn push_user_prompt_lines_compact(
         raw_plain_lines.push(content_line.to_string());
         let prompt_width = unicode_width::UnicodeWidthStr::width(content_line);
 
-        let gutter_span = Span::styled(
-            format!("{body_gutter} "),
-            Style::default().fg(self_color),
-        );
+        let gutter_span = Span::styled(format!("{body_gutter} "), Style::default().fg(self_color));
         let text_span = Span::styled(content_line.to_string(), Style::default().fg(text_color));
 
         lines.push(Line::from(vec![gutter_span, text_span]).alignment(align));
@@ -950,8 +944,7 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
             if !cwd.is_empty() {
-                let home = std::env::var("HOME")
-                    .unwrap_or_default();
+                let home = std::env::var("HOME").unwrap_or_default();
                 let display_path = if !home.is_empty() && cwd.starts_with(&home) {
                     format!("~{}", &cwd[home.len()..])
                 } else {
@@ -1778,17 +1771,12 @@ fn render_message_into(
                 // pos 0, 1, 2: render normally.
                 // pos 2: also append a fold-summary line after rendering.
                 // pos >= 3: skip rendering entirely (just record the segment).
-                let run_failed =
-                    folded_run_has_failure(ctx.messages, msg_global_idx, pos, run_len);
+                let run_failed = folded_run_has_failure(ctx.messages, msg_global_idx, pos, run_len);
                 // A failed tool always renders, whatever its position in the run.
                 if pos < 3 || tools_ui::tool_output_looks_failed(&msg.content) {
                     let tool_start_line = acc.lines.len();
-                    let cached = get_cached_message_lines(
-                        msg,
-                        width,
-                        app.diff_mode(),
-                        render_tool_message,
-                    );
+                    let cached =
+                        get_cached_message_lines(msg, width, app.diff_mode(), render_tool_message);
                     if let Some(target) = tool_message_copy_target(msg, cached.len()) {
                         acc.copy_targets
                             .push(offset_copy_target(target, tool_start_line));
@@ -1829,12 +1817,8 @@ fn render_message_into(
             } else {
                 // ── Normal (non-folded or expanded) path ──────────────────
                 let tool_start_line = acc.lines.len();
-                let cached = get_cached_message_lines(
-                    msg,
-                    width,
-                    app.diff_mode(),
-                    render_tool_message,
-                );
+                let cached =
+                    get_cached_message_lines(msg, width, app.diff_mode(), render_tool_message);
                 if let Some(target) = tool_message_copy_target(msg, cached.len()) {
                     acc.copy_targets
                         .push(offset_copy_target(target, tool_start_line));
@@ -1843,12 +1827,10 @@ fn render_message_into(
                     acc.push_auto(align_if_unset(line, align));
                 }
                 if let Some(member) = spawned_member_for_tool(msg, &ctx.swarm_members) {
-                    for line in
-                        crate::tui::info_widget::swarm_gallery::render_swarm_chat_card_lines(
-                            std::slice::from_ref(member),
-                            width.saturating_sub(1) as usize,
-                        )
-                    {
+                    for line in crate::tui::info_widget::swarm_gallery::render_swarm_chat_card_lines(
+                        std::slice::from_ref(member),
+                        width.saturating_sub(1) as usize,
+                    ) {
                         acc.push_auto(line.alignment(ratatui::layout::Alignment::Left));
                     }
                 }
@@ -1884,11 +1866,8 @@ fn render_message_into(
                                     })
                             })
                             .unwrap_or_else(|| "unknown".to_string());
-                        let expandable = messages::edit_tool_inline_diff_is_expandable(
-                            tc,
-                            &msg.content,
-                            width,
-                        );
+                        let expandable =
+                            messages::edit_tool_inline_diff_is_expandable(tc, &msg.content, width);
                         acc.edit_tool_line_ranges.push((
                             msg_global_idx,
                             file_path,

@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
-mod compaction;
 pub mod cheap_route;
+mod compaction;
 pub mod debate_status;
 mod environment;
 mod inline_tail;

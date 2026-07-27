@@ -3,8 +3,8 @@ use super::selection_highlight::highlight_line_selection;
 use super::tools_ui::{get_tool_activity_detail, summarize_batch_running_tools_compact};
 use super::visual_debug::{self, FrameCaptureBuilder};
 use super::{
-    ProcessingStatus, TuiState, accent_color, ai_color, asap_color, dim_color, tool_color,
-    queued_color, user_color,
+    ProcessingStatus, TuiState, accent_color, ai_color, asap_color, dim_color, queued_color,
+    tool_color, user_color,
 };
 use crate::message::ConnectionPhase;
 use crate::tui::app;
@@ -1069,13 +1069,8 @@ pub(super) fn build_status_line(
             _ => None,
         };
 
-        let left_spans = build_left_segment(
-            spinner,
-            state_word,
-            time_str,
-            extra_detail,
-            state_color,
-        );
+        let left_spans =
+            build_left_segment(spinner, state_word, time_str, extra_detail, state_color);
 
         // ── RIGHT segment: metrics or warning ──────────────────────────
         let right_text = build_right_segment(app, kv_cache_problem.as_ref(), elapsed);
@@ -1167,10 +1162,7 @@ pub(super) fn build_status_line(
             } else {
                 " ^W hjkl panes"
             };
-            all_spans.push(Span::styled(
-                hint,
-                Style::default().fg(rgb(80, 80, 80)),
-            ));
+            all_spans.push(Span::styled(hint, Style::default().fg(rgb(80, 80, 80))));
         }
 
         let line = Line::from(all_spans);
@@ -1270,7 +1262,7 @@ mod tests {
     use super::*;
     use jcode_tui_style::palette::{self, Role, Tier};
     use ratatui::style::Modifier;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn right_fact_stack_shifts_up_as_a_unit_when_bottom_row_is_occupied() {
@@ -1820,14 +1812,21 @@ mod tests {
 
         let variants: Vec<(&'static str, ProcessingStatus)> = vec![
             ("sending…", ProcessingStatus::Sending),
-            ("connecting…", ProcessingStatus::Connecting(
-                crate::message::ConnectionPhase::Connecting,
-            )),
-            ("thinking…", ProcessingStatus::Thinking(std::time::Instant::now())),
+            (
+                "connecting…",
+                ProcessingStatus::Connecting(crate::message::ConnectionPhase::Connecting),
+            ),
+            (
+                "thinking…",
+                ProcessingStatus::Thinking(std::time::Instant::now()),
+            ),
             ("streaming…", ProcessingStatus::Streaming),
-            ("blocked", ProcessingStatus::WaitingForNetwork {
-                listener: "tcp".to_string(),
-            }),
+            (
+                "blocked",
+                ProcessingStatus::WaitingForNetwork {
+                    listener: "tcp".to_string(),
+                },
+            ),
             ("running", ProcessingStatus::RunningTool("bash".to_string())),
         ];
 
@@ -1855,13 +1854,7 @@ mod tests {
 
         // RunningTool with extra_detail still keeps state word at span 2.
         let extra = Some(vec![Span::styled(" · src/app.rs", Style::default())]);
-        let spans = build_left_segment(
-            "⠋",
-            "running",
-            "12s".to_string(),
-            extra,
-            Color::White,
-        );
+        let spans = build_left_segment("⠋", "running", "12s".to_string(), extra, Color::White);
         assert_eq!(spans[2].content.as_ref(), "running");
         let prefix: usize = spans[0].content.width() + spans[1].content.width();
         assert_eq!(prefix, 2);
@@ -1870,9 +1863,6 @@ mod tests {
 
     // ── WP6 input area tests ────────────────────────────────────────
 
-
-
-
     /// Minimal state for testing `draw_queued`.
     struct QueuedTestState {
         processing: bool,
@@ -1880,119 +1870,341 @@ mod tests {
     }
 
     impl TuiState for QueuedTestState {
-        fn is_processing(&self) -> bool { self.processing }
-        fn queued_messages(&self) -> &[String] { &self.queued }
-        fn pending_soft_interrupts(&self) -> &[String] { &[] }
-        fn interleave_message(&self) -> Option<&str> { None }
-        fn centered_mode(&self) -> bool { false }
-        fn input(&self) -> &str { "" }
-        fn cursor_pos(&self) -> usize { 0 }
-        fn is_remote_mode(&self) -> bool { false }
-        fn display_messages(&self) -> &[crate::tui::DisplayMessage] { &[] }
-        fn display_user_message_count(&self) -> usize { 0 }
-        fn compacted_hidden_user_prompts(&self) -> usize { 0 }
-        fn has_display_edit_tool_messages(&self) -> bool { false }
-        fn side_pane_images(&self) -> Vec<crate::session::RenderedImage> { vec![] }
-        fn display_messages_version(&self) -> u64 { 0 }
-        fn streaming_text(&self) -> &str { "" }
-        fn scroll_offset(&self) -> usize { 0 }
-        fn auto_scroll_paused(&self) -> bool { false }
-        fn provider_name(&self) -> String { "mock".into() }
-        fn provider_model(&self) -> String { "mock-model".into() }
-        fn upstream_provider(&self) -> Option<String> { None }
-        fn connection_type(&self) -> Option<String> { None }
-        fn status_detail(&self) -> Option<String> { None }
-        fn mcp_servers(&self) -> Vec<(String, usize)> { vec![] }
-        fn available_skills(&self) -> Vec<String> { vec![] }
-        fn streaming_tokens(&self) -> (u64, u64) { (0, 0) }
-        fn streaming_cache_tokens(&self) -> (Option<u64>, Option<u64>) { (None, None) }
-        fn output_tps(&self) -> Option<f32> { None }
-        fn streaming_tool_calls(&self) -> Vec<crate::tui::ToolCall> { vec![] }
-        fn elapsed(&self) -> Option<std::time::Duration> { None }
-        fn status(&self) -> ProcessingStatus { ProcessingStatus::Idle }
-        fn command_suggestions(&self) -> Vec<(String, &'static str)> { vec![] }
-        fn active_skill(&self) -> Option<String> { None }
-        fn subagent_status(&self) -> Option<String> { None }
-        fn batch_progress(&self) -> Option<crate::bus::BatchProgress> { None }
-        fn time_since_activity(&self) -> Option<std::time::Duration> { None }
-        fn chat_overscroll_active(&self) -> bool { false }
-        fn chat_overscroll_remaining(&self) -> Option<f32> { None }
-        fn total_session_tokens(&self) -> Option<(u64, u64)> { None }
-        fn is_canary(&self) -> bool { false }
-        fn is_replay(&self) -> bool { false }
-        fn diff_mode(&self) -> crate::config::DiffDisplayMode { crate::config::DiffDisplayMode::Off }
-        fn current_session_id(&self) -> Option<String> { None }
-        fn session_display_name(&self) -> Option<String> { None }
-        fn server_display_name(&self) -> Option<String> { None }
-        fn server_display_icon(&self) -> Option<String> { None }
-        fn server_sessions(&self) -> Vec<String> { vec![] }
-        fn connected_clients(&self) -> Option<usize> { None }
-        fn status_notice(&self) -> Option<String> { None }
-        fn inline_swarm_gallery_active(&self) -> bool { false }
-        fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> { vec![] }
-        fn swarm_members_for_transcript(&self) -> Vec<crate::protocol::SwarmMemberStatus> { vec![] }
-        fn swarm_panel_selected(&self) -> usize { 0 }
-        fn swarm_panel_focused(&self) -> bool { false }
-        fn swarm_panel_full_page(&self) -> bool { false }
-        fn remote_startup_phase_active(&self) -> bool { false }
-        fn dictation_key_label(&self) -> Option<String> { None }
-        fn animation_elapsed(&self) -> f32 { 0.0 }
-        fn rate_limit_remaining(&self) -> Option<std::time::Duration> { None }
-        fn queue_mode(&self) -> bool { false }
-        fn next_prompt_new_session_armed(&self) -> bool { false }
-        fn has_stashed_input(&self) -> bool { false }
-        fn context_info(&self) -> crate::prompt::ContextInfo { Default::default() }
-        fn context_limit(&self) -> Option<usize> { None }
-        fn info_widget_overlays_enabled(&self) -> bool { false }
-        fn client_update_available(&self) -> bool { false }
-        fn server_update_available(&self) -> Option<bool> { None }
-        fn info_widget_data(&self) -> crate::tui::info_widget::InfoWidgetData { Default::default() }
-        fn render_streaming_markdown(&self, _: usize) -> Vec<Line<'static>> { vec![] }
-        fn auth_status(&self) -> crate::auth::AuthStatus { Default::default() }
+        fn is_processing(&self) -> bool {
+            self.processing
+        }
+        fn queued_messages(&self) -> &[String] {
+            &self.queued
+        }
+        fn pending_soft_interrupts(&self) -> &[String] {
+            &[]
+        }
+        fn interleave_message(&self) -> Option<&str> {
+            None
+        }
+        fn centered_mode(&self) -> bool {
+            false
+        }
+        fn input(&self) -> &str {
+            ""
+        }
+        fn cursor_pos(&self) -> usize {
+            0
+        }
+        fn is_remote_mode(&self) -> bool {
+            false
+        }
+        fn display_messages(&self) -> &[crate::tui::DisplayMessage] {
+            &[]
+        }
+        fn display_user_message_count(&self) -> usize {
+            0
+        }
+        fn compacted_hidden_user_prompts(&self) -> usize {
+            0
+        }
+        fn has_display_edit_tool_messages(&self) -> bool {
+            false
+        }
+        fn side_pane_images(&self) -> Vec<crate::session::RenderedImage> {
+            vec![]
+        }
+        fn display_messages_version(&self) -> u64 {
+            0
+        }
+        fn streaming_text(&self) -> &str {
+            ""
+        }
+        fn scroll_offset(&self) -> usize {
+            0
+        }
+        fn auto_scroll_paused(&self) -> bool {
+            false
+        }
+        fn provider_name(&self) -> String {
+            "mock".into()
+        }
+        fn provider_model(&self) -> String {
+            "mock-model".into()
+        }
+        fn upstream_provider(&self) -> Option<String> {
+            None
+        }
+        fn connection_type(&self) -> Option<String> {
+            None
+        }
+        fn status_detail(&self) -> Option<String> {
+            None
+        }
+        fn mcp_servers(&self) -> Vec<(String, usize)> {
+            vec![]
+        }
+        fn available_skills(&self) -> Vec<String> {
+            vec![]
+        }
+        fn streaming_tokens(&self) -> (u64, u64) {
+            (0, 0)
+        }
+        fn streaming_cache_tokens(&self) -> (Option<u64>, Option<u64>) {
+            (None, None)
+        }
+        fn output_tps(&self) -> Option<f32> {
+            None
+        }
+        fn streaming_tool_calls(&self) -> Vec<crate::tui::ToolCall> {
+            vec![]
+        }
+        fn elapsed(&self) -> Option<std::time::Duration> {
+            None
+        }
+        fn status(&self) -> ProcessingStatus {
+            ProcessingStatus::Idle
+        }
+        fn command_suggestions(&self) -> Vec<(String, &'static str)> {
+            vec![]
+        }
+        fn active_skill(&self) -> Option<String> {
+            None
+        }
+        fn subagent_status(&self) -> Option<String> {
+            None
+        }
+        fn batch_progress(&self) -> Option<crate::bus::BatchProgress> {
+            None
+        }
+        fn time_since_activity(&self) -> Option<std::time::Duration> {
+            None
+        }
+        fn chat_overscroll_active(&self) -> bool {
+            false
+        }
+        fn chat_overscroll_remaining(&self) -> Option<f32> {
+            None
+        }
+        fn total_session_tokens(&self) -> Option<(u64, u64)> {
+            None
+        }
+        fn is_canary(&self) -> bool {
+            false
+        }
+        fn is_replay(&self) -> bool {
+            false
+        }
+        fn diff_mode(&self) -> crate::config::DiffDisplayMode {
+            crate::config::DiffDisplayMode::Off
+        }
+        fn current_session_id(&self) -> Option<String> {
+            None
+        }
+        fn session_display_name(&self) -> Option<String> {
+            None
+        }
+        fn server_display_name(&self) -> Option<String> {
+            None
+        }
+        fn server_display_icon(&self) -> Option<String> {
+            None
+        }
+        fn server_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn connected_clients(&self) -> Option<usize> {
+            None
+        }
+        fn status_notice(&self) -> Option<String> {
+            None
+        }
+        fn inline_swarm_gallery_active(&self) -> bool {
+            false
+        }
+        fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+            vec![]
+        }
+        fn swarm_members_for_transcript(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+            vec![]
+        }
+        fn swarm_panel_selected(&self) -> usize {
+            0
+        }
+        fn swarm_panel_focused(&self) -> bool {
+            false
+        }
+        fn swarm_panel_full_page(&self) -> bool {
+            false
+        }
+        fn remote_startup_phase_active(&self) -> bool {
+            false
+        }
+        fn dictation_key_label(&self) -> Option<String> {
+            None
+        }
+        fn animation_elapsed(&self) -> f32 {
+            0.0
+        }
+        fn rate_limit_remaining(&self) -> Option<std::time::Duration> {
+            None
+        }
+        fn queue_mode(&self) -> bool {
+            false
+        }
+        fn next_prompt_new_session_armed(&self) -> bool {
+            false
+        }
+        fn has_stashed_input(&self) -> bool {
+            false
+        }
+        fn context_info(&self) -> crate::prompt::ContextInfo {
+            Default::default()
+        }
+        fn context_limit(&self) -> Option<usize> {
+            None
+        }
+        fn info_widget_overlays_enabled(&self) -> bool {
+            false
+        }
+        fn client_update_available(&self) -> bool {
+            false
+        }
+        fn server_update_available(&self) -> Option<bool> {
+            None
+        }
+        fn info_widget_data(&self) -> crate::tui::info_widget::InfoWidgetData {
+            Default::default()
+        }
+        fn render_streaming_markdown(&self, _: usize) -> Vec<Line<'static>> {
+            vec![]
+        }
+        fn auth_status(&self) -> crate::auth::AuthStatus {
+            Default::default()
+        }
         fn update_cost(&mut self) {}
-        fn diagram_mode(&self) -> crate::config::DiagramDisplayMode { Default::default() }
-        fn diagram_focus(&self) -> bool { false }
-        fn diagram_index(&self) -> usize { 0 }
-        fn diagram_scroll(&self) -> (i32, i32) { (0, 0) }
-        fn diagram_pane_ratio(&self) -> u8 { 50 }
-        fn diagram_pane_ratio_user_adjusted(&self) -> bool { false }
-        fn diagram_pane_animating(&self) -> bool { false }
-        fn diagram_pane_enabled(&self) -> bool { false }
-        fn diagram_pane_position(&self) -> crate::config::DiagramPanePosition { Default::default() }
-        fn diagram_zoom(&self) -> u8 { 100 }
-        fn diff_pane_scroll(&self) -> usize { 0 }
-        fn diff_pane_scroll_x(&self) -> i32 { 0 }
-        fn side_panel_image_zoom_percent(&self) -> u8 { 100 }
-        fn diff_pane_focus(&self) -> bool { false }
+        fn diagram_mode(&self) -> crate::config::DiagramDisplayMode {
+            Default::default()
+        }
+        fn diagram_focus(&self) -> bool {
+            false
+        }
+        fn diagram_index(&self) -> usize {
+            0
+        }
+        fn diagram_scroll(&self) -> (i32, i32) {
+            (0, 0)
+        }
+        fn diagram_pane_ratio(&self) -> u8 {
+            50
+        }
+        fn diagram_pane_ratio_user_adjusted(&self) -> bool {
+            false
+        }
+        fn diagram_pane_animating(&self) -> bool {
+            false
+        }
+        fn diagram_pane_enabled(&self) -> bool {
+            false
+        }
+        fn diagram_pane_position(&self) -> crate::config::DiagramPanePosition {
+            Default::default()
+        }
+        fn diagram_zoom(&self) -> u8 {
+            100
+        }
+        fn diff_pane_scroll(&self) -> usize {
+            0
+        }
+        fn diff_pane_scroll_x(&self) -> i32 {
+            0
+        }
+        fn side_panel_image_zoom_percent(&self) -> u8 {
+            100
+        }
+        fn diff_pane_focus(&self) -> bool {
+            false
+        }
         fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot {
             static EMPTY: std::sync::LazyLock<crate::side_panel::SidePanelSnapshot> =
                 std::sync::LazyLock::new(crate::side_panel::SidePanelSnapshot::default);
             &EMPTY
         }
-        fn pin_images(&self) -> bool { false }
-        fn inline_images_visible(&self) -> bool { false }
-        fn diff_line_wrap(&self) -> bool { true }
-        fn inline_interactive_state(&self) -> Option<&crate::tui::InlineInteractiveState> { None }
-        fn inline_view_state(&self) -> Option<&crate::tui::InlineViewState> { None }
-        fn changelog_scroll(&self) -> Option<usize> { None }
-        fn help_scroll(&self) -> Option<usize> { None }
-        fn model_status_overlay(&self) -> Option<(usize, &str)> { None }
-        fn session_picker_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::session_picker::SessionPicker>> { None }
-        fn login_picker_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::login_picker::LoginPicker>> { None }
-        fn account_picker_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::account_picker::AccountPicker>> { None }
-        fn usage_overlay(&self) -> Option<&std::cell::RefCell<crate::tui::usage_overlay::UsageOverlay>> { None }
-        fn working_dir(&self) -> Option<String> { None }
-        fn now_millis(&self) -> u64 { 0 }
-        fn copy_badge_ui(&self) -> crate::tui::CopyBadgeUiState { Default::default() }
-        fn copy_selection_mode(&self) -> bool { false }
-        fn copy_selection_range(&self) -> Option<crate::tui::CopySelectionRange> { None }
-        fn copy_selection_status(&self) -> Option<crate::tui::CopySelectionStatus> { None }
-        fn suggestion_prompts(&self) -> Vec<(String, String)> { vec![] }
-        fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)> { vec![] }
-        fn onboarding_preview_mode(&self) -> bool { false }
-        fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> { None }
-        fn chat_native_scrollbar(&self) -> bool { false }
-        fn side_panel_native_scrollbar(&self) -> bool { false }
+        fn pin_images(&self) -> bool {
+            false
+        }
+        fn inline_images_visible(&self) -> bool {
+            false
+        }
+        fn diff_line_wrap(&self) -> bool {
+            true
+        }
+        fn inline_interactive_state(&self) -> Option<&crate::tui::InlineInteractiveState> {
+            None
+        }
+        fn inline_view_state(&self) -> Option<&crate::tui::InlineViewState> {
+            None
+        }
+        fn changelog_scroll(&self) -> Option<usize> {
+            None
+        }
+        fn help_scroll(&self) -> Option<usize> {
+            None
+        }
+        fn model_status_overlay(&self) -> Option<(usize, &str)> {
+            None
+        }
+        fn session_picker_overlay(
+            &self,
+        ) -> Option<&std::cell::RefCell<crate::tui::session_picker::SessionPicker>> {
+            None
+        }
+        fn login_picker_overlay(
+            &self,
+        ) -> Option<&std::cell::RefCell<crate::tui::login_picker::LoginPicker>> {
+            None
+        }
+        fn account_picker_overlay(
+            &self,
+        ) -> Option<&std::cell::RefCell<crate::tui::account_picker::AccountPicker>> {
+            None
+        }
+        fn usage_overlay(
+            &self,
+        ) -> Option<&std::cell::RefCell<crate::tui::usage_overlay::UsageOverlay>> {
+            None
+        }
+        fn working_dir(&self) -> Option<String> {
+            None
+        }
+        fn now_millis(&self) -> u64 {
+            0
+        }
+        fn copy_badge_ui(&self) -> crate::tui::CopyBadgeUiState {
+            Default::default()
+        }
+        fn copy_selection_mode(&self) -> bool {
+            false
+        }
+        fn copy_selection_range(&self) -> Option<crate::tui::CopySelectionRange> {
+            None
+        }
+        fn copy_selection_status(&self) -> Option<crate::tui::CopySelectionStatus> {
+            None
+        }
+        fn suggestion_prompts(&self) -> Vec<(String, String)> {
+            vec![]
+        }
+        fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)> {
+            vec![]
+        }
+        fn onboarding_preview_mode(&self) -> bool {
+            false
+        }
+        fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> {
+            None
+        }
+        fn chat_native_scrollbar(&self) -> bool {
+            false
+        }
+        fn side_panel_native_scrollbar(&self) -> bool {
+            false
+        }
     }
 
     #[test]
@@ -2023,7 +2235,11 @@ mod tests {
             .collect();
 
         // Should have 2 lines, each starting with +N
-        assert_eq!(text.len(), 2, "expected 2 queued message lines, got: {text:?}");
+        assert_eq!(
+            text.len(),
+            2,
+            "expected 2 queued message lines, got: {text:?}"
+        );
         assert!(text[0].starts_with("+1 "), "first line: {}", text[0]);
         assert!(text[1].starts_with("+2 "), "second line: {}", text[1]);
         assert!(text[0].contains("first message"), "line 0: {text:?}");
@@ -2032,7 +2248,10 @@ mod tests {
 
     #[test]
     fn input_prompt_chat_mode_uses_accent_color() {
-        let state = QueuedTestState { processing: false, queued: vec![] };
+        let state = QueuedTestState {
+            processing: false,
+            queued: vec![],
+        };
         let (_prompt, color) = input_prompt(&state);
         let expected = palette::role_color(Role::Accent, palette::detect_tier());
         assert_eq!(color, expected, "prompt should use Accent color");
@@ -3480,4 +3699,3 @@ enum QueuedMsgType {
     Interleave,
     Queued,
 }
-

@@ -630,7 +630,7 @@ pub fn build_hook_spawn_command(
     // Scrub stale provider-lock vars before setting metadata (so metadata can
     // intentionally propagate provider vars if needed via extra_env).
     scrub_provider_lock_env(&mut cmd);
-    
+
     cmd.args(prefix_args)
         .arg(&command.program)
         .args(&command.args)
@@ -1275,12 +1275,10 @@ mod tests {
         // Session-local provider locks (e.g. JCODE_FORCE_PROVIDER=1 set by
         // ProviderActivation::apply_env) must not leak into spawned sessions:
         // an inherited lock makes every cross-provider /model switch fail.
-        let command = TerminalCommand::new(
-            std::path::PathBuf::from("/usr/local/bin/jcode"),
-            vec![],
-        )
-        .kind("resume")
-        .session_id("ses_scrub");
+        let command =
+            TerminalCommand::new(std::path::PathBuf::from("/usr/local/bin/jcode"), vec![])
+                .kind("resume")
+                .session_id("ses_scrub");
 
         let cmd = build_spawn_command("kitty", &command, Path::new("/work/dir"))
             .expect("kitty spawn command should build");
@@ -1301,12 +1299,10 @@ mod tests {
     fn extra_env_provider_var_survives_the_scrub() {
         // Intentional propagation: an explicit extra_env provider var must win
         // over the scrub (env() after env_remove() re-adds the key).
-        let command = TerminalCommand::new(
-            std::path::PathBuf::from("/usr/local/bin/jcode"),
-            vec![],
-        )
-        .kind("swarm-agent")
-        .spawn_env("JCODE_ACTIVE_PROVIDER", "openai");
+        let command =
+            TerminalCommand::new(std::path::PathBuf::from("/usr/local/bin/jcode"), vec![])
+                .kind("swarm-agent")
+                .spawn_env("JCODE_ACTIVE_PROVIDER", "openai");
 
         let cmd = build_spawn_command("kitty", &command, Path::new("/work/dir"))
             .expect("kitty spawn command should build");
@@ -1322,12 +1318,10 @@ mod tests {
     #[test]
     fn hook_spawn_command_scrubs_provider_lock_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let command = TerminalCommand::new(
-            std::path::PathBuf::from("/usr/local/bin/jcode"),
-            vec![],
-        )
-        .kind("resume")
-        .session_id("ses_hook_scrub");
+        let command =
+            TerminalCommand::new(std::path::PathBuf::from("/usr/local/bin/jcode"), vec![])
+                .kind("resume")
+                .session_id("ses_hook_scrub");
 
         let cmd = build_hook_spawn_command("wezterm start --", &command, Path::new("/work/dir"))
             .expect("hook spawn command should build");

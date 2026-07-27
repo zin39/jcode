@@ -23,7 +23,12 @@ const EMERGENCY_KITTY: u8 = 2;
 
 fn set_emergency_restore_state(active: bool, keyboard_enhanced: bool) {
     let value = if active {
-        EMERGENCY_ACTIVE | if keyboard_enhanced { EMERGENCY_KITTY } else { 0 }
+        EMERGENCY_ACTIVE
+            | if keyboard_enhanced {
+                EMERGENCY_KITTY
+            } else {
+                0
+            }
     } else {
         0
     };
@@ -622,10 +627,7 @@ pub fn spawn_session_signal_watchers() {
         .name("jcode-signal-watcher".to_string())
         .spawn(move || {
             if let Some(sig) = signals.forever().next() {
-                crate::logging::info(&format!(
-                    "Received {} in TUI process",
-                    signal_name(sig)
-                ));
+                crate::logging::info(&format!("Received {} in TUI process", signal_name(sig)));
                 handle_termination_signal(sig);
             }
         })

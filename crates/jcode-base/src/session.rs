@@ -43,11 +43,11 @@ mod persistence;
 mod render;
 mod storage_paths;
 pub mod task_state;
+use classify::classify_session;
 pub use crash::{
     CrashedSessionsInfo, detect_crashed_sessions, find_recent_crashed_sessions,
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
 };
-use classify::classify_session;
 pub use jcode_session_types::{
     EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
@@ -920,9 +920,9 @@ impl Session {
     /// `ensure_initial_session_context_message`) and internal system reminders
     /// are excluded. Machine-generated first prompts count.
     pub fn has_any_visible_messages(&self) -> bool {
-        self.messages.iter().any(|msg| {
-            is_visible_conversation_message(msg)
-        })
+        self.messages
+            .iter()
+            .any(|msg| is_visible_conversation_message(msg))
     }
 
     /// Persist an immutable session-context snapshot as the first provider-visible

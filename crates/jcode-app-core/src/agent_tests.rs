@@ -1399,15 +1399,30 @@ async fn validate_tool_allowed_resolves_aliases_against_canonical_allowlist() {
     agent.disabled_tools = HashSet::new();
 
     assert!(agent.validate_tool_allowed("agentgrep").is_ok());
-    assert!(agent.validate_tool_allowed("grep").is_ok(), "OAuth alias grep must resolve to agentgrep");
-    assert!(agent.validate_tool_allowed("Grep").is_ok(), "PascalCase OAuth alias must resolve");
+    assert!(
+        agent.validate_tool_allowed("grep").is_ok(),
+        "OAuth alias grep must resolve to agentgrep"
+    );
+    assert!(
+        agent.validate_tool_allowed("Grep").is_ok(),
+        "PascalCase OAuth alias must resolve"
+    );
     assert!(agent.validate_tool_allowed("Bash").is_ok());
-    assert!(agent.validate_tool_allowed("skill").is_ok(), "skill alias must resolve to skill_manage");
-    assert!(agent.validate_tool_allowed("edit").is_err(), "non-allowlisted tool still rejected");
+    assert!(
+        agent.validate_tool_allowed("skill").is_ok(),
+        "skill alias must resolve to skill_manage"
+    );
+    assert!(
+        agent.validate_tool_allowed("edit").is_err(),
+        "non-allowlisted tool still rejected"
+    );
 
     // Disabled list should also match by canonical name.
     agent.allowed_tools = None;
     agent.disabled_tools = ["agentgrep"].into_iter().map(String::from).collect();
-    assert!(agent.validate_tool_allowed("grep").is_err(), "alias of disabled tool must be rejected");
+    assert!(
+        agent.validate_tool_allowed("grep").is_err(),
+        "alias of disabled tool must be rejected"
+    );
     assert!(agent.validate_tool_allowed("bash").is_ok());
 }

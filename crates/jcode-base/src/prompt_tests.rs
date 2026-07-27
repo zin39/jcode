@@ -473,8 +473,14 @@ fn test_skills_section_honors_total_budget_with_overflow_names_only() {
         section.contains("More skills (names only):"),
         "overflow names-only line must appear when budget is hit; got: {section}"
     );
-    assert!(section.contains("# Available Skills"), "header must still be present");
-    assert!(section.contains("mention these skills"), "footer must still be present");
+    assert!(
+        section.contains("# Available Skills"),
+        "header must still be present"
+    );
+    assert!(
+        section.contains("mention these skills"),
+        "footer must still be present"
+    );
 }
 
 #[test]

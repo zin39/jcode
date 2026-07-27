@@ -135,9 +135,18 @@ fn render_empty_chat(state: &TestState, width: u16, height: u16) -> String {
 fn empty_session_shows_wordmark_and_three_ghost_prompts() {
     let state = TestState {
         welcome_suggestions: vec![
-            ("Explain this codebase".to_string(), "Explain the codebase".to_string()),
-            ("Add error handling in a recent file".to_string(), "Add error handling".to_string()),
-            ("Fix the failing tests".to_string(), "Fix failing tests".to_string()),
+            (
+                "Explain this codebase".to_string(),
+                "Explain the codebase".to_string(),
+            ),
+            (
+                "Add error handling in a recent file".to_string(),
+                "Add error handling".to_string(),
+            ),
+            (
+                "Fix the failing tests".to_string(),
+                "Fix failing tests".to_string(),
+            ),
         ],
         ..Default::default()
     };
@@ -180,9 +189,10 @@ fn empty_session_without_welcome_prompts_shows_wordmark_only() {
 fn non_empty_session_renders_messages_not_welcome() {
     let state = TestState {
         display_messages: vec![DisplayMessage::user("hello")],
-        welcome_suggestions: vec![
-            ("Explain this codebase".to_string(), "Explain the codebase".to_string()),
-        ],
+        welcome_suggestions: vec![(
+            "Explain this codebase".to_string(),
+            "Explain the codebase".to_string(),
+        )],
         ..Default::default()
     };
     let text = render_empty_chat(&state, 100, 30);

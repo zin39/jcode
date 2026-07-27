@@ -168,7 +168,10 @@ impl Agent {
         if let Some(text) = first_user_text {
             // Strip a leading inline system-reminder block when the real
             // request shares one text block with it.
-            let cleaned = match (text.find("</system-reminder>"), text.contains("<system-reminder")) {
+            let cleaned = match (
+                text.find("</system-reminder>"),
+                text.contains("<system-reminder"),
+            ) {
                 (Some(end), true) => text[end + "</system-reminder>".len()..].trim(),
                 _ => text.trim(),
             };
@@ -247,7 +250,6 @@ impl Agent {
 
         split
     }
-
 
     /// When gold mode is on for this session and this agent can invoke
     /// `cheap_route` (i.e. it is a coordinator, not a spawned subagent — those

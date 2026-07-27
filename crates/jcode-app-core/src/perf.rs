@@ -213,7 +213,9 @@ pub fn no_animation_enabled() -> bool {
         return true;
     }
     // NO_COLOR (any non-empty value) implies no animation.
-    std::env::var("NO_COLOR").map(|v| !v.trim().is_empty()).unwrap_or(false)
+    std::env::var("NO_COLOR")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Check whether an env variable has a truthy value.
@@ -977,11 +979,17 @@ mod tests {
 
         // Temporarily set JCODE_NO_ANIMATION=1 and verify the policy.
         let prev = std::env::var("JCODE_NO_ANIMATION").ok();
-        unsafe { std::env::set_var("JCODE_NO_ANIMATION", "1"); }
+        unsafe {
+            std::env::set_var("JCODE_NO_ANIMATION", "1");
+        }
         let policy = tui_policy_for(&profile, &display);
         match prev {
-            Some(v) => unsafe { std::env::set_var("JCODE_NO_ANIMATION", &v); },
-            None => unsafe { std::env::remove_var("JCODE_NO_ANIMATION"); },
+            Some(v) => unsafe {
+                std::env::set_var("JCODE_NO_ANIMATION", &v);
+            },
+            None => unsafe {
+                std::env::remove_var("JCODE_NO_ANIMATION");
+            },
         }
 
         assert!(policy.no_animation);

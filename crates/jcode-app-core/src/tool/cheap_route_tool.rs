@@ -94,8 +94,11 @@ impl Tool for CheapRouteTool {
 fn format_cheap_outcome(outcome: &CheapRouteOutcome) -> String {
     // Report the models that ACTUALLY ran (may differ from the recommendation
     // when cheaper routes errored and we fell back), not just the recommendation.
-    let mut models_used: Vec<&str> =
-        outcome.results.iter().map(|r| r.model_used.as_str()).collect();
+    let mut models_used: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.model_used.as_str())
+        .collect();
     models_used.sort_unstable();
     models_used.dedup();
     let ran_on = if models_used.is_empty() {

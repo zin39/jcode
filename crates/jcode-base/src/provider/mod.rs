@@ -287,9 +287,7 @@ pub fn restore_session_model_best_effort(
         Ok(()) => return provider.model(),
         Err(err) => err,
     };
-    if model_request != model
-        && set_model_with_auth_refresh(provider, model).is_ok()
-    {
+    if model_request != model && set_model_with_auth_refresh(provider, model).is_ok() {
         return provider.model();
     }
 
@@ -971,7 +969,8 @@ impl MultiProvider {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Unknown provider profile '{}'", profile_name))?;
 
-        let expected_api_method = crate::provider_catalog::openai_compatible_api_method(profile_name);
+        let expected_api_method =
+            crate::provider_catalog::openai_compatible_api_method(profile_name);
         let registry = ProviderRegistry::new(self);
         let provider = {
             let existing = registry

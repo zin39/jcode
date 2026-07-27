@@ -726,7 +726,12 @@ mod tests {
     fn rank_routes_by_cost_orders_cheapest_first_and_drops_unavailable() {
         use crate::{RouteCheapnessEstimate, RouteCostConfidence, RouteCostSource};
 
-        fn priced(model: &str, available: bool, input_micros: u64, output_micros: u64) -> ModelRoute {
+        fn priced(
+            model: &str,
+            available: bool,
+            input_micros: u64,
+            output_micros: u64,
+        ) -> ModelRoute {
             ModelRoute {
                 model: model.to_string(),
                 provider: "p".to_string(),

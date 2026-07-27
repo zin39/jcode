@@ -83,7 +83,9 @@ mod tests {
 
         // realtime
         assert!(!is_selectable_coding_model("gpt-4o-realtime"));
-        assert!(!is_selectable_coding_model("openai/gpt-4o-realtime-preview"));
+        assert!(!is_selectable_coding_model(
+            "openai/gpt-4o-realtime-preview"
+        ));
 
         // audio
         assert!(!is_selectable_coding_model("gpt-4o-audio-preview"));
@@ -134,7 +136,9 @@ mod tests {
         assert!(!is_selectable_coding_model("ada:personal-org"));
 
         // ft: prefix (general fine-tune)
-        assert!(!is_selectable_coding_model("ft:gpt-4o-mini-2024-07-18:personal:org"));
+        assert!(!is_selectable_coding_model(
+            "ft:gpt-4o-mini-2024-07-18:personal:org"
+        ));
 
         // babbage
         assert!(!is_selectable_coding_model("babbage-002"));
@@ -196,7 +200,9 @@ mod tests {
         assert!(is_selectable_coding_model("claude-3-5-sonnet-20241022"));
         assert!(is_selectable_coding_model("claude-sonnet-4-20250514"));
         assert!(is_selectable_coding_model("deepseek-r1"));
-        assert!(is_selectable_coding_model("openrouter/deepseek/deepseek-chat-v3-0324"));
+        assert!(is_selectable_coding_model(
+            "openrouter/deepseek/deepseek-chat-v3-0324"
+        ));
         assert!(is_selectable_coding_model("anthropic/claude-3.5-sonnet"));
     }
 }

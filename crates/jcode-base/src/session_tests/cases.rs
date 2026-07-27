@@ -2380,15 +2380,15 @@ fn test_empty_session_with_context_not_persisted() -> Result<()> {
         .map_err(|e| anyhow!(e))?;
     let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
 
-    let mut session = Session::create_with_id(
-        "session_empty_context_nopersist".to_string(),
-        None,
-        None,
-    );
+    let mut session =
+        Session::create_with_id("session_empty_context_nopersist".to_string(), None, None);
     // Simulate the context message added by Agent::new / App::new
     session.ensure_initial_session_context_message();
     assert!(!session.messages.is_empty(), "should have context message");
-    assert!(!session.has_any_visible_messages(), "context message is not a visible conversation message");
+    assert!(
+        !session.has_any_visible_messages(),
+        "context message is not a visible conversation message"
+    );
 
     session.save()?;
 
@@ -2409,11 +2409,8 @@ fn test_session_persisted_after_first_user_message() -> Result<()> {
         .map_err(|e| anyhow!(e))?;
     let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
 
-    let mut session = Session::create_with_id(
-        "session_first_message_persist".to_string(),
-        None,
-        None,
-    );
+    let mut session =
+        Session::create_with_id("session_first_message_persist".to_string(), None, None);
     session.ensure_initial_session_context_message();
 
     // First save should be skipped (only context message)
@@ -2431,7 +2428,10 @@ fn test_session_persisted_after_first_user_message() -> Result<()> {
             cache_control: None,
         }],
     );
-    assert!(session.has_any_visible_messages(), "should detect real user message");
+    assert!(
+        session.has_any_visible_messages(),
+        "should detect real user message"
+    );
 
     session.save()?;
 
@@ -2442,7 +2442,10 @@ fn test_session_persisted_after_first_user_message() -> Result<()> {
 
     // Verify the persisted session can be loaded
     let loaded = Session::load("session_first_message_persist")?;
-    assert!(loaded.has_any_visible_messages(), "loaded session should have user messages");
+    assert!(
+        loaded.has_any_visible_messages(),
+        "loaded session should have user messages"
+    );
     Ok(())
 }
 
@@ -2487,11 +2490,8 @@ fn test_session_with_custom_title_persists_without_visible_messages() -> Result<
         .map_err(|e| anyhow!(e))?;
     let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
 
-    let mut session = Session::create_with_id(
-        "session_custom_title_persist".to_string(),
-        None,
-        None,
-    );
+    let mut session =
+        Session::create_with_id("session_custom_title_persist".to_string(), None, None);
     // Simulate the context message added by Agent::new
     session.ensure_initial_session_context_message();
     assert!(!session.has_any_visible_messages());
@@ -2506,10 +2506,7 @@ fn test_session_with_custom_title_persists_without_visible_messages() -> Result<
     );
 
     let loaded = Session::load("session_custom_title_persist")?;
-    assert_eq!(
-        loaded.custom_title.as_deref(),
-        Some("My important session")
-    );
+    assert_eq!(loaded.custom_title.as_deref(), Some("My important session"));
     Ok(())
 }
 
@@ -2523,11 +2520,7 @@ fn test_resume_works_after_guard() -> Result<()> {
     let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
 
     // Simulate a full session lifecycle: create → add messages → save → load (resume)
-    let mut session = Session::create_with_id(
-        "session_resume_guard".to_string(),
-        None,
-        None,
-    );
+    let mut session = Session::create_with_id("session_resume_guard".to_string(), None, None);
     session.ensure_initial_session_context_message();
     session.add_message(
         Role::User,
@@ -2553,7 +2546,13 @@ fn test_resume_works_after_guard() -> Result<()> {
 
     // Load once more to verify journal replay works after guard was introduced
     let reloaded = Session::load("session_resume_guard")?;
-    assert!(reloaded.has_any_visible_messages(), "resumed session should have user messages");
-    assert!(reloaded.messages.len() >= 3, "should have at least 3 messages");
+    assert!(
+        reloaded.has_any_visible_messages(),
+        "resumed session should have user messages"
+    );
+    assert!(
+        reloaded.messages.len() >= 3,
+        "should have at least 3 messages"
+    );
     Ok(())
 }

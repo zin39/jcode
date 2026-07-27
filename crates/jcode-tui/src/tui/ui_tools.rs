@@ -1554,11 +1554,11 @@ pub(super) fn render_batch_subcall_line(
         let tokens = crate::util::estimate_tokens(content);
         let color = match crate::util::approx_tool_output_token_severity(tokens) {
             // A normal-sized output is not a signal, so it must not introduce a
-        // colour of its own. This used to be rgb(118,118,118), two points away
-        // from the tool colour beside it: indistinguishable to the eye, yet it
-        // still counted as a third competing colour in every tool row. Reuse
-        // the shared tool colour so only Warning and Danger actually stand out.
-        crate::util::ApproxTokenSeverity::Normal => tool_color(),
+            // colour of its own. This used to be rgb(118,118,118), two points away
+            // from the tool colour beside it: indistinguishable to the eye, yet it
+            // still counted as a third competing colour in every tool row. Reuse
+            // the shared tool colour so only Warning and Danger actually stand out.
+            crate::util::ApproxTokenSeverity::Normal => tool_color(),
             crate::util::ApproxTokenSeverity::Warning => rgb(214, 184, 92),
             crate::util::ApproxTokenSeverity::Danger => rgb(224, 118, 118),
         };

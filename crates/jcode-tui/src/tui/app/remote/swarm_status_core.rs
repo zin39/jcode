@@ -230,7 +230,10 @@ mod tests {
     #[test]
     fn unchanged_snapshot_is_silent() {
         let prev = vec![member("ant", "running"), member("bat", "completed")];
-        assert_eq!(swarm_status_transition_notice(&prev, &prev.clone(), None), None);
+        assert_eq!(
+            swarm_status_transition_notice(&prev, &prev.clone(), None),
+            None
+        );
     }
 
     #[test]

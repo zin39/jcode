@@ -1116,7 +1116,7 @@ fn post_payload(payload: serde_json::Value, timeout: Duration) -> bool {
         TELEMETRY_PERMANENTLY_REJECTED.store(true, Ordering::Relaxed);
         return false;
     }
-    
+
     let client = TELEMETRY_HTTP_CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .user_agent(jcode_provider_core::JCODE_USER_AGENT)

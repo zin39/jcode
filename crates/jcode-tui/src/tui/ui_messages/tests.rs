@@ -1852,7 +1852,10 @@ fn render_tool_message_shows_token_badge() {
 
     // A normal-sized output is not a signal, so the badge reuses the shared
     // tool colour rather than inventing a near-identical shade beside it.
-    assert_eq!(badge_span.style.fg, Some(jcode_tui_style::theme::tool_color()));
+    assert_eq!(
+        badge_span.style.fg,
+        Some(jcode_tui_style::theme::tool_color())
+    );
 }
 
 fn gmail_draft_message(content: &str, input: serde_json::Value) -> DisplayMessage {
@@ -2990,7 +2993,11 @@ fn running_tool_glyph_advances_across_frames() {
         assert!(frames.iter().all(|f| *f == "[..]"));
     } else {
         assert!(
-            frames.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            frames
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
             "spinner must actually animate, got: {frames:?}"
         );
     }

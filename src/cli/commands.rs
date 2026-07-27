@@ -2603,10 +2603,7 @@ const CLI_AUTO_POKE_SWARM_ACTIVE_COOLDOWN: Duration = Duration::from_secs(5 * 60
 /// Returns true when an auto-poke should be skipped because of the cooldown
 /// or because swarm workers are actively running (coordinator blocked on
 /// `await_members` background watches).
-fn should_skip_auto_poke_for_swarm(
-    session_id: &str,
-    last_poke: &mut Option<Instant>,
-) -> bool {
+fn should_skip_auto_poke_for_swarm(session_id: &str, last_poke: &mut Option<Instant>) -> bool {
     let now = Instant::now();
 
     // Base cooldown: 60s between any pokes

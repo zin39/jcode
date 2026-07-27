@@ -67,7 +67,10 @@ impl DebateState {
                 if detail.is_empty() {
                     buf.push_str(&format!("- {} (d{}) {}\n", icon, difficulty, desc));
                 } else {
-                    buf.push_str(&format!("- {} (d{}) {} — `{}`\n", icon, difficulty, desc, detail));
+                    buf.push_str(&format!(
+                        "- {} (d{}) {} — `{}`\n",
+                        icon, difficulty, desc, detail
+                    ));
                 }
                 // While running, show the live rolling activity tail indented so
                 // the user can open the panel and watch the cheap model work.

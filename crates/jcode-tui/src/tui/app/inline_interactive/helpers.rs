@@ -260,9 +260,9 @@ mod tests {
             old: false,
             created_date: None,
             effort: None,
-                available_efforts: Vec::new(),
-                provider_group: None,
-                is_recent: false,
+            available_efforts: Vec::new(),
+            provider_group: None,
+            is_recent: false,
         }
     }
 
