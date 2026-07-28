@@ -204,6 +204,25 @@ pub fn recommended_actions(
     actions
 }
 
+/// Render a credential path for diagnostics, abbreviating the home directory.
+///
+/// Diagnostics previously hardcoded `~/.jcode/auth.json`, which silently became
+/// wrong when credentials consolidated into the canonical secrets dir. Deriving
+/// the string from the real resolved path keeps the two from drifting again.
+pub(crate) fn display_credential_path(path: Result<std::path::PathBuf, anyhow::Error>) -> String {
+    // A path that cannot be resolved is described generically rather than
+    // guessed at: naming the wrong file is what this helper exists to prevent.
+    let Ok(path) = path else {
+        return "jcode-managed credential file".to_string();
+    };
+    if let Some(home) = dirs::home_dir()
+        && let Ok(relative) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", relative.display());
+    }
+    path.display().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

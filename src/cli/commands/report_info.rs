@@ -348,10 +348,8 @@ async fn build_auth_doctor_report(
         checked_provider: provider_arg.map(str::to_string),
         validate,
         any_issue: reports.iter().any(|provider| provider.needs_attention),
-        credentials_dir: crate::storage::app_config_dir()
-            .ok()
-            .map(|dir| dir.display().to_string()),
-        legacy_credentials_dir: legacy_credentials_dir_if_populated(),
+        credentials_dir: Some(crate::storage::app_config_dir()?.display().to_string()),
+        legacy_credentials_dir: legacy_credentials_dir_if_populated()?,
         providers: reports,
     })
 }
@@ -363,26 +361,36 @@ async fn build_auth_doctor_report(
 /// keeps working copies for downgrade safety. Reporting it unconditionally
 /// would just reintroduce the "two locations" confusion this consolidation set
 /// out to remove, so it is surfaced only when files are actually there.
-fn legacy_credentials_dir_if_populated() -> Option<String> {
-    let dir = crate::storage::jcode_dir().ok()?;
-    let has_credentials = std::fs::read_dir(&dir).ok()?.flatten().any(|entry| {
-        let path = entry.path();
-        if !path.is_file() {
-            return false;
-        }
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                !name.contains(".bak")
-                    && (name.ends_with(".env")
-                        || name == "auth.json"
-                        || name == "openai-auth.json"
-                        || name.ends_with("_oauth.json")
-                        || name == "google_credentials.json")
-            })
-    });
+fn legacy_credentials_dir_if_populated() -> Result<Option<String>> {
+    let dir = crate::storage::jcode_dir()?;
+    // A missing legacy directory is the expected steady state for a fresh
+    // install, so it is absence rather than an error worth surfacing.
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(None);
+    };
 
-    has_credentials.then(|| dir.display().to_string())
+    let mut has_credentials = false;
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.contains(".bak")
+            && (name.ends_with(".env")
+                || name == "auth.json"
+                || name == "openai-auth.json"
+                || name.ends_with("_oauth.json")
+                || name == "google_credentials.json")
+        {
+            has_credentials = true;
+            break;
+        }
+    }
+
+    Ok(has_credentials.then(|| dir.display().to_string()))
 }
 
 async fn run_auth_doctor_validation(

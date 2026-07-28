@@ -1538,10 +1538,7 @@ async fn run_stream_with_retries(
                 // Surface a clear error immediately.
                 if is_oauth && is_oauth_org_policy_error(&error_str) {
                     let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "{}\n\nYour Claude OAuth access token was rejected by the organization's policy — this organization does not allow OAuth authentication.\n\nTo fix this:\n• Switch to a different OAuth account or organization that allows OAuth, or\n• Use an API key route instead (`jcode login --provider claude-api`).",
-                            e
-                        )))
+                        .send(Err(anyhow::anyhow!("{}{}", e, OAUTH_ORG_POLICY_GUIDANCE)))
                         .await;
                     return;
                 }
@@ -1667,24 +1664,22 @@ async fn run_stream_with_retries(
                     continue;
                 }
 
-                // Non-retryable or final attempt
-                if is_oauth && is_oauth_org_policy_error(&error_str) {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "{}\n\nYour Claude OAuth access token was rejected by the organization's policy — this organization does not allow OAuth authentication.\n\nTo fix this:\n• Switch to a different OAuth account or organization that allows OAuth, or\n• Use an API key route instead (`jcode login --provider claude-api`).",
-                            e
-                        )))
-                        .await;
-                } else if is_oauth && is_oauth_auth_error(&error_str) {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "{}\n\nClaude OAuth authentication failed. Run `jcode login --provider claude` (preferred) or `claude`, then retry.",
-                            e
-                        )))
-                        .await;
+                // Non-retryable or final attempt. Pick the guidance first so
+                // there is a single send, and the org-policy wording stays
+                // defined in exactly one place.
+                let failure = if !is_oauth {
+                    e
+                } else if is_oauth_org_policy_error(&error_str) {
+                    anyhow::anyhow!("{}{}", e, OAUTH_ORG_POLICY_GUIDANCE)
+                } else if is_oauth_auth_error(&error_str) {
+                    anyhow::anyhow!(
+                        "{}\n\nClaude OAuth authentication failed. Run `jcode login --provider claude` (preferred) or `claude`, then retry.",
+                        e
+                    )
                 } else {
-                    let _ = tx.send(Err(e)).await;
-                }
+                    e
+                };
+                let _ = tx.send(Err(failure)).await;
                 return;
             }
         }
@@ -2134,6 +2129,11 @@ fn is_oauth_auth_error(error_str: &str) -> bool {
         || ((error_str.contains("401 unauthorized") || error_str.contains("403 forbidden"))
             && (error_str.contains("oauth") || error_str.contains("token")))
 }
+
+/// Guidance shown when an organization forbids OAuth outright.
+///
+/// Defined once so the retry path and the final-attempt path cannot drift.
+const OAUTH_ORG_POLICY_GUIDANCE: &str = "\n\nYour Claude OAuth access token was rejected by the organization's policy — this organization does not allow OAuth authentication.\n\nTo fix this:\n• Switch to a different OAuth account or organization that allows OAuth, or\n• Use an API key route instead (`jcode login --provider claude-api`).";
 
 /// Detect the Anthropic "OAuth not allowed for this organization" 403.
 /// This is a non-retryable org-policy rejection — the org itself forbids OAuth
