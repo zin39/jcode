@@ -81,10 +81,7 @@ impl AuthTestTarget {
                     .to_string(),
             ]),
             Self::Openai => Ok(vec![
-                crate::storage::jcode_dir()?
-                    .join("openai-auth.json")
-                    .display()
-                    .to_string(),
+                crate::auth::codex::jcode_auth_path()?.display().to_string(),
                 crate::storage::user_home_path(".codex/auth.json")?
                     .display()
                     .to_string(),

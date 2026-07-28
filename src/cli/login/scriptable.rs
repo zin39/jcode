@@ -400,7 +400,9 @@ pub(super) async fn complete_scriptable_openai_login(
     auth::oauth::save_openai_tokens_for_account(&tokens, &account_label)?;
     clear_pending_login(&pending_path);
     crate::telemetry::record_auth_success(provider_id, "oauth");
-    let credentials_path = crate::storage::jcode_dir()?.join("openai-auth.json");
+    // Report where the token was actually written. A fixed jcode_dir() path
+    // would tell a calling script to look in the pre-consolidation location.
+    let credentials_path = crate::storage::resolve_secret_path("openai-auth.json")?;
     emit_scriptable_auth_success(
         options.json,
         ScriptableAuthSuccess {
