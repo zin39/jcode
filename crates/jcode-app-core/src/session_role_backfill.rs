@@ -39,18 +39,28 @@ pub(crate) fn classify_legacy_session(
         return Some(SessionAgentRole::Internal);
     }
 
-    let title = title.map(str::trim).filter(|title| !title.is_empty())?;
-
-    // "<description> (@<type> swarm)" is written only by run_swarm_task.
-    if title.ends_with(SWARM_TITLE_SUFFIX) && title.contains("(@") {
-        return Some(SessionAgentRole::SwarmWorker);
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        // "<description> (@<type> swarm)" is written only by run_swarm_task.
+        if title.ends_with(SWARM_TITLE_SUFFIX) && title.contains("(@") {
+            return Some(SessionAgentRole::SwarmWorker);
+        }
     }
 
-    // Cheap-route and subagent runs title the session with the subtask
-    // description and complete in a single user turn. Interactive sessions
-    // reach a second turn almost immediately, so requiring exactly one turn
-    // keeps real short sessions visible.
-    if user_message_count <= 1 {
+    // A conversation is what makes a session worth resuming, and a
+    // conversation needs at least a second user turn. Everything jcode spawns
+    // (cheap-route subtasks, subagents, health probes, `run -p` calls) is
+    // one prompt and one answer, then done.
+    //
+    // Measured against the real corpus that motivated this: of ~4500 stored
+    // sessions, only ~600 ever reached a third user turn, and those are
+    // unmistakably the user's own work (hundreds of turns each), while the
+    // single-turn population is dominated by machine traffic like
+    // "Reply with exactly the two characters: OK".
+    //
+    // Requiring *two or more* turns to stay visible keeps a genuine short
+    // session that the user replied in even once, while a session they opened
+    // and abandoned after one prompt is not something they resume anyway.
+    if user_message_count < 2 {
         return Some(SessionAgentRole::Subagent);
     }
 
@@ -190,10 +200,28 @@ mod tests {
     }
 
     #[test]
-    fn untitled_root_sessions_are_left_visible() {
-        // Interactive sessions are usually untitled, so an untitled root
-        // session must never be reclassified on turn count alone.
-        assert_eq!(classify_legacy_session(None, None, 1), None);
-        assert_eq!(classify_legacy_session(None, Some("   "), 0), None);
+    fn untitled_single_turn_runs_are_hidden() {
+        // The dominant machine population: untitled, one prompt, no reply.
+        // Titles are not required, because health probes and `run -p` calls
+        // create untitled sessions too.
+        assert_eq!(
+            classify_legacy_session(None, None, 1),
+            Some(SessionAgentRole::Subagent)
+        );
+        assert_eq!(
+            classify_legacy_session(None, Some("   "), 0),
+            Some(SessionAgentRole::Subagent)
+        );
+    }
+
+    #[test]
+    fn a_session_the_user_replied_in_stays_visible() {
+        // Two user turns means someone was talking to it. That is the line
+        // between a conversation and a one-shot call.
+        assert_eq!(classify_legacy_session(None, None, 2), None);
+        assert_eq!(
+            classify_legacy_session(None, Some("Untitled work"), 2),
+            None
+        );
     }
 }
