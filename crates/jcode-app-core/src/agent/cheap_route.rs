@@ -1941,11 +1941,30 @@ mod tests {
 
     /// Isolate test from user's ~/.jcode/config.toml by setting JCODE_HOME to a temp dir.
     /// Returns the temp dir (must be kept alive for the test duration).
-    fn isolate_config() -> tempfile::TempDir {
+    /// Guard bundling the temp dir with the process-wide env lock, so the
+    /// isolation cannot outlive the lock that makes it safe.
+    struct IsolatedConfig {
+        _env: std::sync::MutexGuard<'static, ()>,
+        temp: tempfile::TempDir,
+    }
+    impl IsolatedConfig {
+        fn path(&self) -> &std::path::Path {
+            self.temp.path()
+        }
+    }
+
+    fn isolate_config() -> IsolatedConfig {
+        // JCODE_HOME is process-global, so isolating config without holding the
+        // env lock is a race, not isolation: a parallel test overwrites the
+        // variable mid-run. That race made a strict-mode test observe
+        // `cheap_route_strict = false` and watch a subtask execute on the
+        // coordinator's model — the exact escalation the test forbids. Taking
+        // the lock here rather than at each call site means no test can forget.
+        let _env = jcode_base::storage::lock_test_env();
         let temp = tempfile::tempdir().expect("failed to create temp dir");
         unsafe { std::env::set_var("JCODE_HOME", temp.path()) };
         jcode_base::config::invalidate_config_cache();
-        temp
+        IsolatedConfig { _env, temp }
     }
 
     #[test]
@@ -2192,6 +2211,85 @@ mod tests {
         fn current_model(&self) -> String {
             String::new()
         }
+    }
+
+    /// L4 RUNTIME proof: a total cheap-route blackout under strict mode must
+    /// FAIL, not escalate.
+    ///
+    /// This drives the real `run_cheap_route` entry point rather than the pure
+    /// helpers, because the helpers cannot catch the failure mode that actually
+    /// shipped: a gate that is correct but never reached. `resolve_worker_route`
+    /// existed with ZERO callers and enforced nothing.
+    ///
+    /// Regression guard for 70035ce0b, which made an empty ranking mean "use the
+    /// parent model", so a drained balance silently billed the frontier model.
+    #[tokio::test]
+    async fn blackout_under_strict_fails_instead_of_escalating() {
+        let temp = isolate_config();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "[agents]\ncheap_route_strict = true\n",
+        )
+        .expect("write strict config");
+        jcode_base::config::invalidate_config_cache();
+
+        // The blackout condition in production: every cheap provider is
+        // credential-cooled or banned so ranking yields nothing, but a real
+        // coordinator model IS available. That is precisely the state
+        // 70035ce0b escalated into silently.
+        struct BlackoutBackend {
+            parent: Mutex<VecDeque<String>>,
+            ran: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl CheapRouteBackend for BlackoutBackend {
+            async fn ask_parent(&self, _p: &str) -> Result<String> {
+                Ok(self.parent.lock().unwrap().pop_front().unwrap_or_default())
+            }
+            async fn run_subtask(
+                &self,
+                st: &Subtask,
+                model: &str,
+                _r: Option<&str>,
+            ) -> Result<String> {
+                self.ran.lock().unwrap().push(model.to_string());
+                Ok(format!("done: {}", st.description))
+            }
+            fn routes(&self) -> Vec<ModelRoute> {
+                Vec::new()
+            }
+            fn current_model(&self) -> String {
+                // An EXPENSIVE coordinator, so escalation would be billable.
+                "claude-opus-4-8".to_string()
+            }
+        }
+        let backend = BlackoutBackend {
+            parent: Mutex::new(VecDeque::from(vec![
+                r#"[{"description":"do it","prompt":"do it","difficulty":1}]"#.to_string(),
+            ])),
+            ran: Mutex::new(Vec::new()),
+        };
+
+        let err = run_cheap_route(&backend, "任务")
+            .await
+            .expect_err("strict mode must refuse to escalate on a blackout");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cheap-route blackout"),
+            "must fail with the blackout error, got: {msg}"
+        );
+        assert!(
+            msg.contains("cheap_route_strict"),
+            "error must name the setting so the user can opt back in: {msg}"
+        );
+
+        // The decisive assertion: NO subtask ran. Escalation would have executed
+        // the subtask on the coordinator's model and billed it.
+        assert!(
+            backend.ran.lock().unwrap().is_empty(),
+            "no work may run when strict mode refuses to escalate; ran on: {:?}",
+            backend.ran.lock().unwrap()
+        );
     }
 
     #[tokio::test]
