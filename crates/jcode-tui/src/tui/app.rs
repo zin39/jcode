@@ -103,6 +103,7 @@ mod replay;
 pub(crate) mod run_shell;
 mod runtime_memory;
 mod shortcut_hints;
+mod side_panel_focus;
 mod split_view;
 mod sponsor_disclosure;
 mod state_ui;

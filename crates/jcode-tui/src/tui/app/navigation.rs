@@ -1050,7 +1050,7 @@ impl App {
             return;
         }
 
-        let restore_id = side_panel_page_to_restore(
+        let restore_id = super::side_panel_focus::side_panel_page_to_restore(
             &self.side_panel.pages,
             self.last_side_panel_focus_id.as_deref(),
         );
@@ -2108,93 +2108,5 @@ mod ctrl_bracket_decoding_tests {
                 );
             }
         }
-    }
-}
-
-/// Which side-panel page to focus when the user reopens the panel.
-///
-/// Prefers the page updated most recently over the one the user last looked at.
-/// Restoring the remembered page meant that opening the panel after a
-/// cheap_route or web-search run showed a STALE page while the live one sat
-/// unfocused, which reads as "the panel is broken". Pages without a timestamp
-/// (0) cannot be compared, so they fall through to the remembered id and then
-/// to the first page.
-pub(super) fn side_panel_page_to_restore(
-    pages: &[crate::side_panel::SidePanelPage],
-    remembered_id: Option<&str>,
-) -> Option<String> {
-    let freshest = pages
-        .iter()
-        .filter(|page| page.updated_at_ms > 0)
-        .max_by_key(|page| page.updated_at_ms)
-        .map(|page| page.id.clone());
-    let remembered = remembered_id
-        .filter(|id| pages.iter().any(|page| page.id == *id))
-        .map(str::to_owned);
-    freshest
-        .or(remembered)
-        .or_else(|| pages.first().map(|page| page.id.clone()))
-}
-
-#[cfg(test)]
-mod side_panel_restore_tests {
-    use super::side_panel_page_to_restore;
-    use crate::side_panel::SidePanelPage;
-
-    fn page(id: &str, updated_at_ms: u64) -> SidePanelPage {
-        SidePanelPage {
-            id: id.to_string(),
-            title: id.to_string(),
-            file_path: String::new(),
-            format: Default::default(),
-            source: Default::default(),
-            content: String::new(),
-            updated_at_ms,
-        }
-    }
-
-    /// Reopening the panel after a cheap_route run showed the STALE page: the
-    /// remembered id won even when a different page had just been written. The
-    /// freshest page must win, or the live view looks broken.
-    #[test]
-    fn reopening_focuses_the_freshest_page_not_the_remembered_one() {
-        let pages = vec![page("websearch", 100), page("debate", 900)];
-
-        assert_eq!(
-            side_panel_page_to_restore(&pages, Some("websearch")).as_deref(),
-            Some("debate"),
-            "a page written after the remembered one must win"
-        );
-
-        // Order in the vec must not matter; only the timestamp.
-        let reversed = vec![page("debate", 900), page("websearch", 100)];
-        assert_eq!(
-            side_panel_page_to_restore(&reversed, Some("websearch")).as_deref(),
-            Some("debate")
-        );
-    }
-
-    /// Without timestamps there is nothing to compare, so the previous
-    /// behaviour (remembered page, else first) must still hold.
-    #[test]
-    fn falls_back_to_remembered_then_first_when_untimestamped() {
-        let pages = vec![page("a", 0), page("b", 0)];
-        assert_eq!(
-            side_panel_page_to_restore(&pages, Some("b")).as_deref(),
-            Some("b"),
-            "untimestamped pages should honour the remembered id"
-        );
-        assert_eq!(
-            side_panel_page_to_restore(&pages, None).as_deref(),
-            Some("a"),
-            "with no memory and no timestamps, fall back to the first page"
-        );
-        // A remembered id that no longer exists must not be resurrected.
-        assert_eq!(
-            side_panel_page_to_restore(&pages, Some("deleted")).as_deref(),
-            Some("a")
-        );
-        // No pages at all: nothing to focus.
-        assert_eq!(side_panel_page_to_restore(&[], Some("x")), None);
     }
 }
