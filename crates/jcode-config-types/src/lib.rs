@@ -567,19 +567,13 @@ pub struct AgentsConfig {
     pub cheap_route_strong_model: Option<String>,
     /// Enforce cheap routing: never silently fall back to an expensive model.
     ///
-    /// Cheap routing is normally a *cascade* — it escalates to the coordinator's
-    /// own model when cheap routes are unavailable, which is the standard
-    /// FrugalGPT/RouteLLM design. That is the right default for most users, but
-    /// it means a drained balance or a dead key quietly bills the frontier model
-    /// instead of erroring, and the spend only shows up on an invoice.
-    ///
-    /// When `true`:
-    /// - hard subtasks use `cheap_route_strong_model` only; they never fall back
-    ///   to the coordinator's model when it is unset
-    /// - the coordinator's model is never appended as a last-resort candidate
-    /// - a total cheap-route blackout fails loudly instead of escalating
-    ///
-    /// Off by default, so existing cascade behavior is unchanged.
+    /// Cheap routing is normally a cascade that escalates to the coordinator's
+    /// own model when cheap routes are unavailable (the FrugalGPT/RouteLLM
+    /// design). That is the right default, but it means a drained balance or a
+    /// dead key quietly bills the frontier model and only shows up on an
+    /// invoice. When `true`, hard subtasks use `cheap_route_strong_model` only,
+    /// the coordinator is never a last-resort candidate, and a total blackout
+    /// fails loudly. Off by default, so cascade behaviour is unchanged.
     #[serde(default)]
     pub cheap_route_strict: bool,
     /// When true, a coordinator (an agent that can spawn subagents) is instructed
