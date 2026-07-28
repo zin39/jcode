@@ -1922,3 +1922,75 @@ fn test_anthropic_opus_5_low_effort_reaches_the_wire() {
     // Opus 5 rejects `thinking.type.enabled`; it requires adaptive thinking.
     assert!(matches!(thinking, Some(ApiThinking::Adaptive { .. })));
 }
+
+// ── is_oauth_org_policy_error classifier tests ──────────────────────────
+
+#[test]
+fn test_is_oauth_org_policy_error_matches_real_error() {
+    // The exact error string that stream_response produces for the org-policy 403.
+    // error_str is lowercased before classification.
+    let error = "anthropic api error (403 forbidden): {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"oauth authentication is currently not allowed for this organization.\"}}";
+    assert!(
+        is_oauth_org_policy_error(error),
+        "must match the real Anthropic org-policy 403 response"
+    );
+}
+
+#[test]
+fn test_is_oauth_org_policy_error_matches_snake_case_code() {
+    // If Anthropic returns the snake_case machine-readable code instead.
+    let error = "anthropic api error (403 forbidden): oauth_not_allowed_for_organization";
+    assert!(is_oauth_org_policy_error(error));
+}
+
+#[test]
+fn test_is_oauth_org_policy_error_rejects_normal_oauth_failures() {
+    // Expired token is NOT an org-policy error; is_oauth_auth_error handles it.
+    assert!(!is_oauth_org_policy_error(
+        "anthropic api error (401 unauthorized): oauth token has expired"
+    ));
+
+    // Generic 401 is not an org-policy error.
+    assert!(!is_oauth_org_policy_error(
+        "anthropic api error (401 unauthorized): invalid token"
+    ));
+
+    // 403 without the org-policy message is not an org-policy error.
+    assert!(!is_oauth_org_policy_error(
+        "anthropic api error (403 forbidden): insufficient permissions"
+    ));
+
+    // Network error is not an org-policy error.
+    assert!(!is_oauth_org_policy_error(
+        "failed to send request to anthropic api: connection reset"
+    ));
+}
+
+#[test]
+fn test_is_oauth_org_policy_error_not_triggered_by_200_body() {
+    // A successful response body containing "403" as page content is not an error.
+    assert!(!is_oauth_org_policy_error(
+        "http 200 ok with 403 bytes of content"
+    ));
+}
+
+#[test]
+fn test_catalog_classifier_excludes_org_policy_error() {
+    // The catalog path force-refreshes the token whenever this returns true.
+    // An org-policy 403 is not refreshable, so it must be excluded — otherwise
+    // the real cause is masked by a "failed to refresh token" error.
+    let org_policy = "Anthropic API error (403 Forbidden): {\"error\":{\"message\":\"OAuth authentication is currently not allowed for this organization.\"}}";
+    assert!(is_oauth_org_policy_error(&org_policy.to_lowercase()));
+    assert!(
+        !is_oauth_catalog_auth_error(org_policy),
+        "org-policy 403 must not trigger a pointless catalog token refresh"
+    );
+
+    // A plain 403/401 without the org-policy marker still triggers a refresh.
+    assert!(is_oauth_catalog_auth_error(
+        "Anthropic API error (403 Forbidden): insufficient permissions"
+    ));
+    assert!(is_oauth_catalog_auth_error(
+        "Anthropic API error (401 Unauthorized): oauth token has expired"
+    ));
+}

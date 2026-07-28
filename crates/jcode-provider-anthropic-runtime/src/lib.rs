@@ -1532,6 +1532,20 @@ async fn run_stream_with_retries(
                 // Anthropic API", and the retry classifier needs to see it.
                 let error_str = format!("{e:#}").to_lowercase();
 
+                // OAuth org-policy rejection: the org forbids OAuth entirely.
+                // This is not a refreshable token error; force-refreshing the token
+                // won't help because the organization itself does not allow OAuth.
+                // Surface a clear error immediately.
+                if is_oauth && is_oauth_org_policy_error(&error_str) {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "{}\n\nYour Claude OAuth access token was rejected by the organization's policy — this organization does not allow OAuth authentication.\n\nTo fix this:\n• Switch to a different OAuth account or organization that allows OAuth, or\n• Use an API key route instead (`jcode login --provider claude-api`).",
+                            e
+                        )))
+                        .await;
+                    return;
+                }
+
                 // OAuth auth failures: force refresh and retry once immediately.
                 if is_oauth && is_oauth_auth_error(&error_str) && !attempted_forced_refresh {
                     attempted_forced_refresh = true;
@@ -1654,7 +1668,14 @@ async fn run_stream_with_retries(
                 }
 
                 // Non-retryable or final attempt
-                if is_oauth && is_oauth_auth_error(&error_str) {
+                if is_oauth && is_oauth_org_policy_error(&error_str) {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "{}\n\nYour Claude OAuth access token was rejected by the organization's policy — this organization does not allow OAuth authentication.\n\nTo fix this:\n• Switch to a different OAuth account or organization that allows OAuth, or\n• Use an API key route instead (`jcode login --provider claude-api`).",
+                            e
+                        )))
+                        .await;
+                } else if is_oauth && is_oauth_auth_error(&error_str) {
                     let _ = tx
                         .send(Err(anyhow::anyhow!(
                             "{}\n\nClaude OAuth authentication failed. Run `jcode login --provider claude` (preferred) or `claude`, then retry.",
@@ -2114,8 +2135,25 @@ fn is_oauth_auth_error(error_str: &str) -> bool {
             && (error_str.contains("oauth") || error_str.contains("token")))
 }
 
+/// Detect the Anthropic "OAuth not allowed for this organization" 403.
+/// This is a non-retryable org-policy rejection — the org itself forbids OAuth
+/// authentication. Do NOT force-refresh the token; the access token is valid
+/// but the organization does not permit OAuth-based access.
+fn is_oauth_org_policy_error(error_str: &str) -> bool {
+    error_str.contains("403")
+        && (error_str.contains("oauth authentication is currently not allowed")
+            || error_str.contains("oauth_not_allowed_for_organization"))
+}
+
 fn is_oauth_catalog_auth_error(error_str: &str) -> bool {
     let lower = error_str.to_ascii_lowercase();
+    // An org-policy rejection is not refreshable: the token is valid, the
+    // organization simply forbids OAuth. Refreshing burns a round trip and,
+    // when no refresh token exists, replaces the real cause with a misleading
+    // "failed to refresh" error. Let the caller surface the original 403.
+    if is_oauth_org_policy_error(&lower) {
+        return false;
+    }
     lower.contains("401 unauthorized")
         || lower.contains("403 forbidden")
         || is_oauth_auth_error(&lower)
