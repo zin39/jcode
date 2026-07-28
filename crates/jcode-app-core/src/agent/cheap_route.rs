@@ -381,9 +381,22 @@ pub fn parse_recommended_model(text: &str, menu: &[CheapRouteCandidate]) -> Resu
 }
 
 /// Instruction asking the parent to split the task into difficulty-rated subtasks.
+///
+/// The independence requirement is stated explicitly and with an example,
+/// because "independent" alone was not enough: parents emitted chained
+/// subtasks referring to `{previous output}`, and each subtask prompt is sent
+/// verbatim to a worker in a FRESH session with no prior context, so the
+/// placeholder arrived unsubstituted and the worker answered by asking for the
+/// missing input. One good subtask followed by two confused ones is worse than
+/// a single self-contained subtask.
 pub fn build_decompose_prompt(task: &str) -> String {
     format!(
-        "Split the following coding task into the smallest independent subtasks. \
+        "Split the following coding task into the smallest SELF-CONTAINED subtasks. \
+Each subtask runs in a SEPARATE session with NO memory of the others and NO access \
+to their output, so every prompt must stand alone: repeat any file paths and context \
+it needs, and never refer to a previous subtask or use placeholders like \
+'{{previous output}}'. If a step genuinely needs an earlier step's result, merge them \
+into ONE subtask instead of splitting. Prefer fewer, complete subtasks. \
 For each subtask rate difficulty 1 (trivial/mechanical) to 5 (hard, needs a strong model). \
 Respond with ONLY a JSON array, no prose. Each element: \
 {{\"description\": string, \"prompt\": string, \"difficulty\": integer}}.\n\nTASK:\n{task}"
@@ -4044,5 +4057,40 @@ mod tests {
             classify_failure(&anyhow!("status: 500 internal server error")),
             BreakerFailureKind::Timeout
         );
+    }
+}
+
+#[cfg(test)]
+mod decompose_prompt_tests {
+    use super::build_decompose_prompt;
+
+    /// Each subtask prompt is sent verbatim to a worker in a FRESH session with
+    /// no prior context (see `run_subtask`, which passes `&subtask.prompt`
+    /// unchanged). A live run proved "independent" was too weak a word: the
+    /// parent emitted chained subtasks referencing `{previous output}`, the
+    /// placeholder was never substituted, and two of three workers replied by
+    /// asking for the missing input instead of doing the work.
+    #[test]
+    fn decompose_prompt_forbids_cross_subtask_references() {
+        let prompt = build_decompose_prompt("read a file and summarize it");
+
+        assert!(
+            prompt.contains("SELF-CONTAINED"),
+            "must demand self-contained subtasks, not merely 'independent'"
+        );
+        assert!(
+            prompt.contains("SEPARATE session"),
+            "must state WHY: each subtask runs with no memory of the others"
+        );
+        assert!(
+            prompt.contains("previous output"),
+            "must name the exact placeholder pattern that broke a real run"
+        );
+        assert!(
+            prompt.contains("merge them"),
+            "must give the fix for genuinely dependent steps, not just a ban"
+        );
+        // The task itself must still reach the parent.
+        assert!(prompt.contains("read a file and summarize it"));
     }
 }
