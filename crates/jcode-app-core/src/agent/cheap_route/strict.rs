@@ -84,6 +84,36 @@ pub(super) fn blackout_error(current_model: &str) -> anyhow::Error {
 mod strict_routing_tests {
     use super::{coordinator_is_allowed_as_last_resort, resolve_strong_model};
 
+    /// L4: a total cheap-route blackout must fail with an ACTIONABLE error.
+    ///
+    /// Regression guard for 70035ce0b, which made an empty ranking fall through
+    /// to "use the parent model" — so a drained balance or dead key silently
+    /// billed the frontier model and only surfaced on an invoice. The message
+    /// must name the model it refused to use and say how to change the policy,
+    /// otherwise the failure is just an unexplained stall.
+    #[test]
+    fn blackout_error_names_the_refused_model_and_the_escape_hatch() {
+        let err = super::blackout_error("claude-opus-4-8").to_string();
+        assert!(
+            err.contains("claude-opus-4-8"),
+            "must name the model it refused to escalate to: {err}"
+        );
+        assert!(
+            err.contains("NOT be escalated"),
+            "must state that escalation was refused, not merely that something failed: {err}"
+        );
+        assert!(
+            err.contains("cheap_route_strict"),
+            "must name the setting so the user can opt back into cascading: {err}"
+        );
+        // The three real causes seen live on this machine: 401 dead credential,
+        // 402 drained balance, 429 rate limit. The message should point at them
+        // rather than leaving the user to guess which provider broke.
+        for cause in ["dead credential", "drained balance", "rate limit"] {
+            assert!(err.contains(cause), "should mention {cause:?}: {err}");
+        }
+    }
+
     /// L2: with `cheap_route_strong_model` unset, the non-strict cascade promotes
     /// the coordinator into the strong tier — so every hard subtask bills the
     /// model you are chatting with. Strict mode must refuse that promotion.
