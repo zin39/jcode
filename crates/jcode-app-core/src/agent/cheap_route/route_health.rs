@@ -218,3 +218,78 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    /// Serialize the tests that touch the shared JCODE_HOME-backed cache.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct HomeGuard(Option<String>);
+    impl HomeGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let previous = std::env::var("JCODE_HOME").ok();
+            // SAFETY: guarded by LOCK so no other test reads the env concurrently.
+            unsafe { std::env::set_var("JCODE_HOME", dir) };
+            Self(previous)
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(home) => std::env::set_var("JCODE_HOME", home),
+                    None => std::env::remove_var("JCODE_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_quarantined_route_is_remembered_across_runs_and_cleared_on_success() {
+        let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempfile::tempdir().expect("temp dir");
+        let _home = HomeGuard::set(temp.path());
+
+        assert!(
+            quarantined().is_empty(),
+            "a fresh install starts with every route healthy"
+        );
+
+        quarantine("dead-model", "Invalid model id");
+
+        // The point of persisting: a *later* run (a fresh read of the file)
+        // must still skip the route instead of re-paying its timeout.
+        let seen = quarantined();
+        assert_eq!(seen.len(), 1, "the dead route survives into the next run");
+        assert!(
+            seen.get("dead-model")
+                .is_some_and(|reason| reason.contains("Invalid model id")),
+            "the reason is kept so a vanished model is explainable, got {seen:?}"
+        );
+
+        mark_healthy("dead-model");
+        assert!(
+            quarantined().is_empty(),
+            "a route that succeeds is trusted again immediately, not after the expiry"
+        );
+    }
+
+    #[test]
+    fn an_enormous_provider_error_does_not_bloat_the_cache() {
+        let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = tempfile::tempdir().expect("temp dir");
+        let _home = HomeGuard::set(temp.path());
+
+        quarantine("chatty-model", &"x".repeat(10_000));
+
+        let reason = quarantined()
+            .remove("chatty-model")
+            .expect("route was quarantined");
+        assert!(
+            reason.chars().count() <= 200,
+            "provider errors can be whole JSON bodies; the cache must stay small"
+        );
+    }
+}
