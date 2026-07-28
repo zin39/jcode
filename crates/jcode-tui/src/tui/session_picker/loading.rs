@@ -1707,6 +1707,13 @@ fn parse_jcode_session_info(
 }
 
 pub fn load_sessions() -> Result<Vec<SessionInfo>> {
+    // Sessions written before `agent_role` existed carry no classification, so
+    // without this the fix would only apply to newly created sessions and the
+    // user's list would stay buried under old machine-created work. The
+    // backfill is one-shot (guarded by an on-disk marker) and idempotent, so
+    // running it from the load path costs nothing on subsequent opens.
+    crate::session_role_backfill::backfill_session_roles();
+
     let sessions_dir = storage::jcode_dir()?.join("sessions");
     let scan_limit = session_scan_limit();
 

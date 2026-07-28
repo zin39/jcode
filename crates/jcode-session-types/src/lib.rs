@@ -1119,7 +1119,5 @@ pub fn session_is_internal_agent(
     parent_id: Option<&str>,
     is_debug: bool,
 ) -> bool {
-    agent_role.is_some()
-        || parent_id.is_some_and(|parent| !parent.trim().is_empty())
-        || is_debug
+    agent_role.is_some() || parent_id.is_some_and(|parent| !parent.trim().is_empty()) || is_debug
 }

@@ -2487,3 +2487,7 @@ pub fn pick_session() -> Result<Option<PickerResult>> {
 #[cfg(test)]
 #[path = "session_picker_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_picker/internal_session_tests.rs"]
+mod internal_session_tests;

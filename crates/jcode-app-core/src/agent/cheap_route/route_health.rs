@@ -61,23 +61,61 @@ fn load() -> RouteHealthFile {
     let Some(path) = path() else {
         return RouteHealthFile::default();
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return RouteHealthFile::default();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // A missing cache is the normal first-run state, not a problem.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return RouteHealthFile::default();
+        }
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "cheap-route health cache unreadable ({}); treating all routes as healthy: {err}",
+                path.display()
+            ));
+            return RouteHealthFile::default();
+        }
     };
-    // A corrupt cache must never break routing: fall back to "everything is
-    // healthy" and let the run re-learn.
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    match serde_json::from_slice(&bytes) {
+        Ok(file) => file,
+        Err(err) => {
+            // A corrupt cache must never break routing: fall back to
+            // "everything is healthy" and let the run re-learn. Say so, or a
+            // permanently unparseable cache silently disables the optimisation.
+            crate::logging::warn(&format!(
+                "cheap-route health cache is corrupt; re-learning route health: {err}"
+            ));
+            RouteHealthFile::default()
+        }
+    }
 }
 
 fn store(file: &RouteHealthFile) {
     let Some(path) = path() else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        crate::logging::warn(&format!(
+            "cannot create cheap-route health cache dir {}: {err}",
+            parent.display()
+        ));
+        return;
     }
-    if let Ok(json) = serde_json::to_vec_pretty(file) {
-        let _ = std::fs::write(&path, json);
+    let json = match serde_json::to_vec_pretty(file) {
+        Ok(json) => json,
+        Err(err) => {
+            crate::logging::warn(&format!("cannot serialize cheap-route health cache: {err}"));
+            return;
+        }
+    };
+    // Losing this cache only costs a slower next run, so a write failure is
+    // reported and tolerated rather than propagated into the routing path.
+    if let Err(err) = std::fs::write(&path, json) {
+        crate::logging::warn(&format!(
+            "cannot persist cheap-route health cache {}: {err}",
+            path.display()
+        ));
     }
 }
 
