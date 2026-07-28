@@ -1652,6 +1652,11 @@ fn parse_jcode_session_info(
         session.model.as_deref(),
     );
 
+    // Keep the raw stored title for role classification. The displayed title
+    // below falls back to derived text and finally the short name, none of
+    // which say anything about how the session was created.
+    let title_for_role = session.title.clone();
+    let parent_for_role = session.parent_id.clone();
     let title = session
         .custom_title
         .or_else(|| {
@@ -1686,7 +1691,20 @@ fn parse_jcode_session_info(
         provider_key: session.provider_key,
         is_canary: session.is_canary,
         is_debug: session.is_debug,
-        agent_role: session.agent_role,
+        // Sessions written before `agent_role` existed carry no
+        // classification. Derive it here from data this parse already
+        // produced, rather than migrating ~350MB of snapshots on first open:
+        // the rewrite made the first `/resume` stall for many seconds, which
+        // just trades one bad experience for another. The stored role always
+        // wins when present.
+        agent_role: session.agent_role.or_else(|| {
+            crate::session_legacy_role::classify_legacy_session(
+                parent_for_role.as_deref(),
+                title_for_role.as_deref(),
+                user_message_count,
+                session.saved,
+            )
+        }),
         saved: session.saved,
         save_label: session.save_label,
         category: session.category,
@@ -1707,13 +1725,6 @@ fn parse_jcode_session_info(
 }
 
 pub fn load_sessions() -> Result<Vec<SessionInfo>> {
-    // Sessions written before `agent_role` existed carry no classification, so
-    // without this the fix would only apply to newly created sessions and the
-    // user's list would stay buried under old machine-created work. The
-    // backfill is one-shot (guarded by an on-disk marker) and idempotent, so
-    // running it from the load path costs nothing on subsequent opens.
-    crate::session_role_backfill::backfill_session_roles();
-
     let sessions_dir = storage::jcode_dir()?.join("sessions");
     let scan_limit = session_scan_limit();
 

@@ -98,3 +98,79 @@ fn a_blank_parent_id_does_not_count_as_lineage() {
         "a blank parent_id is not lineage and must never hide a user's own session"
     );
 }
+
+#[test]
+fn legacy_sessions_without_a_stored_role_are_still_classified_on_load() {
+    // End-to-end cover for the pre-existing corpus: sessions written before
+    // `agent_role` existed have `None` on disk, and must still be recognised
+    // as machine-created when the picker loads them. Without this the fix
+    // would only apply to newly created sessions.
+    let _env_lock = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let previous_home = std::env::var("JCODE_HOME").ok();
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let push_user = |session: &mut Session, id: &str, text: &str| {
+        session.append_stored_message(crate::session::StoredMessage {
+            id: id.to_string(),
+            role: crate::message::Role::User,
+            content: vec![crate::message::ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+            display_role: None,
+            timestamp: None,
+            tool_duration_ms: None,
+            token_usage: None,
+        });
+    };
+
+    // A one-shot agent run: single user turn, no stored role.
+    let mut one_shot = Session::create_with_id("session_legacy_oneshot".to_string(), None, None);
+    push_user(
+        &mut one_shot,
+        "m1",
+        "Reply with exactly the two characters: OK",
+    );
+    assert!(
+        one_shot.agent_role.is_none(),
+        "fixture must reproduce the legacy on-disk shape: no stored role"
+    );
+    one_shot.save().expect("save one-shot session");
+
+    // A real conversation: the user replied, so it stays resumable.
+    let mut conversation =
+        Session::create_with_id("session_legacy_conversation".to_string(), None, None);
+    push_user(&mut conversation, "m1", "help me fix the build");
+    push_user(&mut conversation, "m2", "still broken, try again");
+    conversation.save().expect("save conversation");
+
+    invalidate_session_list_cache();
+    let sessions = load_sessions().expect("load sessions");
+
+    let loaded_one_shot = sessions
+        .iter()
+        .find(|session| session.id == "session_legacy_oneshot")
+        .expect("one-shot session should still be loaded, just hidden");
+    let loaded_conversation = sessions
+        .iter()
+        .find(|session| session.id == "session_legacy_conversation")
+        .expect("conversation should load");
+    let one_shot_hidden = loaded_one_shot.is_internal_agent_session();
+    let conversation_visible = !loaded_conversation.is_internal_agent_session();
+
+    match previous_home {
+        Some(home) => crate::env::set_var("JCODE_HOME", home),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    invalidate_session_list_cache();
+
+    assert!(
+        one_shot_hidden,
+        "a legacy single-turn run must be recognised as machine-created without a stored role"
+    );
+    assert!(
+        conversation_visible,
+        "a session the user replied in must remain visible in the resume list"
+    );
+}

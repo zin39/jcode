@@ -580,7 +580,8 @@ fn load_sessions_includes_saved_sessions_beyond_scan_limit() {
 
     let mut saved_session = Session::create_with_id(
         "session_saved_beyond_scan_limit".to_string(),
-        Some("/tmp/saved-beyond-scan".to_string()),
+        // No parent: this stands in for a top-level session the user saved.
+        None,
         Some("Saved Beyond Scan".to_string()),
     );
     saved_session.mark_saved(Some("Pinned Session".to_string()));
