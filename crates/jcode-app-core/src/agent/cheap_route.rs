@@ -10,6 +10,8 @@ use futures::future::join_all;
 use jcode_provider_core::ModelRoute;
 use jcode_provider_core::selection::{CheapRouteCandidate, rank_routes_by_cost};
 
+pub mod bus_progress;
+mod route_health;
 mod strict;
 use serde::Deserialize;
 use strict::{blackout_error, coordinator_is_allowed_as_last_resort, strong_model_or_empty};
@@ -77,6 +79,26 @@ impl RouteBreaker {
         Self {
             map: std::collections::HashMap::new(),
         }
+    }
+
+    /// Start with routes an earlier run condemned as misconfigured.
+    ///
+    /// Only persisted *config* failures arrive here (see `route_health`), so
+    /// pre-tripping them is safe: they are deterministic provider rejections,
+    /// not transient slowness. This is what stops every run re-paying the
+    /// timeout cost of a model the provider has removed.
+    fn with_known_dead(dead: std::collections::HashMap<String, String>) -> Self {
+        let mut breaker = Self::new();
+        for model in dead.into_keys() {
+            breaker.map.insert(
+                model,
+                RouteBreakerState {
+                    consecutive_failures: 1,
+                    last_failure_kind: Some(BreakerFailureKind::ConfigError),
+                },
+            );
+        }
+        breaker
     }
 
     /// Record a failure for `route_key` (model name). Returns `true` if
@@ -652,7 +674,10 @@ pub async fn run_cheap_route(
     //    A run-scoped circuit breaker skips routes that repeatedly fail across
     //    subtasks so dead routes (e.g. product-not-activated, persistent timeouts)
     //    don't waste a full timeout on every subtask.
-    let mut breaker = RouteBreaker::new();
+    // Seed the breaker with routes an earlier run already proved dead, so a
+    // permanently misconfigured model is not re-probed (and re-timed-out) on
+    // every invocation. Successful routes clear themselves below.
+    let mut breaker = RouteBreaker::with_known_dead(route_health::quarantined());
     let mut results = Vec::with_capacity(subtasks.len());
     for (subtask_index, subtask) in subtasks.iter().enumerate() {
         // Gold mode: run a multi-model debate on a HARD REASONING subtask
@@ -737,11 +762,20 @@ pub async fn run_cheap_route(
             .await;
             match attempt {
                 Ok(Ok(output)) => {
+                    // The route works: retire any stale quarantine immediately
+                    // rather than making a recovered model wait out the expiry.
+                    route_health::mark_healthy(model);
                     chosen = Some((model.to_string(), api_method.clone(), output));
                     break;
                 }
                 Ok(Err(err)) => {
                     let kind = classify_failure(&err);
+                    if kind == BreakerFailureKind::ConfigError {
+                        // Deterministic provider rejection: remember it so the
+                        // next run skips this route instead of paying the same
+                        // failure again.
+                        route_health::quarantine(model, &err.to_string());
+                    }
                     let tripped = breaker.record_failure(model, kind);
                     let suffix = if tripped {
                         " (circuit breaker tripped)"

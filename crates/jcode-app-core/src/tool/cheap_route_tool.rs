@@ -74,7 +74,22 @@ impl Tool for CheapRouteTool {
         );
         let gold_k = crate::config::config().agents.cheap_route_gold_k;
 
-        let reporter = Arc::new(SidePanelDebateReporter::new(ctx.session_id.clone()));
+        // Drive both surfaces: the side panel keeps the detailed live tail,
+        // while the bus reporter puts per-subtask rows inline where the user is
+        // already looking. Previously only the side panel was fed, so a run
+        // that took minutes rendered as a frozen UI with no way to tell
+        // progress from a hang.
+        let reporter = Arc::new(crate::agent::cheap_route::bus_progress::MultiReporter::new(
+            vec![
+                Arc::new(SidePanelDebateReporter::new(ctx.session_id.clone())),
+                Arc::new(
+                    crate::agent::cheap_route::bus_progress::BusProgressReporter::new(
+                        ctx.session_id.clone(),
+                        ctx.tool_call_id.clone(),
+                    ),
+                ),
+            ],
+        ));
         let backend = ProviderCheapBackend::new(self.provider.clone(), self.registry.clone())
             .with_gold(gold_mode, gold_k)
             .with_reporter(reporter);

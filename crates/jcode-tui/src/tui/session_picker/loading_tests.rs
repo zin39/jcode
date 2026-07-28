@@ -601,7 +601,7 @@ fn load_sessions_includes_saved_sessions_beyond_scan_limit() {
     for idx in 0..55 {
         let mut session = Session::create_with_id(
             format!("session_newer_unsaved_{idx:03}"),
-            Some(format!("/tmp/newer-unsaved-{idx:03}")),
+            None,
             Some(format!("Newer Unsaved {idx:03}")),
         );
         session.append_stored_message(crate::session::StoredMessage {
@@ -994,7 +994,7 @@ fn benchmark_resume_loading_reports_timings() {
     for idx in 0..120 {
         let mut session = Session::create_with_id(
             format!("session_resume_bench_{idx:03}"),
-            Some(format!("/tmp/resume-bench-{idx:03}")),
+            None,
             Some(format!("Resume Bench {idx:03}")),
         );
         session.append_stored_message(crate::session::StoredMessage {
@@ -1127,7 +1127,7 @@ fn parallel_fill_skips_many_recent_empty_sessions_to_reach_scan_limit() {
     for idx in 0..200 {
         let mut session = Session::create_with_id(
             format!("session_empty_{}", 1_790_000_000_000u64 + idx as u64),
-            Some(format!("/tmp/empty-{idx:03}")),
+            None,
             Some(format!("Empty {idx:03}")),
         );
         session.save().expect("save empty session");
@@ -1137,7 +1137,7 @@ fn parallel_fill_skips_many_recent_empty_sessions_to_reach_scan_limit() {
     for idx in 0..60 {
         let mut session = Session::create_with_id(
             format!("session_full_{}", 1_780_000_000_000u64 + idx as u64),
-            Some(format!("/tmp/full-{idx:03}")),
+            None,
             Some(format!("Full {idx:03}")),
         );
         push_message(&mut session, &format!("real content {idx:03}"));
@@ -1189,7 +1189,7 @@ fn hidden_debug_sessions_do_not_consume_default_resume_budget() {
     for idx in 0..60 {
         let mut session = Session::create_with_id(
             format!("session_regular_{}", 1_780_000_000_000u64 + idx as u64),
-            Some(format!("/tmp/regular-{idx:03}")),
+            None,
             Some(format!("Regular {idx:03}")),
         );
         session.is_debug = false;
@@ -1204,7 +1204,7 @@ fn hidden_debug_sessions_do_not_consume_default_resume_budget() {
     for idx in 0..75 {
         let mut session = Session::create_with_id(
             format!("session_debug_{}", 1_790_000_000_000u64 + idx as u64),
-            Some(format!("/tmp/debug-{idx:03}")),
+            None,
             Some(format!("Debug {idx:03}")),
         );
         session.is_debug = true;

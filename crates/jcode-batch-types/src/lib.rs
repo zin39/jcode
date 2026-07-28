@@ -2,7 +2,7 @@ use jcode_message_types::ToolCall;
 use serde::{Deserialize, Serialize};
 
 /// Progress update from a running batch tool call
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchSubcallState {
     Running,
