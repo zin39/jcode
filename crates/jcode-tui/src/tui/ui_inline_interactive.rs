@@ -981,7 +981,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
 
     // Add footer hint line for model picker (not account picker)
     if !is_account_picker && picker.kind == crate::tui::PickerKind::Model && !lines.is_empty() {
-        let footer_hint = " ←/→ effort · Tab route · Enter select ";
+        let footer_hint = " ←/→ effort · header ←/→ expand/collapse · Tab route · Enter select ";
         lines.push(Line::from(Span::styled(
             footer_hint,
             Style::default().fg(rgb(80, 80, 100)).italic(),

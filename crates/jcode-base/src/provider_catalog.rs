@@ -422,8 +422,9 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
             push("kimi-for-coding");
             push("kimi-k2.5");
             push("kimi-k2.6");
-            push("kimi-k2-thinking");
-            push("kimi-k2-thinking-turbo");
+            push("kimi-k2.7-code");
+            push("kimi-k2.7-code-highspeed");
+            push("kimi-k3");
         }
         "firmware" => {
             push("kimi-k2.5");
@@ -444,9 +445,9 @@ pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile)
         "moonshotai" => {
             push("kimi-k2.5");
             push("kimi-k2.6");
-            push("kimi-k2-thinking");
-            push("kimi-k2-thinking-turbo");
-            push("kimi-k2-turbo-preview");
+            push("kimi-k2.7-code");
+            push("kimi-k2.7-code-highspeed");
+            push("kimi-k3");
         }
         "nebius" => {
             push("openai/gpt-oss-120b");

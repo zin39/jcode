@@ -1655,12 +1655,32 @@ impl InlineInteractiveState {
     /// unreachable in the picker even though their models had loaded.
     fn row_is_selectable(&self, pos: usize) -> bool {
         match self.display_rows.get(pos) {
-            Some(PickerDisplayRow::ProviderHeader { provider, .. }) => {
-                self.collapse_state.is_collapsed(provider)
-            }
+            // Provider headers are always selectable so users can expand or
+            // collapse the group from the header row.
+            Some(PickerDisplayRow::ProviderHeader { .. }) => true,
             Some(row) => !row.is_header(),
             None => false,
         }
+    }
+
+    /// Find the next entry (non-header) display row after `from`.
+    pub fn next_entry_row(&self, from: usize) -> Option<usize> {
+        (from.saturating_add(1)..self.display_rows.len()).find(|&pos| {
+            matches!(
+                self.display_rows.get(pos),
+                Some(PickerDisplayRow::Entry { .. })
+            )
+        })
+    }
+
+    /// Find the previous entry (non-header) display row before `from`.
+    pub fn prev_entry_row(&self, from: usize) -> Option<usize> {
+        (0..from).rev().find(|&pos| {
+            matches!(
+                self.display_rows.get(pos),
+                Some(PickerDisplayRow::Entry { .. })
+            )
+        })
     }
 
     /// Find the next selectable row from the current position.
@@ -1975,8 +1995,8 @@ mod tests {
             "reverse navigation should find a selectable row"
         );
 
-        // Once expanded the header stops absorbing the selection, because its
-        // entries are reachable directly beneath it.
+        // Once expanded the header remains selectable so users can navigate
+        // back to it and collapse the group.
         picker.collapse_state.expand("siliconflow");
         picker.rebuild_display_rows();
         let expanded_header = picker
@@ -1992,8 +2012,90 @@ mod tests {
             })
             .any(|row| row == expanded_header);
         assert!(
-            !landed_on_expanded_header,
-            "expanded headers should stay skippable"
+            landed_on_expanded_header,
+            "expanded provider headers should be selectable so they can be collapsed"
+        );
+    }
+
+    /// Regression: provider groups must be both expandable and collapsible.
+    /// After expanding a collapsed group the header must stay selectable so the
+    /// user can navigate back to it and collapse it again.
+    #[test]
+    fn provider_group_can_be_expanded_and_then_collapsed() {
+        use super::{InlineInteractiveState, PickerAction, PickerDisplayRow, PickerEntry};
+
+        let grouped_entry = |name: &str, group: &str| PickerEntry {
+            name: name.to_string(),
+            action: PickerAction::Model,
+            provider_group: Some(group.to_string()),
+            ..Default::default()
+        };
+        let mut picker = InlineInteractiveState {
+            kind: super::PickerKind::Model,
+            entries: vec![
+                grouped_entry("anthropic/claude-sonnet-4", "auto"),
+                grouped_entry("Qwen/Qwen2.5-72B-Instruct", "siliconflow"),
+                grouped_entry("Qwen/Qwen2.5-7B-Instruct", "siliconflow"),
+            ],
+            filtered: vec![0, 1, 2],
+            selected: 0,
+            column: 0,
+            filter: String::new(),
+            preview: false,
+            display_rows: Vec::new(),
+            collapse_state: super::CollapseState::default(),
+        };
+        picker.collapse_state.collapse("siliconflow");
+        picker.rebuild_display_rows();
+
+        let header_row = picker
+            .display_rows
+            .iter()
+            .position(|row| {
+                matches!(row, PickerDisplayRow::ProviderHeader { provider, .. } if provider == "siliconflow")
+            })
+            .expect("collapsed group should render its header");
+        assert!(
+            picker.row_is_selectable(header_row),
+            "collapsed header must be selectable"
+        );
+
+        // Expand the group
+        picker.collapse_state.expand("siliconflow");
+        picker.rebuild_display_rows();
+
+        let header_row = picker
+            .display_rows
+            .iter()
+            .position(|row| {
+                matches!(row, PickerDisplayRow::ProviderHeader { provider, .. } if provider == "siliconflow")
+            })
+            .expect("expanded group should still render its header");
+        assert!(
+            picker.row_is_selectable(header_row),
+            "expanded header must also be selectable so it can be collapsed"
+        );
+
+        // Entries are now visible
+        let entry_count = picker
+            .display_rows
+            .iter()
+            .filter(|row| matches!(row, PickerDisplayRow::Entry { .. }))
+            .count();
+        assert_eq!(entry_count, 3, "expanded group should show all entries");
+
+        // Collapse the group back
+        picker.collapse_state.collapse("siliconflow");
+        picker.rebuild_display_rows();
+
+        let entry_count = picker
+            .display_rows
+            .iter()
+            .filter(|row| matches!(row, PickerDisplayRow::Entry { .. }))
+            .count();
+        assert_eq!(
+            entry_count, 1,
+            "collapsed group should hide its entries again"
         );
     }
 

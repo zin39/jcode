@@ -1114,6 +1114,33 @@ fn open_weight_family_context_limits_match_published_windows() {
 }
 
 #[test]
+fn moonshotai_static_models_have_no_retired_ids() {
+    let profile = jcode_provider_metadata::openai_compatible_profiles()
+        .iter()
+        .find(|profile| profile.id == "moonshotai")
+        .expect("moonshotai profile must exist");
+    let models = openai_compatible_profile_static_models(*profile);
+    let retired: &[&str] = &[
+        "kimi-k2-thinking",
+        "kimi-k2-thinking-turbo",
+        "kimi-k2-turbo-preview",
+    ];
+    for id in retired {
+        assert!(
+            !models.contains(&id.to_string()),
+            "moonshotai static models must not include retired id {id}"
+        );
+    }
+    // Ensure the currently-served replacements are present.
+    for id in &["kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k3"] {
+        assert!(
+            models.contains(&id.to_string()),
+            "moonshotai static models must include {id}"
+        );
+    }
+}
+
+#[test]
 fn minimax_default_provider_applies_openai_api_key_env_not_openrouter() {
     // Regression for #407: `default_provider = "minimax"` (the built-in MiniMax
     // profile) must resolve credentials from the profile's documented

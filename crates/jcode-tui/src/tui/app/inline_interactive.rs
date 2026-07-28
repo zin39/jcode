@@ -1048,8 +1048,12 @@ impl App {
             // Preselect the current model row, expanding its group if needed
             preselect_current_model_entry(picker);
             // Fallback: ensure selected points to a selectable entry, not a header
-            if !picker.display_rows.is_empty() && picker.display_rows[0].is_header() {
-                if let Some(first_entry) = picker.next_selectable_row(0) {
+            if picker
+                .display_rows
+                .get(picker.selected)
+                .is_some_and(|r| r.is_header())
+            {
+                if let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header()) {
                     picker.selected = first_entry;
                 }
             }
@@ -2040,8 +2044,12 @@ impl App {
             // Preselect the current model row, expanding its group if needed
             preselect_current_model_entry(picker);
             // Fallback: ensure selected points to a selectable entry, not a header
-            if !picker.display_rows.is_empty() && picker.display_rows[0].is_header() {
-                if let Some(first_entry) = picker.next_selectable_row(0) {
+            if picker
+                .display_rows
+                .get(picker.selected)
+                .is_some_and(|r| r.is_header())
+            {
+                if let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header()) {
                     picker.selected = first_entry;
                 }
             }
@@ -3967,16 +3975,14 @@ impl App {
         picker.rebuild_display_rows();
 
         // Ensure selected row is a selectable entry (not a header)
-        if !picker.display_rows.is_empty() {
-            let current_row = picker.selected;
-            if let Some(row) = picker.display_rows.get(current_row) {
-                if row.is_header() {
-                    // Try to find next selectable row
-                    if let Some(next) = picker.next_selectable_row(current_row) {
-                        picker.selected = next;
-                    } else if let Some(prev) = picker.prev_selectable_row(current_row) {
-                        picker.selected = prev;
-                    }
+        let current_row = picker.selected;
+        if let Some(row) = picker.display_rows.get(current_row) {
+            if row.is_header() {
+                // Try to find next entry row
+                if let Some(next) = picker.next_entry_row(current_row) {
+                    picker.selected = next;
+                } else if let Some(prev) = picker.prev_entry_row(current_row) {
+                    picker.selected = prev;
                 }
             }
         }
