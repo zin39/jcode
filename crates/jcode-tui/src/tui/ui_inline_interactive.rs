@@ -207,34 +207,26 @@ fn format_effort_ladder(
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     if is_row_selected {
-        // Focused row: show full ladder with selected effort bracketed and highlighted
-        let selected_effort = entry.effort.as_deref().unwrap_or("");
+        // Focused row: show only the current effort between chevrons, e.g. `‹ high ›`.
+        //
+        // Rendering the whole ladder inline needed 30+ columns, so on real
+        // terminal widths it was truncated mid-list ("‹none min") and the
+        // selected value was often in the clipped region — leaving no way to
+        // see what Left/Right had actually selected. Only one value is ever
+        // active, and the chevrons already advertise that arrows cycle it.
+        let selected_effort = entry
+            .effort
+            .as_deref()
+            .or(entry.available_efforts.first().map(String::as_str))
+            .unwrap_or("");
 
         spans.push(Span::styled("  ", Style::default()));
-        spans.push(Span::styled("‹", Style::default().fg(dim_color())));
-
-        for (i, effort) in entry.available_efforts.iter().enumerate() {
-            // Add space separator between efforts
-            if i > 0 {
-                spans.push(Span::styled(" ", Style::default().fg(dim_color())));
-            }
-
-            let is_selected = effort == selected_effort;
-            let label = short_effort_label(effort);
-
-            if is_selected {
-                // Selected effort: bracketed like [med] with accent color
-                spans.push(Span::styled(
-                    format!("[{}]", label),
-                    Style::default().fg(rgb(255, 200, 100)).bold(),
-                ));
-            } else {
-                // Unselected efforts are dim, no brackets
-                spans.push(Span::styled(label, Style::default().fg(dim_color())));
-            }
-        }
-
-        spans.push(Span::styled("›", Style::default().fg(dim_color())));
+        spans.push(Span::styled("‹ ", Style::default().fg(dim_color())));
+        spans.push(Span::styled(
+            short_effort_label(selected_effort),
+            Style::default().fg(rgb(255, 200, 100)).bold(),
+        ));
+        spans.push(Span::styled(" ›", Style::default().fg(dim_color())));
     } else {
         // Unfocused row: just show the selected effort dimly
         if let Some(ref effort) = entry.effort {
@@ -1012,21 +1004,37 @@ mod tests {
     }
 
     #[test]
-    fn effort_ladder_brackets_selected_effort_on_focused_row() {
+    fn effort_ladder_shows_only_the_selected_effort_and_stays_narrow() {
         let mut picker = sample_picker();
         picker.entries[0].available_efforts = vec![
             "none".to_string(),
-            "low".to_string(),
+            "minimal".to_string(),
             "medium".to_string(),
             "high".to_string(),
+            "xhigh".to_string(),
         ];
         picker.entries[0].effort = Some("medium".to_string());
 
-        // Only the focused row brackets the selected effort.
+        // The focused row shows the selected value and nothing else: rendering
+        // every option overflowed the column and clipped the actual selection.
         let focused = effort_ladder_text(&picker.entries[0], true);
-        assert!(focused.contains("[med]"), "focused row: {focused}");
-        let unfocused = effort_ladder_text(&picker.entries[0], false);
-        assert!(!unfocused.contains('['), "unfocused row: {unfocused}");
+        assert!(focused.contains("med"), "focused row: {focused}");
+        for other in ["none", "min", "high", "xhigh"] {
+            assert!(
+                !focused.contains(other),
+                "focused row should not list `{other}`, got: {focused}"
+            );
+        }
+        assert!(
+            focused.chars().count() <= 12,
+            "ladder must stay narrow enough to never clip, got {} chars: {focused}",
+            focused.chars().count()
+        );
+
+        // Cycling to another effort updates the visible value.
+        picker.entries[0].effort = Some("xhigh".to_string());
+        let cycled = effort_ladder_text(&picker.entries[0], true);
+        assert!(cycled.contains("xhigh"), "after cycling: {cycled}");
     }
 
     #[test]

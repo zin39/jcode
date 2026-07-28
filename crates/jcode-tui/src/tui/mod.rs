@@ -1645,35 +1645,34 @@ impl InlineInteractiveState {
         self.display_rows = rows;
     }
 
-    /// Find the next selectable row (non-header) from current position.
-    /// Returns the display row index or None if at end.
-    pub fn next_selectable_row(&self, from: usize) -> Option<usize> {
-        let mut pos = from.saturating_add(1);
-        while pos < self.display_rows.len() {
-            if !self.display_rows[pos].is_header() {
-                return Some(pos);
+    /// Whether a display row can hold the selection.
+    ///
+    /// Entry rows are always selectable. Headers normally are not, because
+    /// their contents are already reachable directly below them. A *collapsed*
+    /// provider header is the exception: it contributes no entry rows at all,
+    /// so if it were skipped the group could never be selected, and therefore
+    /// never expanded with Right. That made configured providers permanently
+    /// unreachable in the picker even though their models had loaded.
+    fn row_is_selectable(&self, pos: usize) -> bool {
+        match self.display_rows.get(pos) {
+            Some(PickerDisplayRow::ProviderHeader { provider, .. }) => {
+                self.collapse_state.is_collapsed(provider)
             }
-            pos += 1;
+            Some(row) => !row.is_header(),
+            None => false,
         }
-        None
     }
 
-    /// Find the previous selectable row (non-header) from current position.
+    /// Find the next selectable row from the current position.
+    /// Returns the display row index or None if at end.
+    pub fn next_selectable_row(&self, from: usize) -> Option<usize> {
+        (from.saturating_add(1)..self.display_rows.len()).find(|&pos| self.row_is_selectable(pos))
+    }
+
+    /// Find the previous selectable row from the current position.
     /// Returns the display row index or None if at start.
     pub fn prev_selectable_row(&self, from: usize) -> Option<usize> {
-        if from == 0 {
-            return None;
-        }
-        let mut pos = from.saturating_sub(1);
-        loop {
-            if !self.display_rows[pos].is_header() {
-                return Some(pos);
-            }
-            if pos == 0 {
-                return None;
-            }
-            pos -= 1;
-        }
+        (0..from).rev().find(|&pos| self.row_is_selectable(pos))
     }
 
     /// Get the entry index for a display row, if it's an Entry row.
@@ -1906,6 +1905,96 @@ mod tests {
             cold_for_secs: 90,
             cached_tokens: Some(12_000),
         }
+    }
+
+    /// A collapsed provider group contributes only its header row. If
+    /// navigation skipped headers unconditionally the selection could never
+    /// land on it, so Right could never expand it and every model inside was
+    /// unreachable even though it had loaded.
+    #[test]
+    fn collapsed_provider_headers_are_reachable_by_navigation() {
+        use super::{InlineInteractiveState, PickerAction, PickerDisplayRow, PickerEntry};
+
+        let grouped_entry = |name: &str, group: &str| PickerEntry {
+            name: name.to_string(),
+            action: PickerAction::Model,
+            provider_group: Some(group.to_string()),
+            ..Default::default()
+        };
+        let mut picker = InlineInteractiveState {
+            kind: super::PickerKind::Model,
+            entries: vec![
+                grouped_entry("anthropic/claude-sonnet-4", "auto"),
+                grouped_entry("Qwen/Qwen2.5-72B-Instruct", "siliconflow"),
+            ],
+            filtered: vec![0, 1],
+            selected: 0,
+            column: 0,
+            filter: String::new(),
+            preview: false,
+            display_rows: Vec::new(),
+            collapse_state: super::CollapseState::default(),
+        };
+        picker.collapse_state.collapse("siliconflow");
+        picker.rebuild_display_rows();
+
+        // The collapsed group renders a header but no entry rows.
+        let header_row = picker
+            .display_rows
+            .iter()
+            .position(|row| {
+                matches!(row, PickerDisplayRow::ProviderHeader { provider, .. } if provider == "siliconflow")
+            })
+            .expect("collapsed group should still render its header");
+        assert!(
+            picker.entry_index_for_display_row(header_row).is_none(),
+            "collapsed group should contribute no entry rows"
+        );
+
+        // Walking down from the top must be able to land on that header.
+        let mut pos = picker.next_selectable_row(0).or(Some(0));
+        let mut reached = false;
+        while let Some(current) = pos {
+            if current == header_row {
+                reached = true;
+                break;
+            }
+            pos = picker.next_selectable_row(current);
+        }
+        assert!(
+            reached,
+            "collapsed provider header must be reachable, rows: {:?}",
+            picker.display_rows
+        );
+
+        // And walking back up from the end must reach it too.
+        assert!(
+            picker
+                .prev_selectable_row(picker.display_rows.len())
+                .is_some(),
+            "reverse navigation should find a selectable row"
+        );
+
+        // Once expanded the header stops absorbing the selection, because its
+        // entries are reachable directly beneath it.
+        picker.collapse_state.expand("siliconflow");
+        picker.rebuild_display_rows();
+        let expanded_header = picker
+            .display_rows
+            .iter()
+            .position(|row| {
+                matches!(row, PickerDisplayRow::ProviderHeader { provider, .. } if provider == "siliconflow")
+            })
+            .expect("expanded group still has a header");
+        let landed_on_expanded_header =
+            std::iter::successors(picker.next_selectable_row(0), |&current| {
+                picker.next_selectable_row(current)
+            })
+            .any(|row| row == expanded_header);
+        assert!(
+            !landed_on_expanded_header,
+            "expanded headers should stay skippable"
+        );
     }
 
     #[test]
