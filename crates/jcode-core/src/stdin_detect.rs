@@ -222,19 +222,13 @@ mod macos {
             buffer: *mut libc::c_void,
             buffersize: i32,
         ) -> i32;
-        fn proc_pidfdinfo(
-            pid: i32,
-            fd: i32,
-            flavor: i32,
-            buffer: *mut libc::c_void,
-            buffersize: i32,
-        ) -> i32;
     }
 
     const PROC_PIDLISTFDS: i32 = 1;
-    const PROC_PIDFDVNODEPATHINFO: i32 = 2;
-    const PROC_PIDFDSOCKETINFO: i32 = 3;
-    const PROC_PIDFDPIPEINFO: i32 = 6;
+    /// `proc_fdtype` values from `sys/proc_info.h`. Used below to classify fd 0
+    /// by name instead of by magic number.
+    const PROX_FDTYPE_VNODE: u32 = 1;
+    const PROX_FDTYPE_PIPE: u32 = 6;
 
     #[repr(C)]
     struct proc_fdinfo {
@@ -306,8 +300,8 @@ mod macos {
         // Check if fd 0 exists and is a pipe or vnode (pty)
         for fd in fds {
             if fd.proc_fd == 0 {
-                // fd type 1 = vnode (could be pty), 6 = pipe
-                return fd.proc_fdtype == 1 || fd.proc_fdtype == 6;
+                // A vnode here is typically a pty; a pipe means piped stdin.
+                return fd.proc_fdtype == PROX_FDTYPE_VNODE || fd.proc_fdtype == PROX_FDTYPE_PIPE;
             }
         }
 

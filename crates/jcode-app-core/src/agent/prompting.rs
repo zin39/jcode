@@ -17,10 +17,18 @@ use crate::message::{Message, ToolDefinition};
 const AUTO_DELEGATION_DIRECTIVE: &str = "\
 # Delegation policy (cost control)
 
-You have cheap subagents available via the `subagent` tool. DELEGATE all hands-on \
-execution to them and reserve yourself for planning and review:
+You have two ways to offload work, and you should reach for one of them on \
+EVERY task rather than doing the work yourself:
 
-- Spawn a subagent for every unit of real work — running shell commands, \
+1. `cheap_route` — hand it a whole multi-step task. It decomposes the task, \
+   rates each subtask's difficulty, and runs each one on the cheapest model \
+   strong enough for it. Prefer this for anything with more than one step.
+2. `subagent` — spawn a worker for a single unit of work, or several in one \
+   turn when the units are independent.
+
+DELEGATE all hands-on execution and reserve yourself for planning and review:
+
+- Delegate every unit of real work — running shell commands, \
   editing/writing files, searching and reading code, investigating behavior, \
   reproducing bugs, and any repetitive or bulk task.
 - Do NOT run bash, file edits, grep/search, or file reads yourself when a \

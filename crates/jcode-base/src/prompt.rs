@@ -235,14 +235,6 @@ pub(crate) fn build_skills_section(available_skills: &[SkillInfo], max_chars: us
         })
         .collect();
 
-    // Precompute names-only overflow line cost (all skill names).
-    let all_names: String = available_skills
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let full_overflow_cost = overflow_prefix.len() + all_names.len() + footer.len();
-
     // Greedily add skill lines while they fit (with footer reserved).
     let mut included = 0usize;
     for (idx, (skill, desc)) in available_skills.iter().zip(truncated.iter()).enumerate() {
