@@ -8,6 +8,36 @@ lives somewhere the naive search did not look.
 
 If you are debugging "does provider X have a credential?", read this first.
 
+## Where credentials live
+
+**All secrets live in one directory**, referred to below as `<config>`:
+
+| Platform | `<config>` |
+|----------|------------|
+| macOS    | `~/Library/Application Support/jcode/` |
+| Linux    | `~/.config/jcode/` (XDG `$XDG_CONFIG_HOME/jcode/`) |
+| Windows  | `%APPDATA%\jcode\` |
+
+This covers **both** API-key `*.env` files and OAuth token JSON. `~/.jcode/`
+remains jcode's home for everything that is *not* a secret: `config.toml`,
+`logs/`, and `builds/`.
+
+Credentials used to be split by type, with `*.env` keys in `<config>` and OAuth
+JSON in `~/.jcode/`, which meant "where are my credentials?" had two answers
+depending on how you logged in. OAuth files now resolve to `<config>` as well.
+
+To see the resolved location on your machine, don't guess:
+
+```sh
+jcode auth doctor | head -2
+# credentials dir: /Users/you/Library/Application Support/jcode
+```
+
+Existing installs need no action. An OAuth file found only in the old location
+is **copied** forward on first read, and the original is deliberately **kept**:
+downgrading to an older jcode, which reads only `~/.jcode/`, would otherwise
+report your credentials as missing. Expect both copies to exist for a while.
+
 ## The two "dual-auth" providers: Anthropic and OpenAI
 
 Anthropic/Claude and OpenAI each support **two completely independent credential
@@ -15,9 +45,9 @@ paths**, surfaced as **two separate login providers**:
 
 | Concept            | Login provider id | Auth kind | Where the credential lives                                  |
 |--------------------|-------------------|-----------|-------------------------------------------------------------|
-| Claude, OAuth/sub  | `claude`          | OAuth     | `~/.jcode/auth.json` → `anthropic_accounts[].access` (`sk-ant-oat...`) |
+| Claude, OAuth/sub  | `claude`          | OAuth     | `<config>/auth.json` → `anthropic_accounts[].access` (`sk-ant-oat...`) |
 | Claude, API key    | `anthropic-api`   | API key   | `ANTHROPIC_API_KEY` env **or** `~/.config/jcode/anthropic.env`         |
-| OpenAI, OAuth      | `openai`          | OAuth     | `~/.jcode/openai-auth.json` (Codex/ChatGPT login)            |
+| OpenAI, OAuth      | `openai`          | OAuth     | `<config>/openai-auth.json` (Codex/ChatGPT login)            |
 | OpenAI, API key    | `openai-api`      | API key   | `OPENAI_API_KEY` env **or** `~/.config/jcode/openai.env`     |
 
 Key facts that trip people up:
@@ -29,7 +59,7 @@ Key facts that trip people up:
   store is `~/.config/jcode/anthropic.env` (XDG `$XDG_CONFIG_HOME/jcode/anthropic.env`),
   written by `jcode login --provider anthropic-api`. `printenv ANTHROPIC_API_KEY`
   returning nothing does **not** mean there is no key.
-- `~/.jcode/auth.json` holds **only OAuth accounts**, never the API key.
+- `<config>/auth.json` holds **only OAuth accounts**, never the API key.
 - `claude` and `anthropic-api` are **different providers** with different
   availability. Having a Claude subscription login (OAuth) does **not** make
   `anthropic-api` usable, and vice versa.
@@ -91,7 +121,7 @@ jcode auth-test --provider <id>
 
 1. Run `jcode auth status --json` and read the entry for the **specific** login
    provider id (`claude` vs `anthropic-api` are different!).
-2. If you must inspect files: OAuth → `~/.jcode/auth.json` (and external imports);
+2. If you must inspect files: OAuth → `<config>/auth.json` (and external imports);
    API key → `ANTHROPIC_API_KEY` env or `~/.config/jcode/<provider>.env`.
 3. Ignore `auth-validation.json` verdicts older than 7 days (shown as `stale`);
    re-run `jcode auth-test` instead.

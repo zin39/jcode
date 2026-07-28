@@ -4,6 +4,14 @@ This document explains how authentication works in J-Code.
 
 ## Overview
 
+> `<config>` is jcode's credential directory: `~/Library/Application Support/jcode/`
+> on macOS, `~/.config/jcode/` on Linux, `%APPDATA%\jcode\` on Windows. Run
+> `jcode auth doctor` to print the resolved path. Files found in the older
+> `~/.jcode/` location are copied forward on first read and kept there, so
+> downgrading to an older jcode still works. See
+> [docs/AUTH_CREDENTIAL_SOURCES.md](docs/AUTH_CREDENTIAL_SOURCES.md).
+
+
 J-Code can detect existing local credentials and can also run built-in OAuth and API-key login flows.
 
 For auth files managed by other tools/CLIs, jcode asks before reading them. If you
@@ -12,11 +20,11 @@ for future sessions and still leaves the original file untouched (no move,
 rewrite, or permission mutation). Symlinked external auth files are rejected.
 
 Credentials are stored locally:
-- J-Code Claude OAuth (if logged in via `jcode login --provider claude`): `~/.jcode/auth.json`
+- J-Code Claude OAuth (if logged in via `jcode login --provider claude`): `<config>/auth.json`
 - Claude Code CLI: `~/.claude/.credentials.json` (Linux/Windows), or the **macOS login Keychain** item `Claude Code-credentials` (the default on macOS, where the JSON file usually does not exist), or the `CLAUDE_CODE_OAUTH_TOKEN` env var (set by `claude setup-token`)
 - OpenCode (optional provider/OAuth import source): `~/.local/share/opencode/auth.json`
 - pi (optional provider/OAuth import source): `~/.pi/agent/auth.json`
-- J-Code OpenAI/Codex OAuth: `~/.jcode/openai-auth.json`
+- J-Code OpenAI/Codex OAuth: `<config>/openai-auth.json`
 - Codex CLI auth source (read in place only after confirmation): `~/.codex/auth.json`
 - Gemini native OAuth: `~/.jcode/gemini_oauth.json`
 - Gemini CLI import fallback: `~/.gemini/oauth_creds.json`
@@ -40,11 +48,11 @@ Relevant code:
 1. Run `jcode login --provider claude` (recommended), or `jcode login` and choose Claude.
    - For headless / SSH use: `jcode login --provider claude --no-browser`
    - For scriptable remote flows: `jcode login --provider claude --print-auth-url`, then later complete with `--callback-url` or `--auth-code`
-2. Alternative: run `claude` (or `claude setup-token`). jcode can detect Claude Code's credentials, ask before reading them, and remember that approval for future sessions. This works whether Claude Code stored them in `~/.claude/.credentials.json` (Linux/Windows), the macOS login Keychain (`Claude Code-credentials`), or the `CLAUDE_CODE_OAUTH_TOKEN` env var. On macOS, approving the Keychain source copies the credentials into `~/.jcode/auth.json` once so later sessions never re-prompt the Keychain.
+2. Alternative: run `claude` (or `claude setup-token`). jcode can detect Claude Code's credentials, ask before reading them, and remember that approval for future sessions. This works whether Claude Code stored them in `~/.claude/.credentials.json` (Linux/Windows), the macOS login Keychain (`Claude Code-credentials`), or the `CLAUDE_CODE_OAUTH_TOKEN` env var. On macOS, approving the Keychain source copies the credentials into `<config>/auth.json` once so later sessions never re-prompt the Keychain.
 3. Verify with `jcode --provider claude run "Say hello from jcode"`.
 
 Credential discovery order is:
-1. `~/.jcode/auth.json`
+1. `<config>/auth.json`
 2. `~/.claude/.credentials.json`
 3. Claude Code native credentials (macOS Keychain `Claude Code-credentials`, or `CLAUDE_CODE_OAUTH_TOKEN` env var) once approved
 4. `~/.local/share/opencode/auth.json`
@@ -114,10 +122,10 @@ These environment variables control the deprecated Claude Code CLI transport:
    `http://localhost:1455/auth/callback` by default.
    If port `1455` is unavailable, jcode falls back to a manual paste flow where
    you can paste the full callback URL or query string.
-3. After login, tokens are saved to `~/.jcode/openai-auth.json`.
+3. After login, tokens are saved to `<config>/openai-auth.json`.
 
 Credential discovery order is:
-1. `~/.jcode/openai-auth.json`
+1. `<config>/openai-auth.json`
 2. `~/.codex/auth.json`
 3. trusted OpenCode/pi OAuth in `~/.local/share/opencode/auth.json` / `~/.pi/agent/auth.json`
 4. `OPENAI_API_KEY`

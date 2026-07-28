@@ -800,8 +800,8 @@ Set up jcode on this machine for me.
 2. Verify that `jcode` is on my `PATH`.
 3. Launch `jcode` once in a new terminal window/session to confirm it starts successfully.
 4. Before attempting any interactive login flow, assess which providers are already available non-interactively and prefer those first. Check existing local credentials, config files, CLI sessions, and environment variables such as:
-   - Claude: `~/.jcode/auth.json`, `~/.claude/.credentials.json`, `~/.local/share/opencode/auth.json`, `ANTHROPIC_API_KEY`
-   - OpenAI: `~/.jcode/openai-auth.json`, `~/.codex/auth.json`, `OPENAI_API_KEY`
+   - Claude: `<config>/auth.json` (see `jcode auth doctor`), `~/.claude/.credentials.json`, `~/.local/share/opencode/auth.json`, `ANTHROPIC_API_KEY`
+   - OpenAI: `<config>/openai-auth.json`, `~/.codex/auth.json`, `OPENAI_API_KEY`
    - Gemini: `~/.jcode/gemini_oauth.json`, `~/.gemini/oauth_creds.json`
    - GitHub Copilot: existing auth under `~/.config/github-copilot/`
    - Azure OpenAI: `~/.config/jcode/azure-openai.env`, `AZURE_OPENAI_*`, or an existing `az login`

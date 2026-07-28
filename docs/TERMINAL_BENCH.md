@@ -27,7 +27,7 @@ The helper script will build it for you automatically if it is missing.
 
 The current adapter is designed for:
 
-- OpenAI OAuth auth file at `~/.jcode/openai-auth.json`
+- OpenAI OAuth auth file at `<config>/openai-auth.json` (run `jcode auth doctor` for the path)
 - `gpt-5.4`
 - high reasoning effort
 - priority service tier
