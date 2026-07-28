@@ -1283,7 +1283,9 @@ impl App {
             // already has effort-expanded, provider-classified rows.
             const SYNC_REMOTE_FALLBACK_MAX_MODELS: usize = 64;
             if self.remote_available_entries.len() <= SYNC_REMOTE_FALLBACK_MAX_MODELS {
-                self.build_remote_model_routes_fallback()
+                let mut routes = self.build_remote_model_routes_fallback();
+                self.extend_remote_routes_for_uncovered_models(&mut routes);
+                routes
             } else {
                 let routes = self.build_remote_model_routes_lightweight_fallback(&current_model);
                 let routes_ms = routes_started.elapsed().as_millis();

@@ -226,16 +226,11 @@ fn format_effort_ladder(
                 // Selected effort: bracketed like [med] with accent color
                 spans.push(Span::styled(
                     format!("[{}]", label),
-                    Style::default()
-                        .fg(rgb(255, 200, 100))
-                        .bold(),
+                    Style::default().fg(rgb(255, 200, 100)).bold(),
                 ));
             } else {
                 // Unselected efforts are dim, no brackets
-                spans.push(Span::styled(
-                    label,
-                    Style::default().fg(dim_color()),
-                ));
+                spans.push(Span::styled(label, Style::default().fg(dim_color())));
             }
         }
 
@@ -1028,31 +1023,39 @@ mod tests {
         picker.entries[0].effort = Some("medium".to_string());
 
         // Focused row should have bracketed selected effort
-        let spans = format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
+        let spans =
+            format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
 
         // Find the span containing [med]
-        let has_bracketed_med = spans.iter().any(|span| {
-            span.content.as_ref().contains("[med]")
-        });
-        assert!(has_bracketed_med, "focused row should have [med] bracketed, got: {:?}", spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>());
+        let has_bracketed_med = spans
+            .iter()
+            .any(|span| span.content.as_ref().contains("[med]"));
+        assert!(
+            has_bracketed_med,
+            "focused row should have [med] bracketed, got: {:?}",
+            spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>()
+        );
 
         // Unfocused row should not have brackets
-        let unfocused_spans = format_effort_ladder(&picker.entries[0], false).expect("should render effort ladder for unfocused");
+        let unfocused_spans = format_effort_ladder(&picker.entries[0], false)
+            .expect("should render effort ladder for unfocused");
         let unfocused_text: String = unfocused_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!unfocused_text.contains("["), "unfocused row should not have brackets, got: {}", unfocused_text);
+        assert!(
+            !unfocused_text.contains("["),
+            "unfocused row should not have brackets, got: {}",
+            unfocused_text
+        );
     }
 
     #[test]
     fn effort_ladder_shows_ladder_with_chevrons_on_focused_row() {
         let mut picker = sample_picker();
-        picker.entries[0].available_efforts = vec![
-            "none".to_string(),
-            "low".to_string(),
-            "medium".to_string(),
-        ];
+        picker.entries[0].available_efforts =
+            vec!["none".to_string(), "low".to_string(), "medium".to_string()];
         picker.entries[0].effort = Some("low".to_string());
 
-        let spans = format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
+        let spans =
+            format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
 
         // Should start with ‹ and end with ›
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
