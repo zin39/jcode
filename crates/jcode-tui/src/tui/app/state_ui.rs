@@ -634,8 +634,23 @@ impl App {
         } else {
             snapshot
         };
-        if self.side_panel_user_hidden && snapshot.focused_page_id.is_some() {
+        // A user-hidden panel stays hidden for routine updates, so a panel you
+        // deliberately closed does not pop back open on every refresh. But the
+        // hide was a decision about the page that was showing THEN; a brand new
+        // page (e.g. a cheap_route run starting after you closed a web-search
+        // page) is new information the user has not dismissed. Without this,
+        // closing the panel once silently disabled auto-open for the rest of
+        // the session, and the live cheap-route view never appeared again.
+        let is_new_page = side_panel_focus_is_new_page(
+            snapshot.focused_page_id.as_deref(),
+            &self.side_panel.pages,
+        );
+        if self.side_panel_user_hidden && snapshot.focused_page_id.is_some() && !is_new_page {
             snapshot.focused_page_id = None;
+        } else if is_new_page {
+            // Honour the reveal: leaving these set would immediately re-hide it.
+            self.side_panel_user_hidden = false;
+            self.side_panel_explicit_hidden = false;
         }
         self.apply_side_panel_snapshot(snapshot);
     }
@@ -2205,4 +2220,63 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     false
+}
+
+/// Whether an incoming snapshot focuses a page the UI has never shown.
+///
+/// A user-hidden panel must stay hidden for routine refreshes, but a brand new
+/// page is information the user has not dismissed yet. Closing the panel once
+/// otherwise disabled auto-open for the rest of the session, so a cheap_route
+/// run's live view never appeared.
+pub(super) fn side_panel_focus_is_new_page(
+    focused_id: Option<&str>,
+    known_pages: &[crate::side_panel::SidePanelPage],
+) -> bool {
+    focused_id.is_some_and(|id| !known_pages.iter().any(|page| page.id == id))
+}
+
+#[cfg(test)]
+mod side_panel_autoopen_tests {
+    use super::side_panel_focus_is_new_page;
+    use crate::side_panel::SidePanelPage;
+
+    fn page(id: &str) -> SidePanelPage {
+        SidePanelPage {
+            id: id.to_string(),
+            title: id.to_string(),
+            file_path: String::new(),
+            format: Default::default(),
+            source: Default::default(),
+            content: String::new(),
+            updated_at_ms: 1,
+        }
+    }
+
+    /// Closing the panel once used to disable auto-open for the whole session,
+    /// so a cheap_route run's live view never appeared again. A page the UI has
+    /// never shown is new information the user has not dismissed, and must be
+    /// allowed to reveal the panel.
+    #[test]
+    fn a_never_seen_page_may_reveal_a_hidden_panel() {
+        let known = vec![page("websearch")];
+        assert!(
+            side_panel_focus_is_new_page(Some("debate"), &known),
+            "a cheap_route page the UI has never shown must be able to open the panel"
+        );
+    }
+
+    /// The sticky hide still has to work, or a panel the user deliberately
+    /// closed would pop back on every routine refresh.
+    #[test]
+    fn refreshing_an_already_known_page_does_not_reveal() {
+        let known = vec![page("websearch"), page("debate")];
+        assert!(
+            !side_panel_focus_is_new_page(Some("debate"), &known),
+            "re-focusing a page the user already dismissed must NOT reopen the panel"
+        );
+        assert!(
+            !side_panel_focus_is_new_page(None, &known),
+            "a snapshot with no focus must never count as a reveal"
+        );
+    }
 }
