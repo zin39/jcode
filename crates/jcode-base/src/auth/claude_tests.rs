@@ -62,7 +62,11 @@ fn jcode_path_respects_jcode_home() {
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
 
-    assert_eq!(jcode_path().unwrap(), temp.path().join("auth.json"));
+    assert_eq!(
+        jcode_path().unwrap(),
+        crate::storage::app_config_dir().unwrap().join("auth.json"),
+        "credentials live in the canonical secrets dir, still sandboxed under JCODE_HOME"
+    );
     assert_eq!(
         claude_code_path().unwrap(),
         temp.path()

@@ -65,11 +65,11 @@ impl GoogleTokens {
 }
 
 pub fn credentials_path() -> Result<std::path::PathBuf> {
-    Ok(crate::storage::jcode_dir()?.join("google_credentials.json"))
+    crate::storage::resolve_secret_path("google_credentials.json")
 }
 
 pub fn tokens_path() -> Result<std::path::PathBuf> {
-    Ok(crate::storage::jcode_dir()?.join("google_oauth.json"))
+    crate::storage::resolve_secret_path("google_oauth.json")
 }
 
 pub fn load_credentials() -> Result<GoogleCredentials> {

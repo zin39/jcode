@@ -88,6 +88,9 @@ fn save_openai_tokens_uses_jcode_home_sandbox() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
     let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    // Asserts the saved OAuth tokens are read back, so a real exported key
+    // must not satisfy load_credentials first.
+    let _no_api_key = EnvVarGuard::unset("OPENAI_API_KEY");
 
     let tokens = OAuthTokens {
         access_token: "at_sandbox".to_string(),
@@ -99,8 +102,14 @@ fn save_openai_tokens_uses_jcode_home_sandbox() -> Result<()> {
 
     save_openai_tokens(&tokens)?;
 
-    let auth_path = temp.path().join("openai-auth.json");
+    // Still sandboxed under JCODE_HOME, now via the canonical secrets dir.
+    let auth_path = crate::storage::app_config_dir()?.join("openai-auth.json");
     assert!(auth_path.exists(), "expected {}", auth_path.display());
+    assert!(
+        auth_path.starts_with(temp.path()),
+        "credential must stay inside the JCODE_HOME sandbox, got {}",
+        auth_path.display()
+    );
 
     let creds = crate::auth::codex::load_credentials()?;
     assert_eq!(creds.access_token, "at_sandbox");

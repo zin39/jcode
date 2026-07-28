@@ -106,7 +106,7 @@ fn relabel_accounts(auth: &mut JcodeOpenAiAuthFile) -> bool {
 }
 
 fn jcode_auth_path() -> Result<PathBuf> {
-    Ok(crate::storage::jcode_dir()?.join("openai-auth.json"))
+    crate::storage::resolve_secret_path("openai-auth.json")
 }
 
 fn legacy_auth_path() -> Result<PathBuf> {

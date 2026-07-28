@@ -903,3 +903,66 @@ fn browser_suppressed_inside_test_harness_without_env_overrides() {
         "browser opens must be suppressed in test binaries even without --no-browser/env vars"
     );
 }
+
+/// R1: jcode must have exactly ONE directory for secrets.
+///
+/// The credential split previously ran along the wrong axis: `*.env` API keys
+/// were read only from `app_config_dir()`, while every OAuth token JSON lived
+/// in `jcode_dir()`. "Where are my credentials?" therefore had two answers
+/// depending on how you logged in, which is confusing and unnecessary.
+///
+/// This asserts every OAuth resolver now agrees with the env-file location.
+/// It is deliberately exhaustive: a new provider that reaches for `jcode_dir()`
+/// re-introduces the split, and this test is what catches it.
+#[test]
+fn all_credentials_resolve_to_one_dir() {
+    let _lock = crate::storage::lock_test_env();
+    let sandbox = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", sandbox.path());
+
+    let canonical = crate::storage::app_config_dir().expect("config dir");
+
+    let resolvers: Vec<(&str, std::path::PathBuf)> = vec![
+        (
+            "claude auth.json",
+            crate::auth::claude::jcode_path().unwrap(),
+        ),
+        (
+            "gemini_oauth.json",
+            crate::auth::gemini::tokens_path().unwrap(),
+        ),
+        (
+            "antigravity_oauth.json",
+            crate::auth::antigravity::tokens_path().unwrap(),
+        ),
+        (
+            "google_credentials.json",
+            crate::auth::google::credentials_path().unwrap(),
+        ),
+        (
+            "google_oauth.json",
+            crate::auth::google::tokens_path().unwrap(),
+        ),
+    ];
+
+    for (label, path) in resolvers {
+        assert_eq!(
+            path.parent(),
+            Some(canonical.as_path()),
+            "{label} must resolve into the canonical secrets dir {}, got {}",
+            canonical.display(),
+            path.display()
+        );
+    }
+
+    // The env-file loaders define the canonical location, so a representative
+    // API-key file must land in the same directory as the OAuth files above.
+    let env_file_dir = crate::storage::secret_path("anthropic.env").unwrap();
+    restore_env_var("JCODE_HOME", prev_home);
+    assert_eq!(
+        env_file_dir.parent(),
+        Some(canonical.as_path()),
+        "API-key env files and OAuth token files must share one directory"
+    );
+}

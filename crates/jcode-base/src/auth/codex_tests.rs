@@ -18,6 +18,18 @@ impl EnvVarGuard {
         crate::env::set_var(key, value);
         Self { key, previous }
     }
+
+    /// Clear an ambient credential for the duration of a test.
+    ///
+    /// `JCODE_HOME` sandboxes files, but not the environment. A developer with
+    /// a real `OPENAI_API_KEY` exported would otherwise have their live key
+    /// picked up by the API-key fallback in `load_credentials`, so tests
+    /// asserting on OAuth tokens failed locally while passing in CI.
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        crate::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -199,6 +211,8 @@ fn multi_account_active_switch_works() {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    // A real exported key would otherwise satisfy load_credentials first.
+    let _no_api_key = EnvVarGuard::unset("OPENAI_API_KEY");
     set_active_account_override(None);
 
     upsert_account(OpenAiAccount {
@@ -271,6 +285,9 @@ fn load_credentials_ignores_legacy_oauth_without_consent() {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().unwrap();
     let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    // This asserts load_credentials finds NOTHING, so a real exported key
+    // would mask the very failure the test is checking for.
+    let _no_api_key = EnvVarGuard::unset("OPENAI_API_KEY");
     set_active_account_override(None);
 
     let legacy_path = temp

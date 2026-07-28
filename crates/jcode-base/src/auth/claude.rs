@@ -290,7 +290,7 @@ fn opencode_path() -> Result<PathBuf> {
 }
 
 pub fn jcode_path() -> Result<PathBuf> {
-    Ok(crate::storage::jcode_dir()?.join("auth.json"))
+    crate::storage::resolve_secret_path("auth.json")
 }
 
 // ---- Multi-account helpers ----

@@ -12,6 +12,17 @@ impl EnvVarGuard {
         crate::env::set_var(key, value);
         Self { key, previous }
     }
+
+    /// Clear an ambient credential for the duration of a test.
+    ///
+    /// `JCODE_HOME` sandboxes files, not the environment, so a developer with
+    /// a real key exported would otherwise have it satisfy the API-key
+    /// fallback ahead of the OAuth tokens under test.
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        crate::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvVarGuard {
