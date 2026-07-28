@@ -108,8 +108,16 @@ pub fn backfill_session_roles() -> usize {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let Some(mut session) = Session::load(stem).ok() else {
-            continue;
+        let mut session = match Session::load(stem) {
+            Ok(session) => session,
+            Err(err) => {
+                // One unreadable session must not abort the migration for the
+                // rest; it stays unclassified and simply remains visible.
+                crate::logging::warn(&format!(
+                    "session role backfill skipped unreadable session {stem}: {err}"
+                ));
+                continue;
+            }
         };
         if session.agent_role.is_some() {
             continue;

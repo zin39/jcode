@@ -52,9 +52,17 @@ fn now_secs() -> u64 {
 }
 
 fn path() -> Option<PathBuf> {
-    jcode_storage::jcode_dir()
-        .ok()
-        .map(|dir| dir.join("cheap-route-health.json"))
+    match jcode_storage::jcode_dir() {
+        Ok(dir) => Some(dir.join("cheap-route-health.json")),
+        Err(err) => {
+            // Without a home directory the cache is simply unavailable;
+            // routing still works, it just re-learns dead routes each run.
+            crate::logging::warn(&format!(
+                "cheap-route health cache unavailable (no jcode dir): {err}"
+            ));
+            None
+        }
+    }
 }
 
 fn load() -> RouteHealthFile {
