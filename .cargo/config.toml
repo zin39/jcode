@@ -15,4 +15,11 @@
 # monolith), so 4 jobs (~6-7 GiB) keeps a single direct build comfortably
 # memory-safe on a ~15 GiB machine while staying parallel. The adaptive
 # dev_cargo.sh path uses more cores when memory allows.
-jobs = 4
+# Raised 4 -> 8. The comment above sized this for a ~15 GiB machine; the
+# largest unit (jcode-app-core) peaks well under 2 GiB, so 8 jobs (~12 GiB
+# worst case) is safe on 32 GiB and lets the wide fan-out of ~800 small units
+# actually use the cores. NOTE: this does NOT speed up the common inner loop,
+# which is a serial chain (base -> app-core -> tui -> jcode) with measured
+# average parallelism of only 1.5; it helps cold/full builds. Override with
+# CARGO_BUILD_JOBS on a smaller machine.
+jobs = 8

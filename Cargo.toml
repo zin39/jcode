@@ -281,6 +281,11 @@ incremental = true
 [profile.selfdev]
 inherits = "release"
 opt-level = 0
+# Keep debuginfo in .o files instead of running dsymutil and packing a .dSYM
+# on every link. Measured on a 16-core macOS box: touching jcode-app-core and
+# rebuilding the binary went 30s -> 14-18s, because this profile's cost is
+# dominated by the serial link at the end of the chain, not by codegen.
+split-debuginfo = "unpacked"
 
 # Full LTO release for stable/distribution builds
 [profile.release-lto]
