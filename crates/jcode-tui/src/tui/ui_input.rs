@@ -4,7 +4,7 @@ use super::tools_ui::{get_tool_activity_detail, summarize_batch_running_tools_co
 use super::visual_debug::{self, FrameCaptureBuilder};
 use super::{
     ProcessingStatus, TuiState, accent_color, ai_color, asap_color, dim_color, queued_color,
-    tool_color, user_color,
+    tool_color,
 };
 use crate::message::ConnectionPhase;
 use crate::tui::app;

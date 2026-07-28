@@ -1022,29 +1022,11 @@ mod tests {
         ];
         picker.entries[0].effort = Some("medium".to_string());
 
-        // Focused row should have bracketed selected effort
-        let spans =
-            format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
-
-        // Find the span containing [med]
-        let has_bracketed_med = spans
-            .iter()
-            .any(|span| span.content.as_ref().contains("[med]"));
-        assert!(
-            has_bracketed_med,
-            "focused row should have [med] bracketed, got: {:?}",
-            spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>()
-        );
-
-        // Unfocused row should not have brackets
-        let unfocused_spans = format_effort_ladder(&picker.entries[0], false)
-            .expect("should render effort ladder for unfocused");
-        let unfocused_text: String = unfocused_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            !unfocused_text.contains("["),
-            "unfocused row should not have brackets, got: {}",
-            unfocused_text
-        );
+        // Only the focused row brackets the selected effort.
+        let focused = effort_ladder_text(&picker.entries[0], true);
+        assert!(focused.contains("[med]"), "focused row: {focused}");
+        let unfocused = effort_ladder_text(&picker.entries[0], false);
+        assert!(!unfocused.contains('['), "unfocused row: {unfocused}");
     }
 
     #[test]
@@ -1054,13 +1036,18 @@ mod tests {
             vec!["none".to_string(), "low".to_string(), "medium".to_string()];
         picker.entries[0].effort = Some("low".to_string());
 
-        let spans =
-            format_effort_ladder(&picker.entries[0], true).expect("should render effort ladder");
+        let text = effort_ladder_text(&picker.entries[0], true);
+        assert!(text.contains('‹'), "should have ‹ chevron, got: {text}");
+        assert!(text.contains('›'), "should have › chevron, got: {text}");
+    }
 
-        // Should start with ‹ and end with ›
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains('‹'), "should have ‹ chevron, got: {}", text);
-        assert!(text.contains('›'), "should have › chevron, got: {}", text);
+    /// Rendered text of an entry's effort ladder, for assertion convenience.
+    fn effort_ladder_text(entry: &crate::tui::PickerEntry, focused: bool) -> String {
+        format_effort_ladder(entry, focused)
+            .expect("should render effort ladder")
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
     }
 
     #[test]

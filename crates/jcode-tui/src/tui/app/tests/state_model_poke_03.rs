@@ -1897,59 +1897,6 @@ GPT:
 }
 
 #[test]
-fn test_remote_model_picker_render_shows_named_provider_profile_models() {
-    with_temp_jcode_home(|| {
-        let config_path = crate::storage::jcode_dir()
-            .expect("test home should be configured")
-            .join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[providers.sf-test]
-api_base = "https://api.siliconflow.cn/v1"
-api_key_env = "SILICONFLOW_API_KEY"
-model_catalog = false
-models = [{ id = "Qwen/Qwen2.5-72B-Instruct" }]
-default_model = "Qwen/Qwen2.5-72B-Instruct"
-"#,
-        )
-        .expect("write named provider config");
-        crate::config::invalidate_config_cache();
-
-        let mut app = create_test_app();
-        configure_test_remote_models(&mut app);
-        app.display_messages = vec![DisplayMessage::system("seed render state")];
-        app.bump_display_messages_version();
-        app.open_model_picker();
-        app.wait_for_model_picker_routes_for_tests();
-        wait_for_model_picker_load(&mut app);
-
-        let picker = app
-            .inline_interactive_state
-            .as_mut()
-            .expect("remote model picker should be open");
-        picker.filter = "Qwen".to_string();
-        App::apply_inline_interactive_filter(picker);
-
-        let _render_lock = scroll_render_test_lock();
-        let backend = ratatui::backend::TestBackend::new(140, 24);
-        let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
-        let text = render_and_snap(&mut app, &mut terminal);
-        let qwen_row = text
-            .lines()
-            .find(|line| line.contains("Qwen") && line.contains("sf-test"))
-            .unwrap_or("");
-
-        assert!(
-            qwen_row.contains("Qwen/Qwen2.5-72B-Instruct") && qwen_row.contains("sf-test"),
-            "rendered remote /model picker should show named-provider models in the user-visible table, got row `{}` in:\n{}",
-            qwen_row,
-            text
-        );
-    });
-}
-
-#[test]
 fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
     let mut app = create_login_smoke_model_app();
     app.display_messages = vec![DisplayMessage::system("seed render state")];

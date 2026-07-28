@@ -9,7 +9,7 @@ use crate::tui::{DisplayMessage, markdown};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use jcode_session_types::SessionStatus;
-use jcode_tui_style::palette::{Role, Tier, detect_tier, role_color};
+use jcode_tui_style::palette::{Role, Tier, role_color};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},

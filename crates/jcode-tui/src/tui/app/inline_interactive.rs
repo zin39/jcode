@@ -31,15 +31,12 @@ use helpers::{
 /// and sets the selection to that entry's display row.
 fn preselect_current_model_entry(picker: &mut InlineInteractiveState) {
     // Find the entry with is_current: true
-    let current_entry_idx = picker.entries.iter().position(|e| e.is_current);
-    if current_entry_idx.is_none() {
+    let Some(current_idx) = picker.entries.iter().position(|e| e.is_current) else {
         return;
-    }
-    let current_idx = current_entry_idx.unwrap();
+    };
 
-    // Check if this entry is in the filtered list
-    let filtered_pos = picker.filtered.iter().position(|&i| i == current_idx);
-    if filtered_pos.is_none() {
+    // Only preselect when the current entry survives the active filter.
+    if !picker.filtered.iter().any(|&i| i == current_idx) {
         return;
     }
 
@@ -831,20 +828,6 @@ impl App {
     /// auth method: an older session may have baked an OAuth-only fallback
     /// route into the cache, which would otherwise permanently hide the
     /// API-key route for that model.
-    fn append_jcode_subscription_routes_static(
-        remote_available_entries: &[String],
-        routes: &mut Vec<crate::provider::ModelRoute>,
-        require_credentials: bool,
-        require_remote_advertisement: bool,
-    ) {
-        append_jcode_subscription_routes_impl(
-            routes,
-            require_credentials,
-            require_remote_advertisement,
-            remote_available_entries,
-        );
-    }
-
     fn extend_remote_routes_for_uncovered_models(
         &self,
         routes: &mut Vec<crate::provider::ModelRoute>,
@@ -1406,48 +1389,6 @@ impl App {
         let build = move || {
             let routes_started = std::time::Instant::now();
             let routes = build_routes();
-            let routes_ms = routes_started.elapsed().as_millis();
-            let _ = tx.send(Ok(ModelPickerRoutesResult { routes, routes_ms }));
-        };
-
-        // Route loads resolve per-model disk caches through `jcode_dir()`, so the
-        // worker must inherit the spawning thread's test home (no-op in release).
-        let build = crate::storage::inherit_test_home(build);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(build);
-        } else {
-            std::thread::spawn(build);
-        }
-
-        self.pending_model_picker_load = Some(PendingModelPickerLoad {
-            request_id,
-            signature,
-            picker_started,
-            receiver: rx,
-            store_remote_options: false,
-        });
-    }
-
-    /// Remote-session variant of [`Self::start_model_picker_route_load`]: the
-    /// names-only fallback walks per-model disk caches (O(models × catalog))
-    /// and previously ran synchronously on the input path, freezing the UI
-    /// for seconds while `/model` was being typed.
-    fn start_remote_model_picker_route_load(
-        &mut self,
-        signature: ModelPickerCacheSignature,
-        picker_started: std::time::Instant,
-    ) {
-        self.model_picker_load_request_id = self.model_picker_load_request_id.wrapping_add(1);
-        let request_id = self.model_picker_load_request_id;
-        let remote_provider_name = self.remote_provider_name.clone();
-        let remote_available_entries = self.remote_available_entries.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let build = move || {
-            let routes_started = std::time::Instant::now();
-            let routes = crate::provider::remote_model_routes_fallback(
-                remote_provider_name.as_deref(),
-                &remote_available_entries,
-            );
             let routes_ms = routes_started.elapsed().as_millis();
             let _ = tx.send(Ok(ModelPickerRoutesResult { routes, routes_ms }));
         };

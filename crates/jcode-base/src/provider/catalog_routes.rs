@@ -507,10 +507,8 @@ pub fn named_provider_profile_routes(
     let mut models: Vec<(String, bool)> = Vec::new(); // (model_id, from_live_catalog)
     let mut from_live_catalog = false;
 
-    // 1. Try live catalog cache when model_catalog is not explicitly false.
-    if profile_config.model_catalog
-        || (!profile_config.model_catalog && profile_config.models.is_empty())
-    {
+    // 1. Try the live catalog cache when the profile opted in, or has no explicit models.
+    if profile_config.model_catalog || profile_config.models.is_empty() {
         if let Some(cache) =
             jcode_provider_openrouter::load_disk_cache_entry_for_namespace(profile_name)
         {
