@@ -1142,3 +1142,59 @@ async fn spawn_admission_lock_serializes_per_swarm_only() {
             .is_ok()
     );
 }
+
+/// L1: the spawn path must enforce `cheap_route_ban`.
+///
+/// `resolve_worker_route` in cheap_route.rs documents itself as "THE single
+/// backend gate ... Fail loudly instead of billing", but it had ZERO callers:
+/// the enforcement was written and never wired in, so a coordinator could spawn
+/// its entire swarm onto the frontier model. This asserts the shared gate
+/// classifies the models the spawn path now checks.
+#[test]
+fn spawn_gate_rejects_banned_worker_models() {
+    use crate::agent::cheap_route::model_is_cheap_route_banned;
+
+    let _lock = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    jcode_base::env::set_var("JCODE_HOME", temp.path());
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "[agents]\ncheap_route_ban = [\"claude-\", \"gpt-5\"]\n",
+    )
+    .expect("write config");
+    jcode_base::config::invalidate_config_cache();
+
+    // Frontier models the ban list targets are refused.
+    for model in ["claude-opus-4-8", "claude-sonnet-4-6", "gpt-5.5"] {
+        assert!(
+            model_is_cheap_route_banned(model),
+            "{model} must be refused as a worker model"
+        );
+    }
+
+    // Real cheap routes from the user's catalog must stay spawnable. A ban entry
+    // is substring-matched against model/provider/api_method, so an over-broad
+    // entry silently kills good routes; these are the ones that regressed when
+    // the list read "zai" and "minimax".
+    for model in [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "glm-5.2",
+        "zai-org/GLM-5.2",
+        "MiniMaxAI/MiniMax-M2.5",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    ] {
+        assert!(
+            !model_is_cheap_route_banned(model),
+            "{model} is a cheap route and must remain spawnable"
+        );
+    }
+
+    if let Some(prev) = prev_home {
+        jcode_base::env::set_var("JCODE_HOME", prev);
+    } else {
+        jcode_base::env::remove_var("JCODE_HOME");
+    }
+    jcode_base::config::invalidate_config_cache();
+}

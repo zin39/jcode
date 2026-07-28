@@ -605,6 +605,20 @@ pub(super) async fn spawn_swarm_agent(
         configured_swarm_model.clone(),
         &coordinator,
     );
+    // THE spawn-path gate. Whatever resolved the model above -- an explicit
+    // `model` arg, the agents.swarm_model pin, or coordinator inheritance -- a
+    // worker must never run on a model excluded by cheap_route_ban. Without this
+    // a coordinator could spawn its whole swarm onto the frontier model, which is
+    // both the expensive failure and the one the user cannot see until billed.
+    // Fail loudly rather than silently billing.
+    if let Some(model) = selection.model.as_deref()
+        && crate::agent::cheap_route::model_is_cheap_route_banned(model)
+    {
+        return Err(anyhow::anyhow!(
+            "refusing to spawn a worker on '{model}': excluded by agents.cheap_route_ban. \
+             Pass an allowed model, or remove it from the ban list."
+        ));
+    }
     let spawn_model = selection.model.clone();
     let spawn_provider_key = selection.provider_key.clone();
     let spawn_route_api_method = selection.route_api_method.clone();

@@ -377,6 +377,46 @@ pub fn parse_recommended_model(text: &str, menu: &[CheapRouteCandidate]) -> Resu
     Ok(menu[0].route.model.clone())
 }
 
+/// Resolve the model used for HARD subtasks (difficulty above the threshold).
+///
+/// Non-strict (default) falls back to the coordinator's own model when
+/// `cheap_route_strong_model` is unset, which is the standard cascade design.
+/// That fallback is also the single largest source of silent frontier spend:
+/// with the setting unset, EVERY hard subtask bills the model you are chatting
+/// with. Under `cheap_route_strict` there is no implicit fallback — an unset
+/// strong model means hard subtasks stay on the cheap list instead.
+///
+/// Returns `None` when strict mode has no configured strong model, meaning
+/// "use the cheapest-first list", never "use the coordinator".
+fn resolve_strong_model(
+    configured: Option<&str>,
+    current_model: &str,
+    strict: bool,
+) -> Option<String> {
+    let configured = configured
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
+    match configured {
+        Some(model) => Some(model),
+        // Strict: refuse to silently promote the coordinator into the strong
+        // tier. Cheap-but-weaker beats expensive-and-unrequested.
+        None if strict => None,
+        None => Some(current_model.to_string()),
+    }
+}
+
+/// Whether the coordinator's own model may be appended as the last-resort
+/// candidate.
+///
+/// This is the escape hatch that keeps a subtask alive when every cheap route
+/// fails. Under `cheap_route_strict` it is removed entirely: the user asked for
+/// cheap-only, so exhausting the cheap routes must fail loudly rather than bill
+/// the frontier model. A banned model is never eligible in either mode.
+fn coordinator_is_allowed_as_last_resort(current_model: &str, strict: bool) -> bool {
+    !current_model.is_empty() && !strict && !model_is_cheap_route_banned(current_model)
+}
+
 /// Instruction asking the parent to split the task into difficulty-rated subtasks.
 pub fn build_decompose_prompt(task: &str) -> String {
     format!(
@@ -545,8 +585,21 @@ pub async fn run_cheap_route(
     // all cooled down by health tracking (e.g. a transient quota blip across
     // every cheap provider), don't fail the run — fall through to the parent's
     // current model as the last resort (the candidate list below appends it).
+    let strict = crate::config::config().agents.cheap_route_strict;
     if ranked.is_empty() && current_model.trim().is_empty() {
         return Err(anyhow!("no available model routes to route work to"));
+    }
+    // Strict mode: a total cheap-route blackout must FAIL, not escalate. The
+    // fall-through below is a cascade escape hatch, and it is exactly how a
+    // drained balance or dead key turns into silent frontier spend that only
+    // surfaces on an invoice. The user asked for cheap-only, so say so.
+    if ranked.is_empty() && strict {
+        return Err(anyhow!(
+            "cheap-route blackout: every cheap route is unavailable (dead credential, \
+             drained balance, or rate limit) and agents.cheap_route_strict is on, so \
+             work will NOT be escalated to '{current_model}'. Fix a cheap provider, or \
+             set cheap_route_strict = false to allow escalation."
+        ));
     }
     let menu: Vec<CheapRouteCandidate> = ranked.iter().take(MAX_MENU).cloned().collect();
 
@@ -610,13 +663,15 @@ pub async fn run_cheap_route(
     let difficulty_threshold = crate::config::config()
         .agents
         .cheap_route_difficulty_threshold;
-    let strong_model = crate::config::config()
-        .agents
-        .cheap_route_strong_model
-        .clone()
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| current_model.clone());
+    let strong_model = resolve_strong_model(
+        crate::config::config()
+            .agents
+            .cheap_route_strong_model
+            .as_deref(),
+        &current_model,
+        strict,
+    )
+    .unwrap_or_default();
     let strong_api = ranked
         .iter()
         .find(|c| c.route.model == strong_model)
@@ -627,8 +682,7 @@ pub async fn run_cheap_route(
     // expensive banned coordinator just because every cheap route is dead — the
     // subtask should fail loudly instead. The cheap candidates above are already
     // a cooled-but-cheap fallback, so this only drops the truly-expensive escape.
-    if !current_model.is_empty()
-        && !model_is_cheap_route_banned(&current_model)
+    if coordinator_is_allowed_as_last_resort(&current_model, strict)
         && !candidates.iter().any(|(m, _)| m == &current_model)
     {
         candidates.push((current_model, None));
@@ -4043,5 +4097,68 @@ mod tests {
             classify_failure(&anyhow!("status: 500 internal server error")),
             BreakerFailureKind::Timeout
         );
+    }
+}
+
+#[cfg(test)]
+mod strict_routing_tests {
+    use super::{coordinator_is_allowed_as_last_resort, resolve_strong_model};
+
+    /// L2: with `cheap_route_strong_model` unset, the non-strict cascade promotes
+    /// the coordinator into the strong tier — so every hard subtask bills the
+    /// model you are chatting with. Strict mode must refuse that promotion.
+    #[test]
+    fn strict_never_promotes_coordinator_to_strong_tier() {
+        // Default (cascade) behaviour is preserved: unset => coordinator.
+        assert_eq!(
+            resolve_strong_model(None, "claude-opus-4-8", false).as_deref(),
+            Some("claude-opus-4-8"),
+            "non-strict must keep the documented cascade fallback"
+        );
+
+        // Strict: no configured strong model means fall back to the CHEAP list,
+        // never to the coordinator.
+        assert_eq!(
+            resolve_strong_model(None, "claude-opus-4-8", true),
+            None,
+            "strict must not silently route hard subtasks to the coordinator"
+        );
+
+        // An explicitly configured strong model is honoured in both modes.
+        for strict in [false, true] {
+            assert_eq!(
+                resolve_strong_model(Some("glm-5.2"), "claude-opus-4-8", strict).as_deref(),
+                Some("glm-5.2"),
+            );
+        }
+
+        // Whitespace-only is treated as unset, not as a model named " ".
+        assert_eq!(
+            resolve_strong_model(Some("   "), "claude-opus-4-8", true),
+            None
+        );
+    }
+
+    /// L3: the coordinator is appended as a last-resort candidate on every run.
+    /// Strict mode removes that escape hatch so exhausting the cheap routes
+    /// fails instead of billing the frontier model.
+    #[test]
+    fn strict_drops_the_coordinator_last_resort_candidate() {
+        // Non-strict keeps the escape hatch (model not in any ban list here).
+        assert!(
+            coordinator_is_allowed_as_last_resort("some-unbanned-model", false),
+            "non-strict must retain the last-resort fallback"
+        );
+
+        // Strict removes it entirely.
+        assert!(
+            !coordinator_is_allowed_as_last_resort("some-unbanned-model", true),
+            "strict must not append the coordinator as a fallback candidate"
+        );
+
+        // An empty coordinator model is never a candidate in either mode.
+        for strict in [false, true] {
+            assert!(!coordinator_is_allowed_as_last_resort("", strict));
+        }
     }
 }
