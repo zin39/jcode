@@ -307,3 +307,46 @@ impl Agent {
         self.build_memory_prompt_nonblocking_shared(messages.to_vec().into(), _memory_event_tx)
     }
 }
+
+#[cfg(test)]
+mod delegation_directive_tests {
+    use super::AUTO_DELEGATION_DIRECTIVE;
+
+    /// The directive is the entire mechanism behind "delegate automatically":
+    /// it is what tells a coordinator to offload work instead of doing it. It
+    /// previously named only `subagent`, so a coordinator never learned that
+    /// `cheap_route` exists — and cheap_route is the better tool for a
+    /// multi-step request, because it rates each subtask's difficulty and runs
+    /// each on the cheapest model strong enough for it.
+    #[test]
+    fn directive_offers_both_delegation_tools() {
+        assert!(
+            AUTO_DELEGATION_DIRECTIVE.contains("cheap_route"),
+            "coordinator must be told cheap_route exists, or it will never use it"
+        );
+        assert!(
+            AUTO_DELEGATION_DIRECTIVE.contains("subagent"),
+            "single-unit delegation must still be offered"
+        );
+        // The directive must state the routing behaviour that makes cheap_route
+        // the right default, not just name the tool.
+        assert!(
+            AUTO_DELEGATION_DIRECTIVE.contains("difficulty"),
+            "directive should explain that cheap_route routes by subtask difficulty"
+        );
+    }
+
+    /// Cheap models measurably collapse on long-horizon, multi-file work, so
+    /// the directive must keep naming what NOT to delegate. A live run of this
+    /// config had a cheap worker search the wrong repository and then report a
+    /// function "does not exist" rather than reading the file it was given.
+    #[test]
+    fn directive_still_reserves_judgment_work_and_demands_evidence() {
+        for expected in ["Multi-file refactors", "root-cause debugging", "evidence"] {
+            assert!(
+                AUTO_DELEGATION_DIRECTIVE.contains(expected),
+                "directive must retain the {expected:?} guardrail"
+            );
+        }
+    }
+}

@@ -169,15 +169,6 @@ pub(crate) use viewport::{
 static LAST_MAX_SCROLL: AtomicUsize = AtomicUsize::new(0);
 /// Whether the chat viewport used a native scrollbar in the most recent frame.
 ///
-/// Initialized to `1` (assume visible) so the very first frame of a freshly
-/// resumed/loaded session prepares the narrow (scrollbar-reserved) width FIRST.
-/// Because narrow wraps at least as much as wide, an overflowing transcript is
-/// detected on that single narrow build and kept, avoiding a wasted wide build
-/// (~seconds on a long transcript) that would otherwise be discarded. Short
-/// transcripts that fit still fall through to a (cheap) second wide build, and
-/// the real decision is written back every frame, so steady state is unaffected.
-#[cfg(not(test))]
-static LAST_CHAT_SCROLLBAR_VISIBLE: AtomicUsize = AtomicUsize::new(1);
 /// Total line count in the pinned diff/content pane (set during render).
 #[cfg(not(test))]
 static PINNED_PANE_TOTAL_LINES: AtomicUsize = AtomicUsize::new(0);
@@ -219,7 +210,6 @@ static LAST_USER_PROMPT_POSITIONS: OnceLock<Mutex<Vec<usize>>> = OnceLock::new()
 #[cfg(test)]
 thread_local! {
     static TEST_LAST_MAX_SCROLL: Cell<usize> = const { Cell::new(0) };
-    static TEST_LAST_CHAT_SCROLLBAR_VISIBLE: Cell<bool> = const { Cell::new(false) };
     static TEST_PINNED_PANE_TOTAL_LINES: Cell<usize> = const { Cell::new(0) };
     static TEST_LAST_DIFF_PANE_EFFECTIVE_SCROLL: Cell<usize> = const { Cell::new(0) };
     static TEST_LAST_DIFF_PANE_MAX_SCROLL: Cell<usize> = const { Cell::new(0) };
@@ -247,33 +237,6 @@ pub fn last_max_scroll() -> usize {
     #[cfg(not(test))]
     {
         LAST_MAX_SCROLL.load(Ordering::Relaxed)
-    }
-}
-
-fn set_last_chat_scrollbar_visible(visible: bool) {
-    #[cfg(test)]
-    {
-        TEST_LAST_CHAT_SCROLLBAR_VISIBLE.with(|state| state.set(visible));
-        return;
-    }
-    #[cfg(not(test))]
-    {
-        LAST_CHAT_SCROLLBAR_VISIBLE.store(usize::from(visible), Ordering::Relaxed);
-    }
-}
-
-/// Whether the chat native scrollbar was visible on the most recent render frame.
-/// Used as hysteresis so steady-state frames only prepare a single chat width
-/// instead of both the wide and narrow variants (which thrashes the prep caches
-/// on long transcripts during streaming).
-fn last_chat_scrollbar_visible() -> bool {
-    #[cfg(test)]
-    {
-        return TEST_LAST_CHAT_SCROLLBAR_VISIBLE.with(Cell::get);
-    }
-    #[cfg(not(test))]
-    {
-        LAST_CHAT_SCROLLBAR_VISIBLE.load(Ordering::Relaxed) != 0
     }
 }
 
@@ -3053,7 +3016,6 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     let prepared = prepare_at(stable_prepare_width);
     let initial_content_height = prepared.total_wrapped_lines().max(1) as u16;
     let chat_scrollbar_visible = scrollbar_enabled && overflows(&prepared);
-    set_last_chat_scrollbar_visible(chat_scrollbar_visible);
     if let Some(ref mut capture) = debug_capture {
         capture.image_regions = prepared
             .image_regions

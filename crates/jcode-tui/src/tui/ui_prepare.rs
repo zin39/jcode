@@ -1439,8 +1439,6 @@ struct BodyRenderCtx<'a> {
     /// Number rendered next to the first user prompt = global prompt count +
     /// number of prompts hidden by compaction.
     prompt_number_offset: usize,
-    total_prompts: usize,
-    pending_count: usize,
     anchored_images: Arc<super::inline_image_ui::AnchoredInlineImages>,
     inline_images_visible: bool,
     messages: &'a [DisplayMessage],
@@ -2117,8 +2115,6 @@ pub(super) fn prepare_body_incremental(
         width,
         centered,
         prompt_number_offset: app.compacted_hidden_user_prompts(),
-        total_prompts: app.display_user_message_count(),
-        pending_count: input_ui::pending_prompt_count(app),
         anchored_images,
         inline_images_visible: app.inline_images_visible(),
         messages,
@@ -2448,8 +2444,6 @@ pub(super) fn prepare_body_prepended(
         width,
         centered,
         prompt_number_offset: app.compacted_hidden_user_prompts(),
-        total_prompts: app.display_user_message_count(),
-        pending_count: input_ui::pending_prompt_count(app),
         anchored_images: super::inline_image_ui::resolve_anchored_items_cached(app),
         inline_images_visible: app.inline_images_visible(),
         messages,
@@ -2701,8 +2695,6 @@ pub(super) fn prepare_body(
         width,
         centered,
         prompt_number_offset: app.compacted_hidden_user_prompts(),
-        total_prompts: app.display_user_message_count(),
-        pending_count: input_ui::pending_prompt_count(app),
         // Images anchored to transcript messages render inline right after the
         // message that produced them (tool result or user prompt).
         anchored_images: super::inline_image_ui::resolve_anchored_items_cached(app),
