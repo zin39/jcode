@@ -132,10 +132,20 @@ impl SidePanelDebateReporter {
 
     fn flush(&self, state: &DebateState) {
         let content = state.render();
+        // The page is titled for what it usually shows. This reporter serves
+        // cheap-route runs (the common case) as well as gold-mode debates, and
+        // labelling every cheap-route run "Gold Debate" made the live view
+        // undiscoverable: users looking for cheap-route progress had no reason
+        // to open a page about debates.
+        let title = if state.subtasks.is_empty() && !state.proposers.is_empty() {
+            "Gold Debate"
+        } else {
+            "Cheap Route"
+        };
         match crate::side_panel::write_markdown_page(
             &self.session_id,
             "debate",
-            Some("Gold Debate"),
+            Some(title),
             &content,
             true,
         ) {

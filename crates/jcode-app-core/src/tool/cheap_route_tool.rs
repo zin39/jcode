@@ -82,11 +82,52 @@ impl Tool for CheapRouteTool {
         let output = format_cheap_outcome(&outcome);
 
         Ok(ToolOutput::new(output)
-            .with_title(format!("cheap_route · {}", outcome.recommended_model))
+            .with_title(format!("cheap_route · {}", models_used_label(&outcome)))
             .with_metadata(json!({
                 "recommendedModel": outcome.recommended_model,
                 "subtaskCount": outcome.subtasks.len(),
             })))
+    }
+}
+
+/// How to open the live cheap-route view.
+///
+/// The panel already streams the plan, the model per subtask, and a rolling
+/// output tail, but nothing pointed at it, so a run looked opaque while it was
+/// the part users most wanted to watch. Read the actual binding rather than
+/// hardcoding "Alt+M": `keybindings.side_panel_toggle` is user-configurable, and
+/// a hint naming the wrong key is worse than no hint.
+fn side_panel_hint() -> String {
+    let configured = crate::config::config()
+        .keybindings
+        .side_panel_toggle
+        .trim()
+        .to_string();
+    if configured.is_empty() {
+        "the side-panel toggle".to_string()
+    } else {
+        configured
+    }
+}
+
+/// The distinct models a run actually used, for the tool-call title.
+///
+/// The title previously showed only `recommended_model`, which hides the case
+/// this whole feature exists to make visible: subtasks routing to DIFFERENT
+/// models, including a fallback after a cheaper route failed.
+fn models_used_label(outcome: &CheapRouteOutcome) -> String {
+    let mut models: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.model_used.as_str())
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    match models.len() {
+        0 => outcome.recommended_model.clone(),
+        1 => models[0].to_string(),
+        // Keep the chip short; the full per-subtask breakdown is in the body.
+        _ => format!("{} +{}", models[0], models.len() - 1),
     }
 }
 
@@ -107,10 +148,12 @@ fn format_cheap_outcome(outcome: &CheapRouteOutcome) -> String {
         models_used.join(", ")
     };
     let mut out = format!(
-        "Ran {} subtask(s) on {} (recommended: {}).\n\n",
+        "Ran {} subtask(s) on {} (recommended: {}).\n\
+         Live progress for a run is in the side panel (toggle it with {}).\n\n",
         outcome.results.len(),
         ran_on,
-        outcome.recommended_model
+        outcome.recommended_model,
+        side_panel_hint(),
     );
     for (index, result) in outcome.results.iter().enumerate() {
         out.push_str(&format!(
@@ -173,5 +216,76 @@ mod tests {
         assert!(rendered.contains("did it"));
         assert!(rendered.contains("Review: OK"));
         assert!(rendered.contains("deepseek-v4-flash"));
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+    use crate::agent::cheap_route::SubtaskResult;
+
+    fn result(model: &str) -> SubtaskResult {
+        SubtaskResult {
+            description: "task".to_string(),
+            output: "out".to_string(),
+            review: "OK".to_string(),
+            model_used: model.to_string(),
+        }
+    }
+
+    fn outcome(models: &[&str]) -> CheapRouteOutcome {
+        CheapRouteOutcome {
+            recommended_model: "recommended-model".to_string(),
+            subtasks: Vec::new(),
+            results: models.iter().map(|m| result(m)).collect(),
+        }
+    }
+
+    /// The tool-call chip previously showed only `recommended_model`, which
+    /// hides the exact thing cheap routing needs to make visible: a subtask
+    /// running on a DIFFERENT model than recommended, e.g. after a cheaper
+    /// route failed and it fell back.
+    #[test]
+    fn title_reports_models_that_actually_ran() {
+        assert_eq!(
+            models_used_label(&outcome(&["deepseek-v4-flash"])),
+            "deepseek-v4-flash",
+            "a single model should be named outright, not shown as the recommendation"
+        );
+
+        // Two different models: the chip must signal the split rather than
+        // silently showing one of them.
+        let label = models_used_label(&outcome(&["deepseek-v4-flash", "glm-5.2"]));
+        assert!(
+            label.contains("+1"),
+            "a multi-model run must be visible in the title, got {label:?}"
+        );
+
+        // Duplicates collapse: three subtasks on one model is still one model.
+        assert_eq!(
+            models_used_label(&outcome(&["glm-5.2", "glm-5.2", "glm-5.2"])),
+            "glm-5.2"
+        );
+
+        // No results (e.g. an early failure) falls back to the recommendation
+        // rather than rendering an empty chip.
+        assert_eq!(models_used_label(&outcome(&[])), "recommended-model");
+    }
+
+    /// The live view existed but nothing pointed at it, so a run looked opaque.
+    /// The hint must also name the REAL binding, since it is user-configurable.
+    #[test]
+    fn output_points_at_the_live_view_using_the_configured_key() {
+        let rendered = format_cheap_outcome(&outcome(&["deepseek-v4-flash"]));
+        assert!(
+            rendered.contains("side panel"),
+            "output must tell the user where live progress is: {rendered}"
+        );
+        let hint = side_panel_hint();
+        assert!(!hint.is_empty(), "hint must never render empty");
+        assert!(
+            rendered.contains(&hint),
+            "output must name the configured toggle ({hint}), not a hardcoded key"
+        );
     }
 }
