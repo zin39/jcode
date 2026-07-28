@@ -75,6 +75,12 @@ struct AuthDoctorReport {
     checked_provider: Option<String>,
     validate: bool,
     any_issue: bool,
+    /// Where jcode stores credentials. Reported because the answer used to
+    /// depend on how you logged in, and users had no way to ask.
+    credentials_dir: Option<String>,
+    /// Pre-consolidation location, reported only while it still holds files,
+    /// so a user who finds credentials there knows they are the legacy copies.
+    legacy_credentials_dir: Option<String>,
     providers: Vec<AuthDoctorProviderReport>,
 }
 
@@ -205,6 +211,17 @@ pub(super) async fn run_auth_doctor_command(
         return Ok(());
     }
 
+    if let Some(dir) = report.credentials_dir.as_deref() {
+        println!("credentials dir: {}", dir);
+        if let Some(legacy) = report.legacy_credentials_dir.as_deref() {
+            println!(
+                "  legacy copies also present in {} (kept so an older jcode can still read them)",
+                legacy
+            );
+        }
+        println!();
+    }
+
     for (index, provider) in report.providers.iter().enumerate() {
         if index > 0 {
             println!();
@@ -331,8 +348,41 @@ async fn build_auth_doctor_report(
         checked_provider: provider_arg.map(str::to_string),
         validate,
         any_issue: reports.iter().any(|provider| provider.needs_attention),
+        credentials_dir: crate::storage::app_config_dir()
+            .ok()
+            .map(|dir| dir.display().to_string()),
+        legacy_credentials_dir: legacy_credentials_dir_if_populated(),
         providers: reports,
     })
+}
+
+/// The pre-consolidation credential directory, but only when it still holds
+/// credential files.
+///
+/// Credentials are copied forward rather than moved, so the legacy directory
+/// keeps working copies for downgrade safety. Reporting it unconditionally
+/// would just reintroduce the "two locations" confusion this consolidation set
+/// out to remove, so it is surfaced only when files are actually there.
+fn legacy_credentials_dir_if_populated() -> Option<String> {
+    let dir = crate::storage::jcode_dir().ok()?;
+    let has_credentials = std::fs::read_dir(&dir).ok()?.flatten().any(|entry| {
+        let path = entry.path();
+        if !path.is_file() {
+            return false;
+        }
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                !name.contains(".bak")
+                    && (name.ends_with(".env")
+                        || name == "auth.json"
+                        || name == "openai-auth.json"
+                        || name.ends_with("_oauth.json")
+                        || name == "google_credentials.json")
+            })
+    });
+
+    has_credentials.then(|| dir.display().to_string())
 }
 
 async fn run_auth_doctor_validation(

@@ -1241,9 +1241,13 @@ fn anthropic_oauth_source(status: &AuthStatus) -> Option<(AuthCredentialSource, 
         .unwrap_or_default()
         .is_empty()
     {
+        // Report where the credential actually resolved. A hardcoded
+        // "~/.jcode/auth.json" was wrong once credentials consolidated into
+        // the canonical secrets dir, and a diagnostic that names the wrong
+        // file is worse than one that names none.
         return Some((
             AuthCredentialSource::JcodeManagedFile,
-            "~/.jcode/auth.json".to_string(),
+            display_credential_path(crate::auth::claude::jcode_path().ok()),
         ));
     }
     if let Some(source) = crate::auth::claude::preferred_external_auth_source()
@@ -1274,7 +1278,7 @@ fn openai_oauth_source(status: &AuthStatus) -> Option<(AuthCredentialSource, Str
     {
         return Some((
             AuthCredentialSource::JcodeManagedFile,
-            "~/.jcode/openai-auth.json".to_string(),
+            display_credential_path(crate::auth::codex::jcode_auth_path().ok()),
         ));
     }
     if crate::auth::codex::legacy_auth_allowed() && crate::auth::codex::legacy_auth_source_exists()
@@ -1449,6 +1453,23 @@ fn config_file_has_key(file_name: &str, env_key: &str) -> bool {
     };
     let path = config_dir.join(file_name);
     config_file_contains_assignment(&path, env_key)
+}
+
+/// Render a credential path for diagnostics, abbreviating the home directory.
+///
+/// Diagnostics previously hardcoded `~/.jcode/auth.json`, which silently became
+/// wrong when credentials consolidated into the canonical secrets dir. Deriving
+/// the string from the real resolved path keeps the two from drifting again.
+fn display_credential_path(path: Option<std::path::PathBuf>) -> String {
+    let Some(path) = path else {
+        return "jcode-managed credential file".to_string();
+    };
+    if let Some(home) = dirs::home_dir()
+        && let Ok(relative) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", relative.display());
+    }
+    path.display().to_string()
 }
 
 fn config_file_contains_assignment(path: &Path, env_key: &str) -> bool {
