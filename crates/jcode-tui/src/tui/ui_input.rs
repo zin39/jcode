@@ -1008,8 +1008,12 @@ pub(super) fn build_status_line(
                 ];
 
                 let batch_prog = app.batch_progress();
-                let is_batch = name == "batch";
-                let batch_total_initial = if is_batch {
+                // Any tool that reports fan-out progress gets the live
+                // completed/running readout, not just `batch`. Gating on the
+                // tool name meant `cheap_route` published progress that was
+                // never drawn, so a multi-minute run looked frozen.
+                let has_progress = batch_prog.is_some();
+                let batch_total_initial = if name == "batch" {
                     app.streaming_tool_calls()
                         .last()
                         .and_then(|tc| tc.input.get("tool_calls"))
@@ -1019,7 +1023,7 @@ pub(super) fn build_status_line(
                     None
                 };
 
-                if is_batch {
+                if has_progress {
                     append_batch_progress_spans(
                         &mut detail,
                         tool_fg,
@@ -1515,6 +1519,37 @@ mod tests {
         assert_eq!(spans[0].content.as_ref(), " · 0/3 done");
         assert_eq!(spans[0].style.fg, Some(anim_color));
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn progress_spans_render_for_non_batch_tools_too() {
+        // Regression cover: the status line used to draw this readout only
+        // when the running tool was literally named "batch", so `cheap_route`
+        // published progress that was never displayed and a multi-minute run
+        // looked like a hang. The readout is driven by the presence of
+        // progress, not by the tool's name.
+        let mut spans = Vec::new();
+
+        append_batch_progress_spans(
+            &mut spans,
+            rgb(120, 130, 140),
+            Some(crate::bus::BatchProgress {
+                session_id: "s".to_string(),
+                tool_call_id: "cheap-route-call".to_string(),
+                total: 4,
+                completed: 2,
+                last_completed: None,
+                running: Vec::new(),
+                subcalls: Vec::new(),
+            }),
+            None,
+        );
+
+        assert_eq!(
+            spans.first().map(|span| span.content.as_ref()),
+            Some(" · 2/4 done"),
+            "a non-batch tool reporting progress must still show its live count"
+        );
     }
 
     #[test]
