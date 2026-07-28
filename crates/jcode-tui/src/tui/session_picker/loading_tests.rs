@@ -102,6 +102,7 @@ fn cached_grouped_sessions_round_trip_from_disk() {
     let session = SessionInfo {
         id: "session_cache_test_1770000000000".to_string(),
         parent_id: None,
+        agent_role: None,
         short_name: "cache-test".to_string(),
         icon: "🧪".to_string(),
         title: "Cache test".to_string(),

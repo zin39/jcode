@@ -1611,6 +1611,9 @@ impl CheapRouteBackend for ProviderCheapBackend {
         // Mirror SubagentTool::execute: new session pinned to `model`, blocked
         // recursive tools removed, run on an isolated provider fork.
         let mut session = crate::session::Session::create(None, Some(subtask.description.clone()));
+        // One cheap-route subtask per session. These are machine-created work,
+        // so they must not surface in the user's session picker.
+        session.set_agent_role(crate::session::SessionAgentRole::CheapRouteSubtask);
         session.model = Some(model.to_string());
         // Pin the EXACT route chosen by ranking. Without this, a bare model name
         // (e.g. "deepseek-chat") is re-resolved to whatever provider is active —

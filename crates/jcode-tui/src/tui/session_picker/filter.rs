@@ -72,7 +72,14 @@ impl SessionPicker {
             .copied()
             .filter(|session_ref| {
                 self.session_by_ref(*session_ref).is_some_and(|session| {
-                    (show_test || !session.is_debug)
+                    // Machine-created sessions (swarm workers, cheap-route
+                    // subtasks, one-shot runs, debug sessions) are hidden by
+                    // default. They vastly outnumber real sessions, so listing
+                    // them buries the user's own work. The test-session toggle
+                    // reveals them for debugging. Routing every one of these
+                    // through `is_internal_agent_session` means a new spawn
+                    // path cannot leak in by forgetting a specific flag.
+                    (show_test || !session.is_internal_agent_session())
                         && self.session_matches_filter_mode(session, filter_mode)
                 })
             })
@@ -114,7 +121,8 @@ impl SessionPicker {
         refs.iter()
             .filter_map(|session_ref| self.session_by_ref(*session_ref))
             .filter(|session| {
-                session.is_debug && self.session_matches_filter_mode(session, filter_mode)
+                session.is_internal_agent_session()
+                    && self.session_matches_filter_mode(session, filter_mode)
             })
             .count()
     }

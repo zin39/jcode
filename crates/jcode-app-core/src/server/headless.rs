@@ -175,7 +175,10 @@ pub(super) async fn create_headless_session(
         ));
     }
 
-    new_agent.set_debug(true);
+    // Headless spawns are swarm workers created on the user's behalf. Record
+    // the role rather than marking them debug, so the resume picker hides them
+    // for the right reason and worker GC can still reclaim them.
+    new_agent.set_agent_role(crate::session::SessionAgentRole::SwarmWorker);
 
     if selfdev_requested {
         new_agent.set_canary("self-dev");

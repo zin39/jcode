@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use jcode_message_types::ToolCall;
-use jcode_session_types::SessionStatus;
+use jcode_session_types::{SessionAgentRole, SessionStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -122,6 +122,9 @@ pub struct SessionInfo {
     pub provider_key: Option<String>,
     pub is_canary: bool,
     pub is_debug: bool,
+    /// Set when this session was created by the machine (swarm worker,
+    /// cheap-route subtask, one-shot run) rather than opened by the user.
+    pub agent_role: Option<SessionAgentRole>,
     pub saved: bool,
     pub save_label: Option<String>,
     pub status: SessionStatus,
@@ -184,6 +187,21 @@ pub enum PickerItem {
     SavedHeader {
         session_count: usize,
     },
+}
+
+impl SessionInfo {
+    /// Whether this session was created by the machine rather than opened by
+    /// the user, and so must not appear in the default resume list.
+    ///
+    /// Delegates to the shared rule in `jcode-session-types` so the picker and
+    /// the storage layer never disagree about what counts as a real session.
+    pub fn is_internal_agent_session(&self) -> bool {
+        jcode_session_types::session_is_internal_agent(
+            self.agent_role,
+            self.parent_id.as_deref(),
+            self.is_debug,
+        )
+    }
 }
 
 pub fn session_is_claude_code(source: SessionSource, id: &str) -> bool {

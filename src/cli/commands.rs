@@ -2445,6 +2445,14 @@ pub async fn run_single_message_command(
         wait_for_cold_cache_mcp_tools(&registry).await;
     }
     let mut agent = crate::agent::Agent::new(provider.clone(), registry);
+    if resume_session.is_none() {
+        // A fresh `jcode run` session is a non-interactive one-shot: the user
+        // asked for an answer, not for a session to come back to. Scripted and
+        // agent-driven `run` calls were the largest source of session-picker
+        // clutter, so classify them at creation. Resumed runs keep whatever
+        // classification the existing session already has.
+        agent.set_agent_role(crate::session::SessionAgentRole::OneShot);
+    }
     restore_agent_session_if_requested(&mut agent, resume_session)?;
 
     if emit_json {

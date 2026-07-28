@@ -80,10 +80,11 @@ fn create_visible_spawn_session(
 
     let mut session = Session::create(None, None);
     session.working_dir = Some(cwd.display().to_string());
-    // Visible-spawn workers are swarm agents just like headless ones; mark
-    // them debug so the session picker hides them and worker-session GC can
-    // reclaim their transcripts (see headless.rs, which does the same).
-    session.set_debug(true);
+    // Visible-spawn workers are swarm agents just like headless ones. Record
+    // that explicitly so the session picker hides them and worker-session GC
+    // can reclaim their transcripts, without having to lie and call them debug
+    // sessions (see headless.rs, which does the same).
+    session.set_agent_role(crate::session::SessionAgentRole::SwarmWorker);
     if let Some(model) = model_override {
         // Build a model-switch request that preserves the coordinator's auth
         // route, same as create_headless_session does for headless spawns.

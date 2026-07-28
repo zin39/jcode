@@ -1118,6 +1118,8 @@ fn create_launch_session(request: &LaunchRequest) -> Result<(String, PathBuf)> {
     }
 
     let mut session = Session::create(None, Some("Jade relay launch".to_string()));
+    // Relay plumbing, never a session the user opened.
+    session.set_agent_role(crate::session::SessionAgentRole::Internal);
     session.working_dir = Some(cwd.display().to_string());
     if let Some(model) = &request.model {
         session.model = Some(model.clone());

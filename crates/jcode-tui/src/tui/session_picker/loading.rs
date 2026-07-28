@@ -1167,6 +1167,8 @@ struct SessionSummary {
     #[serde(default)]
     is_debug: bool,
     #[serde(default)]
+    agent_role: Option<jcode_session_types::SessionAgentRole>,
+    #[serde(default)]
     saved: bool,
     #[serde(default)]
     save_label: Option<String>,
@@ -1471,6 +1473,8 @@ struct SessionJournalSummaryMeta {
     #[serde(default)]
     is_debug: bool,
     #[serde(default)]
+    agent_role: Option<jcode_session_types::SessionAgentRole>,
+    #[serde(default)]
     saved: Option<bool>,
     #[serde(default)]
     save_label: Option<String>,
@@ -1517,6 +1521,7 @@ fn load_session_summary(path: &Path) -> Result<SessionSummary> {
                     summary.model = entry.meta.model;
                     summary.is_canary = entry.meta.is_canary;
                     summary.is_debug = entry.meta.is_debug;
+                    summary.agent_role = entry.meta.agent_role;
                     if let Some(saved) = entry.meta.saved {
                         summary.saved = saved;
                     }
@@ -1681,6 +1686,7 @@ fn parse_jcode_session_info(
         provider_key: session.provider_key,
         is_canary: session.is_canary,
         is_debug: session.is_debug,
+        agent_role: session.agent_role,
         saved: session.saved,
         save_label: session.save_label,
         category: session.category,
@@ -1763,7 +1769,7 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
         // default list appear to jump from a handful of Jcode rows straight to old
         // external transcripts.
         let mut visible_session_count = 0usize;
-        let mut debug_session_count = 0usize;
+        let mut internal_session_count = 0usize;
         let mut boundary = candidates.len();
         let window = scan_limit.max(1);
         let mut start = 0;
@@ -1775,9 +1781,14 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
             });
             for (offset, parsed_session) in parsed.into_iter().enumerate() {
                 if let Some(info) = parsed_session {
-                    if info.is_debug {
-                        if debug_session_count < scan_limit {
-                            debug_session_count += 1;
+                    // Internal sessions (swarm workers, cheap-route subtasks,
+                    // one-shot runs, debug sessions) are hidden by default and
+                    // can outnumber real sessions by 100:1. Budget them
+                    // separately or a spawn burst eats the whole scan window and
+                    // the user's own recent sessions never get parsed.
+                    if info.is_internal_agent_session() {
+                        if internal_session_count < scan_limit {
+                            internal_session_count += 1;
                             sessions.push(info);
                         }
                     } else {
@@ -1877,6 +1888,7 @@ fn load_external_claude_code_sessions(scan_limit: usize) -> Vec<SessionInfo> {
             SessionInfo {
                 id: format!("claude:{session_id}"),
                 parent_id: None,
+                agent_role: None,
                 short_name,
                 icon: "🧵".to_string(),
                 title,
@@ -2033,6 +2045,7 @@ fn load_codex_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
     Ok(Some(SessionInfo {
         id: format!("codex:{session_id}"),
         parent_id: None,
+        agent_role: None,
         short_name,
         icon: "🧠".to_string(),
         title,
@@ -2232,6 +2245,7 @@ fn load_pi_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
     Ok(Some(SessionInfo {
         id: format!("pi:{session_id}"),
         parent_id: None,
+        agent_role: None,
         short_name,
         icon: "π".to_string(),
         title,
@@ -2398,6 +2412,7 @@ fn load_pi_session_info(path: &Path) -> Result<Option<SessionInfo>> {
     Ok(Some(SessionInfo {
         id: format!("pi:{session_id}"),
         parent_id: None,
+        agent_role: None,
         short_name,
         icon: "π".to_string(),
         title,
@@ -2509,6 +2524,7 @@ fn load_opencode_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
     Ok(Some(SessionInfo {
         id: format!("opencode:{session_id}"),
         parent_id: None,
+        agent_role: None,
         short_name,
         icon: "◌".to_string(),
         title,
@@ -2661,6 +2677,7 @@ fn load_opencode_session_info(path: &Path) -> Result<Option<SessionInfo>> {
     Ok(Some(SessionInfo {
         id: format!("opencode:{session_id}"),
         parent_id: None,
+        agent_role: None,
         short_name,
         icon: "◌".to_string(),
         title,
@@ -2838,6 +2855,7 @@ fn load_cursor_session_stub(path: &Path) -> Result<Option<SessionInfo>> {
     Ok(Some(SessionInfo {
         id: format!("cursor:{session_id}"),
         parent_id: None,
+        agent_role: None,
         short_name,
         icon: "▮".to_string(),
         title,

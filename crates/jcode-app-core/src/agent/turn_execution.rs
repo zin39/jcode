@@ -297,6 +297,15 @@ impl Agent {
         }
     }
 
+    /// Record that this agent's session is machine-created work rather than a
+    /// session the user opened, so user-facing session lists skip it.
+    pub fn set_agent_role(&mut self, role: crate::session::SessionAgentRole) {
+        self.session.set_agent_role(role);
+        if let Err(err) = self.session.save() {
+            logging::error(&format!("Failed to persist session agent role: {}", err));
+        }
+    }
+
     /// Enable or disable memory features for this session.
     pub fn set_memory_enabled(&mut self, enabled: bool) {
         self.memory_enabled = enabled;

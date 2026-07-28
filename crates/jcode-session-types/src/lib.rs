@@ -1067,3 +1067,59 @@ mod session_search_tests {
         assert!(fenced.ends_with("\n````"));
     }
 }
+
+/// Why a session exists when the user did not open it directly.
+///
+/// Every variant means "internal": the session is machine-created work done on
+/// the user's behalf. The variant records *which* subsystem created it, which
+/// keeps logs and the session picker's test view intelligible.
+///
+/// This lives in `jcode-session-types` so both the storage layer
+/// (`jcode-base`) and the session-picker UI classify sessions with the same
+/// definition, instead of each re-deriving "is this a real session?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAgentRole {
+    /// A swarm worker spawned by a coordinator.
+    SwarmWorker,
+    /// A single cheap-route subtask run.
+    CheapRouteSubtask,
+    /// A subagent run launched by a tool.
+    Subagent,
+    /// A non-interactive one-shot run (e.g. `jcode run -p`, scripted API use).
+    OneShot,
+    /// Internal machinery with no user-facing transcript (relay, catchup,
+    /// review children, ambient jobs).
+    Internal,
+}
+
+impl SessionAgentRole {
+    /// Stable label for logs and debug surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SwarmWorker => "swarm_worker",
+            Self::CheapRouteSubtask => "cheap_route_subtask",
+            Self::Subagent => "subagent",
+            Self::OneShot => "one_shot",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// The one rule deciding whether a session is machine-created rather than
+/// opened by the user.
+///
+/// User-facing session lists must route every entry through this, so a new
+/// spawn path cannot leak into the resume picker by forgetting a flag. A
+/// session counts as internal when it declares an agent role, when it is a
+/// child of another session (spawned lineage), or when it is a debug/test
+/// session.
+pub fn session_is_internal_agent(
+    agent_role: Option<SessionAgentRole>,
+    parent_id: Option<&str>,
+    is_debug: bool,
+) -> bool {
+    agent_role.is_some()
+        || parent_id.is_some_and(|parent| !parent.trim().is_empty())
+        || is_debug
+}

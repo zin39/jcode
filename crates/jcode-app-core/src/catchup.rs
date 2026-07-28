@@ -607,6 +607,8 @@ mod tests {
     #[test]
     fn render_markdown_includes_key_sections() {
         let mut session = Session::create(None, Some("catchup".to_string()));
+    // Catch-up summarisation runs on the user's behalf; not a user session.
+    session.set_agent_role(crate::session::SessionAgentRole::Internal);
         session.short_name = Some("fox".to_string());
         session.status = SessionStatus::Closed;
         session.add_message(

@@ -1550,6 +1550,9 @@ pub(super) async fn run_swarm_task(
         Some(format!("{} (@{} swarm)", description, subagent_type)),
     );
     let child_session_id = session.id.clone();
+    // Swarm workers are machine-created: keep the transcript on disk for the
+    // coordinator and replay, but keep it out of the user's session picker.
+    session.set_agent_role(crate::session::SessionAgentRole::SwarmWorker);
     session.model = Some(coordinator_model);
     // Inherit the coordinator's exact auth identity so the forked worker keeps
     // the same provider/auth route (OAuth vs API, openai-compatible profile)

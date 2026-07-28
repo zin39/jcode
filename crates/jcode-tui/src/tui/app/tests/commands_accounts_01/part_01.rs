@@ -7,6 +7,7 @@ fn session_picker_resume_action_keeps_overlay_open() {
             crate::tui::session_picker::SessionInfo {
                 id: "session_keep_open".to_string(),
                 parent_id: None,
+                agent_role: None,
                 short_name: "keep-open".to_string(),
                 icon: "k".to_string(),
                 title: "Keep Open".to_string(),
@@ -59,6 +60,7 @@ fn session_picker_enter_queues_current_terminal_resume_and_closes_overlay() {
             crate::tui::session_picker::SessionInfo {
                 id: "session_here_123".to_string(),
                 parent_id: None,
+                agent_role: None,
                 short_name: "here".to_string(),
                 icon: "h".to_string(),
                 title: "Here".to_string(),
@@ -386,6 +388,7 @@ fn session_picker_preview_wheel_uses_shared_scroll_momentum() {
     let session = SessionInfo {
         id: "session_scroll".to_string(),
         parent_id: None,
+        agent_role: None,
         short_name: "scroll".to_string(),
         icon: "s".to_string(),
         title: "Scroll".to_string(),

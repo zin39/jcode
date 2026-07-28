@@ -65,6 +65,7 @@ fn make_session_with_flags(
     SessionInfo {
         id: id.to_string(),
         parent_id: None,
+        agent_role: None,
         short_name: short_name.to_string(),
         icon: "🧪".to_string(),
         title,

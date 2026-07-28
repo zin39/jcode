@@ -91,6 +91,8 @@ fn is_visible_conversation_message(message: &StoredMessage) -> bool {
     message.display_role.is_none() && !is_internal_system_reminder_message(message)
 }
 
+pub use jcode_session_types::{SessionAgentRole, session_is_internal_agent};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -161,6 +163,19 @@ pub struct Session {
     /// Whether this is a debug/test session (created via debug socket)
     #[serde(default)]
     pub is_debug: bool,
+    /// Why this session exists, when it was not opened by the user directly.
+    ///
+    /// Sessions spawned on the user's behalf (swarm workers, cheap-route
+    /// subtasks, subagents, one-shot `-p` runs) are *internal*: they are real
+    /// sessions on disk for lifecycle, replay and swarm bookkeeping, but the
+    /// user never chose to start them, so user-facing surfaces like the resume
+    /// picker and menu-bar counts must not list them. `None` means the user
+    /// opened this session themselves.
+    ///
+    /// This is persisted so the classification survives a restart and can be
+    /// read from the session file alone, without reconstructing lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<SessionAgentRole>,
     /// Whether this session has been saved/bookmarked by the user
     #[serde(default)]
     pub saved: bool,
@@ -244,6 +259,8 @@ struct SessionStartupStub {
     last_active_at: Option<DateTime<Utc>>,
     #[serde(default)]
     is_debug: bool,
+    #[serde(default)]
+    agent_role: Option<SessionAgentRole>,
     #[serde(default)]
     saved: bool,
     #[serde(default)]
@@ -343,6 +360,7 @@ impl Session {
         session.last_pid = stub.last_pid;
         session.last_active_at = stub.last_active_at;
         session.is_debug = stub.is_debug;
+        session.agent_role = stub.agent_role;
         session.saved = stub.saved;
         session.save_label = stub.save_label;
         session.category = stub.category;
@@ -380,6 +398,7 @@ impl Session {
         session.last_pid = snapshot.last_pid;
         session.last_active_at = snapshot.last_active_at;
         session.is_debug = snapshot.is_debug;
+        session.agent_role = snapshot.agent_role;
         session.saved = snapshot.saved;
         session.save_label = snapshot.save_label;
         session.category = snapshot.category;
@@ -519,6 +538,7 @@ impl Session {
             last_pid: self.last_pid,
             last_active_at: self.last_active_at,
             is_debug: self.is_debug,
+            agent_role: self.agent_role,
             saved: self.saved,
             save_label: self.save_label.clone(),
             category: self.category.clone(),
@@ -722,6 +742,7 @@ impl Session {
         self.last_pid = meta.last_pid;
         self.last_active_at = meta.last_active_at;
         self.is_debug = meta.is_debug;
+        self.agent_role = meta.agent_role;
         self.saved = meta.saved;
         self.save_label = meta.save_label;
         self.mark_memory_profile_dirty();
@@ -763,6 +784,7 @@ impl Session {
             last_pid: Some(std::process::id()),
             last_active_at: Some(now),
             is_debug,
+            agent_role: None,
             saved: false,
             save_label: None,
             category: None,
@@ -819,6 +841,7 @@ impl Session {
             last_pid: Some(std::process::id()),
             last_active_at: Some(now),
             is_debug,
+            agent_role: None,
             saved: false,
             save_label: None,
             category: None,
@@ -835,6 +858,33 @@ impl Session {
         };
         session.reset_persist_state(false);
         session
+    }
+
+    /// Mark this session as machine-created work rather than a session the
+    /// user opened. Internal sessions stay on disk and keep their full
+    /// lifecycle, but user-facing surfaces (resume picker, menu-bar counts)
+    /// must filter them out via [`Session::is_internal_agent_session`].
+    ///
+    /// Call this at creation, before `save()`, so the very first snapshot
+    /// written to disk already carries the classification.
+    pub fn set_agent_role(&mut self, role: SessionAgentRole) {
+        self.agent_role = Some(role);
+        if self.status == SessionStatus::Active {
+            self.sync_internal_presence_flag();
+        }
+    }
+
+    /// Whether this session was created by the machine rather than opened by
+    /// the user.
+    ///
+    /// This is the single source of truth for "should a user-facing session
+    /// list show this?". It is deliberately broader than `agent_role` alone:
+    /// a session is internal if it carries an explicit role, if it is a child
+    /// of another session (spawned lineage), or if it is a debug/test session.
+    /// Every user-facing listing must go through this predicate so a new spawn
+    /// path cannot leak into the picker by forgetting a flag.
+    pub fn is_internal_agent_session(&self) -> bool {
+        session_is_internal_agent(self.agent_role, self.parent_id.as_deref(), self.is_debug)
     }
 
     /// Mark this session as a debug/test session
@@ -1091,8 +1141,7 @@ request in this new forked session, using the inherited conversation only as con
     /// are hidden from user-facing presence UIs like the menu bar (issue
     /// #508).
     fn sync_internal_presence_flag(&self) {
-        let internal = self.is_debug || self.parent_id.is_some();
-        crate::storage::set_session_internal(&self.id, internal);
+        crate::storage::set_session_internal(&self.id, self.is_internal_agent_session());
     }
 
     /// Detect if an active session likely crashed (process no longer running)
@@ -1650,6 +1699,8 @@ struct RemoteStartupSessionSnapshot {
     last_active_at: Option<DateTime<Utc>>,
     #[serde(default)]
     is_debug: bool,
+    #[serde(default)]
+    agent_role: Option<SessionAgentRole>,
     #[serde(default)]
     saved: bool,
     #[serde(default)]
