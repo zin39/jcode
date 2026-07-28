@@ -1141,6 +1141,7 @@ fn parallel_fill_skips_many_recent_empty_sessions_to_reach_scan_limit() {
             Some(format!("Full {idx:03}")),
         );
         push_message(&mut session, &format!("real content {idx:03}"));
+        push_message(&mut session, &format!("real follow-up {idx:03}"));
         session.save().expect("save full session");
     }
 
@@ -1194,7 +1195,10 @@ fn hidden_debug_sessions_do_not_consume_default_resume_budget() {
         );
         session.is_debug = false;
         session.is_canary = false;
+        // Two user turns: the backfill treats a single-turn session as a
+        // one-shot agent run, and these fixtures stand for real sessions.
         push_message(&mut session, &format!("regular content {idx:03}"));
+        push_message(&mut session, &format!("regular follow-up {idx:03}"));
         session.save().expect("save regular session");
     }
 

@@ -665,6 +665,20 @@ fn test_loading_preview_refreshes_search_index_for_picker_filtering() {
         tool_duration_ms: None,
         token_usage: None,
     });
+    // A second user turn makes this a conversation rather than a one-shot
+    // agent run, which is what the picker is expected to list.
+    session.append_stored_message(crate::session::StoredMessage {
+        id: "msg2".to_string(),
+        role: crate::message::Role::User,
+        content: vec![crate::message::ContentBlock::Text {
+            text: "follow-up turn".to_string(),
+            cache_control: None,
+        }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+    });
     session.save().expect("save session");
 
     let sessions = load_sessions().expect("load sessions");
