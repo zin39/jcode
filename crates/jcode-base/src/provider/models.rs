@@ -779,6 +779,25 @@ pub fn finish_anthropic_model_catalog_refresh_for_scope(scope: &str) {
 
 fn account_model_cache_is_fresh() -> bool {
     let scope = current_openai_account_scope();
+    // Hydrate from the on-disk snapshot first. `is_fresh` only consults the
+    // in-memory `fetched_at` map, which a freshly started process has never
+    // populated, so this reported "stale" on every launch even when the
+    // snapshot on disk was minutes old. The visible effect was worse than a
+    // wrong label: an Unknown availability state makes the picker fall back to
+    // the API-key route, so a working OAuth account silently billed per token.
+    //
+    // Hydration is idempotent and cheap after the first call (the service
+    // keeps the parsed scope), so doing it here rather than at every call site
+    // keeps the freshness question honest wherever it is asked.
+    if OPENAI_MODEL_CATALOG_SERVICE.is_fresh(&scope) {
+        return true;
+    }
+    // A missing or unreadable snapshot is the ordinary first-run case, not an
+    // error to report: there is simply nothing to hydrate, and the freshness
+    // answer below is then correctly `false`.
+    if load_openai_catalog_from_disk(&scope).is_none() {
+        return false;
+    }
     OPENAI_MODEL_CATALOG_SERVICE.is_fresh(&scope)
 }
 

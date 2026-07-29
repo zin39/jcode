@@ -144,6 +144,40 @@ fn test_openai_model_catalog_hydrates_from_disk_cache() {
 }
 
 #[test]
+fn availability_uses_the_disk_snapshot_on_a_fresh_process() {
+    // `cached_openai_model_ids` hydrated from disk, but the availability path
+    // asked `is_fresh` directly. That reads an in-memory map a newly started
+    // process has never populated, so a snapshot written minutes ago reported
+    // "availability snapshot is stale (account-snapshot)" on every launch.
+    //
+    // The consequence was not cosmetic: an Unknown availability state makes the
+    // model picker prefer the API-key route, so a working OAuth account was
+    // silently billed per token.
+    with_clean_provider_test_env(|| {
+        crate::auth::codex::set_active_account_override(Some("fresh-proc".to_string()));
+        persist_openai_model_catalog(&OpenAIModelCatalog {
+            available_models: vec!["gpt-5.5".to_string()],
+            context_limits: Default::default(),
+            reasoning_efforts: Default::default(),
+        });
+
+        // Simulate a fresh process: drop everything the service holds in memory
+        // so only the on-disk snapshot remains.
+        crate::provider::models::reset_model_catalog_services_for_tests();
+
+        let availability = crate::provider::model_availability_for_account("gpt-5.5");
+        assert_eq!(
+            availability.state,
+            crate::provider::AccountModelAvailabilityState::Available,
+            "a snapshot on disk must be consulted before declaring it stale; got {:?}",
+            availability.reason
+        );
+
+        crate::auth::codex::set_active_account_override(None);
+    });
+}
+
+#[test]
 fn test_anthropic_model_catalog_hydrates_from_disk_cache() {
     with_clean_provider_test_env(|| {
         crate::env::remove_var("ANTHROPIC_API_KEY");
