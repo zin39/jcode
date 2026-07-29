@@ -270,6 +270,42 @@ fn filter_routes_by_provider_allowlist(
     }
 }
 
+/// Ordering for the routes offered under a single model row in `/model`.
+///
+/// Module-level (not nested in the picker builder) so the ordering contract
+/// can be tested directly: the OAuth-vs-API-key regression this encodes was
+/// invisible precisely because nothing could assert on it.
+pub(crate) fn route_sort_key(r: &PickerOption) -> (u8, u8, u64, String) {
+    let avail = if r.available { 0 } else { 1 };
+    // Subscription (OAuth) routes rank above metered API-key routes for
+    // the same model. A ChatGPT/Claude plan is already paid for, so
+    // defaulting to the key silently bills per token for a request the
+    // subscription would have covered.
+    //
+    // OpenAI OAuth and OpenAI API key used to share rank 0. Both also
+    // report `estimated_reference_cost_micros = None` (a subscription
+    // with no published per-request quota cannot be reduced to a
+    // per-request figure), so the cheapness tiebreak was MAX == MAX and
+    // ordering fell through to comparing the provider label, which is
+    // the identical string "OpenAI" for both. The winner was therefore
+    // whichever route the sort happened to leave first, and in practice
+    // that was the API key. Anthropic was never affected only because
+    // its API-key arm already sat at rank 1.
+    let method = match crate::provider::ModelRouteApiMethod::parse(&r.api_method) {
+        crate::provider::ModelRouteApiMethod::ClaudeOAuth
+        | crate::provider::ModelRouteApiMethod::OpenAIOAuth => 0,
+        crate::provider::ModelRouteApiMethod::OpenAIApiKey
+        | crate::provider::ModelRouteApiMethod::AnthropicApiKey
+        | crate::provider::ModelRouteApiMethod::OpenAiCompatible { .. } => 1,
+        crate::provider::ModelRouteApiMethod::Cursor => 2,
+        crate::provider::ModelRouteApiMethod::Copilot => 3,
+        crate::provider::ModelRouteApiMethod::OpenRouter => 4,
+        _ => 5,
+    };
+    let cheapness = r.estimated_reference_cost_micros.unwrap_or(u64::MAX);
+    (avail, method, cheapness, r.provider.clone())
+}
+
 fn model_picker_usage_key(model_name: &str, route: &PickerOption, effort: Option<&str>) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}",
@@ -1645,23 +1681,6 @@ impl App {
                 });
         }
         let grouping_ms = grouping_started.elapsed().as_millis();
-
-        fn route_sort_key(r: &PickerOption) -> (u8, u8, u64, String) {
-            let avail = if r.available { 0 } else { 1 };
-            let method = match crate::provider::ModelRouteApiMethod::parse(&r.api_method) {
-                crate::provider::ModelRouteApiMethod::ClaudeOAuth
-                | crate::provider::ModelRouteApiMethod::OpenAIOAuth
-                | crate::provider::ModelRouteApiMethod::OpenAIApiKey => 0,
-                crate::provider::ModelRouteApiMethod::AnthropicApiKey
-                | crate::provider::ModelRouteApiMethod::OpenAiCompatible { .. } => 1,
-                crate::provider::ModelRouteApiMethod::Cursor => 2,
-                crate::provider::ModelRouteApiMethod::Copilot => 3,
-                crate::provider::ModelRouteApiMethod::OpenRouter => 4,
-                _ => 5,
-            };
-            let cheapness = r.estimated_reference_cost_micros.unwrap_or(u64::MAX);
-            (avail, method, cheapness, r.provider.clone())
-        }
 
         fn route_matches_recent_auth(route_provider: &str, login_provider: &str) -> bool {
             jcode_provider_core::model_route_provider_labels_related(route_provider, login_provider)
@@ -4036,7 +4055,7 @@ mod tests {
         model_picker_route_is_current, model_picker_route_is_default,
         model_picker_route_is_recommended, picker_is_runtime_model_picker,
         remote_model_catalog_cache_is_fresh, remote_model_catalog_cache_origin,
-        remote_model_catalog_snapshot_is_safe, route_supports_reasoning_effort,
+        remote_model_catalog_snapshot_is_safe, route_sort_key, route_supports_reasoning_effort,
     };
     use crate::tui::{
         AgentModelTarget, App, InlineInteractiveState, PickerAction, PickerEntry, PickerKind,
@@ -4576,6 +4595,82 @@ mod tests {
         assert_eq!(
             filter_routes_by_provider_allowlist(routes, Some(&["  ".to_string()]), "x").len(),
             2
+        );
+    }
+
+    /// A paid subscription must outrank a metered API key for the same model.
+    ///
+    /// The bug: OpenAI OAuth and OpenAI API key both sat at method rank 0, and
+    /// both report `estimated_reference_cost_micros = None`, so the cheapness
+    /// tiebreak compared MAX to MAX and fell through to the provider label,
+    /// which is the identical string "OpenAI". Ordering was therefore
+    /// arbitrary, and the API-key route won: every OpenAI model in `/model`
+    /// showed "api key" as its default route even for a user with a working
+    /// ChatGPT OAuth login, silently billing per token for requests the
+    /// subscription already covered.
+    #[test]
+    fn oauth_routes_outrank_api_key_routes_for_the_same_model() {
+        fn opt(api_method: &str, provider: &str) -> crate::tui::PickerOption {
+            crate::tui::PickerOption {
+                provider: provider.to_string(),
+                api_method: api_method.to_string(),
+                available: true,
+                detail: String::new(),
+                // Both subscription and (unpriced) key routes report None here,
+                // which is exactly why cheapness could not break the tie.
+                estimated_reference_cost_micros: None,
+            }
+        }
+
+        let mut openai = vec![
+            opt("openai-api-key", "OpenAI"),
+            opt("openai-oauth", "OpenAI"),
+        ];
+        openai.sort_by_key(route_sort_key);
+        assert_eq!(
+            openai[0].api_method, "openai-oauth",
+            "a ChatGPT subscription is already paid for; defaulting to the \
+             metered key bills twice for the same request"
+        );
+
+        // Sort must not depend on input order.
+        let mut reversed = vec![
+            opt("openai-oauth", "OpenAI"),
+            opt("openai-api-key", "OpenAI"),
+        ];
+        reversed.sort_by_key(route_sort_key);
+        assert_eq!(reversed[0].api_method, "openai-oauth");
+
+        // The Anthropic pair already behaved; pin it so the shared ranking
+        // cannot regress while fixing the OpenAI side.
+        let mut anthropic = vec![
+            opt("api-key", "Anthropic"),
+            opt("claude-oauth", "Anthropic"),
+        ];
+        anthropic.sort_by_key(route_sort_key);
+        assert_eq!(anthropic[0].api_method, "claude-oauth");
+    }
+
+    /// Availability still dominates: an unavailable OAuth route must not be
+    /// preferred over a working API key, or the picker would default to a
+    /// route that cannot serve the request.
+    #[test]
+    fn an_unavailable_oauth_route_loses_to_a_working_api_key() {
+        fn opt(api_method: &str, available: bool) -> crate::tui::PickerOption {
+            crate::tui::PickerOption {
+                provider: "OpenAI".to_string(),
+                api_method: api_method.to_string(),
+                available,
+                detail: String::new(),
+                estimated_reference_cost_micros: None,
+            }
+        }
+
+        let mut routes = vec![opt("openai-oauth", false), opt("openai-api-key", true)];
+        routes.sort_by_key(route_sort_key);
+        assert_eq!(
+            routes[0].api_method, "openai-api-key",
+            "preferring a subscription must never mean preferring a dead route"
         );
     }
 }
