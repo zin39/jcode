@@ -934,9 +934,24 @@ fn probe_bedrock_status(status: &mut AuthStatus) {
     }
 }
 
+/// True when the resolved OpenAI credential came from an OAuth login rather
+/// than a bare API key.
+///
+/// A refresh token is the usual marker, but it is not the only one: tokens
+/// minted by the ChatGPT device/OAuth flow (and some imported Codex sessions)
+/// carry only a short-lived access token plus an `id_token`, with no refresh
+/// token at all. Keying solely off `refresh_token` misclassified those logins
+/// as API keys, which cleared `openai_has_oauth` and made the model picker drop
+/// every `openai-oauth` route even though the credential worked fine. The rest
+/// of the codebase (sidecar, pricing, usage, `/review`) already uses this
+/// refresh-or-id-token test, so this keeps the auth probe consistent with them.
+pub(crate) fn codex_credentials_are_oauth(creds: &codex::CodexCredentials) -> bool {
+    !creds.refresh_token.trim().is_empty() || creds.id_token.is_some()
+}
+
 fn probe_openai_status(status: &mut AuthStatus) {
     if let Ok(creds) = codex::load_credentials() {
-        if !creds.refresh_token.is_empty() {
+        if codex_credentials_are_oauth(&creds) {
             status.openai_has_oauth = true;
             if let Some(expires_at) = creds.expires_at {
                 let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1471,3 +1486,8 @@ fn api_key_available(env_key: &str, file_name: &str) -> bool {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn probe_openai_status_for_test(status: &mut AuthStatus) {
+    probe_openai_status(status);
+}

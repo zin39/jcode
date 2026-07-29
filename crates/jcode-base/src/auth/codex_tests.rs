@@ -515,3 +515,101 @@ fn oauth_credentials_still_work_when_oauth_accounts_exist() {
     assert_eq!(creds.access_token, "at_oauth_valid");
     assert_eq!(creds.refresh_token, "rt_oauth_valid");
 }
+
+/// Regression: a ChatGPT OAuth login that carries an `id_token` but no refresh
+/// token must still be classified as OAuth.
+///
+/// The device/OAuth flow can mint a short-lived access token plus an
+/// `id_token` and leave `refresh_token` empty. `probe_openai_status` used to
+/// test only `refresh_token`, so such an account was filed as an API key:
+/// `openai_has_oauth` stayed false, and `append_openai_routes` therefore
+/// emitted no `openai-oauth` route at all. The result was a working OpenAI
+/// login that never appeared in the `/model` picker.
+#[test]
+fn oauth_without_refresh_token_is_classified_as_oauth() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _no_api_key = EnvVarGuard::unset("OPENAI_API_KEY");
+    set_active_account_override(None);
+
+    upsert_account(OpenAiAccount {
+        label: "openai-1".to_string(),
+        access_token: "at_no_refresh".to_string(),
+        refresh_token: String::new(),
+        id_token: Some("id_token_present".to_string()),
+        account_id: Some("acct_no_refresh".to_string()),
+        expires_at: Some(9999999999999),
+        email: Some("chatgpt@example.com".to_string()),
+    })
+    .unwrap();
+
+    let creds = load_credentials().unwrap();
+    assert!(
+        creds.refresh_token.is_empty(),
+        "fixture must reproduce the empty-refresh-token shape"
+    );
+    assert!(
+        crate::auth::codex_credentials_are_oauth(&creds),
+        "an id_token-only ChatGPT login must count as OAuth, not as an API key"
+    );
+}
+
+/// A real API key (no refresh token, no id_token) must NOT be mistaken for
+/// OAuth, otherwise the fix above would flip the bug around and advertise
+/// `openai-oauth` routes for a plain platform key.
+#[test]
+fn bare_api_key_is_not_classified_as_oauth() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _api_key = EnvVarGuard::set("OPENAI_API_KEY", "sk-env-only");
+    set_active_account_override(None);
+
+    let creds = load_credentials().unwrap();
+    assert_eq!(creds.access_token, "sk-env-only");
+    assert!(
+        !crate::auth::codex_credentials_are_oauth(&creds),
+        "a bare API key must not be advertised as an OAuth credential"
+    );
+}
+
+/// End-to-end gate check: the credential shape that broke the picker must make
+/// `AuthStatus::openai_has_oauth` true.
+///
+/// This is the flag `append_openai_routes` reads to decide whether to emit any
+/// `openai-oauth:` route, so it is the precise switch that decided whether a
+/// working ChatGPT login appeared in `/model`.
+#[test]
+fn auth_status_reports_oauth_for_id_token_only_account() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _no_api_key = EnvVarGuard::unset("OPENAI_API_KEY");
+    set_active_account_override(None);
+
+    upsert_account(OpenAiAccount {
+        label: "openai-1".to_string(),
+        access_token: "at_no_refresh".to_string(),
+        refresh_token: String::new(),
+        id_token: Some("id_token_present".to_string()),
+        account_id: Some("acct_no_refresh".to_string()),
+        expires_at: Some(9999999999999),
+        email: Some("chatgpt@example.com".to_string()),
+    })
+    .unwrap();
+
+    let mut status = crate::auth::AuthStatus::default();
+    crate::auth::probe_openai_status_for_test(&mut status);
+
+    assert!(
+        status.openai_has_oauth,
+        "picker gate `openai_has_oauth` must be set for an id_token-only login"
+    );
+    assert_eq!(status.openai, crate::auth::AuthState::Available);
+    assert_eq!(
+        status.openai_oauth_state,
+        crate::auth::AuthState::Available,
+        "the OAuth-specific state must also be recorded, since route building reads it"
+    );
+}
