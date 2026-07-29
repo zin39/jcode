@@ -1698,7 +1698,7 @@ fn parse_jcode_session_info(
         // just trades one bad experience for another. The stored role always
         // wins when present.
         agent_role: session.agent_role.or_else(|| {
-            crate::session_legacy_role::classify_legacy_session(
+            jcode_session_types::classify_legacy_session(
                 parent_for_role.as_deref(),
                 title_for_role.as_deref(),
                 user_message_count,

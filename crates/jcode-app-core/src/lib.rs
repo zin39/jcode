@@ -43,12 +43,6 @@ pub mod server;
 pub mod server_spawn;
 pub mod session_effort;
 pub mod session_launch;
-/// Legacy session classification now lives in `jcode-session-types` so the
-/// productivity scanner (a leaf crate) can apply the same rule without
-/// depending on this one. Re-exported to keep existing call paths.
-pub mod session_legacy_role {
-    pub use jcode_session_types::legacy_role::*;
-}
 pub mod session_rebuild;
 pub mod setup_hints;
 pub mod ssh_remote;
