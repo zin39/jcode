@@ -11,8 +11,9 @@ use super::{
     filter_routes_by_provider_allowlist, key_char_eq_ignore_ascii_case,
     model_picker_route_is_current, model_picker_route_is_default,
     model_picker_route_is_recommended, picker_is_runtime_model_picker,
-    remote_model_catalog_cache_is_fresh, remote_model_catalog_cache_origin,
-    remote_model_catalog_snapshot_is_safe, route_sort_key, route_supports_reasoning_effort,
+    remote_model_catalog_cache_build, remote_model_catalog_cache_is_fresh,
+    remote_model_catalog_cache_origin, remote_model_catalog_snapshot_is_safe, route_sort_key,
+    route_supports_reasoning_effort,
 };
 use crate::tui::{
     AgentModelTarget, App, InlineInteractiveState, PickerAction, PickerEntry, PickerKind,
@@ -472,11 +473,37 @@ fn remote_model_catalog_cache_rejects_stale_and_future_timestamps() {
     let mut cache = RemoteModelCatalogCache {
         version: REMOTE_MODEL_CATALOG_CACHE_VERSION,
         origin: remote_model_catalog_cache_origin(),
+        build: remote_model_catalog_cache_build(),
         snapshot,
         observed_at_unix_secs: now,
     };
 
     assert!(remote_model_catalog_cache_is_fresh(&cache, now));
+
+    // A snapshot written by a different build must be rejected however recent
+    // it is. The route set is derived from the server's code, so an older
+    // build's cache describes an older route vocabulary. This is exactly how a
+    // cache written 77 seconds before a fix kept serving the pre-fix routes:
+    // `/model` showed only "api key" for a working OAuth account, and the 24h
+    // age window meant it would have kept doing so all day.
+    let good_build = cache.build.clone();
+    cache.build = "v0.0.0-previous (deadbee)".to_string();
+    assert!(
+        !remote_model_catalog_cache_is_fresh(&cache, now),
+        "a cache from another build must not be served, even when brand new"
+    );
+    cache.build = good_build;
+    assert!(remote_model_catalog_cache_is_fresh(&cache, now));
+
+    // Caches written before the field existed deserialize with an empty build
+    // and must also be rejected rather than trusted by default.
+    cache.build = String::new();
+    assert!(
+        !remote_model_catalog_cache_is_fresh(&cache, now),
+        "a pre-upgrade cache with no build stamp must be refetched"
+    );
+    cache.build = remote_model_catalog_cache_build();
+
     cache.observed_at_unix_secs = now - REMOTE_MODEL_CATALOG_CACHE_MAX_AGE_SECS - 1;
     assert!(!remote_model_catalog_cache_is_fresh(&cache, now));
     cache.observed_at_unix_secs = now + 5 * 60 + 1;

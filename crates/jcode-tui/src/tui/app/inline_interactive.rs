@@ -105,6 +105,21 @@ struct RemoteModelCatalogCache {
     version: u8,
     #[serde(default)]
     origin: String,
+    /// Build that produced this snapshot.
+    ///
+    /// The route set is derived from the *server's* code: which providers it
+    /// classifies, and which routes it marks available. A cache written by an
+    /// older build therefore describes an older route vocabulary, and honouring
+    /// it for up to 24h means a freshly upgraded jcode keeps rendering the
+    /// previous build's answer.
+    ///
+    /// This is not hypothetical. A cache written 77 seconds before a fix that
+    /// restored OpenAI OAuth routes kept serving the pre-fix route set, so
+    /// `/model` showed only "api key" for a working OAuth account long after
+    /// the fix shipped. Bumping `version` by hand does not help: the whole
+    /// point is that the bug is discovered *after* the release that caused it.
+    #[serde(default)]
+    build: String,
     #[serde(flatten)]
     snapshot: jcode_provider_core::ModelCatalogSnapshot,
     observed_at_unix_secs: u64,
@@ -494,9 +509,19 @@ fn remote_model_catalog_snapshot_is_safe(
 }
 
 fn remote_model_catalog_cache_is_fresh(cache: &RemoteModelCatalogCache, now: u64) -> bool {
+    // A snapshot from a different build describes a different route
+    // vocabulary, so age alone cannot vouch for it.
+    if cache.build != remote_model_catalog_cache_build() {
+        return false;
+    }
     cache.observed_at_unix_secs <= now.saturating_add(5 * 60)
         && now.saturating_sub(cache.observed_at_unix_secs)
             <= REMOTE_MODEL_CATALOG_CACHE_MAX_AGE_SECS
+}
+
+/// Build identity a remote-catalog snapshot is valid for.
+fn remote_model_catalog_cache_build() -> String {
+    jcode_build_meta::version().to_string()
 }
 
 fn remote_model_catalog_observed_at_unix_secs() -> u64 {
@@ -963,6 +988,7 @@ impl App {
         };
         let cache = RemoteModelCatalogCache {
             version: REMOTE_MODEL_CATALOG_CACHE_VERSION,
+            build: remote_model_catalog_cache_build(),
             origin: remote_model_catalog_cache_origin(),
             snapshot,
             observed_at_unix_secs: remote_model_catalog_observed_at_unix_secs(),
