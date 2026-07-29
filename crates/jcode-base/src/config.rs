@@ -3,6 +3,8 @@
 //! Config is loaded from `~/.jcode/config.toml` (or `$JCODE_HOME/config.toml`)
 //! Environment variables override config file settings.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 pub use jcode_config_types::{
     AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
     CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
@@ -270,30 +272,46 @@ fn scoped_home_config() -> Option<&'static Config> {
 
     let home = jcode_core::env::home_override()?;
     thread_local! {
-        static SCOPED: RefCell<Option<(std::path::PathBuf, &'static Config)>> =
-            const { RefCell::new(None) };
+        static SCOPED: RefCell<
+            Option<(std::path::PathBuf, u64, ConfigCacheFingerprint, &'static Config)>,
+        > = const { RefCell::new(None) };
     }
 
     SCOPED.with(|slot| {
         let mut slot = slot.borrow_mut();
-        // Reload when the thread's home changed, or when a mutation asked every
-        // reader to re-read (the same signal the global cache honours).
-        let force_reload = CONFIG_CACHE
-            .read()
-            .map(|cache| cache.force_reload)
-            .unwrap_or(false);
-        let stale = force_reload
-            || slot
-                .as_ref()
-                .is_none_or(|(cached_home, _)| cached_home != &home);
+        // Reload when this thread's home changed, or when a mutation asked
+        // every reader to re-read.
+        //
+        // Invalidation is tracked with a monotonic counter rather than by
+        // consuming the global `force_reload` flag. Clearing that flag here
+        // would let one thread swallow an invalidation meant for all of them:
+        // the clearing thread reloads, every other thread never learns it
+        // needed to, and each keeps serving a stale config.
+        let generation = CONFIG_INVALIDATION_GENERATION.load(Ordering::Acquire);
+        // Env-driven overrides (e.g. JCODE_IDLE_ANIMATION) are part of the
+        // fingerprint, so honour it here for the same reason the global cache
+        // does: a test that changes one without calling
+        // `invalidate_config_cache` must still be seen.
+        let fingerprint = ConfigCacheFingerprint::current();
+        let stale = slot.as_ref().is_none_or(
+            |(cached_home, cached_generation, cached_fingerprint, _)| {
+                cached_home != &home
+                    || *cached_generation != generation
+                    || cached_fingerprint != &fingerprint
+            },
+        );
         if stale {
             let config = leak_config(Config::load());
-            *slot = Some((home.clone(), config));
-            if let Ok(mut cache) = CONFIG_CACHE.write() {
-                cache.force_reload = false;
-            }
+            // Re-fingerprint after loading: applying overrides can itself set
+            // env vars, which would otherwise force a reload on every call.
+            *slot = Some((
+                home.clone(),
+                generation,
+                ConfigCacheFingerprint::current(),
+                config,
+            ));
         }
-        slot.as_ref().map(|(_, config)| *config)
+        slot.as_ref().map(|(_, _, _, config)| *config)
     })
 }
 
@@ -452,7 +470,12 @@ fn config_env_fingerprint() -> Vec<(String, String)> {
     values
 }
 
+/// Bumped by every [`invalidate_config_cache`] call so per-thread caches can
+/// detect an invalidation without consuming a shared flag.
+static CONFIG_INVALIDATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 pub fn invalidate_config_cache() {
+    CONFIG_INVALIDATION_GENERATION.fetch_add(1, Ordering::Release);
     let mut cache = CONFIG_CACHE
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
