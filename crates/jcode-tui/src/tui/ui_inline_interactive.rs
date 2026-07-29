@@ -615,7 +615,25 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
     }
     let account_state_width = (max_account_state_len + 1).clamp(7, 10);
     let account_title_width = width.saturating_sub(marker_width + account_state_width);
-    let model_width = width.saturating_sub(marker_width + provider_width + via_width);
+    // The effort ladder is drawn between the model and provider columns, so it
+    // consumes part of the row that this layout never allocated. Subtracting it
+    // from the model column keeps the later columns on screen; without this the
+    // provider column absorbed the overflow and METHOD was pushed off the edge
+    // entirely (rendering as "OpenAI …" with no method text at all).
+    //
+    // `picker_render_width` performs the same reservation when sizing the box.
+    // Both must agree, or the box is sized for columns this loop then draws
+    // somewhere else.
+    let ladder_width = picker
+        .filtered
+        .iter()
+        .take(WIDTH_SCAN_LIMIT)
+        .map(|&fi| effort_ladder_display_width(&picker.entries[fi]))
+        .max()
+        .unwrap_or(0);
+    let model_width = width
+        .saturating_sub(marker_width + provider_width + via_width)
+        .saturating_sub(ladder_width);
 
     let (col_labels, col_logical) = picker.header_layout(is_preview);
     let col_widths: [usize; 3] = if is_account_picker {

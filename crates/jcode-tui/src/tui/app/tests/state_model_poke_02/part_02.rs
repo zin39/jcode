@@ -402,3 +402,49 @@ fn test_model_picker_effort_wraps_and_enter_stages_choice() {
         app.pending_reasoning_effort
     );
 }
+
+/// The METHOD column must render its text, not be pushed off the row.
+///
+/// The picker sizes its box with `picker_render_width` but lays out columns
+/// again in the draw loop, and only the former reserved room for the inline
+/// effort ladder. The draw path therefore handed the leftover width to the
+/// model column, the ladder ate into it, and the last column fell off: rows
+/// rendered as "OpenAI …" with no method at all. That is what made a working
+/// OAuth login look absent from `/model`.
+#[test]
+fn model_picker_renders_the_method_column_next_to_the_effort_ladder() {
+    let mut app = create_login_smoke_model_app();
+    app.display_messages = vec![DisplayMessage::system("seed render state")];
+    app.bump_display_messages_version();
+    app.open_model_picker();
+    app.wait_for_model_picker_routes_for_tests();
+    wait_for_model_picker_load(&mut app);
+    {
+        let picker = app
+            .inline_interactive_state
+            .as_mut()
+            .expect("model picker should be open");
+        picker.filter = "gpt-5.4".to_string();
+        App::apply_inline_interactive_filter(picker);
+    }
+
+    let _lock = scroll_render_test_lock();
+    let backend = ratatui::backend::TestBackend::new(180, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
+    let text = render_and_snap(&app, &mut terminal);
+
+    let row = text
+        .lines()
+        .find(|line| line.contains("GPT-5.4") && line.contains("OpenAI"))
+        .unwrap_or_else(|| panic!("expected a rendered GPT-5.4 row, got:\n{text}"));
+
+    assert!(
+        row.contains("‹ high ›"),
+        "the effort ladder should render on the focused row: {row}"
+    );
+    assert!(
+        row.contains("oauth"),
+        "METHOD must still render after the ladder; a clipped column makes an \
+         OAuth route look like it does not exist: {row}"
+    );
+}
