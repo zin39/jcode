@@ -1300,6 +1300,12 @@ pub struct FeatureConfig {
     /// Set when the user sends their first message; persists across restarts
     /// so returning users never see the ghost prompts again.
     pub has_completed_onboarding: bool,
+
+    /// Inject a system-prompt directive instructing the agent to verify
+    /// uncertain or fast-changing facts with a websearch instead of asserting
+    /// them from memory (default: false). Reduces hallucinations for questions
+    /// where the answer may have changed or the model is unsure.
+    pub web_grounding: bool,
 }
 
 impl Default for FeatureConfig {
@@ -1313,6 +1319,7 @@ impl Default for FeatureConfig {
             kv_cache_miss_notices: true,
             update_channel: UpdateChannel::default(),
             has_completed_onboarding: false,
+            web_grounding: false,
         }
     }
 }
