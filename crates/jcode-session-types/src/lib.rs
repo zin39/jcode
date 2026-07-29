@@ -3,6 +3,10 @@ use jcode_message_types::{ContentBlock, Message, Role, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+pub mod legacy_role;
+
+pub use legacy_role::classify_legacy_session;
+
 /// Identifies a session to resume, across the agent backends jcode can import
 /// from. This is pure data (only ids/paths) with no UI dependency; it lives in
 /// `jcode-session-types` so the foundation/import layer can match on it without

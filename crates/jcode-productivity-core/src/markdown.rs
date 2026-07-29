@@ -145,8 +145,47 @@ pub fn render_markdown(r: &ProductivityReport) -> String {
         ));
     }
 
+    // Delegated work is reported, never folded into the headline figures: the
+    // user caused it, but they did not type it. Omit the section entirely when
+    // there is none, so users who never delegate see no dead weight.
+    if r.delegated_sessions > 0 {
+        o.push_str("## 🤝 Delegated to agents\n\n");
+        o.push_str(
+            "_Work you handed to swarm workers, subagents and cheap-route subtasks. Kept out of the totals above, which are your own activity._\n\n",
+        );
+        o.push_str("| Metric | Value |\n|---|---|\n");
+        o.push_str(&format!(
+            "| 🧑‍🚀 Agent sessions | {} |\n",
+            human(r.delegated_sessions)
+        ));
+        o.push_str(&format!(
+            "| 💬 Agent messages | {} |\n",
+            human(r.delegated_messages)
+        ));
+        o.push_str(&format!(
+            "| 🛠️ Agent tool calls | {} |\n",
+            human(r.delegated_tool_calls)
+        ));
+        o.push_str(&format!(
+            "| 🔤 Agent tokens | {} in / {} out |\n",
+            human(r.delegated_input_tokens),
+            human(r.delegated_output_tokens)
+        ));
+
+        // The ratio is the interesting number: it says how much of the work
+        // you set in motion you did not have to do yourself.
+        let total = r.total_sessions + r.delegated_sessions;
+        if total > 0 {
+            let pct = (r.delegated_sessions as f64 / total as f64) * 100.0;
+            o.push_str(&format!(
+                "\n**{pct:.0}%** of all sessions were run by agents on your behalf.\n"
+            ));
+        }
+        o.push('\n');
+    }
+
     o.push_str(&format!(
-        "_Generated {} · scanned {} sessions in {:.1}s ({} cached). 🖼️ Dashboard image copied to your clipboard._\n",
+        "_Generated {} · scanned {} transcripts in {:.1}s ({} cached). 🖼️ Dashboard image copied to your clipboard._\n",
         r.generated_at,
         human(r.scanned_files),
         r.scan_secs,

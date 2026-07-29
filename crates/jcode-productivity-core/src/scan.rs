@@ -8,6 +8,7 @@
 use crate::model::SessionSummary;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Local, Timelike};
+use jcode_session_types::{SessionAgentRole, classify_legacy_session, session_is_internal_agent};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -32,7 +33,7 @@ struct Cache {
     entries: HashMap<String, CacheEntry>,
 }
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 fn cache_path() -> Result<PathBuf> {
     let dir = jcode_storage::jcode_dir()?
@@ -192,6 +193,19 @@ struct RawSession {
     provider_key: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    // Classification inputs. A stored `agent_role` wins when present; the
+    // rest let us apply the same legacy rule the resume picker uses, so a
+    // session written before `agent_role` existed is judged identically here.
+    #[serde(default)]
+    agent_role: Option<SessionAgentRole>,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    saved: bool,
+    #[serde(default)]
+    is_debug: bool,
     #[serde(default)]
     messages: Vec<RawMessage>,
 }
@@ -206,6 +220,30 @@ struct RawMessage {
     timestamp: Option<String>,
     #[serde(default)]
     token_usage: Option<RawTokenUsage>,
+    /// Set when a message is rendered as something other than plain
+    /// conversation (system notices, injected context). Such a message is not
+    /// something the user said.
+    #[serde(default)]
+    display_role: Option<String>,
+}
+
+impl RawMessage {
+    /// Whether this user-role message is something the user actually typed.
+    ///
+    /// Mirrors the rule the session picker uses for "visible conversation", so
+    /// the two surfaces agree on what a turn is. A message counts only when it
+    /// renders as ordinary conversation and carries real text: tool results and
+    /// injected system reminders are stored under the user role but are not the
+    /// user speaking.
+    fn is_user_prompt(&self) -> bool {
+        if self.display_role.is_some() {
+            return false;
+        }
+        self.content.iter().any(|block| match block {
+            RawBlock::Text { text } => !text.trim_start().starts_with("<system-reminder>"),
+            _ => false,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -244,6 +282,14 @@ fn parse_session_file(path: &Path) -> Result<SessionSummary> {
     Ok(summarize(raw))
 }
 
+/// Summarize one transcript's raw JSON. Exposed for tests so the classification
+/// rules can be exercised against real transcript shapes without writing files.
+#[cfg(test)]
+pub(crate) fn summarize_json(bytes: &[u8]) -> Result<SessionSummary> {
+    let raw: RawSession = serde_json::from_slice(bytes)?;
+    Ok(summarize(raw))
+}
+
 fn summarize(raw: RawSession) -> SessionSummary {
     let mut s = SessionSummary {
         created_at: raw.created_at.clone(),
@@ -269,7 +315,17 @@ fn summarize(raw: RawSession) -> SessionSummary {
     for msg in &raw.messages {
         let role = msg.role.as_deref().unwrap_or("");
         match role {
-            "user" => s.user_msgs += 1,
+            // Count what the user actually said, not every message stored
+            // under the user role. Tool results are recorded as user-role
+            // messages, and on a real transcript they outnumber genuine
+            // prompts roughly 8:1, so counting them made "prompts sent"
+            // meaningless and, worse, made every agent run look like a long
+            // conversation to the delegation rule below.
+            "user" => {
+                if msg.is_user_prompt() {
+                    s.user_msgs += 1;
+                }
+            }
             "assistant" => s.assistant_msgs += 1,
             _ => {}
         }
@@ -294,9 +350,10 @@ fn summarize(raw: RawSession) -> SessionSummary {
                 RawBlock::Text { text } => {
                     let len = text.chars().count() as u64;
                     if role == "user" {
-                        // Skip giant tool-result-ish or reminder blobs from the
-                        // human "typed" proxy; keep it to real prompts.
-                        if !text.trim_start().starts_with("<system-reminder>") {
+                        // Keep the "human typed this" proxy to real prompts:
+                        // same rule as the turn count, so a system notice or a
+                        // reminder blob never reads as the user's effort.
+                        if msg.is_user_prompt() {
                             s.user_chars += len;
                         }
                     } else if role == "assistant" {
@@ -325,6 +382,21 @@ fn summarize(raw: RawSession) -> SessionSummary {
     }
 
     s.active_dates = active_dates.into_iter().collect();
+
+    // Classify only once the message loop has run, because the legacy rule
+    // needs the user turn count. A stored role wins; otherwise fall back to
+    // the same inference the resume picker uses, so the two surfaces never
+    // disagree about whose work a session was.
+    let role = raw.agent_role.or_else(|| {
+        classify_legacy_session(
+            raw.parent_id.as_deref(),
+            raw.title.as_deref(),
+            s.user_msgs as usize,
+            raw.saved,
+        )
+    });
+    s.delegated = session_is_internal_agent(role, raw.parent_id.as_deref(), raw.is_debug);
+
     s
 }
 

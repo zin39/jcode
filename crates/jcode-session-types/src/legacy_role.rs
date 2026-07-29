@@ -23,7 +23,7 @@
 //! A stored role always wins over anything inferred here, and a session the
 //! user explicitly saved is never reclassified at all.
 
-use crate::session::SessionAgentRole;
+use crate::SessionAgentRole;
 
 /// Title suffix written by `run_swarm_task` for spawned workers.
 const SWARM_TITLE_SUFFIX: &str = " swarm)";

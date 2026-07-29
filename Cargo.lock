@@ -3999,6 +3999,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "jcode-session-types",
  "jcode-storage",
  "rayon",
  "resvg 0.46.0",

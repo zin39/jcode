@@ -22,7 +22,8 @@ pub fn build_report(scan: ScanResult) -> ProductivityReport {
 
     let mut r = ProductivityReport {
         generated_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
-        total_sessions: summaries.len() as u64,
+        // `total_sessions` is set after the fold, from the sessions that
+        // actually counted, so delegated runs never inflate it.
         scanned_files: scan.scanned_files,
         parse_errors: scan.parse_errors,
         scan_secs: scan.scan_secs,
@@ -38,9 +39,25 @@ pub fn build_report(scan: ScanResult) -> ProductivityReport {
     let mut date_counts: HashMap<String, u64> = HashMap::new();
 
     let mut total_session_msgs: u64 = 0;
+    let mut own_sessions: u64 = 0;
 
     for s in summaries {
         let msgs = (s.user_msgs + s.assistant_msgs) as u64;
+
+        // Machine-created sessions are the user's doing but not their typing.
+        // Roll them up separately so the headline numbers stay an honest
+        // measure of the user's own activity, while delegated work is still
+        // reported rather than silently dropped.
+        if s.delegated {
+            r.delegated_sessions += 1;
+            r.delegated_messages += msgs;
+            r.delegated_tool_calls += s.total_tool_calls();
+            r.delegated_input_tokens += s.input_tokens;
+            r.delegated_output_tokens += s.output_tokens;
+            continue;
+        }
+
+        own_sessions += 1;
         r.total_messages += msgs;
         total_session_msgs += msgs;
         r.user_prompts += s.user_msgs as u64;
@@ -96,6 +113,9 @@ pub fn build_report(scan: ScanResult) -> ProductivityReport {
 
     r.user_words = (r.user_chars as f64 / 5.0).round() as u64;
     r.distinct_projects = projects.len() as u64;
+    // Sessions the user actually opened. Counted from the fold rather than
+    // `summaries.len()` so it cannot drift from the rows that fed the totals.
+    r.total_sessions = own_sessions;
     r.avg_session_msgs = if r.total_sessions > 0 {
         total_session_msgs as f64 / r.total_sessions as f64
     } else {

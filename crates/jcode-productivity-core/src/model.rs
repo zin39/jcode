@@ -24,6 +24,16 @@ pub struct SessionSummary {
     pub provider_key: Option<String>,
     pub model: Option<String>,
 
+    /// Whether jcode created this session itself (swarm worker, cheap-route
+    /// subtask, subagent, one-shot run) rather than the user opening it.
+    ///
+    /// These are kept, not discarded: the user genuinely caused that work, so
+    /// dropping it understates throughput. But they never typed it, so folding
+    /// it into the headline effort figures would overstate their own activity.
+    /// The report separates the two instead of guessing.
+    #[serde(default)]
+    pub delegated: bool,
+
     /// Message counts.
     pub user_msgs: u32,
     pub assistant_msgs: u32,
@@ -125,6 +135,17 @@ pub struct ProductivityReport {
     pub archetype_blurb: String,
     pub power_score: u64,
     pub badges: Vec<String>,
+
+    // Delegated work -------------------------------------------------------
+    // Machine-created sessions (swarm workers, cheap-route subtasks, subagents,
+    // one-shot runs), reported separately so the headline figures stay a
+    // measure of what the user did, while the work they delegated is still
+    // visible rather than silently dropped.
+    pub delegated_sessions: u64,
+    pub delegated_messages: u64,
+    pub delegated_tool_calls: u64,
+    pub delegated_input_tokens: u64,
+    pub delegated_output_tokens: u64,
 
     // Meta -----------------------------------------------------------------
     pub scanned_files: u64,
