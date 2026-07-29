@@ -293,6 +293,11 @@ inherits = "release"
 lto = "thin"
 codegen-units = 16
 incremental = false
+# Strip the symbol table from distributed binaries. Deliberately set here
+# rather than on `release`: `selfdev` inherits from `release`, and stripping
+# there would cost readable panic backtraces during development for no gain,
+# since self-dev builds are never shipped.
+strip = "symbols"
 
 [profile.dev]
 debug = 0
