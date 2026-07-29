@@ -1477,10 +1477,10 @@ impl App {
         let now = Instant::now();
 
         // --- Cooldown guard ---
-        if let Some(until) = self.auto_poke_cooldown_until {
-            if now < until {
-                return false;
-            }
+        if let Some(until) = self.auto_poke_cooldown_until
+            && now < until
+        {
+            return false;
         }
 
         // --- Swarm-activity skip: use longer cooldown when workers are running ---

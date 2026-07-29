@@ -1945,7 +1945,7 @@ impl App {
             .unwrap_or(0);
         let next_idx = (current_idx + 1) % panes.len();
         self.focus_pane(panes[next_idx]);
-        self.set_status_notice(&format!("Focus: {}", self.pane_label(panes[next_idx])));
+        self.set_status_notice(format!("Focus: {}", self.pane_label(panes[next_idx])));
     }
 
     /// Focus the pane in the given direction (vim-style h/j/k/l).
@@ -1977,7 +1977,7 @@ impl App {
         };
 
         self.focus_pane(panes[next]);
-        self.set_status_notice(&format!("Focus: {}", self.pane_label(panes[next])));
+        self.set_status_notice(format!("Focus: {}", self.pane_label(panes[next])));
     }
 
     /// Human-readable label for a pane kind.

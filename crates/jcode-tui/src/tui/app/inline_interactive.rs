@@ -36,7 +36,7 @@ fn preselect_current_model_entry(picker: &mut InlineInteractiveState) {
     };
 
     // Only preselect when the current entry survives the active filter.
-    if !picker.filtered.iter().any(|&i| i == current_idx) {
+    if !picker.filtered.contains(&current_idx) {
         return;
     }
 
@@ -2368,34 +2368,34 @@ impl App {
         }
         match code {
             KeyCode::Down => {
-                if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    if let Some(next) = picker.next_selectable_row(picker.selected) {
-                        picker.selected = next;
-                    }
+                if let Some(picker) = self.inline_interactive_state.as_mut()
+                    && let Some(next) = picker.next_selectable_row(picker.selected)
+                {
+                    picker.selected = next;
                 }
                 Ok(true)
             }
             KeyCode::Up => {
-                if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    if let Some(prev) = picker.prev_selectable_row(picker.selected) {
-                        picker.selected = prev;
-                    }
+                if let Some(picker) = self.inline_interactive_state.as_mut()
+                    && let Some(prev) = picker.prev_selectable_row(picker.selected)
+                {
+                    picker.selected = prev;
                 }
                 Ok(true)
             }
             KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    if let Some(next) = picker.next_selectable_row(picker.selected) {
-                        picker.selected = next;
-                    }
+                if let Some(picker) = self.inline_interactive_state.as_mut()
+                    && let Some(next) = picker.next_selectable_row(picker.selected)
+                {
+                    picker.selected = next;
                 }
                 Ok(true)
             }
             KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(picker) = self.inline_interactive_state.as_mut() {
-                    if let Some(prev) = picker.prev_selectable_row(picker.selected) {
-                        picker.selected = prev;
-                    }
+                if let Some(picker) = self.inline_interactive_state.as_mut()
+                    && let Some(prev) = picker.prev_selectable_row(picker.selected)
+                {
+                    picker.selected = prev;
                 }
                 Ok(true)
             }
@@ -4053,14 +4053,14 @@ impl App {
 
         // Ensure selected row is a selectable entry (not a header)
         let current_row = picker.selected;
-        if let Some(row) = picker.display_rows.get(current_row) {
-            if row.is_header() {
-                // Try to find next entry row
-                if let Some(next) = picker.next_entry_row(current_row) {
-                    picker.selected = next;
-                } else if let Some(prev) = picker.prev_entry_row(current_row) {
-                    picker.selected = prev;
-                }
+        if let Some(row) = picker.display_rows.get(current_row)
+            && row.is_header()
+        {
+            // Try to find next entry row
+            if let Some(next) = picker.next_entry_row(current_row) {
+                picker.selected = next;
+            } else if let Some(prev) = picker.prev_entry_row(current_row) {
+                picker.selected = prev;
             }
         }
     }

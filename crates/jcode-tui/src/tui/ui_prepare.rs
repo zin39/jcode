@@ -1806,11 +1806,11 @@ fn render_message_into(
                     }
                 }
                 // pos >= 3: skip rendering but still handle side effects.
-                if let Some(ref tc) = msg.tool_data {
-                    if let Some(_items) = ctx.anchored_images.by_tool.get(&tc.id) {
-                        // Folded tools with anchored images: drop images silently
-                        // (they are hidden behind the fold). They reappear on expand.
-                    }
+                if let Some(ref tc) = msg.tool_data
+                    && let Some(_items) = ctx.anchored_images.by_tool.get(&tc.id)
+                {
+                    // Folded tools with anchored images: drop images silently
+                    // (they are hidden behind the fold). They reappear on expand.
                 }
             } else {
                 // ── Normal (non-folded or expanded) path ──────────────────

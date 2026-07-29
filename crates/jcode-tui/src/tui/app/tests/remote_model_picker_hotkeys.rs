@@ -165,7 +165,7 @@ default_model = "Qwen/Qwen2.5-72B-Instruct"
         let _render_lock = scroll_render_test_lock();
         let backend = ratatui::backend::TestBackend::new(140, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
-        let text = render_and_snap(&mut app, &mut terminal);
+        let text = render_and_snap(&app, &mut terminal);
         let qwen_row = text
             .lines()
             .find(|line| line.contains("Qwen") && line.contains("sf-test"))

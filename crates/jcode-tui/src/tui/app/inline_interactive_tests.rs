@@ -666,7 +666,7 @@ fn oauth_routes_outrank_api_key_routes_for_the_same_model() {
         }
     }
 
-    let mut openai = vec![
+    let mut openai = [
         opt("openai-api-key", "OpenAI"),
         opt("openai-oauth", "OpenAI"),
     ];
@@ -678,7 +678,7 @@ fn oauth_routes_outrank_api_key_routes_for_the_same_model() {
     );
 
     // Sort must not depend on input order.
-    let mut reversed = vec![
+    let mut reversed = [
         opt("openai-oauth", "OpenAI"),
         opt("openai-api-key", "OpenAI"),
     ];
@@ -687,7 +687,7 @@ fn oauth_routes_outrank_api_key_routes_for_the_same_model() {
 
     // The Anthropic pair already behaved; pin it so the shared ranking
     // cannot regress while fixing the OpenAI side.
-    let mut anthropic = vec![
+    let mut anthropic = [
         opt("api-key", "Anthropic"),
         opt("claude-oauth", "Anthropic"),
     ];
@@ -710,7 +710,7 @@ fn an_unavailable_oauth_route_loses_to_a_working_api_key() {
         }
     }
 
-    let mut routes = vec![opt("openai-oauth", false), opt("openai-api-key", true)];
+    let mut routes = [opt("openai-oauth", false), opt("openai-api-key", true)];
     routes.sort_by_key(route_sort_key);
     assert_eq!(
         routes[0].api_method, "openai-api-key",

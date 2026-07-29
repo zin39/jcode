@@ -2040,18 +2040,30 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
         openrouter_openai_row,
         openrouter_openai_text
     );
-    for text in [
-        &openai_text,
-        &comtegra_text,
-        &copilot_text,
-        &deepseek_text,
-        &kimi_text,
-        &openrouter_openai_text,
+    // "Unstacked" means each model occupies exactly ONE row, with its multiple
+    // routes collapsed behind a `(N)` count plus the Tab-cycled method column,
+    // rather than one row per route. So the invariant is uniqueness of the
+    // model name across rows, not absence of `(N)`.
+    //
+    // The loop body had been emptied to comments, so it iterated six rendered
+    // pickers and asserted nothing whatsoever.
+    for (label, model, text) in [
+        ("openai", "GPT-5.4", &openai_text),
+        ("comtegra", "glm-51-nvfp4", &comtegra_text),
+        ("deepseek", "deepseek-v4-pro", &deepseek_text),
+        ("openrouter_openai", "openai/gpt-5.5", &openrouter_openai_text),
     ] {
-        // NEW DESIGN: Section headers like "▾ OpenAI (2)" show provider counts.
-        // The old test checked that model rows didn't stack routes as "Provider (2)".
-        // Now we just verify model rows render (the header having (2) is expected).
-        // The real check is that Tab cycles through route options.
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains(model) && line.contains('▸'))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "{label}: `{model}` must occupy exactly one row with its routes \
+             collapsed behind the method column, but rendered {} rows:\n{text}",
+            rows.len()
+        );
     }
 }
 

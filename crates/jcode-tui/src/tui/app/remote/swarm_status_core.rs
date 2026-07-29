@@ -127,10 +127,10 @@ pub(in crate::tui::app) fn swarm_status_transition_notice(
             let mut segment = format!("{} {}", format_names(names), transition.verb());
             // Append the view-keybind hint only to spawn announcements so the
             // user discovers how to open the inline swarm panel.
-            if transition == Transition::Spawned {
-                if let Some(key) = view_key_label {
-                    segment.push_str(&format!(" · {key} to view"));
-                }
+            if transition == Transition::Spawned
+                && let Some(key) = view_key_label
+            {
+                segment.push_str(&format!(" · {key} to view"));
             }
             segment
         })

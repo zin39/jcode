@@ -261,6 +261,21 @@ impl App {
     }
 }
 
+impl App {
+    /// Rate-limit notice line, with the weekly-gated subscribe nudge appended
+    /// when the gate allows (user is blocked on tokens right now).
+    pub(super) fn rate_limit_notice_with_nudge(&mut self, reset_secs: u64) -> String {
+        let mut line = format!(
+            "⏳ Rate limit hit. Will auto-retry in {} seconds...",
+            reset_secs
+        );
+        if self.claim_subscribe_nudge(SubscribeNudgeTrigger::RateLimited) {
+            line.push_str(&format!("\n{}", RATE_LIMIT_NUDGE_LINE));
+        }
+        line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,7 +298,7 @@ mod tests {
         assert!(weekly_gate_allows(1_000, 1_000 + week));
         assert!(!weekly_gate_allows(1_000, 1_000 + week - 1));
         // Fresh state (never shown) allows immediately.
-        assert!(weekly_gate_allows(0, 0 + week));
+        assert!(weekly_gate_allows(0, week));
         assert!(weekly_gate_allows(0, u64::MAX));
     }
 
@@ -347,20 +362,5 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(60 * 61)), "1h 1m");
         assert_eq!(format_elapsed(Duration::from_secs(7200)), "2h");
         assert_eq!(format_elapsed(Duration::from_secs(60 * 45)), "45m");
-    }
-}
-
-impl App {
-    /// Rate-limit notice line, with the weekly-gated subscribe nudge appended
-    /// when the gate allows (user is blocked on tokens right now).
-    pub(super) fn rate_limit_notice_with_nudge(&mut self, reset_secs: u64) -> String {
-        let mut line = format!(
-            "⏳ Rate limit hit. Will auto-retry in {} seconds...",
-            reset_secs
-        );
-        if self.claim_subscribe_nudge(SubscribeNudgeTrigger::RateLimited) {
-            line.push_str(&format!("\n{}", RATE_LIMIT_NUDGE_LINE));
-        }
-        line
     }
 }

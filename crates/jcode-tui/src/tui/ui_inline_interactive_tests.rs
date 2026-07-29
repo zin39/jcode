@@ -7,8 +7,6 @@
 
 use super::*;
 
-use super::*;
-
 #[test]
 fn format_elapsed_uses_whole_seconds_below_one_minute() {
     assert_eq!(format_elapsed(0.0), "0s");

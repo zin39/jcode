@@ -588,10 +588,10 @@ fn build_center_text(app: &dyn TuiState) -> String {
     let info = app.info_widget_data();
     let mut parts: Vec<String> = Vec::new();
 
-    if let Some(ref name) = info.session_name {
-        if !name.is_empty() {
-            parts.push(name.clone());
-        }
+    if let Some(ref name) = info.session_name
+        && !name.is_empty()
+    {
+        parts.push(name.clone());
     }
 
     let model = info
@@ -1264,7 +1264,7 @@ fn streaming_status_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jcode_tui_style::palette::{self, Role, Tier};
+    use jcode_tui_style::palette::{self, Role};
     use ratatui::style::Modifier;
     use ratatui::{Terminal, backend::TestBackend};
 

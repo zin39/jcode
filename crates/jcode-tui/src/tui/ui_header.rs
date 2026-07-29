@@ -950,7 +950,6 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use std::sync::OnceLock;
 
     struct MockProvider;
 

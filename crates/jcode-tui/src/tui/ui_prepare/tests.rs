@@ -184,7 +184,7 @@ fn snapshot_user_and_assistant_format_at_varying_widths() {
             let agent_color = role_color(Role::Agent, tier);
             lines.push(
                 Line::from(Span::styled(
-                    format!("jcode · mock-model"),
+                    "jcode · mock-model".to_string(),
                     Style::default().fg(agent_color),
                 ))
                 .alignment(ratatui::layout::Alignment::Left),

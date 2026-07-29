@@ -1155,7 +1155,6 @@ fn render_ownership_gated_todo_result_keeps_the_full_card() {
         hill_climbability: Some(100),
         feedback_loop: Some("Run the complete workflow".to_string()),
         end_to_end_ownership: Some(80),
-        ..Default::default()
     }];
     let content = format!(
         "{}\n\nGoals:\n{}\n\n{}",

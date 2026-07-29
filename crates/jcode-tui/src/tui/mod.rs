@@ -1300,8 +1300,9 @@ pub enum AgentModelTarget {
     Ambient,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PickerAction {
+    #[default]
     Model,
     Account(AccountPickerAction),
     Login(crate::provider_catalog::LoginProviderDescriptor),
@@ -1319,12 +1320,6 @@ pub enum PickerAction {
         target: AgentModelTarget,
         clear_override: bool,
     },
-}
-
-impl Default for PickerAction {
-    fn default() -> Self {
-        PickerAction::Model
-    }
 }
 
 /// Unified inline picker with three columns.

@@ -506,7 +506,7 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
                 }
             }
         }
-        return copy_to_clipboard_osc52(text);
+        copy_to_clipboard_osc52(text)
     }
 
     // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
@@ -958,13 +958,13 @@ pub(super) fn clipboard_image() -> Option<(String, String)> {
             .output()
         {
             let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if result == "ok" {
-                if let Ok(data) = std::fs::read(&temp_path) {
-                    let _ = std::fs::remove_file(&temp_path);
-                    if !data.is_empty() {
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                        return Some(("image/png".to_string(), b64));
-                    }
+            if result == "ok"
+                && let Ok(data) = std::fs::read(&temp_path)
+            {
+                let _ = std::fs::remove_file(&temp_path);
+                if !data.is_empty() {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    return Some(("image/png".to_string(), b64));
                 }
             }
         }
@@ -1194,10 +1194,10 @@ fn cached_sidecar_label() -> Option<String> {
     const TTL: Duration = Duration::from_secs(60);
 
     if let Ok(guard) = CACHE.lock() {
-        if let Some((ts, label)) = guard.as_ref() {
-            if ts.elapsed() < TTL {
-                return label.clone();
-            }
+        if let Some((ts, label)) = guard.as_ref()
+            && ts.elapsed() < TTL
+        {
+            return label.clone();
         }
     }
 

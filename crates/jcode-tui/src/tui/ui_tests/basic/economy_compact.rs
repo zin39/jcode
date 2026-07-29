@@ -1,4 +1,3 @@
-use super::*;
 use crate::tui::ui::prepare::prepare_body;
 
 /// WP12: economy mode - messages beyond the compact threshold render in
@@ -403,9 +402,11 @@ fn tool_fold_stays_quiet_when_every_tool_succeeded() {
 #[test]
 fn a_routine_tool_row_stays_within_its_colour_budget() {
     use std::collections::BTreeSet;
-    let mut tool = crate::tui::ToolCall::default();
-    tool.name = "Bash".to_string();
-    tool.input = serde_json::json!({"command": "cargo test --all"});
+    let tool = crate::tui::ToolCall {
+        name: "Bash".to_string(),
+        input: serde_json::json!({"command": "cargo test --all"}),
+        ..Default::default()
+    };
 
     let state = TestState {
         display_messages: vec![DisplayMessage::tool("Bash".to_string(), tool)],
