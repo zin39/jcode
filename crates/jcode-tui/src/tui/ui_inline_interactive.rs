@@ -369,10 +369,17 @@ fn picker_render_width(picker: &crate::tui::InlineInteractiveState, max_width: u
     let mut max_model_len = display_width(picker.primary_label());
     let mut max_provider_len = display_width(picker.secondary_label(is_preview));
     let mut max_via_len = display_width(picker.tertiary_label());
+    // The inline effort ladder is emitted between the model and provider
+    // columns at render time but was never counted here, so every column after
+    // it was pushed right and the last one (METHOD) fell off the edge. On a
+    // real catalog that truncated "api key" to "ap", which reads as though the
+    // row *is* an api-key route and hides whether OAuth is being used at all.
+    let mut max_effort_len = 0usize;
 
     for &fi in picker.filtered.iter().take(WIDTH_SCAN_LIMIT) {
         let entry = &picker.entries[fi];
         max_model_len = max_model_len.max(display_width(picker_entry_display_name(entry).as_str()));
+        max_effort_len = max_effort_len.max(effort_ladder_display_width(entry));
         if let Some(route) = entry.active_option() {
             let provider_label = route_provider_display(&route.provider, &route.api_method);
             let provider_label = if entry.option_count() > 1 {
@@ -396,7 +403,7 @@ fn picker_render_width(picker: &crate::tui::InlineInteractiveState, max_width: u
     };
     let min_model_width = max_model_len.clamp(6, 8);
 
-    let budget = max_width.saturating_sub(marker_width);
+    let budget = max_width.saturating_sub(marker_width + max_effort_len);
     if provider_width + via_width + min_model_width > budget {
         let provider_floor = 8usize.min(provider_width);
         let via_floor = 4usize.min(via_width);
@@ -417,7 +424,34 @@ fn picker_render_width(picker: &crate::tui::InlineInteractiveState, max_width: u
         .min(model_cap)
         .min(model_budget.max(min_model_width.min(model_budget)));
 
-    marker_width + provider_width + via_width + model_width
+    marker_width + max_effort_len + provider_width + via_width + model_width
+}
+
+/// Columns the inline effort ladder occupies for `entry`.
+///
+/// Must track [`format_effort_ladder`]: the focused row renders
+/// `"  \u{2039} <label> \u{203a}"` and unfocused rows render `" <label>"`. Width is
+/// computed for the *focused* shape because any row can become focused without
+/// the layout being recomputed, and a column that shifts as you arrow down is
+/// worse than one that is uniformly a little wider.
+fn effort_ladder_display_width(entry: &crate::tui::PickerEntry) -> usize {
+    if !matches!(
+        entry.action,
+        crate::tui::PickerAction::Model | crate::tui::PickerAction::AgentModelChoice { .. }
+    ) {
+        return 0;
+    }
+    if entry.available_efforts.is_empty() {
+        return 0;
+    }
+
+    let selected = entry
+        .effort
+        .as_deref()
+        .or(entry.available_efforts.first().map(String::as_str))
+        .unwrap_or("");
+    // "  " + "\u{2039} " + label + " \u{203a}"
+    display_width("  \u{2039}  \u{203a}") + display_width(short_effort_label(selected).as_ref())
 }
 
 pub(super) fn format_elapsed(secs: f32) -> String {
@@ -1285,6 +1319,42 @@ mod tests {
                 .map(|(text, warning)| (text.as_str(), *warning)),
             Some(("⚠ ConverseStream · no tools", true))
         );
+    }
+
+    /// The METHOD column must survive the inline effort ladder.
+    ///
+    /// The ladder is rendered between the model and provider columns but was
+    /// not counted in the width budget, so it pushed every later column right
+    /// and clipped the last one. With a real catalog that rendered "api key"
+    /// as "ap", which reads like the row *is* an api-key route: the exact
+    /// symptom that made a working OAuth login look absent from `/model`.
+    #[test]
+    fn effort_ladder_does_not_squeeze_out_the_method_column() {
+        let mut picker = sample_picker();
+        let without_ladder = picker_render_width(&picker, 200);
+
+        picker.entries[0].effort = Some("high".to_string());
+        picker.entries[0].available_efforts =
+            vec!["low".to_string(), "high".to_string(), "max".to_string()];
+        let with_ladder = picker_render_width(&picker, 200);
+
+        let ladder = effort_ladder_display_width(&picker.entries[0]);
+        assert!(
+            ladder > 0,
+            "a model with efforts must reserve ladder columns"
+        );
+        assert_eq!(
+            with_ladder,
+            without_ladder + ladder,
+            "the ladder must widen the row rather than steal from METHOD"
+        );
+    }
+
+    /// Rows without effort support must not pay for a ladder they never draw.
+    #[test]
+    fn models_without_efforts_reserve_no_ladder_width() {
+        let picker = sample_picker();
+        assert_eq!(effort_ladder_display_width(&picker.entries[0]), 0);
     }
 
     #[test]
