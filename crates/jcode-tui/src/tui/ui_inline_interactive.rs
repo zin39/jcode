@@ -525,7 +525,18 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         let entry = &picker.entries[fi];
         let route = entry.active_option();
         if let Some(r) = route {
-            max_provider_len = max_provider_len.max(display_width(r.provider.as_str()));
+            // Multi-route rows render "OpenAI (2)", not "OpenAI". Measuring the
+            // bare label left the column four columns short, so the suffix was
+            // clipped to "OpenAI …" and the route count became unreadable.
+            // `picker_render_width` already accounts for it; this loop must
+            // agree or the box is sized for a column the row overflows.
+            let provider_label = route_provider_display(&r.provider, &r.api_method);
+            let provider_label = if entry.option_count() > 1 {
+                format!("{} ({})", provider_label, entry.option_count())
+            } else {
+                provider_label
+            };
+            max_provider_len = max_provider_len.max(display_width(provider_label.as_str()));
             max_via_len = max_via_len.max(display_width(&api_method_display(&r.api_method)));
         }
         if is_account_picker {

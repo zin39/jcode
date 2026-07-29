@@ -443,6 +443,16 @@ fn model_picker_renders_the_method_column_next_to_the_effort_ladder() {
         "the effort ladder should render on the focused row: {row}"
     );
     assert!(
+        !row.contains('\u{2026}'),
+        "no column may be truncated: a clipped PROVIDER hides the route count \
+         and a clipped METHOD hides the auth mode: {row}"
+    );
+    assert!(
+        row.contains("OpenAI (2)"),
+        "the route count must survive; it is how a user sees a second route \
+         exists at all: {row}"
+    );
+    assert!(
         row.contains("oauth"),
         "METHOD must still render after the ladder; a clipped column makes an \
          OAuth route look like it does not exist: {row}"
