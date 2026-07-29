@@ -116,9 +116,7 @@ pub fn expand_session_tools(session_id: &str, names: &[String]) {
     let mut policies = SESSION_TOOL_POLICIES
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let policy = policies
-        .entry(session_id.to_string())
-        .or_insert_with(SessionToolPolicy::default);
+    let policy = policies.entry(session_id.to_string()).or_default();
     for name in names {
         policy.expanded_tools.insert(name.clone());
     }

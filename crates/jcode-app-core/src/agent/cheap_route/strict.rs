@@ -61,10 +61,7 @@ pub(super) fn strong_model_or_empty(current_model: &str, strict: bool) -> String
         .agents
         .cheap_route_strong_model
         .clone();
-    match resolve_strong_model(configured.as_deref(), current_model, strict) {
-        Some(model) => model,
-        None => String::new(),
-    }
+    resolve_strong_model(configured.as_deref(), current_model, strict).unwrap_or_default()
 }
 
 /// Error for a total cheap-route blackout under strict mode.

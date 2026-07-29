@@ -127,7 +127,7 @@ impl RouteBreaker {
     fn is_tripped(&self, route_key: &str) -> bool {
         self.map
             .get(route_key)
-            .map_or(false, |s| match s.last_failure_kind {
+            .is_some_and(|s| match s.last_failure_kind {
                 Some(BreakerFailureKind::ConfigError) => s.consecutive_failures >= 1,
                 Some(BreakerFailureKind::Timeout) => s.consecutive_failures >= 2,
                 None => false,
@@ -691,8 +691,8 @@ pub async fn run_cheap_route(
                 .map(|c| (c.route.model.clone(), Some(c.route.api_method.clone())))
                 .take(backend.gold_k().max(2))
                 .collect();
-            if proposers.len() >= 2 {
-                if let Ok(output) = run_debate(
+            if proposers.len() >= 2
+                && let Ok(output) = run_debate(
                     backend,
                     subtask,
                     &proposers,
@@ -700,17 +700,16 @@ pub async fn run_cheap_route(
                     backend.reporter(),
                 )
                 .await
-                {
-                    results.push(SubtaskResult {
-                        description: subtask.description.clone(),
-                        output,
-                        review: String::new(),
-                        model_used: format!("debate({})", proposers.len()),
-                    });
-                    continue;
-                }
-                // on debate Err: fall through to the normal single-model path below
+            {
+                results.push(SubtaskResult {
+                    description: subtask.description.clone(),
+                    output,
+                    review: String::new(),
+                    model_used: format!("debate({})", proposers.len()),
+                });
+                continue;
             }
+            // on debate Err: fall through to the normal single-model path below
         }
 
         // Hard subtasks try the strong model first (then cheap routes as

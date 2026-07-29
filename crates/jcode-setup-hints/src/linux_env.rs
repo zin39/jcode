@@ -58,6 +58,8 @@ pub(crate) enum LinuxCompositor {
 }
 
 impl LinuxCompositor {
+    /// Only the Linux hotkey-install paths render a compositor name.
+    #[cfg(target_os = "linux")]
     pub(crate) fn name(&self) -> &'static str {
         match self {
             LinuxCompositor::Niri => "niri",
@@ -683,7 +685,8 @@ mod tests {
 
     #[test]
     fn detects_compositors_from_sockets_and_desktop_names() {
-        let cases: Vec<(Vec<(&str, &str)>, Option<LinuxCompositor>)> = vec![
+        type EnvCase<'a> = (Vec<(&'a str, &'a str)>, Option<LinuxCompositor>);
+        let cases: Vec<EnvCase<'_>> = vec![
             (
                 vec![("NIRI_SOCKET", "/run/niri.sock")],
                 Some(LinuxCompositor::Niri),

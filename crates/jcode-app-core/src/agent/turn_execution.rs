@@ -483,17 +483,17 @@ impl Agent {
         let mut tools = self.build_filtered_tool_definitions().await;
 
         // Append deferred tool index to load_tools description when deferred mode is on.
-        if crate::config::config().tools.deferred {
-            if let Some(lt) = tools.iter_mut().find(|d| d.name == "load_tools") {
-                let index = self.registry.deferred_tool_index().await;
-                if !index.is_empty() {
-                    let mut desc = lt.description.clone();
-                    desc.push_str("\n\nDeferred tools available to load:\n");
-                    for (name, summary) in &index {
-                        desc.push_str(&format!("- {name} — {summary}\n"));
-                    }
-                    lt.description = desc;
+        if crate::config::config().tools.deferred
+            && let Some(lt) = tools.iter_mut().find(|d| d.name == "load_tools")
+        {
+            let index = self.registry.deferred_tool_index().await;
+            if !index.is_empty() {
+                let mut desc = lt.description.clone();
+                desc.push_str("\n\nDeferred tools available to load:\n");
+                for (name, summary) in &index {
+                    desc.push_str(&format!("- {name} — {summary}\n"));
                 }
+                lt.description = desc;
             }
         }
 

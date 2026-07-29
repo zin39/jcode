@@ -14,10 +14,6 @@ use tokio::sync::{Mutex, RwLock};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "headless session creation wires provider, global session, swarm state, interrupts, and MCP pool together"
-)]
 /// Choose the route-pinned model request for a spawned headless session.
 ///
 /// Resolution must happen BEFORE `set_model`, not as a fallback after it
@@ -49,6 +45,10 @@ fn resolve_spawn_model_request(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "headless session creation wires provider, global session, swarm state, interrupts, and MCP pool together"
+)]
 pub(super) async fn create_headless_session(
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
