@@ -126,12 +126,16 @@ pub fn expand_session_tools(session_id: &str, names: &[String]) {
 
 /// Return the set of deferred tools the session has explicitly loaded.
 pub fn session_expanded_tools(session_id: &str) -> HashSet<String> {
-    SESSION_TOOL_POLICIES
+    // A session with no policy entry has simply expanded nothing yet, which is
+    // the ordinary case on the first turn. `unwrap_or_default` here is an
+    // absent-key default, not a discarded error.
+    let policies = SESSION_TOOL_POLICIES
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(session_id)
-        .map(|policy| policy.expanded_tools.clone())
-        .unwrap_or_default()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match policies.get(session_id) {
+        Some(policy) => policy.expanded_tools.clone(),
+        None => HashSet::new(),
+    }
 }
 
 /// Registry of available tools (Arc-wrapped for sharing)
@@ -410,10 +414,12 @@ impl Registry {
             .filter(|(name, _)| !CORE_FULL_SCHEMA_TOOLS.contains(&name.as_str()))
             .map(|(name, tool)| {
                 let desc = tool.description();
+                // `split` always yields at least one item, so this take(1) is
+                // total: an empty description simply gives an empty summary.
                 let first_sentence = desc
                     .split(". ")
                     .next()
-                    .unwrap_or("")
+                    .unwrap_or(desc)
                     .chars()
                     .take(100)
                     .collect::<String>();
