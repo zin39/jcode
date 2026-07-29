@@ -1587,6 +1587,36 @@ mod tests {
         assert!(cleared.len() < original.len());
     }
 
+    /// Companion to `spill_pointer_line_matches_compaction_consumer` in
+    /// jcode-app-core. That test proves the producer emits this shape; this one
+    /// proves the consumer accepts it verbatim.
+    ///
+    /// The literal below is copied from the producer's actual output rather
+    /// than written to suit this function, which is the whole point: the
+    /// original test hand-wrote a marker no producer emitted, so a real
+    /// mismatch between the two crates went unnoticed and the preservation
+    /// path was dead in shipped builds.
+    #[test]
+    fn a_real_producer_pointer_line_survives_clearing() {
+        let head = "x".repeat(400);
+        // Exactly what agent::tools::spill_pointer_line renders.
+        let original = format!(
+            "{head}\n\n[Tool output truncated by jcode: tool `bash` produced 61000 chars; \
+             kept 60000 inline. FULL output saved to /home/u/.jcode/sessions/truncated_outputs/s_bash_20260729T120000.txt \
+             \u{2014} use the read tool with start_line/limit for targeted sections.]\n\ntail"
+        );
+
+        let cleared = cleared_tool_result_content(&original);
+
+        assert!(cleared.starts_with(CLEARED_MARKER_PREFIX));
+        assert!(
+            cleared
+                .contains("/home/u/.jcode/sessions/truncated_outputs/s_bash_20260729T120000.txt"),
+            "clearing must keep the path to the spilled output, else it is unrecoverable: {cleared}"
+        );
+        assert!(cleared.len() < original.len());
+    }
+
     #[test]
     fn spurious_full_output_phrase_is_not_treated_as_pointer() {
         // The needle phrase appearing in ordinary tool output (not on a real

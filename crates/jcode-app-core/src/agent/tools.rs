@@ -7,6 +7,31 @@ use crate::tool::ToolOutput;
 /// (`max_tool_result_chars`) don't accidentally raise the ceiling.
 pub(super) const MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY: usize = 512 * 1024;
 
+/// Prefix of the spill-pointer line, and the needle that carries the path.
+///
+/// These are load-bearing across crates: when compaction clears a large tool
+/// result it keeps this line so the agent can still read the spilled file
+/// (`jcode_compaction_core::cleared_tool_result_content`). That consumer
+/// matches on the exact prefix and needle below, so the two must agree
+/// verbatim. They previously did not, which silently disabled the whole
+/// preservation path: compaction dropped the only pointer to the saved output.
+///
+/// Keep these in sync with `SPILL_POINTER_LINE_PREFIX` / `SPILL_POINTER_NEEDLE`
+/// in `jcode-compaction-core`. `spill_pointer_line_matches_compaction_consumer`
+/// pins the contract end-to-end.
+pub(super) const SPILL_POINTER_LINE_PREFIX: &str = "[Tool output truncated by jcode";
+pub(super) const SPILL_POINTER_NEEDLE: &str = "FULL output saved to ";
+
+/// Build the spill-pointer line in the one format the compaction consumer
+/// recognises. Centralised so the two producers below cannot drift apart.
+fn spill_pointer_line(tool_name: &str, original_chars: usize, kept: usize, path: &str) -> String {
+    format!(
+        "{SPILL_POINTER_LINE_PREFIX}: tool `{tool_name}` produced {original_chars} chars; \
+         kept {kept} inline. {SPILL_POINTER_NEEDLE}{path} \
+         \u{2014} use the read tool with start_line/limit for targeted sections.]"
+    )
+}
+
 /// Truncate a native tool output before it enters the conversation transcript.
 ///
 /// Two caps apply (in order):
@@ -35,10 +60,10 @@ pub(super) fn cap_tool_output_for_history(
         let truncated_path = save_truncated_output(session_id, tool_name, &output.output);
 
         output.output = format!(
-            "{head}\n\n[...truncated {dropped} chars; full output saved to {path}]\n\n{tail}",
+            "{head}\n\n{pointer}\n\n{tail}",
             head = head,
-            dropped = original_chars - max_result_chars,
-            path = truncated_path,
+            pointer =
+                spill_pointer_line(tool_name, original_chars, max_result_chars, &truncated_path),
             tail = tail,
         );
     }
@@ -77,10 +102,10 @@ pub(super) fn cap_sdk_tool_content_for_history(
         let truncated_path = save_truncated_output(session_id, tool_name, &content);
 
         return format!(
-            "{head}\n\n[...truncated {dropped} chars; full output saved to {path}]\n\n{tail}",
+            "{head}\n\n{pointer}\n\n{tail}",
             head = head,
-            dropped = original_chars - max_result_chars,
-            path = truncated_path,
+            pointer =
+                spill_pointer_line(tool_name, original_chars, max_result_chars, &truncated_path),
             tail = tail,
         );
     }
@@ -257,8 +282,8 @@ mod tests {
 
         // Should be shorter than input but larger than the cap (marker adds overhead)
         assert!(capped.output.len() < 61_000);
-        assert!(capped.output.contains("[...truncated "));
-        assert!(capped.output.contains("full output saved to "));
+        assert!(capped.output.contains(SPILL_POINTER_LINE_PREFIX));
+        assert!(capped.output.contains(SPILL_POINTER_NEEDLE));
     }
 
     #[test]
@@ -271,16 +296,56 @@ mod tests {
         let capped = cap_tool_output_for_history("bash", "test-session", output);
         // The 60k config cap truncates first; verify output is reduced
         assert!(capped.output.len() < 80_000);
-        assert!(capped.output.contains("[...truncated "));
-        assert!(capped.output.contains("full output saved to "));
+        assert!(capped.output.contains(SPILL_POINTER_LINE_PREFIX));
+        assert!(capped.output.contains(SPILL_POINTER_NEEDLE));
     }
 
     #[test]
     fn cap_sdk_tool_content_truncates_with_head_tail() {
         let chunk = "y".repeat(61_000);
         let capped = cap_sdk_tool_content_for_history("custom", "test-session", chunk);
-        assert!(capped.contains("[...truncated "));
-        assert!(capped.contains("full output saved to "));
+        assert!(capped.contains(SPILL_POINTER_LINE_PREFIX));
+        assert!(capped.contains(SPILL_POINTER_NEEDLE));
+    }
+
+    /// The bug this pins: compaction keeps the spill-pointer line so the agent
+    /// can still read the spilled file after a large tool result is cleared,
+    /// but it matches on an exact prefix and needle. The producer here used to
+    /// emit `[...truncated N chars; full output saved to PATH]`, which matches
+    /// neither (wrong prefix, and lowercase "full"), so the preservation path
+    /// was silently dead and compaction discarded the only pointer to the
+    /// saved output.
+    ///
+    /// The existing compaction-core unit test did not catch it because it
+    /// hand-wrote the marker it expected instead of asking the producer for
+    /// one. This test asserts against real producer output, so the two sides
+    /// cannot drift apart again.
+    #[test]
+    fn spill_pointer_line_matches_compaction_consumer() {
+        let chunk = "0123456789".repeat(6_100); // 61_000 chars, over the 60k cap
+        let capped = cap_tool_output_for_history("bash", "test-session", ToolOutput::new(chunk));
+
+        let pointer = capped
+            .output
+            .lines()
+            .find(|line| line.trim_start().starts_with(SPILL_POINTER_LINE_PREFIX))
+            .expect("producer must emit a line with the prefix compaction looks for");
+
+        assert!(
+            pointer.contains(SPILL_POINTER_NEEDLE),
+            "the pointer line must carry the needle compaction extracts the path from: {pointer}"
+        );
+
+        // Compaction takes everything from the needle onward as the path, so
+        // the path has to actually follow it on that same line.
+        let after_needle = pointer
+            .split_once(SPILL_POINTER_NEEDLE)
+            .expect("needle present")
+            .1;
+        assert!(
+            after_needle.contains(".txt"),
+            "the saved-output path must follow the needle: {pointer}"
+        );
     }
 
     #[test]
