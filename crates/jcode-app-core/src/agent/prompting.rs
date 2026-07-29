@@ -14,7 +14,7 @@ use crate::message::{Message, ToolDefinition};
 /// complete" claims, so delegated work needs an explicit verification step
 /// rather than a trusted self-report. See
 /// `cheap-models-coding-agents-research.md`.
-const AUTO_DELEGATION_DIRECTIVE: &str = "\
+pub(crate) const AUTO_DELEGATION_DIRECTIVE: &str = "\
 # Delegation policy (cost control)
 
 You have two ways to offload work, and you should reach for one of them on \
@@ -23,8 +23,9 @@ EVERY task rather than doing the work yourself:
 1. `cheap_route` — hand it a whole multi-step task. It decomposes the task, \
    rates each subtask's difficulty, and runs each one on the cheapest model \
    strong enough for it. Prefer this for anything with more than one step.
-2. `subagent` — spawn a worker for a single unit of work, or several in one \
-   turn when the units are independent.
+2. `swarm` with `action: spawn` — spawn a worker for a single unit of work, \
+   or several in one turn when the units are independent. Always pass a \
+   `label` and a `prompt`.
 
 DELEGATE all hands-on execution and reserve yourself for planning and review:
 
@@ -32,9 +33,9 @@ DELEGATE all hands-on execution and reserve yourself for planning and review:
   editing/writing files, searching and reading code, investigating behavior, \
   reproducing bugs, and any repetitive or bulk task.
 - Do NOT run bash, file edits, grep/search, or file reads yourself when a \
-  subagent can do it. Each time you do cheap work directly you waste the \
+  spawned worker can do it. Each time you do cheap work directly you waste the \
   expensive model.
-- For independent subtasks, spawn multiple subagents in the SAME turn — they run \
+- For independent subtasks, spawn multiple workers in the SAME turn — they run \
   concurrently, which is faster.
 - Keep yourself for: understanding the request, decomposing it into delegable \
   subtasks, choosing what to delegate, and reviewing/integrating subagent \
@@ -50,9 +51,9 @@ yourself, because cheap models measurably collapse on them:
 Never trust a subagent's word that it finished. Cheap models frequently report \
 success on unfinished work, so:
 
-- Ask subagents to return evidence (diffs, command output, test results), not a \
+- Ask workers to return evidence (diffs, command output, test results), not a \
   claim of completion.
-- Confirm anything load-bearing yourself — check the diff, or have a subagent \
+- Confirm anything load-bearing yourself — check the diff, or have a worker \
   run the tests and show you the output — before you build on it or report done.";
 
 /// Injected into a coordinator's system prompt when gold mode is on for the
@@ -290,9 +291,15 @@ impl Agent {
         if !crate::config::config().agents.auto_delegate {
             return;
         }
-        // Only coordinators get this. A spawned subagent has the `subagent` tool
+        // Only coordinators get this. A spawned worker has the spawn tool
         // removed, so it must not be told to delegate work it cannot delegate.
-        if self.validate_tool_allowed("subagent").is_err() {
+        //
+        // This gate must name the tool the directive actually tells the model to
+        // call. It used to check `subagent`, which no longer exists in the
+        // registry: the check therefore always passed (it only consults
+        // allow/deny lists, not registration) and every coordinator was told to
+        // call a deleted tool, producing "Unknown tool: subagent" at runtime.
+        if self.validate_tool_allowed("swarm").is_err() {
             return;
         }
         if !split.dynamic_part.is_empty() {
@@ -329,7 +336,7 @@ mod delegation_directive_tests {
             "coordinator must be told cheap_route exists, or it will never use it"
         );
         assert!(
-            AUTO_DELEGATION_DIRECTIVE.contains("subagent"),
+            AUTO_DELEGATION_DIRECTIVE.contains("swarm"),
             "single-unit delegation must still be offered"
         );
         // The directive must state the routing behaviour that makes cheap_route

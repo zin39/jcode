@@ -7,7 +7,7 @@ mod environment;
 mod inline_tail;
 mod interrupts;
 mod messages;
-mod prompting;
+pub(crate) mod prompting;
 mod provider;
 mod response_recovery;
 mod status;

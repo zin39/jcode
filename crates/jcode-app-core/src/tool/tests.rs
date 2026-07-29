@@ -95,6 +95,40 @@ async fn subagent_tool_is_not_registered() {
     );
 }
 
+/// The auto-delegation directive is an instruction to CALL something, so every
+/// tool it names must exist in the live registry.
+///
+/// This is not hypothetical. The directive told every coordinator to use
+/// `subagent` after that tool was deleted upstream, and its guard checked
+/// `validate_tool_allowed("subagent")`, which only consults allow/deny lists
+/// and never registration, so the guard always passed. Coordinators obeyed and
+/// got `Unknown tool: subagent` back. The old test only asserted the directive
+/// *contained* the string, so it enforced the bug instead of catching it.
+#[tokio::test]
+async fn delegation_directive_only_names_tools_that_are_registered() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let names = registry.tool_names().await;
+
+    for tool in ["cheap_route", "swarm"] {
+        assert!(
+            crate::agent::prompting::AUTO_DELEGATION_DIRECTIVE.contains(tool),
+            "delegation directive should offer `{tool}`"
+        );
+        assert!(
+            names.iter().any(|name| name == tool),
+            "the delegation directive tells the model to call `{tool}`, but it \
+             is not registered"
+        );
+    }
+
+    assert!(
+        !crate::agent::prompting::AUTO_DELEGATION_DIRECTIVE.contains("`subagent`"),
+        "`subagent` is not a registered tool; the directive must not instruct \
+         the model to call it"
+    );
+}
+
 struct BareSchemaTool;
 
 #[async_trait]
