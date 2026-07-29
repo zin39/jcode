@@ -19,3 +19,4 @@ target-ttest*/
 /*.mp4
 /*.png
 dist/
+.claude/worktrees/
