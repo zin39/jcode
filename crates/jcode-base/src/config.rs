@@ -247,7 +247,66 @@ fn populate_context_limits_from_config_ref(cfg: &Config) {
 /// throttle, not every frame. When those inputs change, the next checked call
 /// reloads config.toml and invalidates dependent auth/model caches. Older
 /// references remain valid for the duration of any in-flight operation.
+/// Per-thread config cache used while a scoped test home is active.
+///
+/// `config()` caches into a process-global, but test homes are scoped
+/// per-thread (`jcode_core::env::scoped_home_override`). With cargo's default
+/// parallel test threads that pairing is incoherent: thread A pins a temp home
+/// and a config in it, thread B calls `config()`, sees a different fingerprint,
+/// reloads from *its* home, and overwrites the global with a config A never
+/// asked for. A then reads back B's values.
+///
+/// That is not theoretical. It produced a rotating set of failures across the
+/// reasoning-region tests, which pin `reasoning_display = current` and then
+/// found the mode reset to the default mid-test: three consecutive full-suite
+/// runs failed 4, 5 and 5 tests with a different membership each time, while
+/// `--test-threads=1` passed every one.
+///
+/// When a thread has its own home, give it its own cache. Production has no
+/// home override, so this is inert outside tests.
+#[cfg(any(test, feature = "test-support"))]
+fn scoped_home_config() -> Option<&'static Config> {
+    use std::cell::RefCell;
+
+    let home = jcode_core::env::home_override()?;
+    thread_local! {
+        static SCOPED: RefCell<Option<(std::path::PathBuf, &'static Config)>> =
+            const { RefCell::new(None) };
+    }
+
+    SCOPED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        // Reload when the thread's home changed, or when a mutation asked every
+        // reader to re-read (the same signal the global cache honours).
+        let force_reload = CONFIG_CACHE
+            .read()
+            .map(|cache| cache.force_reload)
+            .unwrap_or(false);
+        let stale = force_reload
+            || slot
+                .as_ref()
+                .is_none_or(|(cached_home, _)| cached_home != &home);
+        if stale {
+            let config = leak_config(Config::load());
+            *slot = Some((home.clone(), config));
+            if let Ok(mut cache) = CONFIG_CACHE.write() {
+                cache.force_reload = false;
+            }
+        }
+        slot.as_ref().map(|(_, config)| *config)
+    })
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+#[inline]
+fn scoped_home_config() -> Option<&'static Config> {
+    None
+}
+
 pub fn config() -> &'static Config {
+    if let Some(config) = scoped_home_config() {
+        return config;
+    }
     let now = Instant::now();
     if let Ok(cache) = CONFIG_CACHE.read()
         && !cache.force_reload

@@ -1409,6 +1409,12 @@ mod draw_call_tests {
     fn draw_call_history_records_all_draws_and_summarizes() {
         // Single test covers both summary math and the ring-buffer bound so we
         // never race two tests on the shared static history.
+        //
+        // Consolidating is not sufficient on its own: the futile-draw tests
+        // write to the same process-global ring buffer, so this must take the
+        // shared lock too. Without it this test read another test's samples and
+        // failed intermittently under parallel runs.
+        let _guard = draw_call_test_lock();
         clear_draw_call_history();
         record_draw_call_attribution(sample(1_000, 2.0, Some(50)));
         record_draw_call_attribution(sample(1_033, 4.0, Some(150)));

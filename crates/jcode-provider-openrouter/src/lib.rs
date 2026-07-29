@@ -346,17 +346,29 @@ fn configured_cache_namespace() -> String {
 
 fn cache_path_for_namespace(namespace: &str) -> PathBuf {
     let namespace = sanitize_cache_namespace(namespace);
-    if let Ok(path) = std::env::var("JCODE_HOME") {
-        return PathBuf::from(path)
-            .join("cache")
-            .join(format!("{}_models.json", namespace));
-    }
+    // Resolve the home through `jcode_core::env`, which owns the per-thread
+    // override, rather than reading `JCODE_HOME`/`dirs::home_dir()` directly.
+    //
+    // Reading the process env here made this cache escape test isolation: a
+    // test with a scoped temp home still resolved to the developer's real
+    // `~/.jcode/cache`, so provider defaults derived from it varied with
+    // whatever models that machine had last fetched. That is exactly how
+    // `test_tui_cerebras_paste_key_lifecycle_...` failed intermittently: it
+    // expects the static profile default `gpt-oss-120b` but read the real
+    // Cerebras catalog and got `zai-glm-4.7`.
+    let home = jcode_core::env::home_override()
+        .or_else(|| {
+            std::env::var_os(jcode_core::env::JCODE_HOME_VAR)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".jcode")
+        });
 
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".jcode")
-        .join("cache")
-        .join(format!("{}_models.json", namespace))
+    home.join("cache").join(format!("{}_models.json", namespace))
 }
 
 fn cache_path() -> PathBuf {
