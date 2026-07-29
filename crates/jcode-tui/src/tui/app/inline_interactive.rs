@@ -511,6 +511,7 @@ fn model_picker_route_is_current(
     route: &PickerOption,
     current_model: &str,
     current_provider: &str,
+    current_api_method: Option<&str>,
 ) -> bool {
     if model_name != current_model {
         return false;
@@ -524,7 +525,28 @@ fn model_picker_route_is_current(
     if current_provider.trim().eq_ignore_ascii_case("remote") {
         return true;
     }
-    jcode_provider_core::model_route_provider_labels_match(&route.provider, current_provider)
+    if !jcode_provider_core::model_route_provider_labels_match(&route.provider, current_provider) {
+        return false;
+    }
+    // A provider can expose the same model under several credential paths:
+    // OpenAI serves gpt-5.5 over both ChatGPT OAuth and a metered API key, and
+    // both routes carry the label "OpenAI". Matching on the label alone made
+    // every one of them "current", so the first route in the list won and the
+    // picker preselected whichever the catalog happened to emit first. When
+    // that was the API key, a paid subscription sat unused while requests
+    // billed per token, and the row gave no hint that another route existed.
+    //
+    // The session already records which credential path the active route uses
+    // (`route_api_method`, written when a route is chosen); honour it. Sessions
+    // predating that field, or providers with a single route, still match on
+    // the label alone.
+    match current_api_method {
+        Some(method) if !method.trim().is_empty() => {
+            crate::provider::ModelRouteApiMethod::parse(&route.api_method)
+                == crate::provider::ModelRouteApiMethod::parse(method)
+        }
+        _ => true,
+    }
 }
 
 const RECOMMENDED_MODELS: &[&str] = &["gpt-5.5", "claude-opus-4-8"];
@@ -1721,6 +1743,10 @@ impl App {
         } else {
             self.provider.name().to_string()
         };
+        // Which credential path the active route uses. Written when a route is
+        // picked; absent on sessions that predate it, which then fall back to
+        // provider-label matching.
+        let current_api_method = self.session.route_api_method.clone();
         let recent_auth_provider = self
             .recent_authenticated_provider
             .as_ref()
@@ -1812,7 +1838,13 @@ impl App {
 
             // Find current route for this model
             let current_option = all_routes.iter().position(|route| {
-                model_picker_route_is_current(name, route, &current_model, &current_provider)
+                model_picker_route_is_current(
+                    name,
+                    route,
+                    &current_model,
+                    &current_provider,
+                    current_api_method.as_deref(),
+                )
             });
 
             let is_recommended = all_routes

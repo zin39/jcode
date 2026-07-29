@@ -170,12 +170,73 @@ fn model_picker_current_route_requires_matching_provider() {
         &openai_route,
         "gpt-5.5",
         "OpenAI",
+        None,
     ));
     assert!(!model_picker_route_is_current(
         "gpt-5.5",
         &copilot_route,
         "gpt-5.5",
         "OpenAI",
+        None,
+    ));
+}
+
+/// One provider, two credential paths: the picker must preselect the one the
+/// session is actually on.
+///
+/// OpenAI serves gpt-5.5 over both ChatGPT OAuth and a metered API key, and
+/// both routes carry the label "OpenAI". Matching on the label alone made
+/// every route "current", so `position()` returned index 0 and the picker
+/// preselected whichever the catalog emitted first. When that was the API
+/// key, a paid subscription sat unused while requests billed per token.
+#[test]
+fn model_picker_current_route_distinguishes_auth_methods_of_one_provider() {
+    let oauth = picker_option_with_method("OpenAI", "openai-oauth");
+    let api_key = picker_option_with_method("OpenAI", "openai-api-key");
+
+    // Session recorded as running on OAuth: only the OAuth route is current.
+    assert!(model_picker_route_is_current(
+        "gpt-5.5",
+        &oauth,
+        "gpt-5.5",
+        "OpenAI",
+        Some("openai-oauth"),
+    ));
+    assert!(!model_picker_route_is_current(
+        "gpt-5.5",
+        &api_key,
+        "gpt-5.5",
+        "OpenAI",
+        Some("openai-oauth"),
+    ));
+
+    // And the reverse, so the fix is not just "always prefer oauth".
+    assert!(model_picker_route_is_current(
+        "gpt-5.5",
+        &api_key,
+        "gpt-5.5",
+        "OpenAI",
+        Some("openai-api-key"),
+    ));
+    assert!(!model_picker_route_is_current(
+        "gpt-5.5",
+        &oauth,
+        "gpt-5.5",
+        "OpenAI",
+        Some("openai-api-key"),
+    ));
+
+    // Sessions predating `route_api_method` keep the old label-only behaviour
+    // rather than losing their selection entirely.
+    assert!(model_picker_route_is_current(
+        "gpt-5.5", &oauth, "gpt-5.5", "OpenAI", None,
+    ));
+    assert!(model_picker_route_is_current(
+        "gpt-5.5",
+        &api_key,
+        "gpt-5.5",
+        "OpenAI",
+        Some("   "),
     ));
 }
 
