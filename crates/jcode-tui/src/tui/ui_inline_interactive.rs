@@ -403,6 +403,18 @@ fn picker_render_width(picker: &crate::tui::InlineInteractiveState, max_width: u
     };
     let min_model_width = max_model_len.clamp(6, 8);
 
+    // Reserve ladder columns only while the row can still afford them. The
+    // provider/method floors (8 + 4) plus the marker already claim most of a
+    // very narrow window, so on a ~24-column terminal a 10-column ladder cannot
+    // fit at all. Drop the reservation rather than return a row wider than the
+    // window: a clipped ladder is recoverable (arrow keys still cycle effort,
+    // and the value is echoed in the status line), whereas an oversized row
+    // corrupts the whole picker frame.
+    let floors = 8usize + 4;
+    if max_effort_len + floors + marker_width > max_width {
+        max_effort_len = 0;
+    }
+
     let budget = max_width.saturating_sub(marker_width + max_effort_len);
     if provider_width + via_width + min_model_width > budget {
         let provider_floor = 8usize.min(provider_width);
@@ -420,9 +432,15 @@ fn picker_render_width(picker: &crate::tui::InlineInteractiveState, max_width: u
     }
 
     let model_budget = budget.saturating_sub(provider_width + via_width);
+    // Clamp to what is left rather than to `min_model_width`: on a very narrow
+    // terminal the provider/method floors can already consume the whole budget,
+    // and honouring a model minimum on top of them would return a row wider
+    // than the window. Reserving ladder columns made that reachable, so the
+    // final width is capped at the budget it was computed from.
     let model_width = max_model_len
         .min(model_cap)
-        .min(model_budget.max(min_model_width.min(model_budget)));
+        .min(model_budget.max(min_model_width))
+        .min(model_budget);
 
     marker_width + max_effort_len + provider_width + via_width + model_width
 }
@@ -1355,6 +1373,25 @@ mod tests {
     fn models_without_efforts_reserve_no_ladder_width() {
         let picker = sample_picker();
         assert_eq!(effort_ladder_display_width(&picker.entries[0]), 0);
+    }
+
+    /// Reserving ladder columns must not let the row overflow a narrow
+    /// terminal. The budget shrinks the provider/method columns to their
+    /// floors instead, so a small window still renders a usable picker rather
+    /// than a row wider than the screen.
+    #[test]
+    fn ladder_reservation_still_fits_a_narrow_terminal() {
+        let mut picker = sample_picker();
+        picker.entries[0].effort = Some("high".to_string());
+        picker.entries[0].available_efforts = vec!["high".to_string()];
+
+        for max_width in [24usize, 32, 40, 60, 80, 120] {
+            let w = picker_render_width(&picker, max_width);
+            assert!(
+                w <= max_width,
+                "picker width {w} exceeds the {max_width}-column budget"
+            );
+        }
     }
 
     #[test]
