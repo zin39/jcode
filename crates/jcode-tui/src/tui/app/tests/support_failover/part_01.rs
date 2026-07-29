@@ -351,6 +351,18 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
     // still held because the auth overrides and caches touched below really are
     // process-global.
     let _scoped_home = crate::storage::scoped_test_home(temp.path());
+
+    // `JCODE_INITIAL_PROVIDER_EXPLICIT` is read straight from the process env
+    // (see `onboarding_should_prefer_strongest_model`), so it is inherited from
+    // whatever shell launched `cargo test`. A developer who exports it - which
+    // jcode itself does when it starts a session with an explicit provider -
+    // silently flips onboarding assertions that a hermetic home is supposed to
+    // control. Clear it for the duration so the test observes its own state
+    // rather than the machine's.
+    let saved_initial_provider_explicit =
+        std::env::var_os(INITIAL_PROVIDER_EXPLICIT_ENV);
+    crate::env::remove_var(INITIAL_PROVIDER_EXPLICIT_ENV);
+
     crate::auth::claude::set_active_account_override(None);
     crate::auth::codex::set_active_account_override(None);
     crate::auth::AuthStatus::invalidate_cache();
@@ -358,12 +370,19 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
 
     let result = f();
 
+    if let Some(value) = saved_initial_provider_explicit {
+        crate::env::set_var(INITIAL_PROVIDER_EXPLICIT_ENV, value);
+    }
     crate::auth::claude::set_active_account_override(None);
     crate::auth::codex::set_active_account_override(None);
     crate::auth::AuthStatus::invalidate_cache();
     crate::tui::app::helpers::clear_ambient_info_cache_for_tests();
     result
 }
+
+/// Set by jcode when a session starts with an explicit provider, so it is
+/// routinely present in a developer's environment and leaks into tests.
+const INITIAL_PROVIDER_EXPLICIT_ENV: &str = "JCODE_INITIAL_PROVIDER_EXPLICIT";
 
 /// Run `f` in a hermetic `JCODE_HOME` with reasoning display pinned to
 /// `current`.
