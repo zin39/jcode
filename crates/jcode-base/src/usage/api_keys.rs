@@ -98,7 +98,7 @@ pub(super) fn enqueue_api_key_usage_tasks(
             continue;
         }
 
-        let source_key = crate::provider_catalog::openai_compatible_api_method(&profile.id);
+        let source_key = crate::provider_catalog::openai_compatible_api_method(profile.id);
         let has_balance_api = matches!(profile.id, "deepseek" | "moonshotai");
         // Only surface profiles jcode has actually used (or that expose a real
         // balance API); listing every configured-but-idle key is noise.
@@ -200,7 +200,7 @@ async fn fetch_openai_api_key_report() -> ProviderUsage {
 async fn fetch_compatible_profile_report(
     profile: crate::provider_catalog::OpenAiCompatibleProfile,
 ) -> ProviderUsage {
-    let source_key = crate::provider_catalog::openai_compatible_api_method(&profile.id);
+    let source_key = crate::provider_catalog::openai_compatible_api_method(profile.id);
     let mut extra_info = Vec::new();
 
     match profile.id {

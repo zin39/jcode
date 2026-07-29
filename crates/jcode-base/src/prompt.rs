@@ -241,7 +241,7 @@ pub(crate) fn build_skills_section(available_skills: &[SkillInfo], max_chars: us
         .map(|s| {
             let desc = s
                 .description
-                .split(|c| c == '.' || c == '!' || c == '?')
+                .split(['.', '!', '?'])
                 .next()
                 .unwrap_or(&s.description);
             if desc.len() > DESC_CAP {

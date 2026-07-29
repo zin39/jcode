@@ -1388,9 +1388,8 @@ mod draw_call_tests {
         }
     }
 
-    /// The draw-call history is a process-global, so tests that clear it and
-    /// then assert on its contents must not interleave. Existing tests in this
-    /// module get away without a lock only by luck.
+    /// The draw-call history is a process-global, so every test that clears it
+    /// and then asserts on its contents must hold this lock.
     fn draw_call_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1407,13 +1406,8 @@ mod draw_call_tests {
 
     #[test]
     fn draw_call_history_records_all_draws_and_summarizes() {
-        // Single test covers both summary math and the ring-buffer bound so we
-        // never race two tests on the shared static history.
-        //
-        // Consolidating is not sufficient on its own: the futile-draw tests
-        // write to the same process-global ring buffer, so this must take the
-        // shared lock too. Without it this test read another test's samples and
-        // failed intermittently under parallel runs.
+        // Covers summary math and the ring-buffer bound together. The lock is
+        // required: the futile-draw tests write this same global buffer.
         let _guard = draw_call_test_lock();
         clear_draw_call_history();
         record_draw_call_attribution(sample(1_000, 2.0, Some(50)));

@@ -580,7 +580,7 @@ fn migrate_stray_env_files_between(jcode_home: &Path, config_dir: &Path) -> usiz
             );
             continue;
         }
-        if std::fs::create_dir_all(&config_dir).is_err() {
+        if std::fs::create_dir_all(config_dir).is_err() {
             continue;
         }
         match std::fs::copy(&path, &dest) {

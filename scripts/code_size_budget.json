@@ -108,7 +108,7 @@
     "crates/jcode-tui/src/tui/ui_tools.rs": 1661,
     "crates/jcode-tui/src/tui/ui_viewport.rs": 1439,
     "src/bin/memory_recall_bench.rs": 2667,
-    "src/bin/tui_bench.rs": 1763,
+    "src/bin/tui_bench.rs": 1767,
     "src/cli/commands.rs": 3362,
     "src/cli/dispatch.rs": 1396,
     "src/cli/login.rs": 1401,

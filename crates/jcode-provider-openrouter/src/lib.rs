@@ -368,7 +368,8 @@ fn cache_path_for_namespace(namespace: &str) -> PathBuf {
                 .join(".jcode")
         });
 
-    home.join("cache").join(format!("{}_models.json", namespace))
+    home.join("cache")
+        .join(format!("{}_models.json", namespace))
 }
 
 fn cache_path() -> PathBuf {

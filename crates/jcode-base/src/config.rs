@@ -293,13 +293,13 @@ fn scoped_home_config() -> Option<&'static Config> {
         // does: a test that changes one without calling
         // `invalidate_config_cache` must still be seen.
         let fingerprint = ConfigCacheFingerprint::current();
-        let stale = slot.as_ref().is_none_or(
-            |(cached_home, cached_generation, cached_fingerprint, _)| {
-                cached_home != &home
-                    || *cached_generation != generation
-                    || cached_fingerprint != &fingerprint
-            },
-        );
+        let stale =
+            slot.as_ref()
+                .is_none_or(|(cached_home, cached_generation, cached_fingerprint, _)| {
+                    cached_home != &home
+                        || *cached_generation != generation
+                        || cached_fingerprint != &fingerprint
+                });
         if stale {
             let config = leak_config(Config::load());
             // Re-fingerprint after loading: applying overrides can itself set

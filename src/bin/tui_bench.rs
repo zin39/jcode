@@ -1191,6 +1191,10 @@ impl TuiState for BenchState {
         Vec::new()
     }
 
+    fn suggestion_prompts_for_welcome(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     fn cache_ttl_status(&self) -> Option<jcode::tui::CacheTtlInfo> {
         None
     }

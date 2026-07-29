@@ -322,7 +322,7 @@ pub fn source_key_for_provider_label(label: &str, runtime_provider: Option<&str>
     // Direct OpenAI-compatible profiles, matched by id or display name.
     for profile in crate::provider_catalog::openai_compatible_profiles() {
         if normalized == profile.id || normalized == profile.display_name.to_ascii_lowercase() {
-            return crate::provider_catalog::openai_compatible_api_method(&profile.id);
+            return crate::provider_catalog::openai_compatible_api_method(profile.id);
         }
     }
 

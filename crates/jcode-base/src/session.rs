@@ -970,9 +970,7 @@ impl Session {
     /// `ensure_initial_session_context_message`) and internal system reminders
     /// are excluded. Machine-generated first prompts count.
     pub fn has_any_visible_messages(&self) -> bool {
-        self.messages
-            .iter()
-            .any(|msg| is_visible_conversation_message(msg))
+        self.messages.iter().any(is_visible_conversation_message)
     }
 
     /// Persist an immutable session-context snapshot as the first provider-visible

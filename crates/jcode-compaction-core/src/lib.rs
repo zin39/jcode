@@ -166,17 +166,15 @@ pub fn dedup_repeated_tool_reads(messages: &mut [Message]) -> usize {
                 && !content.starts_with(CLEARED_MARKER_PREFIX)
                 && !content.starts_with(DEDUP_MARKER_PREFIX)
                 && !content.starts_with(RESOLVED_ERROR_MARKER_PREFIX)
+                && let Some(&last_idx) = last_seen.get(content)
+                && last_idx != mi
             {
-                if let Some(&last_idx) = last_seen.get(content) {
-                    if last_idx != mi {
-                        *content = format!(
-                            "{}; identical to a later result: {} chars removed]",
-                            DEDUP_MARKER_PREFIX,
-                            content.chars().count(),
-                        );
-                        deduped += 1;
-                    }
-                }
+                *content = format!(
+                    "{}; identical to a later result: {} chars removed]",
+                    DEDUP_MARKER_PREFIX,
+                    content.chars().count(),
+                );
+                deduped += 1;
             }
         }
     }
