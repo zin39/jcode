@@ -223,34 +223,30 @@ mod tests {
 mod integration_tests {
     use super::*;
 
-    /// Serialize the tests that touch the shared JCODE_HOME-backed cache.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct HomeGuard(Option<String>);
-    impl HomeGuard {
-        fn set(dir: &std::path::Path) -> Self {
-            let previous = std::env::var("JCODE_HOME").ok();
-            // SAFETY: guarded by LOCK so no other test reads the env concurrently.
-            unsafe { std::env::set_var("JCODE_HOME", dir) };
-            Self(previous)
-        }
+    /// Isolate the cache behind a temp `JCODE_HOME`.
+    ///
+    /// `JCODE_HOME` is process-global, so it must be taken under the shared
+    /// storage test lock. Using a private lock here instead let these tests
+    /// race `isolate_config()` in the cheap-route suite, which repointed
+    /// `JCODE_HOME` mid-run and made unrelated routing tests read the wrong
+    /// config. Reuse the one lock the rest of the codebase already uses.
+    struct IsolatedHome {
+        _env: std::sync::MutexGuard<'static, ()>,
+        _temp: tempfile::TempDir,
     }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(home) => std::env::set_var("JCODE_HOME", home),
-                    None => std::env::remove_var("JCODE_HOME"),
-                }
-            }
-        }
+
+    fn isolate_home() -> IsolatedHome {
+        let _env = jcode_base::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("temp dir");
+        // SAFETY: the storage test lock is held, so no other test reads or
+        // writes the environment concurrently.
+        unsafe { std::env::set_var("JCODE_HOME", temp.path()) };
+        IsolatedHome { _env, _temp: temp }
     }
 
     #[test]
     fn a_quarantined_route_is_remembered_across_runs_and_cleared_on_success() {
-        let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp = tempfile::tempdir().expect("temp dir");
-        let _home = HomeGuard::set(temp.path());
+        let _home = isolate_home();
 
         assert!(
             quarantined().is_empty(),
@@ -278,9 +274,7 @@ mod integration_tests {
 
     #[test]
     fn an_enormous_provider_error_does_not_bloat_the_cache() {
-        let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let temp = tempfile::tempdir().expect("temp dir");
-        let _home = HomeGuard::set(temp.path());
+        let _home = isolate_home();
 
         quarantine("chatty-model", &"x".repeat(10_000));
 

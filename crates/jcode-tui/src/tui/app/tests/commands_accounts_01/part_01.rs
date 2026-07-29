@@ -785,6 +785,16 @@ fn test_catchup_next_queues_resume_for_attention_session() {
                 cache_control: None,
             }],
         );
+        // A second user turn makes this a conversation. Catch-up deliberately
+        // skips machine-created single-turn runs, which is what a session with
+        // only one user message now looks like.
+        target.add_message(
+            crate::message::Role::User,
+            vec![crate::message::ContentBlock::Text {
+                text: "Thanks, keep going.".to_string(),
+                cache_control: None,
+            }],
+        );
         target.mark_closed();
         target.save().expect("save catchup target");
 

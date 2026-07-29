@@ -231,8 +231,11 @@ pub fn gather_recent_sessions(since: Option<DateTime<Utc>>) -> Vec<RecentSession
             && let Ok(session) = crate::session::Session::load(stem)
         {
             loaded += 1;
-            // Skip debug sessions
-            if session.is_debug {
+            // Skip machine-created sessions. `is_debug` alone missed swarm
+            // workers, cheap-route subtasks and one-shot runs, which would
+            // pad the ambient summary with the agent's own scratch work
+            // instead of what the user actually did.
+            if session.is_internal_agent_session() {
                 continue;
             }
             // Only include sessions updated after cutoff

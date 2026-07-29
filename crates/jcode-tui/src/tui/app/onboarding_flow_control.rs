@@ -973,7 +973,12 @@ impl App {
         let locations: Vec<SessionLocation> = sessions
             .into_iter()
             .filter(|session| {
-                session.id != current_session_id && !session.is_debug && !session.is_canary
+                // `is_debug` alone missed swarm workers and one-shot runs,
+                // which would point onboarding at whatever directory a worker
+                // happened to run in rather than a project the user works on.
+                session.id != current_session_id
+                    && !session.is_internal_agent_session()
+                    && !session.is_canary
             })
             .filter_map(|session| {
                 let working_dir = session.working_dir?;

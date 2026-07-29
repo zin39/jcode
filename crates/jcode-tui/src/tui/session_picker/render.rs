@@ -235,7 +235,14 @@ impl SessionPicker {
         };
 
         let canary_marker = if session.is_canary { " 🔬" } else { "" };
-        let debug_marker = if session.is_debug { " 🧪" } else { "" };
+        // Mark every machine-created session, not just debug ones: when the
+        // test toggle reveals them, a swarm worker should be as obviously
+        // not-yours as a debug session.
+        let debug_marker = if session.is_internal_agent_session() {
+            " 🧪"
+        } else {
+            ""
+        };
         let saved_marker = if session.saved { " 📌" } else { "" };
         let selection_marker = if is_marked { "● " } else { "○ " };
         let selection_style = if is_marked {

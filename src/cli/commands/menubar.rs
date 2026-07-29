@@ -33,7 +33,9 @@ impl From<SessionCounts> for CountsReport {
 fn load_user_root_session(session_id: &str) -> Option<bool> {
     session::Session::load_startup_stub(session_id)
         .ok()
-        .map(|session| session.parent_id.is_none() && !session.is_debug)
+        // Use the shared rule rather than re-deriving it: menu-bar counts and
+        // the resume picker must agree on what a user session is.
+        .map(|session| !session.is_internal_agent_session())
 }
 
 fn user_root_session_presence() -> Vec<SessionPresence> {

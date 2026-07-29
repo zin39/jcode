@@ -1347,7 +1347,13 @@ fn load_catchup_candidates(app: &App) -> Vec<crate::tui::session_picker::Session
     crate::tui::session_picker::load_sessions()
         .unwrap_or_default()
         .into_iter()
-        .filter(|session| session.id != current_session_id && session.needs_catchup)
+        .filter(|session| {
+            session.id != current_session_id
+                && session.needs_catchup
+                // Same rule as the picker: machine-created sessions are not
+                // conversations the user needs catching up on.
+                && !session.is_internal_agent_session()
+        })
         .collect()
 }
 

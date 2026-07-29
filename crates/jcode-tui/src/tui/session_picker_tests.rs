@@ -465,7 +465,11 @@ fn test_new_grouped_hides_debug_by_default() {
     assert!(!picker.show_test_sessions);
     // Canary sessions are now visible by default, only debug sessions are hidden
     assert_eq!(picker.visible_sessions.len(), 3); // normal + canary + orphan_normal
-    assert!(picker.visible_session_iter().all(|s| !s.is_debug));
+    assert!(
+        picker
+            .visible_session_iter()
+            .all(|s| !s.is_internal_agent_session())
+    );
     assert_eq!(picker.hidden_test_count, 2); // debug + orphan_debug
 
     picker.toggle_test_sessions();
@@ -485,7 +489,11 @@ fn test_new_grouped_without_servers_shows_orphan_sessions() {
 
     assert!(!picker.show_test_sessions);
     assert_eq!(picker.visible_sessions.len(), 1);
-    assert!(picker.visible_session_iter().all(|s| !s.is_debug));
+    assert!(
+        picker
+            .visible_session_iter()
+            .all(|s| !s.is_internal_agent_session())
+    );
     assert_eq!(picker.hidden_test_count, 1);
     assert_eq!(picker.items.len(), 1);
     assert_eq!(picker.list_state.selected(), Some(0));

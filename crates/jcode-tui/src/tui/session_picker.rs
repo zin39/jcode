@@ -300,7 +300,10 @@ pub struct SessionPicker {
 
 impl SessionPicker {
     pub fn new(sessions: Vec<SessionInfo>) -> Self {
-        let hidden_test_count = sessions.iter().filter(|s| s.is_debug).count();
+        let hidden_test_count = sessions
+            .iter()
+            .filter(|s| s.is_internal_agent_session())
+            .count();
 
         let crashed_sessions = crashed_sessions_from_all_sessions(&sessions);
         let crashed_session_ids: HashSet<String> = crashed_sessions
@@ -408,7 +411,7 @@ impl SessionPicker {
             .iter()
             .flat_map(|g| g.sessions.iter())
             .chain(orphan_sessions.iter())
-            .filter(|s| s.is_debug)
+            .filter(|s| s.is_internal_agent_session())
             .count();
 
         // Gather all sessions for crash detection
@@ -671,7 +674,7 @@ impl SessionPicker {
             .iter()
             .flat_map(|g| g.sessions.iter())
             .chain(orphan_sessions.iter())
-            .filter(|s| s.is_debug)
+            .filter(|s| s.is_internal_agent_session())
             .count();
 
         let all_for_crash: Vec<SessionInfo> = server_groups

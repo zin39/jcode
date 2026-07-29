@@ -27,7 +27,13 @@ pub(super) fn catchup_candidates(
     session_picker::load_sessions()
         .unwrap_or_default()
         .into_iter()
-        .filter(|session| session.id != current_session_id && session.needs_catchup)
+        .filter(|session| {
+            session.id != current_session_id
+                && session.needs_catchup
+                // Catching the user up on a swarm worker or one-shot run is
+                // noise: they never had that conversation.
+                && !session.is_internal_agent_session()
+        })
         .collect()
 }
 

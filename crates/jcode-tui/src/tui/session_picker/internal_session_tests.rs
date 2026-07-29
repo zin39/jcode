@@ -83,6 +83,35 @@ fn toggling_test_sessions_reveals_spawned_agent_sessions() {
 }
 
 #[test]
+fn the_hidden_count_matches_what_the_picker_actually_hid() {
+    // The toggle hint reads "N hidden". If the count uses a narrower rule than
+    // the filter, the hint under-reports and the user is told sessions exist
+    // that the toggle then does not reveal, or vice versa. Pin the two to the
+    // same rule with a session hidden by *lineage* rather than `is_debug`,
+    // which is exactly the case a count on `is_debug` alone gets wrong.
+    let user = make_session("session_user", "user", false, SessionStatus::Closed);
+    let mut child = make_session("session_child", "child", false, SessionStatus::Closed);
+    child.parent_id = Some("session_user".to_string());
+    let worker = make_agent_session("session_worker", "worker", SessionAgentRole::SwarmWorker);
+    let debug = make_session("session_debug", "debug", true, SessionStatus::Closed);
+
+    let total = 4;
+    let mut picker = SessionPicker::new(vec![user, child, worker, debug]);
+
+    assert_eq!(
+        picker.hidden_test_count,
+        total - picker.visible_sessions.len(),
+        "the hidden count must equal what the filter removed, not a narrower `is_debug` tally"
+    );
+    assert_eq!(picker.hidden_test_count, 3);
+
+    // And the toggle must actually produce the sessions the count promised.
+    picker.toggle_test_sessions();
+    assert_eq!(picker.visible_sessions.len(), total);
+    assert_eq!(picker.hidden_test_count, 0);
+}
+
+#[test]
 fn a_blank_parent_id_does_not_count_as_lineage() {
     // Some persisted sessions carry an empty string rather than null. Treating
     // that as a parent would hide real user sessions, which is far worse than
