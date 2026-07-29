@@ -2536,6 +2536,9 @@ pub(crate) fn debug_chat_image_regions_json() -> String {
 /// "same frame or not", which a clock only approximates.
 pub(crate) static FRAME_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Read the current frame epoch. Only tests need to observe it directly;
+/// production code compares epochs it already holds.
+#[cfg(test)]
 pub(crate) fn current_frame_epoch() -> u64 {
     FRAME_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }

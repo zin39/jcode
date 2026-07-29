@@ -1749,7 +1749,7 @@ fn remote_clear_resets_provider_reported_context_usage() {
 fn pane_kind_chat_is_default() {
     let app = create_test_app();
     assert_eq!(app.focused_pane, crate::tui::app::PaneKind::Chat);
-    assert_eq!(app.pane_count(), 1);
+    assert_eq!(crate::tui::TuiState::pane_count(&app), 1);
 }
 
 #[test]

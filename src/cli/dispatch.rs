@@ -21,6 +21,9 @@ use super::{
 };
 use provider_init::ProviderChoice;
 
+/// Only the Linux parent-death path consults this at runtime; the tests below
+/// exercise it on every platform, so it is compiled for both.
+#[cfg(any(target_os = "linux", test))]
 fn is_file_controlled_debug_client() -> bool {
     std::env::var_os("JCODE_DEBUG_CMD_PATH").is_some()
 }

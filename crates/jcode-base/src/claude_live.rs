@@ -248,6 +248,9 @@ fn registry_still_matches(session: &LiveClaudeSession) -> bool {
     })
 }
 
+/// Only the Linux stop path (pidfd-based) clears the registry itself; other
+/// platforms go through a different exit path that does not call this.
+#[cfg(target_os = "linux")]
 fn remove_registry_if_same(session: &LiveClaudeSession) {
     if registry_still_matches(session) {
         let _ = std::fs::remove_file(&session.registry_path);

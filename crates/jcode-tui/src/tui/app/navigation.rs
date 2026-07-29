@@ -1906,25 +1906,6 @@ impl App {
 
     // ── WP13: Multi-pane focus ──────────────────────────────────────────
 
-    /// Count visible panes in the current layout.
-    pub(super) fn pane_count(&self) -> usize {
-        let mut count: usize = 1; // chat is always present
-        if self.diff_pane_visible() {
-            count += 1;
-        }
-        // Count diagram pane if it's pinned and enabled (and not overlapping with diff pane)
-        if self.diagram_pane_enabled
-            && self.diagram_mode == crate::config::DiagramDisplayMode::Pinned
-        {
-            count += 1;
-        }
-        // Count swarm strip if active and not full-page
-        if inline_swarm_gallery_active(self) && !self.swarm_panel_full_page {
-            count += 1;
-        }
-        count
-    }
-
     /// Which panes are currently visible in the layout, in left-to-right / top-to-bottom order.
     pub(super) fn visible_panes(&self) -> Vec<crate::tui::app::PaneKind> {
         let mut panes = vec![crate::tui::app::PaneKind::Chat];
