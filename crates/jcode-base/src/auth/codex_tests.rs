@@ -613,3 +613,43 @@ fn auth_status_reports_oauth_for_id_token_only_account() {
         "the OAuth-specific state must also be recorded, since route building reads it"
     );
 }
+
+/// The user-visible symptom: with an id_token-only login AND an
+/// `OPENAI_API_KEY` also configured, the picker offered `openai-api-key`
+/// routes but not a single `openai-oauth` route, so the ChatGPT-plan models
+/// could not be selected from `/model`.
+#[test]
+fn picker_offers_oauth_routes_for_id_token_only_login() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _api_key = EnvVarGuard::set("OPENAI_API_KEY", "sk-platform-key");
+    set_active_account_override(None);
+
+    upsert_account(OpenAiAccount {
+        label: "openai-1".to_string(),
+        access_token: "at_no_refresh".to_string(),
+        refresh_token: String::new(),
+        id_token: Some("id_token_present".to_string()),
+        account_id: Some("acct".to_string()),
+        expires_at: Some(9999999999999),
+        email: Some("chatgpt@example.com".to_string()),
+    })
+    .unwrap();
+
+    let mut status = crate::auth::AuthStatus::default();
+    crate::auth::probe_openai_status_for_test(&mut status);
+
+    // Both credentials are present, so the picker should offer both kinds of
+    // route. Before the fix the OAuth flag was false and every `openai-oauth`
+    // route was suppressed, leaving only the API-key routes.
+    assert!(
+        status.openai_has_oauth,
+        "OAuth routes are gated on this flag; without it `/model` shows no \
+         openai-oauth entry for a valid ChatGPT login"
+    );
+    assert!(
+        status.openai_has_api_key,
+        "the separately configured platform key should still be detected"
+    );
+}
