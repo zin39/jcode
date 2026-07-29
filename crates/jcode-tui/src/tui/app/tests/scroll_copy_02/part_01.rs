@@ -16,6 +16,15 @@ fn test_local_error_copy_badge_shortcut_supported() {
 
     assert_eq!(app.status_notice(), Some("Copied error".to_string()));
 
+    assert!(
+        clipboard
+            .text()
+            .is_some_and(|copied| copied.contains("permission denied while opening ~/.jcode/config.toml")),
+        "the shortcut must put the error text on the clipboard, not just render a \
+         badge; got {:?}",
+        clipboard.text()
+    );
+
     let text = render_and_snap(&app, &mut terminal);
     assert!(
         text.contains("Copied!"),
@@ -41,6 +50,15 @@ fn test_local_tool_error_copy_badge_shortcut_supported() {
         .unwrap();
 
     assert_eq!(app.status_notice(), Some("Copied error".to_string()));
+
+    assert!(
+        clipboard
+            .text()
+            .is_some_and(|copied| copied.contains("permission denied")),
+        "the shortcut must put the tool error text on the clipboard, not just \
+         render a badge; got {:?}",
+        clipboard.text()
+    );
 
     let text = render_and_snap(&app, &mut terminal);
     assert!(
@@ -68,6 +86,15 @@ fn test_local_tool_failed_output_copy_badge_shortcut_supported() {
 
     assert_eq!(app.status_notice(), Some("Copied output".to_string()));
 
+    assert!(
+        clipboard
+            .text()
+            .is_some_and(|copied| copied.contains("Permission denied")),
+        "the shortcut must put the failed tool output on the clipboard, not just render a \
+         badge; got {:?}",
+        clipboard.text()
+    );
+
     let text = render_and_snap(&app, &mut terminal);
     assert!(
         text.contains("Copied!"),
@@ -93,6 +120,15 @@ fn test_local_blockquote_copy_badge_shortcut_supported() {
         .unwrap();
 
     assert_eq!(app.status_notice(), Some("Copied quote".to_string()));
+
+    assert!(
+        clipboard
+            .text()
+            .is_some_and(|copied| copied.contains("the quick brown fox")),
+        "the shortcut must put the blockquote body on the clipboard, not just render a \
+         badge; got {:?}",
+        clipboard.text()
+    );
 
     let text = render_and_snap(&app, &mut terminal);
     assert!(
