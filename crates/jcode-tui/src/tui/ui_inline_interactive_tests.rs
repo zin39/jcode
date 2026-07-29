@@ -541,3 +541,83 @@ fn agent_target_picker_uses_specific_column_labels() {
     assert_eq!(picker.tertiary_label(), "CONFIG");
     assert!(!picker.shows_default_shortcut_hint());
 }
+
+/// Render the user's ACTUAL catalog shape end to end.
+///
+/// Every earlier check used the login-smoke fixture (one provider, two
+/// routes). The reported catalog is wider: `gpt-5.5` carries OpenAI oauth +
+/// OpenAI api-key under the label "OpenAI (2)", plus a third route under a
+/// separate "OpenAI API" provider. Column widths are driven by the *widest*
+/// row, so a shape this fixture never covered could still clip.
+#[test]
+fn the_reported_catalog_shape_renders_every_column() {
+    fn opt(provider: &str, api_method: &str) -> crate::tui::PickerOption {
+        crate::tui::PickerOption {
+            provider: provider.to_string(),
+            api_method: api_method.to_string(),
+            available: true,
+            detail: String::new(),
+            estimated_reference_cost_micros: None,
+        }
+    }
+
+    let mut picker = sample_picker();
+    picker.entries[0].name = "gpt-5.5".to_string();
+    picker.entries[0].options = vec![
+        opt("OpenAI", "openai-oauth"),
+        opt("OpenAI", "openai-api-key"),
+    ];
+    picker.entries[0].effort = Some("high".to_string());
+    picker.entries[0].available_efforts = vec!["high".to_string()];
+
+    // The widest label in the real catalog: a separate "OpenAI API" section.
+    let mut wide = picker.entries[0].clone();
+    wide.name = "gpt-5.6-terra".to_string();
+    wide.options = vec![opt("OpenAI API", "openai-api-key")];
+    picker.entries.push(wide);
+    picker.filtered = vec![0, 1];
+    picker.display_rows = vec![
+        crate::tui::PickerDisplayRow::Entry { entry_index: 0 },
+        crate::tui::PickerDisplayRow::Entry { entry_index: 1 },
+    ];
+
+    for max_width in [40usize, 56, 60, 80, 120, 200] {
+        let w = picker_render_width(&picker, max_width);
+        assert!(
+            w <= max_width,
+            "width {w} overflows the {max_width}-column window"
+        );
+        // Above the intrinsic width the box must stop growing, which is what
+        // proves the columns are content-fit rather than clipped-to-fit.
+        if max_width >= 80 {
+            assert_eq!(
+                w,
+                picker_render_width(&picker, 200),
+                "content-fit width should be stable once the window is wide enough"
+            );
+        }
+    }
+
+    // The real invariant: the box must be wide enough for every column *plus*
+    // the ladder drawn between them. Asserting a lower bound that the ladder is
+    // merely large enough to satisfy would pass with the ladder unreserved,
+    // so compare against the same width computed with no ladder at all.
+    let ladder = effort_ladder_display_width(&picker.entries[0]);
+    assert!(ladder > 0, "the fixture must exercise a laddered row");
+
+    let with_ladder = picker_render_width(&picker, 200);
+
+    let mut no_ladder_picker = picker.clone();
+    for entry in &mut no_ladder_picker.entries {
+        entry.effort = None;
+        entry.available_efforts = Vec::new();
+    }
+    let without_ladder = picker_render_width(&no_ladder_picker, 200);
+
+    assert_eq!(
+        with_ladder,
+        without_ladder + ladder,
+        "the box must grow by exactly the ladder width; anything less means the \
+         ladder is being drawn over a column that was already allocated"
+    );
+}
