@@ -1007,6 +1007,11 @@ fn test_flicker_frame_history_ignores_manual_scroll_feedback() {
 #[test]
 fn crossing_the_scrollbar_threshold_does_not_rewrap_the_transcript() {
     let _lock = viewport_snapshot_test_lock();
+    // Reset the shared render state, not just the flicker history. Leftover
+    // scroll/layout state from a sibling test changes how `draw` lays this
+    // frame out, and clearing only the flicker ring left this test failing
+    // roughly one full-suite run in nine.
+    crate::tui::ui::clear_test_render_state_for_tests();
 
     // A long single message whose wrapping is highly sensitive to width.
     let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliett \
