@@ -264,17 +264,20 @@ pub fn new_memorable_session_id_avoiding(used_names: &HashSet<String>) -> (Strin
     let ts = Utc::now().timestamp_millis();
     let rand: u64 = rand::random();
 
+    // Claim one starting point, then scan every identity from there. Calling
+    // fetch_add inside the search instead means a concurrent allocation can
+    // advance the cursor mid-scan, so the loop burns its attempts on names it
+    // never actually examined and falls through to reuse while identities are
+    // still free. Scanning from a fixed start guarantees that if any name is
+    // available, it is found.
     let cursor = session_name_cursor();
+    let start = cursor.fetch_add(1, Ordering::Relaxed);
     let word = (0..SESSION_NAMES.len())
-        .find_map(|_| {
-            let idx = cursor.fetch_add(1, Ordering::Relaxed) % SESSION_NAMES.len();
-            let (word, _) = SESSION_NAMES[idx];
+        .find_map(|offset| {
+            let (word, _) = SESSION_NAMES[start.wrapping_add(offset) % SESSION_NAMES.len()];
             (!used_names.contains(word)).then_some(word)
         })
-        .unwrap_or_else(|| {
-            let idx = cursor.fetch_add(1, Ordering::Relaxed) % SESSION_NAMES.len();
-            SESSION_NAMES[idx].0
-        });
+        .unwrap_or_else(|| SESSION_NAMES[start % SESSION_NAMES.len()].0);
 
     let short_name = word.to_string();
     let full_id = format!("session_{}_{ts}_{rand:016x}", word);
@@ -375,6 +378,47 @@ mod tests {
             "the bee identity must remain reserved for the global swarm marker"
         );
         assert_eq!(session_icon("bee"), "💫");
+    }
+
+    /// The cursor is process-global, so a concurrent allocation must not be
+    /// able to starve a scan. Regression: the search advanced the shared cursor
+    /// on every attempt, so interleaved callers consumed each other's attempts
+    /// and the allocator reused a name while others were still free. This
+    /// surfaced only under a full parallel workspace run.
+    #[test]
+    fn concurrent_allocation_cannot_starve_an_available_identity() {
+        // Hammer the shared cursor from several threads so an interleaving is
+        // near-certain, and retry the scan: the bug is a race, so a single
+        // uncontended pass can miss it.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let noise: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = new_memorable_session_id_avoiding(&HashSet::new());
+                    }
+                })
+            })
+            .collect();
+
+        let mut failure = None;
+        'outer: for _ in 0..200 {
+            let mut used = HashSet::new();
+            for _ in 0..SESSION_NAMES.len() {
+                let (_, name) = new_memorable_session_id_avoiding(&used);
+                if !used.insert(name) {
+                    failure = Some("allocator reused an identity while others were still free");
+                    break 'outer;
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for handle in noise {
+            handle.join().expect("noise thread should finish");
+        }
+        assert!(failure.is_none(), "{}", failure.unwrap_or_default());
     }
 
     #[test]

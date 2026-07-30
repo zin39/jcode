@@ -1,4 +1,6 @@
 use super::*;
+// Only the Linux-gated tests below spawn processes.
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
 #[test]
