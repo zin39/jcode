@@ -13,7 +13,7 @@
     "crates/jcode-base/src/provider/tests/model_resolution.rs": 2333,
     "crates/jcode-base/src/session_tests/cases.rs": 2558,
     "crates/jcode-desktop/src/main_tests.rs": 10621,
-    "crates/jcode-desktop/src/session_launch/tests.rs": 1214,
+    "crates/jcode-desktop/src/session_launch/tests.rs": 1232,
     "crates/jcode-desktop/src/single_session_render/tests.rs": 2220,
     "crates/jcode-plan/src/dag/tests.rs": 1392,
     "crates/jcode-provider-openrouter-runtime/src/openrouter_tests.rs": 3029,

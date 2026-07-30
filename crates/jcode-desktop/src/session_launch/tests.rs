@@ -785,6 +785,24 @@ fn workspace_send_message_uses_shared_server_instead_of_prompt_argv() -> Result<
 }
 
 #[cfg(unix)]
+// KNOWN FLAKE, ~25% on a loaded machine (measured 6/24 at b31998415).
+//
+// Not a regression: this failed 24/24 at 54ba9b547; the desktop socket fixes
+// earlier in that range are what made it mostly pass. The residual is a race in
+// this fake server, not in the code under test: `ensure_server_running`
+// liveness-probes and drops the socket, so dead connections sit in the accept
+// queue ahead of real clients while this server accepts sequentially.
+//
+// Three targeted fixes were tried and MEASURED WORSE OR NEUTRAL, so none were
+// kept. Do not re-attempt them without new evidence:
+//   - accepting both clients concurrently via thread::scope  -> 5/20 (worse)
+//   - a short first-read budget to discard dead probes fast  -> 5/20 (worse)
+//   - returning DrainOutcome::Disconnected on EINVAL         -> 6/20 (neutral)
+//
+// The failure surfaces at three different layers depending on timing (EINVAL
+// from set_read_timeout, EOF, and a broken pipe on write), which suggests the
+// fix is to restructure this harness around a concurrent accept loop with an
+// explicit per-client queue rather than to patch any single symptom.
 #[test]
 fn desktop_workers_reconnect_independently_across_same_fake_reload() -> Result<()> {
     let _guard = ENV_LOCK.lock().unwrap();
