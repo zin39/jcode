@@ -162,6 +162,47 @@ pub fn audit_validation_claim(validation: Option<&str>, activity: ToolActivity) 
     })
 }
 
+/// Append an output contract to a spawned worker's prompt.
+///
+/// Recovered from `7a1c15833` (`feat(subagent): optional structured JSON output
+/// via output_schema`), which was dropped when the `subagent` tool it patched
+/// was deleted upstream.
+///
+/// Prompt-only rather than provider-native, because the primary worker model
+/// rejects strict schema mode outright: `deepseek-v4-pro` answers
+/// `HTTP 400 "This response_format type is unavailable now"`. The contract must
+/// therefore be stated in the prompt and checked on the way back.
+pub fn append_output_contract(prompt: &str, schema: &serde_json::Value) -> String {
+    let schema = serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
+    format!(
+        "{prompt}\n\n## Output contract\nYour FINAL message must be exactly one \
+         JSON object, with no prose and no code fences, conforming to this JSON \
+         Schema:\n{schema}"
+    )
+}
+
+/// Parse a worker's final message as the JSON object its contract required.
+///
+/// Tolerates ``` and ```json fences, which models add even when told not to.
+pub fn enforce_structured_output(final_text: &str) -> Result<String, String> {
+    let trimmed = final_text.trim();
+    let content = match trimmed
+        .strip_prefix("```json")
+        .or(trimmed.strip_prefix("```"))
+    {
+        Some(fenced) => fenced
+            .trim_start()
+            .strip_suffix("```")
+            .unwrap_or(fenced)
+            .trim(),
+        None => trimmed,
+    };
+
+    let value: serde_json::Value =
+        serde_json::from_str(content).map_err(|err| format!("invalid JSON: {err}"))?;
+    serde_json::to_string_pretty(&value).map_err(|err| format!("could not re-serialize: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +278,40 @@ mod tests {
             audit_validation_claim(Some("This approach looks correct to me."), silent),
             None,
         );
+    }
+
+    #[test]
+    fn the_output_contract_names_the_schema_and_forbids_fences() {
+        let schema = serde_json::json!({"type": "object"});
+        let prompt = append_output_contract("Do the thing.", &schema);
+        assert!(prompt.starts_with("Do the thing."), "prompt was: {prompt}");
+        assert!(prompt.contains("no code fences"), "prompt was: {prompt}");
+        assert!(
+            prompt.contains("\"type\""),
+            "schema must be inlined: {prompt}"
+        );
+    }
+
+    /// Models add fences even when told not to, so the parser tolerates them.
+    #[test]
+    fn structured_output_accepts_json_bare_and_fenced() {
+        let want = "{\n  \"key\": \"value\"\n}";
+        for input in [
+            r#"{"key": "value"}"#,
+            "```json\n{\"key\": \"value\"}\n```",
+            "```\n{\"key\": \"value\"}\n```",
+            "  \n{\"key\": \"value\"}\n  ",
+        ] {
+            let got = enforce_structured_output(input)
+                .unwrap_or_else(|err| panic!("should parse {input:?}: {err}"));
+            assert_eq!(got, want, "input was {input:?}");
+        }
+    }
+
+    #[test]
+    fn structured_output_reports_why_prose_is_not_usable() {
+        let err = enforce_structured_output("Sure! Here is the result: all good.")
+            .expect_err("prose must not parse as the contracted object");
+        assert!(err.contains("invalid JSON"), "err was: {err}");
     }
 }

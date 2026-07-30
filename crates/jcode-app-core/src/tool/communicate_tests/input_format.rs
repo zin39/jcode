@@ -410,3 +410,51 @@ fn format_status_snapshot_includes_activity_and_metadata() {
     );
     assert!(output.output.contains("Files: src/server/comm_sync.rs"));
 }
+
+/// An `output_schema` on spawn must reach the worker as an explicit contract,
+/// so its answer comes back machine-checkable instead of as prose.
+///
+/// Motivation, measured: a Sonnet worker did 16 tool calls of real research and
+/// then reported "Findings with file:line evidence for each item" while
+/// attaching no findings at all. The work existed; the handoff destroyed it.
+#[test]
+fn an_output_schema_appends_a_contract_to_the_spawned_workers_prompt() {
+    let with_schema: CommunicateInput = serde_json::from_value(serde_json::json!({
+        "action": "spawn",
+        "prompt": "map the seams",
+        "output_schema": {
+            "type": "object",
+            "properties": {"findings": {"type": "array"}},
+            "required": ["findings"]
+        }
+    }))
+    .expect("output_schema should deserialize");
+
+    let message = with_schema
+        .spawn_initial_message()
+        .expect("spawn message should exist");
+    assert!(
+        message.starts_with("map the seams"),
+        "the caller's task must come first: {message}"
+    );
+    assert!(
+        message.contains("## Output contract"),
+        "the contract must be appended: {message}"
+    );
+    assert!(
+        message.contains("findings"),
+        "the schema must be inlined so the worker knows the fields: {message}"
+    );
+
+    // Without a schema the prompt is passed through untouched, so existing
+    // spawns are unaffected.
+    let without: CommunicateInput = serde_json::from_value(serde_json::json!({
+        "action": "spawn",
+        "prompt": "map the seams"
+    }))
+    .expect("plain spawn should deserialize");
+    assert_eq!(
+        without.spawn_initial_message().as_deref(),
+        Some("map the seams")
+    );
+}

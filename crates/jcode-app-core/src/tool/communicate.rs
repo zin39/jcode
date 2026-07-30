@@ -1828,6 +1828,8 @@ struct CommunicateInput {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
+    output_schema: Option<serde_json::Value>,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     task_id: Option<String>,
@@ -1897,7 +1899,14 @@ struct CommunicateInput {
 
 impl CommunicateInput {
     fn spawn_initial_message(&self) -> Option<String> {
-        self.initial_message.clone().or_else(|| self.prompt.clone())
+        let message = self
+            .initial_message
+            .clone()
+            .or_else(|| self.prompt.clone())?;
+        Some(match self.output_schema.as_ref() {
+            Some(schema) => jcode_swarm_core::append_output_contract(&message, schema),
+            None => message,
+        })
     }
 
     fn required_spawn_label(&self) -> anyhow::Result<String> {
@@ -2021,6 +2030,10 @@ impl Tool for CommunicateTool {
                 "initial_message": {
                     "type": "string",
                     "description": "Explicit initial task/instructions for spawn. If both initial_message and prompt are supplied, initial_message wins."
+                },
+                "output_schema": {
+                    "type": "object",
+                    "description": "Optional JSON Schema for spawn. When set, the worker is told its FINAL message must be exactly one JSON object conforming to this schema, so the answer comes back machine-checkable instead of as prose. Use it when you need specific fields (e.g. a list of file:line findings) rather than a summary that claims findings exist."
                 },
                 "limit": {
                     "type": "integer",

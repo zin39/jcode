@@ -1,8 +1,8 @@
 pub mod report_audit;
 
 pub use report_audit::{
-    ToolActivity, audit_validation_claim, forget_session_tool_activity, record_session_tool_call,
-    session_tool_activity,
+    ToolActivity, append_output_contract, audit_validation_claim, enforce_structured_output,
+    forget_session_tool_activity, record_session_tool_call, session_tool_activity,
 };
 
 use jcode_plan::PlanItem;
