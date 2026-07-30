@@ -184,14 +184,22 @@ fn spawn_raw_models_server(
         {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // The listener is non-blocking and accepted sockets inherit
+                    // that on some platforms, so a read can return WouldBlock
+                    // before the request has even arrived. Put this socket back
+                    // into blocking mode and let the read timeout bound it,
+                    // otherwise the loop below exits instantly with an empty
+                    // request ("expected GET /v1/models request, got: ").
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .set_nonblocking(false)
+                        .expect("set accepted stream blocking");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
                         .expect("set read timeout");
                     // Read until the header terminator rather than taking a
                     // single read(): under load the client's request can arrive
-                    // split across TCP segments, and one read then yields an
-                    // empty or truncated request that the assertions report as
-                    // "expected GET /v1/models request, got: ".
+                    // split across TCP segments, and one read then yields a
+                    // truncated request.
                     let mut request = String::new();
                     let mut chunk = [0u8; 8192];
                     loop {
