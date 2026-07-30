@@ -183,24 +183,47 @@ pub fn append_output_contract(prompt: &str, schema: &serde_json::Value) -> Strin
 
 /// Parse a worker's final message as the JSON object its contract required.
 ///
-/// Tolerates ``` and ```json fences, which models add even when told not to.
+/// Tolerates fences and surrounding prose, which models add even when told not
+/// to ("Sure! Here you go:" ahead of a ```json block is the common shape).
+/// Being lenient here costs nothing and saves a whole round trip, since the
+/// object the caller wanted is present either way.
 pub fn enforce_structured_output(final_text: &str) -> Result<String, String> {
     let trimmed = final_text.trim();
-    let content = match trimmed
-        .strip_prefix("```json")
-        .or(trimmed.strip_prefix("```"))
-    {
-        Some(fenced) => fenced
-            .trim_start()
-            .strip_suffix("```")
-            .unwrap_or(fenced)
-            .trim(),
-        None => trimmed,
-    };
 
-    let value: serde_json::Value =
-        serde_json::from_str(content).map_err(|err| format!("invalid JSON: {err}"))?;
-    serde_json::to_string_pretty(&value).map_err(|err| format!("could not re-serialize: {err}"))
+    // Prefer a fenced block anywhere in the message, then the whole message,
+    // then the outermost brace-delimited span. First one that parses wins.
+    let mut candidates = Vec::new();
+    if let Some(start) = trimmed.find("```") {
+        let after = &trimmed[start + 3..];
+        let after = after.strip_prefix("json").unwrap_or(after);
+        let body = match after.find("```") {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        candidates.push(body.trim());
+    }
+    candidates.push(trimmed);
+    if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && open < close
+    {
+        candidates.push(&trimmed[open..=close]);
+    }
+
+    let mut first_error = None;
+    for candidate in candidates {
+        match serde_json::from_str::<serde_json::Value>(candidate) {
+            Ok(value) => {
+                return serde_json::to_string_pretty(&value)
+                    .map_err(|err| format!("could not re-serialize: {err}"));
+            }
+            Err(err) => first_error.get_or_insert_with(|| err.to_string()),
+        };
+    }
+
+    Err(format!(
+        "invalid JSON: {}",
+        first_error.unwrap_or_else(|| "no JSON object found".to_string())
+    ))
 }
 
 #[cfg(test)]
@@ -301,6 +324,11 @@ mod tests {
             "```json\n{\"key\": \"value\"}\n```",
             "```\n{\"key\": \"value\"}\n```",
             "  \n{\"key\": \"value\"}\n  ",
+            // Models routinely prepend a friendly sentence despite the
+            // contract saying no prose, and sometimes trail one too.
+            "Sure! Here you go:\n```json\n{\"key\": \"value\"}\n```",
+            "```json\n{\"key\": \"value\"}\n```\n\nLet me know if you need more.",
+            "Here is the result: {\"key\": \"value\"}",
         ] {
             let got = enforce_structured_output(input)
                 .unwrap_or_else(|err| panic!("should parse {input:?}: {err}"));
