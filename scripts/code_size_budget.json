@@ -24,7 +24,7 @@
     "crates/jcode-base/src/auth/lifecycle.rs": 2590,
     "crates/jcode-base/src/auth/mod.rs": 1493,
     "crates/jcode-base/src/auth/oauth.rs": 1519,
-    "crates/jcode-base/src/background.rs": 1465,
+    "crates/jcode-base/src/background.rs": 1485,
     "crates/jcode-base/src/compaction.rs": 1807,
     "crates/jcode-base/src/gmail.rs": 1213,
     "crates/jcode-base/src/import.rs": 1495,

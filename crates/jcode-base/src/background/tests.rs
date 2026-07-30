@@ -562,3 +562,49 @@ async fn abort_live_tasks_for_reload_keeps_naturally_finished_status() -> Result
     );
     Ok(())
 }
+
+/// A status file must never be observable in a torn state.
+///
+/// Regression: status files were written with a plain truncating write while
+/// pollers read them concurrently, so a reader could catch a partially written
+/// file, fail to parse it, and conclude the task did not exist. That surfaced
+/// as an intermittent "status should exist" failure under parallel load.
+#[tokio::test]
+async fn concurrent_readers_never_observe_a_torn_status_file() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("task.status.json");
+
+    // Seed a valid file so readers always have something to find.
+    super::write_status_file_atomically(&path, "{\"seed\":true}").await;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let path = path.clone();
+        let stop = std::sync::Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut torn = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(text) = tokio::fs::read_to_string(&path).await
+                    && serde_json::from_str::<serde_json::Value>(&text).is_err()
+                {
+                    torn += 1;
+                }
+                tokio::task::yield_now().await;
+            }
+            torn
+        })
+    };
+
+    // Rewrite with a payload large enough that a truncating write has a real
+    // window in which the file on disk is incomplete.
+    let big = format!("{{\"payload\":\"{}\"}}", "x".repeat(200_000));
+    for _ in 0..60 {
+        super::write_status_file_atomically(&path, &big).await;
+        super::write_status_file_atomically(&path, "{\"small\":1}").await;
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let torn = reader.await.expect("reader task should finish");
+    assert_eq!(torn, 0, "readers observed {torn} torn status files");
+    Ok(())
+}

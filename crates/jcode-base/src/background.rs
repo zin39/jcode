@@ -38,6 +38,26 @@ pub struct BackgroundTaskManager {
     output_dir: PathBuf,
 }
 
+/// Write a task status file atomically.
+///
+/// Status files are read concurrently by pollers while the owning task rewrites
+/// them. A plain write truncates in place, so a reader can observe a partial
+/// file, fail to parse it, and conclude the task does not exist. Renaming a
+/// fully written temp file over the target makes every read see either the old
+/// status or the new one, never a torn one.
+async fn write_status_file_atomically(path: &std::path::Path, json: &str) {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    if fs::write(&tmp, json).await.is_err() {
+        // Fall back to a direct write rather than losing the status entirely.
+        let _ = fs::write(path, json).await;
+        return;
+    }
+    if fs::rename(&tmp, path).await.is_err() {
+        let _ = fs::remove_file(&tmp).await;
+        let _ = fs::write(path, json).await;
+    }
+}
+
 impl BackgroundTaskManager {
     /// Create a manager rooted at a specific output directory.
     ///
@@ -132,7 +152,7 @@ impl BackgroundTaskManager {
 
     async fn write_status_file(&self, path: &std::path::Path, status: &TaskStatusFile) {
         if let Ok(json) = serde_json::to_string_pretty(status) {
-            let _ = fs::write(path, json).await;
+            write_status_file_atomically(path, &json).await;
         }
     }
 
@@ -537,7 +557,7 @@ impl BackgroundTaskManager {
                 terminal_event_record(status.clone(), exit_code, error.as_deref()),
             );
             if let Ok(json) = serde_json::to_string_pretty(&final_status) {
-                let _ = tokio::fs::write(&status_path_clone, json).await;
+                write_status_file_atomically(&status_path_clone, &json).await;
             }
 
             // Drop this task from the live map now that its terminal status is
@@ -748,7 +768,7 @@ impl BackgroundTaskManager {
                 terminal_event_record(status.clone(), exit_code, error.as_deref()),
             );
             if let Ok(json) = serde_json::to_string_pretty(&final_status) {
-                let _ = tokio::fs::write(&status_path_clone, json).await;
+                write_status_file_atomically(&status_path_clone, &json).await;
             }
 
             // Prune the live-map entry only after the terminal status file is
