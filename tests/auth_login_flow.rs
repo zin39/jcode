@@ -174,7 +174,11 @@ fn spawn_raw_models_server(
     let status = status.into();
 
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Outlive the client's 2s recv_timeout by a wide margin. When the two
+        // were equal, a loaded machine could let this accept loop expire before
+        // the client's connection was scheduled, so no request was ever read
+        // and the assertion reported an empty request.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while request_count_thread.load(Ordering::SeqCst) < max_requests
             && Instant::now() < deadline
         {
@@ -183,9 +187,25 @@ fn spawn_raw_models_server(
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .expect("set read timeout");
-                    let mut request = vec![0u8; 8192];
-                    let n = stream.read(&mut request).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&request[..n]).into_owned();
+                    // Read until the header terminator rather than taking a
+                    // single read(): under load the client's request can arrive
+                    // split across TCP segments, and one read then yields an
+                    // empty or truncated request that the assertions report as
+                    // "expected GET /v1/models request, got: ".
+                    let mut request = String::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                request.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                                if request.contains("\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     request_count_thread.fetch_add(1, Ordering::SeqCst);
                     let _ = request_tx.send(request);
 
