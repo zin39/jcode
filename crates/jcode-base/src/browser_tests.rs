@@ -157,9 +157,14 @@ fn ensure_browser_session_fails_fast_when_session_process_exits_immediately() {
     let elapsed = start.elapsed();
 
     assert!(session.is_none());
+    // The behaviour under test is that a dead child short-circuits the startup
+    // wait instead of blocking on it. That wait is a 10s deadline polled every
+    // 100ms (see browser.rs), so the meaningful assertion is "well inside the
+    // deadline", not a sub-second wall clock: a 1s bound measures machine load
+    // and fails ~50% of the time on a busy host, which is what it was doing.
     assert!(
-        elapsed < Duration::from_secs(1),
-        "expected immediate failure, got {:?}",
+        elapsed < Duration::from_secs(5),
+        "expected the dead child to short-circuit the 10s startup wait, got {:?}",
         elapsed
     );
 
