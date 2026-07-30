@@ -76,7 +76,10 @@ pub fn resolve_tool_name(name: &str) -> &str {
 
     match name {
         "communicate" => "swarm",
-        "task" | "task_runner" => "subagent",
+        // `subagent` was deleted from the registry; `swarm` is the spawn path.
+        // Leaving these pointed at the old name turned a recoverable alias into
+        // an "Unknown tool: subagent" error, observed in 9 real sessions.
+        "task" | "task_runner" | "subagent" => "swarm",
         "launch" => "open",
         "shell" => "bash",
         "shell_exec" => "bash",
@@ -91,6 +94,10 @@ pub fn resolve_tool_name(name: &str) -> &str {
         // grep mode accepts `pattern` as an alias for `query`, so these calls
         // work as-is.
         "grep" | "file_grep" => "agentgrep",
+        // Models reach for a `glob` tool that this registry never had. agentgrep's
+        // `find` mode is the file-name search they want, so route it there rather
+        // than returning "Unknown tool: glob" (observed in a real session).
+        "glob" | "Glob" => "agentgrep",
         "skill" | "Skill" => "skill_manage",
         "todoread" | "todowrite" | "todo_read" | "todo_write" | "todos" => "todo",
         // The Anthropic OAuth surface advertises PascalCase tool names and
@@ -102,7 +109,7 @@ pub fn resolve_tool_name(name: &str) -> &str {
         "Write" => "write",
         "Edit" => "edit",
         "Grep" => "agentgrep",
-        "Agent" => "subagent",
+        "Agent" => "swarm",
         "ScheduleWakeup" => "schedule",
         other => other,
     }
@@ -136,9 +143,46 @@ mod tests {
         assert_eq!(resolve_tool_name("Write"), "write");
         assert_eq!(resolve_tool_name("Edit"), "edit");
         assert_eq!(resolve_tool_name("Grep"), "agentgrep");
-        assert_eq!(resolve_tool_name("Agent"), "subagent");
+        assert_eq!(resolve_tool_name("Agent"), "swarm");
         assert_eq!(resolve_tool_name("ScheduleWakeup"), "schedule");
         assert_eq!(resolve_tool_name("Skill"), "skill_manage");
         assert_eq!(resolve_tool_name("functions.Read"), "read");
+    }
+
+    /// Every alias must resolve to a tool that still exists.
+    ///
+    /// `subagent` was deleted from the registry, but four aliases (`task`,
+    /// `task_runner`, `subagent`, `Agent`) still pointed at it, so a model
+    /// reaching for the familiar name got `Unknown tool: subagent` instead of
+    /// being routed to `swarm`. That happened in 9 real sessions before this
+    /// was noticed. `glob` had no alias at all and failed the same way.
+    ///
+    /// The registry lives in a downstream crate, so this asserts against the
+    /// known-deleted names rather than a live Registry; the app-core test
+    /// `delegation_directive_only_names_tools_that_are_registered` covers the
+    /// live side.
+    #[test]
+    fn no_alias_resolves_to_a_tool_that_was_deleted() {
+        const DELETED: &[&str] = &["subagent", "grep", "glob", "task", "communicate"];
+        const ALIASES: &[&str] = &[
+            "task",
+            "task_runner",
+            "subagent",
+            "Agent",
+            "communicate",
+            "glob",
+            "Glob",
+            "grep",
+            "file_grep",
+            "Grep",
+        ];
+        for alias in ALIASES {
+            let resolved = resolve_tool_name(alias);
+            assert!(
+                !DELETED.contains(&resolved),
+                "alias `{alias}` resolves to `{resolved}`, which is not a \
+                 registered tool; models calling it get `Unknown tool`"
+            );
+        }
     }
 }
