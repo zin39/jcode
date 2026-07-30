@@ -226,8 +226,12 @@ fn test_resolve_tool_name_oauth_aliases() {
     assert_eq!(Registry::resolve_tool_name("read_file"), "read");
     assert_eq!(Registry::resolve_tool_name("write_file"), "write");
     assert_eq!(Registry::resolve_tool_name("edit_file"), "edit");
-    assert_eq!(Registry::resolve_tool_name("task_runner"), "subagent");
-    assert_eq!(Registry::resolve_tool_name("task"), "subagent");
+    // `subagent` was deleted from the registry, so these route to `swarm`,
+    // the actual spawn path, instead of manufacturing an "Unknown tool" error.
+    assert_eq!(Registry::resolve_tool_name("task_runner"), "swarm");
+    assert_eq!(Registry::resolve_tool_name("task"), "swarm");
+    assert_eq!(Registry::resolve_tool_name("subagent"), "swarm");
+    assert_eq!(Registry::resolve_tool_name("glob"), "agentgrep");
     assert_eq!(Registry::resolve_tool_name("launch"), "open");
     assert_eq!(Registry::resolve_tool_name("grep"), "agentgrep");
     assert_eq!(Registry::resolve_tool_name("file_grep"), "agentgrep");
