@@ -11,6 +11,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Build a Unix socket path short enough to actually bind.
+///
+/// `sun_path` is 104 bytes on macOS, and `bind` fails once the path exceeds it.
+/// These tests composed `temp_dir()` with long descriptive names, which is fine
+/// when TMPDIR is `/tmp` but not when it is a real directory: with TMPDIR at
+/// `~/.jcode/scratch` the reconnect-mismatch path hit exactly 104 bytes and
+/// failed with "path must be shorter than SUN_LEN". Fall back to `/tmp` when the
+/// preferred directory would still be too long.
+#[cfg(unix)]
+fn test_socket_path(tag: &str, nonce: u128) -> std::path::PathBuf {
+    let file = format!("jd-{tag}-{:x}.sock", nonce & 0xffff_ffff_ffff);
+    let preferred = std::env::temp_dir().join(&file);
+    if preferred.as_os_str().len() < 100 {
+        return preferred;
+    }
+    std::path::PathBuf::from("/tmp").join(file)
+}
+
 #[test]
 fn validates_safe_session_ids() -> Result<()> {
     validate_resume_session_id("session_cow_123-abc.def")?;
@@ -436,14 +454,13 @@ fn desktop_session_worker_slots_are_bounded_and_released() -> Result<()> {
 #[test]
 fn desktop_worker_roundtrips_message_with_fake_server() -> Result<()> {
     let _guard = ENV_LOCK.lock().unwrap();
-    let socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-smoke-{}-{}.sock",
-        std::process::id(),
+    let socket_path = test_socket_path(
+        "smoke",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
+            .as_nanos(),
+    );
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     let previous_socket = std::env::var_os("JCODE_SOCKET");
@@ -492,14 +509,8 @@ fn desktop_worker_emits_reloaded_before_real_done_after_fake_reload() -> Result<
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-reload-old-{}-{nonce}.sock",
-        std::process::id(),
-    ));
-    let new_socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-reload-new-{}-{nonce}.sock",
-        std::process::id(),
-    ));
+    let socket_path = test_socket_path("reload-old", nonce);
+    let new_socket_path = test_socket_path("reload-new", nonce);
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&new_socket_path);
     let listener = UnixListener::bind(&socket_path)?;
@@ -563,14 +574,8 @@ fn desktop_worker_rejects_reconnect_session_id_mismatch() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-reload-mismatch-old-{}-{nonce}.sock",
-        std::process::id(),
-    ));
-    let new_socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-reload-mismatch-new-{}-{nonce}.sock",
-        std::process::id(),
-    ));
+    let socket_path = test_socket_path("reload-mismatch-old", nonce);
+    let new_socket_path = test_socket_path("reload-mismatch-new", nonce);
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&new_socket_path);
     let listener = UnixListener::bind(&socket_path)?;
@@ -620,14 +625,13 @@ fn desktop_worker_rejects_reconnect_session_id_mismatch() -> Result<()> {
 #[test]
 fn desktop_worker_rejects_malformed_server_event_lines() -> Result<()> {
     let _guard = ENV_LOCK.lock().unwrap();
-    let socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-malformed-{}-{}.sock",
-        std::process::id(),
+    let socket_path = test_socket_path(
+        "malformed",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
+            .as_nanos(),
+    );
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     let previous_socket = std::env::var_os("JCODE_SOCKET");
@@ -716,18 +720,9 @@ fn validate_reload_socket_path_requires_owned_socket_in_current_directory() -> R
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let current_socket = std::env::temp_dir().join(format!(
-        "jcode-desktop-reload-validate-current-{}-{nonce}.sock",
-        std::process::id(),
-    ));
-    let new_socket = std::env::temp_dir().join(format!(
-        "jcode-desktop-reload-validate-new-{}-{nonce}.sock",
-        std::process::id(),
-    ));
-    let non_socket = std::env::temp_dir().join(format!(
-        "jcode-desktop-reload-validate-file-{}-{nonce}",
-        std::process::id(),
-    ));
+    let current_socket = test_socket_path("reload-validate-current", nonce);
+    let new_socket = test_socket_path("reload-validate-new", nonce);
+    let non_socket = test_socket_path("reload-validate-file", nonce);
     let _ = std::fs::remove_file(&current_socket);
     let _ = std::fs::remove_file(&new_socket);
     let _ = std::fs::remove_file(&non_socket);
@@ -757,14 +752,13 @@ fn validate_reload_socket_path_requires_owned_socket_in_current_directory() -> R
 #[test]
 fn workspace_send_message_uses_shared_server_instead_of_prompt_argv() -> Result<()> {
     let _guard = ENV_LOCK.lock().unwrap();
-    let socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-workspace-send-{}-{}.sock",
-        std::process::id(),
+    let socket_path = test_socket_path(
+        "workspace-send",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-    ));
+            .as_nanos(),
+    );
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     let previous_socket = std::env::var_os("JCODE_SOCKET");
@@ -798,14 +792,8 @@ fn desktop_workers_reconnect_independently_across_same_fake_reload() -> Result<(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-multi-reload-old-{}-{nonce}.sock",
-        std::process::id(),
-    ));
-    let new_socket_path = std::env::temp_dir().join(format!(
-        "jcode-desktop-worker-multi-reload-new-{}-{nonce}.sock",
-        std::process::id(),
-    ));
+    let socket_path = test_socket_path("multi-reload-old", nonce);
+    let new_socket_path = test_socket_path("multi-reload-new", nonce);
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&new_socket_path);
     let listener = UnixListener::bind(&socket_path)?;
@@ -1167,8 +1155,27 @@ fn accept_first_requesting_client(
 ) -> Result<(BufReader<UnixStream>, UnixStream, Value)> {
     loop {
         let (stream, _) = listener.accept()?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        let mut reader = BufReader::new(stream.try_clone()?);
+
+        // `ensure_server_running` liveness-probes the socket and drops the
+        // stream, so a connection accepted here can already be dead and setup
+        // fails with EINVAL. Skip it like the `Ok(0)` arm below rather than
+        // aborting the fake server, which surfaced as a confusing client-side
+        // broken pipe.
+        //
+        // 30s, not 2s: this fake server accepts clients SEQUENTIALLY, so a
+        // second concurrent client waits out the first's whole exchange. Under
+        // parallel suite load that blew the old budget and failed with "failed
+        // to configure server socket timeout".
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(cloned) = stream.try_clone() else {
+            continue;
+        };
+        let mut reader = BufReader::new(cloned);
         let mut first_line = String::new();
         match reader.read_line(&mut first_line) {
             Ok(0) => continue,
