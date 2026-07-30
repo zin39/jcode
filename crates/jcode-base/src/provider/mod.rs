@@ -880,6 +880,23 @@ impl MultiProvider {
     fn openai_compatible_model_prefix(
         model: &str,
     ) -> Option<(crate::provider_catalog::OpenAiCompatibleProfile, &str)> {
+        // Route ids are emitted as `openai-compatible:<profile>` (see
+        // `AuthRoute`/`api_method`), so a fully qualified spec pasted back in as
+        // a model pin arrives as `openai-compatible:<profile>:<model>`. Strip
+        // the redundant transport segment first: without this, `split_once`
+        // takes `openai-compatible` as the profile and leaves
+        // `<profile>:<model>` as the model name, which resolves to the generic
+        // catch-all profile and silently bills the wrong endpoint.
+        let model = model
+            .trim()
+            .strip_prefix("openai-compatible:")
+            .filter(|rest| {
+                rest.split_once(':').is_some_and(|(profile, model)| {
+                    !profile.trim().is_empty() && !model.trim().is_empty()
+                })
+            })
+            .unwrap_or(model);
+
         let (prefix, rest) = model.split_once(':')?;
         if explicit_model_provider_prefix(model).is_some() {
             return None;
