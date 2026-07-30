@@ -2640,6 +2640,14 @@ pub(super) fn build_audited_completion_report(
     let mut report =
         jcode_swarm_core::format_structured_completion_report(message, validation, follow_up);
     if let Some(note) = jcode_swarm_core::audit_validation_claim(validation, activity) {
+        // Logged as well as appended: an unbacked claim is a signal about the
+        // worker's model/prompt, and it should be measurable across sessions
+        // rather than only visible in one report body.
+        crate::logging::warn(&format!(
+            "[swarm:report-audit] unbacked validation claim session={session_id} \
+             commands_run={} files_inspected={} files_edited={}",
+            activity.commands_run, activity.files_inspected, activity.files_edited
+        ));
         report.push_str("\n\n");
         report.push_str(&note);
     }
