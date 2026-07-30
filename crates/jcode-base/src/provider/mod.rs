@@ -16,6 +16,7 @@ pub mod gemini;
 mod image_clamp;
 pub mod jcode;
 pub mod model_filter;
+mod model_pin;
 pub mod models;
 mod multi_provider;
 pub mod openai;
@@ -880,34 +881,7 @@ impl MultiProvider {
     fn openai_compatible_model_prefix(
         model: &str,
     ) -> Option<(crate::provider_catalog::OpenAiCompatibleProfile, &str)> {
-        // Route ids are emitted as `openai-compatible:<profile>` (see
-        // `AuthRoute`/`api_method`), so a fully qualified spec pasted back in as
-        // a model pin arrives as `openai-compatible:<profile>:<model>`. Strip
-        // the redundant transport segment first: without this, `split_once`
-        // takes `openai-compatible` as the profile and leaves
-        // `<profile>:<model>` as the model name, which resolves to the generic
-        // catch-all profile and silently bills the wrong endpoint.
-        let model = model
-            .trim()
-            .strip_prefix("openai-compatible:")
-            .filter(|rest| {
-                rest.split_once(':').is_some_and(|(profile, model)| {
-                    !profile.trim().is_empty() && !model.trim().is_empty()
-                })
-            })
-            .unwrap_or(model);
-
-        let (prefix, rest) = model.split_once(':')?;
-        if explicit_model_provider_prefix(model).is_some() {
-            return None;
-        }
-        let rest = rest.trim();
-        if rest.is_empty() {
-            return None;
-        }
-
-        let profile = crate::provider_catalog::openai_compatible_profile_by_id(prefix)?;
-        Some((profile, rest))
+        model_pin::openai_compatible_model_prefix(model)
     }
 
     /// Find the configured OpenAI-compatible profile that serves a bare model
@@ -952,25 +926,8 @@ impl MultiProvider {
         crate::provider_catalog::openai_compatible_profile_by_id(&fallback?)
     }
 
-    /// Parse a `<name>:<model>` spec whose prefix is a user-defined named
-    /// provider profile from config (`[providers.<name>]`). Built-in provider
-    /// prefixes and catalog profile ids take precedence and never reach here.
     fn named_provider_profile_model_prefix(model: &str) -> Option<(String, String)> {
-        let (prefix, rest) = model.split_once(':')?;
-        if explicit_model_provider_prefix(model).is_some()
-            || Self::openai_compatible_model_prefix(model).is_some()
-        {
-            return None;
-        }
-        let prefix = prefix.trim();
-        let rest = rest.trim();
-        if prefix.is_empty() || rest.is_empty() {
-            return None;
-        }
-        crate::config::config()
-            .providers
-            .contains_key(prefix)
-            .then(|| (prefix.to_string(), rest.to_string()))
+        model_pin::named_provider_profile_model_prefix(model)
     }
 
     /// Bind (or reuse) the runtime for a named config provider profile and
