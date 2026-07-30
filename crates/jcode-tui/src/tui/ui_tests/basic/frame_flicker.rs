@@ -1028,6 +1028,13 @@ fn crossing_the_scrollbar_threshold_does_not_rewrap_the_transcript() {
         };
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
+        // Reset before EVERY render, not once for the whole test. This closure
+        // renders 15 heights and compares their wrap shapes, so state carried
+        // from the previous iteration (scroll position, cached layout, the
+        // flicker ring) makes the comparison depend on iteration order. Doing
+        // it once at the top left a residual difference that failed roughly one
+        // full-suite run in six.
+        crate::tui::ui::clear_test_render_state_for_tests();
         clear_flicker_frame_history_for_tests();
         terminal
             .draw(|frame| crate::tui::ui::draw(frame, &state))
