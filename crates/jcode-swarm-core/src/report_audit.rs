@@ -32,11 +32,33 @@ fn with_activity<T>(action: impl FnOnce(&mut HashMap<String, ToolActivity>) -> T
     action(&mut guard)
 }
 
+/// Upper bound on tracked sessions.
+///
+/// The audit only ever reads the session that is reporting right now, so old
+/// entries are dead weight. A long-lived server sees thousands of sessions
+/// (5,527 on the machine this was measured on), and nothing in the request path
+/// knows when a session is finished, so the map is capped rather than relying
+/// on a cleanup call that would inevitably be missed.
+const MAX_TRACKED_SESSIONS: usize = 512;
+
 /// Record that `session_id` invoked `tool_name`.
 ///
 /// Called from the tool dispatch path, where both are already in scope.
 pub fn record_session_tool_call(session_id: &str, tool_name: &str) {
     with_activity(|activity| {
+        if activity.len() >= MAX_TRACKED_SESSIONS && !activity.contains_key(session_id) {
+            // Evicting an arbitrary entry is acceptable: the worst case is that
+            // a very old session's report is not audited, which is the same
+            // behaviour as before this feature existed. Never evict the session
+            // being recorded, or its own report would lose its evidence.
+            if let Some(victim) = activity
+                .keys()
+                .find(|key| key.as_str() != session_id)
+                .cloned()
+            {
+                activity.remove(&victim);
+            }
+        }
         activity
             .entry(session_id.to_string())
             .or_default()
@@ -121,9 +143,32 @@ const EXECUTION_CLAIMS: &[&str] = &[
     "grep confirmed",
 ];
 
+/// Phrases that negate an execution claim. A worker saying it could *not* run
+/// something is being honest, and flagging that would punish exactly the
+/// behaviour this check exists to encourage.
+const NEGATIONS: &[&str] = &[
+    "did not",
+    "didn't",
+    "could not",
+    "couldn't",
+    "cannot",
+    "can't",
+    "unable to",
+    "was not able",
+    "wasn't able",
+    "not run",
+    "no commands",
+    "without running",
+    "skipped",
+    "failed to run",
+];
+
 /// Whether `validation` claims commands were executed.
 fn claims_execution(validation: &str) -> bool {
     let lowered = validation.to_ascii_lowercase();
+    if NEGATIONS.iter().any(|negation| lowered.contains(negation)) {
+        return false;
+    }
     EXECUTION_CLAIMS.iter().any(|claim| lowered.contains(claim))
 }
 
@@ -300,6 +345,82 @@ mod tests {
         assert_eq!(
             audit_validation_claim(Some("This approach looks correct to me."), silent),
             None,
+        );
+    }
+
+    /// The tally must not grow without bound on a long-lived server, and must
+    /// never evict the session currently being recorded, or that session's own
+    /// report would lose the evidence it is about to be judged against.
+    #[test]
+    fn the_tally_is_bounded_and_never_evicts_the_active_session() {
+        let tag = format!("bounded-{}", std::process::id());
+
+        // Bound: churn well past the cap and confirm the map never exceeds it.
+        for index in 0..(MAX_TRACKED_SESSIONS * 2) {
+            record_session_tool_call(&format!("{tag}-filler-{index}"), "bash");
+        }
+        let tracked = with_activity(|activity| activity.len());
+        assert!(
+            tracked <= MAX_TRACKED_SESSIONS,
+            "tally grew past its cap: {tracked} entries"
+        );
+
+        // Self-eviction: with the map at its cap, recording for a session must
+        // evict some OTHER entry, never the caller's own. Driven through
+        // with_activity so a concurrent test sharing this process-global
+        // cannot perturb the setup between fill and check.
+        for round in 0..64 {
+            let fresh = format!("{tag}-fresh-{round}");
+            with_activity(|activity| {
+                activity.remove(&fresh);
+                let mut pad = 0usize;
+                while activity.len() < MAX_TRACKED_SESSIONS {
+                    activity
+                        .entry(format!("{tag}-pad-{round}-{pad}"))
+                        .or_default()
+                        .record("bash");
+                    pad += 1;
+                }
+            });
+            record_session_tool_call(&fresh, "bash");
+            assert!(
+                with_activity(|activity| activity.contains_key(&fresh)),
+                "a session was evicted by its own recording (round {round})"
+            );
+        }
+    }
+
+    /// An honest admission that a command could NOT be run must not be flagged.
+    /// Punishing that would train workers away from the candour this check
+    /// exists to encourage, and it is the exact phrasing a blocked worker uses.
+    #[test]
+    fn honest_admissions_that_nothing_ran_are_not_treated_as_claims() {
+        let silent = ToolActivity::default();
+        for validation in [
+            "Unable to run cargo test here.",
+            "Could not run the test suite: no harness exists.",
+            "I did not run anything; the task was read-only.",
+            "No commands were run.",
+            "Skipped cargo build because the crate does not compile standalone.",
+            "Failed to run cargo check (toolchain missing).",
+            "Reviewed by reading the files, without running anything.",
+        ] {
+            assert_eq!(
+                audit_validation_claim(Some(validation), silent),
+                None,
+                "honest admission was wrongly flagged: {validation:?}"
+            );
+        }
+
+        // The negation must not become a loophole: a real claim in the same
+        // report is still caught.
+        assert!(
+            audit_validation_claim(
+                Some("Ran cargo test -p jcode-base; all 1213 tests passed."),
+                silent
+            )
+            .is_some(),
+            "a genuine fabricated claim must still be flagged"
         );
     }
 
