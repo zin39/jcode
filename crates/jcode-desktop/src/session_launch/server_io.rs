@@ -40,6 +40,23 @@ pub(super) fn ensure_server_running() -> Result<()> {
     connect_server_with_retry_path(&path, SERVER_START_TIMEOUT).map(|_| ())
 }
 
+/// Arm the per-read timeout on a server connection.
+///
+/// A peer that has already gone away makes `set_read_timeout` fail with EINVAL.
+/// That is a disconnect, not a misconfiguration, so it is reported as one:
+/// surfacing "failed to configure server socket timeout" reads like a bug in
+/// this process and sent one desktop test chasing an invalid argument that was
+/// really just a closed socket.
+fn arm_read_timeout(stream: &UnixStream) -> Result<()> {
+    if stream
+        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
+        .is_err()
+    {
+        anyhow::bail!("jcode server disconnected before the exchange completed");
+    }
+    Ok(())
+}
+
 fn spawn_jcode_server_with_diagnostics() -> Result<()> {
     let mut command = Command::new(jcode_bin());
     command
@@ -321,10 +338,7 @@ pub(super) fn read_session_id_from_events(
     event_tx: Option<&DesktopSessionEventSender>,
     complete_request_id: Option<u64>,
 ) -> Result<Option<String>> {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
-        .context("failed to configure server socket timeout")?;
+    arm_read_timeout(reader.get_ref())?;
     let started = Instant::now();
     let mut line = String::new();
     while started.elapsed() < timeout {
@@ -377,10 +391,7 @@ pub(super) fn read_session_id_from_state(
     event_tx: Option<&DesktopSessionEventSender>,
     state_request_id: u64,
 ) -> Result<String> {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
-        .context("failed to configure server socket timeout")?;
+    arm_read_timeout(reader.get_ref())?;
     let started = Instant::now();
     let mut line = String::new();
     while started.elapsed() < timeout {
@@ -431,10 +442,7 @@ pub(super) fn read_model_changed(
     event_tx: Option<&DesktopSessionEventSender>,
     request_id: u64,
 ) -> Result<()> {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
-        .context("failed to configure server socket timeout")?;
+    arm_read_timeout(reader.get_ref())?;
     let started = Instant::now();
     let mut line = String::new();
     while started.elapsed() < timeout {
@@ -485,10 +493,7 @@ pub(super) fn read_model_catalog(
     event_tx: Option<&DesktopSessionEventSender>,
     request_id: u64,
 ) -> Result<()> {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
-        .context("failed to configure server socket timeout")?;
+    arm_read_timeout(reader.get_ref())?;
     let started = Instant::now();
     let mut line = String::new();
     while started.elapsed() < timeout {
@@ -542,10 +547,7 @@ pub(super) fn read_control_response(
     expected_event_types: &[&str],
     action_label: &str,
 ) -> Result<()> {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
-        .context("failed to configure server socket timeout")?;
+    arm_read_timeout(reader.get_ref())?;
     let started = Instant::now();
     let mut line = String::new();
     while started.elapsed() < timeout {
@@ -619,10 +621,7 @@ pub(super) fn drain_session_events(
     command_rx: &Receiver<DesktopSessionCommand>,
     terminal_request_id: u64,
 ) -> Result<DrainOutcome> {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
-        .context("failed to configure server socket timeout")?;
+    arm_read_timeout(reader.get_ref())?;
     let mut line = String::new();
     let mut pending_cancel_requests = Vec::<PendingCancelRequest>::new();
     loop {
