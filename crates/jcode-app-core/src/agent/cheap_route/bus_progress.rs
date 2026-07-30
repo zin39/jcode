@@ -228,6 +228,71 @@ mod tests {
         assert_eq!(rows[1].state, BatchSubcallState::Failed);
     }
 
+    /// The reporter must actually reach the BUS, not just mutate its own rows.
+    ///
+    /// Both existing tests inspect `reporter.rows` directly, so they would pass
+    /// even if `publish` were never called and nothing ever appeared in the UI.
+    /// The whole point of this type is that a cheap_route run is visible live
+    /// (the user asked whether the side panel shows progress in real time), and
+    /// that claim was resting on reading the code rather than on a test.
+    #[tokio::test]
+    async fn progress_reaches_the_bus_so_the_ui_can_render_it_live() {
+        let mut rx = crate::bus::Bus::global().subscribe();
+        while rx.try_recv().is_ok() {}
+
+        let reporter = BusProgressReporter::new("session_bus".to_string(), "call_bus".to_string());
+        reporter.plan(&[("alpha".to_string(), 1), ("beta".to_string(), 2)]);
+
+        let progress = loop {
+            match rx.try_recv() {
+                Ok(crate::bus::BusEvent::BatchProgress(progress))
+                    if progress.tool_call_id == "call_bus" =>
+                {
+                    break progress;
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("plan() published no BatchProgress on the bus: {err:?}"),
+            }
+        };
+
+        assert_eq!(progress.session_id, "session_bus");
+        assert_eq!(progress.total, 2, "both subtasks must be reported");
+        assert_eq!(
+            progress.completed, 0,
+            "nothing has finished yet when the plan is announced"
+        );
+        assert_eq!(
+            progress.running.len(),
+            2,
+            "both subtasks start running, which is what the UI renders as active rows"
+        );
+        assert!(
+            progress
+                .subcalls
+                .iter()
+                .any(|sub| sub.tool_call.intent.as_deref() == Some("alpha")),
+            "each row must carry its subtask description so the panel is readable: {:?}",
+            progress.subcalls
+        );
+
+        // A completion must be published too, otherwise the panel would show
+        // work as perpetually running.
+        reporter.subtask(0, DebatePhase::Done, "deepseek-v4-pro");
+        let done = loop {
+            match rx.try_recv() {
+                Ok(crate::bus::BusEvent::BatchProgress(progress))
+                    if progress.tool_call_id == "call_bus" =>
+                {
+                    break progress;
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("subtask() published no BatchProgress: {err:?}"),
+            }
+        };
+        assert_eq!(done.completed, 1, "the finished subtask must be counted");
+        assert_eq!(done.running.len(), 1, "one subtask is still running");
+    }
+
     #[test]
     fn subtask_update_for_unknown_index_is_ignored() {
         let reporter = BusProgressReporter::new("session_x".to_string(), "call_1".to_string());

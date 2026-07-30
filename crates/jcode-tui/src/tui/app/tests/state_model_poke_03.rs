@@ -2053,9 +2053,16 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
         ("deepseek", "deepseek-v4-pro", &deepseek_text),
         ("openrouter_openai", "openai/gpt-5.5", &openrouter_openai_text),
     ] {
+        // Count every picker model row, not only the selected one. A '▸'-only
+        // filter matches just the selection, so duplicated unselected rows
+        // would slip past. The right-hand status pane echoes the active model
+        // and section headers ('▾') echo the provider, so exclude both.
         let rows: Vec<&str> = text
             .lines()
-            .filter(|line| line.contains(model) && line.contains('▸'))
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with('│') && trimmed.contains(model) && !trimmed.contains('▾')
+            })
             .collect();
         assert_eq!(
             rows.len(),
@@ -2063,6 +2070,89 @@ fn test_login_smoke_model_picker_renders_unstacked_provider_rows() {
             "{label}: `{model}` must occupy exactly one row with its routes \
              collapsed behind the method column, but rendered {} rows:\n{text}",
             rows.len()
+        );
+    }
+}
+
+/// A model with several routes must produce exactly ONE display row.
+///
+/// This is the invariant `..._renders_unstacked_provider_rows` is named for,
+/// asserted where it is actually decidable. That test renders a picker filtered
+/// to a single model, so a per-entry duplication bug cannot show up in its
+/// output: I duplicated the row push in `rebuild_display_rows` and its
+/// assertion still passed. Checking `display_rows` directly, with two models in
+/// one provider group and multiple routes each, does catch it.
+#[test]
+fn multi_route_models_collapse_to_one_display_row_each() {
+    fn route(provider: &str, method: &str) -> crate::tui::PickerOption {
+        crate::tui::PickerOption {
+            provider: provider.to_string(),
+            api_method: method.to_string(),
+            available: true,
+            detail: String::new(),
+            estimated_reference_cost_micros: None,
+        }
+    }
+    fn entry(name: &str, routes: Vec<crate::tui::PickerOption>) -> crate::tui::PickerEntry {
+        crate::tui::PickerEntry {
+            name: name.to_string(),
+            options: routes,
+            action: crate::tui::PickerAction::Model,
+            selected_option: 0,
+            is_current: false,
+            is_default: false,
+            is_favorite: false,
+            recommended: false,
+            recommendation_rank: usize::MAX,
+            usage_score: 0,
+            old: false,
+            created_date: None,
+            effort: None,
+            available_efforts: Vec::new(),
+            provider_group: Some("OpenAI".to_string()),
+            is_recent: false,
+        }
+    }
+
+    let entries = vec![
+        entry(
+            "gpt-5.4",
+            vec![
+                route("OpenAI", "openai-oauth"),
+                route("OpenAI", "openai-api-key"),
+            ],
+        ),
+        entry("gpt-5.5", vec![route("OpenAI", "openai-oauth")]),
+    ];
+    let mut picker = crate::tui::InlineInteractiveState {
+        kind: crate::tui::PickerKind::Model,
+        filtered: (0..entries.len()).collect(),
+        entries,
+        selected: 0,
+        column: 0,
+        filter: String::new(),
+        preview: false,
+        display_rows: Vec::new(),
+        collapse_state: crate::tui::CollapseState::default(),
+    };
+    picker.rebuild_display_rows();
+
+    for model in ["gpt-5.4", "gpt-5.5"] {
+        let count = picker
+            .display_rows
+            .iter()
+            .filter(|row| match row {
+                crate::tui::PickerDisplayRow::Entry { entry_index } => {
+                    picker.entries[*entry_index].name == model
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            count, 1,
+            "`{model}` must occupy exactly one row with its routes collapsed \
+             behind the method column, got {count} rows: {:?}",
+            picker.display_rows
         );
     }
 }
