@@ -722,6 +722,13 @@ fn absolute_env_file_has_key_reads_absolute_path() {
 
 #[tokio::test]
 async fn run_cheap_route_rescues_via_current_model_when_all_ranked_dead() {
+    // The last-resort rescue is gated on `agents.cheap_route_ban`, which is
+    // read from config, so without isolation this test consults the developer's
+    // real ~/.jcode/config.toml. A ban list containing the fake current model's
+    // family (or simply `strict = true`) suppresses the rescue and the test
+    // fails locally while passing in CI.
+    let _config = isolate_config();
+
     // Every ranked route is dead (mirrors the real case: all 6 cheapest are
     // one exhausted key). The parent's own current model still works.
     let backend = FallbackBackend {

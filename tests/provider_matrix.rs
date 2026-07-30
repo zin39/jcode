@@ -416,7 +416,10 @@ fn assert_model_picker_has_profile_route(
     context: &str,
 ) {
     let resolved = resolve_openai_compatible_profile(profile);
-    let expected_api_method = format!("openai-compatible:{}", resolved.id);
+    // Ask the catalog rather than concatenating: the GENERIC profile's id is
+    // itself "openai-compatible", so its canonical method is the bare
+    // transport, not a doubled "openai-compatible:openai-compatible".
+    let expected_api_method = jcode::provider_catalog::openai_compatible_api_method(&resolved.id);
     let routes = provider.model_routes();
     assert!(
         routes.iter().any(|route| {
@@ -749,8 +752,14 @@ fn provider_matrix_openai_compatible_auth_state_space_material_states_preserve_l
                         let routes = provider.model_routes();
                         assert!(
                             routes.iter().any(|route| {
+                                // Canonical method from the catalog: the generic
+                                // profile's id IS the transport, so the method is
+                                // the bare "openai-compatible".
                                 route.provider == "OpenAI-compatible"
-                                    && route.api_method == "openai-compatible:openai-compatible"
+                                    && route.api_method
+                                        == jcode::provider_catalog::openai_compatible_api_method(
+                                            jcode::provider_catalog::OPENAI_COMPAT_PROFILE.id,
+                                        )
                                     && route.model == model
                                     && route.available
                             }),
