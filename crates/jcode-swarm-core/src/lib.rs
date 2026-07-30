@@ -1,6 +1,9 @@
 pub mod report_audit;
 
-pub use report_audit::{ToolActivity, audit_validation_claim};
+pub use report_audit::{
+    ToolActivity, audit_validation_claim, forget_session_tool_activity, record_session_tool_call,
+    session_tool_activity,
+};
 
 use jcode_plan::PlanItem;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

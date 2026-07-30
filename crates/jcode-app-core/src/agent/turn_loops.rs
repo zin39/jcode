@@ -567,6 +567,7 @@ impl Agent {
                             execution_mode: ToolExecutionMode::AgentTurn,
                         };
                         crate::telemetry::record_tool_call();
+                        jcode_swarm_core::record_session_tool_call(&self.session.id, &tool_name);
                         let tool_result = self
                             .registry
                             .execute(&tool_name, ToolCall::normalize_input_to_object(input), ctx)
@@ -1042,6 +1043,7 @@ impl Agent {
 
                 let result = self.registry.execute(&tc.name, tc.input.clone(), ctx).await;
                 crate::telemetry::record_tool_call();
+                jcode_swarm_core::record_session_tool_call(&self.session.id, &tc.name);
                 self.unlock_tools_if_needed(&tc.name);
                 let tool_elapsed = tool_start.elapsed();
                 logging::info(&format!(

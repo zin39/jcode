@@ -1482,48 +1482,55 @@ async fn validate_tool_allowed_resolves_aliases_against_canonical_allowlist() {
     assert!(agent.validate_tool_allowed("bash").is_ok());
 }
 
-/// The report auditor must read the agent's *real* transcript, so a worker that
+/// The report auditor must read the *dispatch-time tally*, so a worker that
 /// claims it ran commands while calling no tools is caught.
 ///
 /// This is the measured failure mode: a real `deepseek-v4-pro` worker reported
 /// validation "All 7 steps executed with real command output" from a session
 /// whose transcript contained zero tool calls.
-#[tokio::test]
-async fn a_worker_that_ran_nothing_cannot_claim_it_ran_commands() {
-    let _guard = crate::storage::lock_test_env();
-    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
-    let registry = Registry::new(provider.clone()).await;
-    let mut agent = Agent::new(provider, registry);
+///
+/// The tally is used rather than the agent's transcript because `report` runs
+/// inside the worker's own turn, so re-locking its agent deadlocks (seen live
+/// as "Failed to record report: deadline has elapsed").
+#[test]
+fn a_worker_that_ran_nothing_cannot_claim_it_ran_commands() {
+    let session_id = format!("test-audit-{}", std::process::id());
+    jcode_swarm_core::forget_session_tool_activity(&session_id);
 
-    agent.add_message(
-        Role::User,
-        vec![ContentBlock::Text {
-            text: "check the build".to_string(),
-            cache_control: None,
-        }],
-    );
-
-    // A transcript with no tool calls: the claim below is unbacked.
-    assert!(agent.tool_activity().is_silent());
+    // No tool calls recorded: the claim below is unbacked.
     let claim = Some("All 7 steps executed with real command output.");
-    let note = jcode_swarm_core::audit_validation_claim(claim, agent.tool_activity())
-        .expect("an execution claim from a silent worker must be flagged");
+    assert!(jcode_swarm_core::session_tool_activity(&session_id).is_silent());
+    let note = jcode_swarm_core::audit_validation_claim(
+        claim,
+        jcode_swarm_core::session_tool_activity(&session_id),
+    )
+    .expect("an execution claim from a silent worker must be flagged");
     assert!(note.contains("no tool calls at all"), "note was: {note}");
 
-    // Once the worker actually runs a command, the same claim is accepted.
-    agent.add_message(
-        Role::Assistant,
-        vec![ContentBlock::ToolUse {
-            id: "call_1".to_string(),
-            name: "bash".to_string(),
-            input: serde_json::json!({}),
-            thought_signature: None,
-        }],
-    );
-    assert_eq!(agent.tool_activity().commands_run, 1);
+    // Reading files but running nothing still gets flagged, with what it did do.
+    jcode_swarm_core::record_session_tool_call(&session_id, "read");
+    let note = jcode_swarm_core::audit_validation_claim(
+        claim,
+        jcode_swarm_core::session_tool_activity(&session_id),
+    )
+    .expect("an execution claim without commands must be flagged");
+    assert!(note.contains("inspected 1 file(s)"), "note was: {note}");
+
+    // Once a real command runs, the same claim is accepted.
+    jcode_swarm_core::record_session_tool_call(&session_id, "bash");
     assert_eq!(
-        jcode_swarm_core::audit_validation_claim(claim, agent.tool_activity()),
+        jcode_swarm_core::session_tool_activity(&session_id).commands_run,
+        1
+    );
+    assert_eq!(
+        jcode_swarm_core::audit_validation_claim(
+            claim,
+            jcode_swarm_core::session_tool_activity(&session_id),
+        ),
         None,
         "a claim backed by a real command must not be flagged"
     );
+
+    jcode_swarm_core::forget_session_tool_activity(&session_id);
+    assert!(jcode_swarm_core::session_tool_activity(&session_id).is_silent());
 }

@@ -550,13 +550,11 @@ pub(super) async fn handle_lightweight_control_request(
         } => {
             let status = status.unwrap_or_else(|| "ready".to_string());
             let report = super::comm_control::build_audited_completion_report(
-                sessions,
                 &req_session_id,
                 &message,
                 validation.as_deref(),
                 follow_up.as_deref(),
-            )
-            .await;
+            );
             let detail = Some(truncate_detail(&message, 160));
             update_member_status_with_report_tldr(
                 &req_session_id,

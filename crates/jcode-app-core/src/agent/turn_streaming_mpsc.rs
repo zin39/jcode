@@ -825,6 +825,7 @@ impl Agent {
                             execution_mode: ToolExecutionMode::AgentTurn,
                         };
                         crate::telemetry::record_tool_call();
+                        jcode_swarm_core::record_session_tool_call(&self.session.id, &tool_name);
                         let tool_result = self
                             .registry
                             .execute(&tool_name, ToolCall::normalize_input_to_object(input), ctx)

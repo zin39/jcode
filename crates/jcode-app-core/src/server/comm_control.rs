@@ -2627,20 +2627,16 @@ async fn require_plan_driver_swarm(
 /// Build a completion report, appending an audit note when the worker's
 /// free-text `validation` claims commands were run that its transcript does not
 /// show. Shared so the attached-client and lightweight paths cannot diverge.
-pub(super) async fn build_audited_completion_report(
-    sessions: &SessionAgents,
+pub(super) fn build_audited_completion_report(
     session_id: &str,
     message: &str,
     validation: Option<&str>,
     follow_up: Option<&str>,
 ) -> String {
-    let activity = {
-        let reporter = { sessions.read().await.get(session_id).cloned() };
-        match reporter {
-            Some(reporter) => reporter.lock().await.tool_activity(),
-            None => jcode_swarm_core::ToolActivity::default(),
-        }
-    };
+    // Read the dispatch-time tally rather than locking the reporting agent:
+    // `report` is called from inside that agent's own turn, so its Mutex is
+    // already held and re-locking it deadlocks the report.
+    let activity = jcode_swarm_core::session_tool_activity(session_id);
     let mut report =
         jcode_swarm_core::format_structured_completion_report(message, validation, follow_up);
     if let Some(note) = jcode_swarm_core::audit_validation_claim(validation, activity) {

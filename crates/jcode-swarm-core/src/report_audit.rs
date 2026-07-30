@@ -5,9 +5,59 @@
 //! reports carry confident strings like "All 7 steps executed with real command
 //! output" from sessions whose transcript contains zero tool calls.
 //!
-//! The transcript is the ground truth, and it is already in scope where reports
-//! are handled, so the claim can simply be checked against it. This module
-//! keeps that check pure: callers pass in the observed tool-use counts.
+//! Activity is tallied as tools execute rather than read back off the agent at
+//! report time. A worker calls `report` from inside its own turn, so its agent
+//! `Mutex` is already held and re-locking it to inspect the transcript
+//! self-deadlocks (observed as "Failed to record report: deadline has elapsed").
+//! A process-global per-session tally keeps the audit lock-free.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
+/// Per-session tool tallies, recorded at dispatch time.
+///
+/// `Mutex` rather than `RwLock` so a panic while holding it poisons the lock and
+/// the recovery below is explicit: the tally is advisory bookkeeping, and a
+/// poisoned lock must not take down a worker's report. Recovering the inner
+/// value keeps counting rather than silently reporting "no activity", which
+/// would turn a lock error into a false accusation of fabrication.
+static SESSION_TOOL_ACTIVITY: LazyLock<Mutex<HashMap<String, ToolActivity>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Access the tally, recovering from a poisoned lock.
+fn with_activity<T>(action: impl FnOnce(&mut HashMap<String, ToolActivity>) -> T) -> T {
+    let mut guard = SESSION_TOOL_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action(&mut guard)
+}
+
+/// Record that `session_id` invoked `tool_name`.
+///
+/// Called from the tool dispatch path, where both are already in scope.
+pub fn record_session_tool_call(session_id: &str, tool_name: &str) {
+    with_activity(|activity| {
+        activity
+            .entry(session_id.to_string())
+            .or_default()
+            .record(tool_name)
+    });
+}
+
+/// Tool activity recorded so far for `session_id`.
+pub fn session_tool_activity(session_id: &str) -> ToolActivity {
+    // A session with no recorded calls has no entry yet, which is a
+    // genuine zero rather than a discarded error.
+    with_activity(|activity| match activity.get(session_id) {
+        Some(activity) => *activity,
+        None => ToolActivity::default(),
+    })
+}
+
+/// Drop a finished session's tally so long-lived servers do not grow unbounded.
+pub fn forget_session_tool_activity(session_id: &str) {
+    with_activity(|activity| activity.remove(session_id));
+}
 
 /// What a worker's transcript shows it actually did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -21,6 +71,16 @@ pub struct ToolActivity {
 }
 
 impl ToolActivity {
+    /// Count one tool invocation.
+    pub fn record(&mut self, tool_name: &str) {
+        match tool_name {
+            "bash" => self.commands_run += 1,
+            "read" | "agentgrep" => self.files_inspected += 1,
+            "edit" | "write" | "multiedit" | "patch" | "apply_patch" => self.files_edited += 1,
+            _ => {}
+        }
+    }
+
     /// Tally activity from the tool names a session invoked, in order.
     pub fn from_tool_names<I, S>(names: I) -> Self
     where
@@ -29,14 +89,7 @@ impl ToolActivity {
     {
         let mut activity = Self::default();
         for name in names {
-            match name.as_ref() {
-                "bash" => activity.commands_run += 1,
-                "read" | "agentgrep" => activity.files_inspected += 1,
-                "edit" | "write" | "multiedit" | "patch" | "apply_patch" => {
-                    activity.files_edited += 1
-                }
-                _ => {}
-            }
+            activity.record(name.as_ref());
         }
         activity
     }
