@@ -882,6 +882,24 @@ impl Agent {
         &self.session.id
     }
 
+    /// Tool activity recorded in this session's transcript.
+    ///
+    /// Used to cross-check a worker's completion report against what it
+    /// actually did, since the report's `validation` field is free text and
+    /// can describe commands that were never run.
+    pub fn tool_activity(&self) -> jcode_swarm_core::ToolActivity {
+        jcode_swarm_core::ToolActivity::from_tool_names(
+            self.session
+                .messages
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                    _ => None,
+                }),
+        )
+    }
+
     pub(crate) fn set_working_dir_for_pending_context(&mut self, working_dir: Option<String>) {
         if working_dir.is_some() {
             self.session.working_dir = working_dir;

@@ -921,7 +921,7 @@ async fn spawned_workers_are_not_told_to_delegate() {
         jcode_session_types::SessionAgentRole::Subagent,
     ] {
         let mut worker = Agent::new(provider.clone(), registry.clone());
-        worker.session.agent_role = Some(role.clone());
+        worker.session.agent_role = Some(role);
         assert!(
             !worker.delegation_directive_emitted_for_test(),
             "{role:?} is itself delegated work and must not be told to delegate again"
@@ -1480,4 +1480,50 @@ async fn validate_tool_allowed_resolves_aliases_against_canonical_allowlist() {
         "alias of disabled tool must be rejected"
     );
     assert!(agent.validate_tool_allowed("bash").is_ok());
+}
+
+/// The report auditor must read the agent's *real* transcript, so a worker that
+/// claims it ran commands while calling no tools is caught.
+///
+/// This is the measured failure mode: a real `deepseek-v4-pro` worker reported
+/// validation "All 7 steps executed with real command output" from a session
+/// whose transcript contained zero tool calls.
+#[tokio::test]
+async fn a_worker_that_ran_nothing_cannot_claim_it_ran_commands() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "check the build".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    // A transcript with no tool calls: the claim below is unbacked.
+    assert!(agent.tool_activity().is_silent());
+    let claim = Some("All 7 steps executed with real command output.");
+    let note = jcode_swarm_core::audit_validation_claim(claim, agent.tool_activity())
+        .expect("an execution claim from a silent worker must be flagged");
+    assert!(note.contains("no tool calls at all"), "note was: {note}");
+
+    // Once the worker actually runs a command, the same claim is accepted.
+    agent.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        }],
+    );
+    assert_eq!(agent.tool_activity().commands_run, 1);
+    assert_eq!(
+        jcode_swarm_core::audit_validation_claim(claim, agent.tool_activity()),
+        None,
+        "a claim backed by a real command must not be flagged"
+    );
 }

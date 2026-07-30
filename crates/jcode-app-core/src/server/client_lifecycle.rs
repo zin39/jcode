@@ -47,9 +47,9 @@ use super::provider_control::{
 use super::{
     AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
     SessionControlHandle, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
-    SwarmMutationRuntime, VersionedPlan, format_structured_completion_report,
-    register_session_interrupt_queue, send_swarm_plan_to_session, truncate_detail,
-    update_member_status, update_member_status_with_report, update_member_status_with_report_tldr,
+    SwarmMutationRuntime, VersionedPlan, register_session_interrupt_queue,
+    send_swarm_plan_to_session, truncate_detail, update_member_status,
+    update_member_status_with_report, update_member_status_with_report_tldr,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
@@ -2437,11 +2437,14 @@ pub(super) async fn handle_client(
                 tldr,
             } => {
                 let status = status.unwrap_or_else(|| "ready".to_string());
-                let report = format_structured_completion_report(
+                let report = super::comm_control::build_audited_completion_report(
+                    &sessions,
+                    &req_session_id,
                     &message,
                     validation.as_deref(),
                     follow_up.as_deref(),
-                );
+                )
+                .await;
                 let detail = Some(truncate_detail(&message, 160));
                 update_member_status_with_report_tldr(
                     &req_session_id,

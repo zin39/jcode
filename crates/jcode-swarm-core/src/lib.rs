@@ -1,3 +1,7 @@
+pub mod report_audit;
+
+pub use report_audit::{ToolActivity, audit_validation_claim};
+
 use jcode_plan::PlanItem;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;

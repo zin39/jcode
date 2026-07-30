@@ -2623,3 +2623,29 @@ async fn require_plan_driver_swarm(
     });
     None
 }
+
+/// Build a completion report, appending an audit note when the worker's
+/// free-text `validation` claims commands were run that its transcript does not
+/// show. Shared so the attached-client and lightweight paths cannot diverge.
+pub(super) async fn build_audited_completion_report(
+    sessions: &SessionAgents,
+    session_id: &str,
+    message: &str,
+    validation: Option<&str>,
+    follow_up: Option<&str>,
+) -> String {
+    let activity = {
+        let reporter = { sessions.read().await.get(session_id).cloned() };
+        match reporter {
+            Some(reporter) => reporter.lock().await.tool_activity(),
+            None => jcode_swarm_core::ToolActivity::default(),
+        }
+    };
+    let mut report =
+        jcode_swarm_core::format_structured_completion_report(message, validation, follow_up);
+    if let Some(note) = jcode_swarm_core::audit_validation_claim(validation, activity) {
+        report.push_str("\n\n");
+        report.push_str(&note);
+    }
+    report
+}
