@@ -687,6 +687,12 @@ impl Registry {
             Self::tool_lifecycle_fields("start", name, resolved_name, &input, &ctx),
         );
 
+        // Single choke point for every tool dispatch, so the report audit sees
+        // the same calls the transcript does. Recording in the agent turn loops
+        // instead missed real work: a worker that genuinely ran `bash` was
+        // still tallied at zero and wrongly flagged as fabricating.
+        jcode_swarm_core::record_session_tool_call(&ctx.session_id, resolved_name);
+
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
