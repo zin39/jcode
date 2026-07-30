@@ -630,6 +630,49 @@ fn apply_login_provider_profile_env_preserves_compatible_profile_for_auto_spawn(
     }
 }
 
+/// Clear every OpenAI-compatible profile's API-key variable for the duration of
+/// a test, restoring them on drop.
+///
+/// Auto-init tests that assert "no credentials available" cleared a
+/// hand-written list of key names, which rotted: the list had
+/// `OPENROUTER_API_KEY` but not `ZHIPU_BIGMODEL_API_KEY`, so a developer with
+/// any *other* provider key exported saw the OpenAI-compatible autodetect
+/// report a configured provider and the assertion fail, while CI passed.
+/// Deriving the list from the catalog means a newly added provider cannot
+/// reintroduce the same hole.
+struct ClearedProfileApiKeys {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl ClearedProfileApiKeys {
+    fn new() -> Self {
+        let saved: Vec<(String, Option<String>)> =
+            crate::provider_catalog::openai_compatible_profiles()
+                .iter()
+                .map(|profile| {
+                    crate::provider_catalog::resolve_openai_compatible_profile(*profile).api_key_env
+                })
+                .map(|key| {
+                    let previous = std::env::var(&key).ok();
+                    crate::env::remove_var(&key);
+                    (key, previous)
+                })
+                .collect();
+        Self { saved }
+    }
+}
+
+impl Drop for ClearedProfileApiKeys {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => crate::env::set_var(&key, value),
+                None => crate::env::remove_var(&key),
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[expect(
     clippy::await_holding_lock,
@@ -837,6 +880,10 @@ async fn auto_provider_noninteractive_skips_untrusted_external_auth_instead_of_b
     .collect();
 
     crate::env::set_var("JCODE_HOME", dir.path());
+    // Also scope the home per-thread: the OpenAI-compatible autodetect behind
+    // `has_openrouter` reads provider env files under `app_config_dir()`.
+    let _scoped_home = crate::storage::scoped_test_home(dir.path());
+    let _cleared_profile_keys = ClearedProfileApiKeys::new();
     crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
     for key in [
         "JCODE_DEFERRED_AUTH_BOOTSTRAP",

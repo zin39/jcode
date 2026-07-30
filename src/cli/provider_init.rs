@@ -50,6 +50,8 @@ pub enum ProviderChoice {
     OpencodeGo,
     #[value(alias = "z.ai", alias = "z-ai", alias = "zai-coding")]
     Zai,
+    #[value(alias = "bigmodel", alias = "zhipuai", alias = "glm")]
+    Zhipu,
     #[value(
         alias = "kimi-code",
         alias = "kimi-coding",
@@ -142,6 +144,7 @@ impl ProviderChoice {
             Self::Opencode => "opencode",
             Self::OpencodeGo => "opencode-go",
             Self::Zai => "zai",
+            Self::Zhipu => "zhipu",
             Self::Kimi => "kimi",
             Self::Ai302 => "302ai",
             Self::Baseten => "baseten",
@@ -232,6 +235,10 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
     (
         ProviderChoice::Zai,
         crate::provider_catalog::ZAI_LOGIN_PROVIDER,
+    ),
+    (
+        ProviderChoice::Zhipu,
+        crate::provider_catalog::ZHIPU_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::Kimi,
@@ -1508,6 +1515,7 @@ async fn init_provider_with_options(
         ProviderChoice::Opencode
         | ProviderChoice::OpencodeGo
         | ProviderChoice::Zai
+        | ProviderChoice::Zhipu
         | ProviderChoice::Ai302
         | ProviderChoice::Baseten
         | ProviderChoice::Cortecs

@@ -126,6 +126,19 @@ fn test_parse_tailscale_dns_name_invalid_json() {
 #[test]
 fn configured_auth_test_targets_only_include_configured_supported_providers() {
     let _guard = crate::storage::lock_test_env();
+    // OpenRouter's state is read from a real `openrouter.env` under the app
+    // config dir, not from the `AuthStatus` this test constructs. Without a
+    // hermetic home the assertion below passes only on machines that happen to
+    // have an OpenRouter key on disk, and fails everywhere else.
+    let temp = tempfile::tempdir().expect("temp home");
+    let _home = crate::storage::scoped_test_home(temp.path());
+    let config_dir = crate::storage::app_config_dir().expect("config dir");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(
+        config_dir.join("openrouter.env"),
+        "OPENROUTER_API_KEY=test-openrouter-key\n",
+    )
+    .expect("write openrouter key");
 
     let status = AuthStatus {
         anthropic: ProviderAuth {
