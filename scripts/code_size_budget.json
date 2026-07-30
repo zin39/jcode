@@ -55,7 +55,7 @@
     "crates/jcode-protocol/src/wire.rs": 1448,
     "crates/jcode-provider-anthropic-runtime/src/lib.rs": 2395,
     "crates/jcode-provider-anthropic/src/lib.rs": 1363,
-    "crates/jcode-provider-bedrock/src/lib.rs": 1979,
+    "crates/jcode-provider-bedrock/src/lib.rs": 1995,
     "crates/jcode-provider-core/src/lib.rs": 1642,
     "crates/jcode-provider-doctor/src/lifecycle_driver.rs": 1974,
     "crates/jcode-provider-doctor/src/live_provider_probes.rs": 2029,

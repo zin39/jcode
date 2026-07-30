@@ -1527,6 +1527,22 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Redirect credential lookups at `temp` for the duration of a test.
+    ///
+    /// XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
+    /// JCODE_HOME first and otherwise falls back to `dirs::config_dir()`, which on
+    /// macOS is ~/Library/Application Support and ignores XDG entirely. Without the
+    /// JCODE_HOME redirect these tests read (and `save_env_value_to_env_file`
+    /// WROTE) the developer's real bedrock.env, so they detected credentials that
+    /// were never configured. Both vars are set so the redirect holds on macOS and
+    /// Linux alike.
+    fn isolated_config_home(temp: &tempfile::TempDir) -> [EnvVarGuard; 2] {
+        [
+            EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str()),
+            EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str()),
+        ]
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -1560,15 +1576,7 @@ mod tests {
     fn detects_env_credentials_requires_region_and_credential_hint() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let _removed = [
             "JCODE_BEDROCK_ENABLE",
             API_KEY_ENV,
@@ -1601,15 +1609,7 @@ mod tests {
     fn detects_bedrock_login_env_file_credentials() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         for key in [
             "JCODE_BEDROCK_ENABLE",
             API_KEY_ENV,
@@ -1648,15 +1648,7 @@ mod tests {
     fn configured_profile_from_bedrock_env_overrides_stale_bearer_token() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let _removed = [
             "JCODE_BEDROCK_ENABLE",
             API_KEY_ENV,
@@ -1711,15 +1703,7 @@ mod tests {
     fn maps_profile_required_foundation_model_to_inference_profile() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let p = BedrockProvider::new();
         p.profile_required_models
             .write()
@@ -1739,15 +1723,7 @@ mod tests {
     fn maps_foundation_model_from_stale_cached_profile_list() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let p = BedrockProvider::new();
         *p.fetched_inference_profiles.write().unwrap() = vec![
             "global.amazon.nova-2-lite-v1:0".to_string(),
@@ -1763,15 +1739,7 @@ mod tests {
     fn hides_profile_required_foundation_model_when_profile_route_exists() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let p = BedrockProvider::new();
         *p.fetched_models.write().unwrap() = vec!["amazon.nova-2-lite-v1:0".to_string()];
         *p.fetched_inference_profiles.write().unwrap() =
@@ -1803,15 +1771,7 @@ mod tests {
     fn hides_foundation_model_when_profile_route_exists() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let p = BedrockProvider::new();
         *p.fetched_models.write().unwrap() = vec!["amazon.nova-2-lite-v1:0".to_string()];
         *p.fetched_inference_profiles.write().unwrap() =
@@ -1839,15 +1799,7 @@ mod tests {
     fn profile_required_foundation_model_without_profile_route_is_disabled() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let p = BedrockProvider::new();
         *p.fetched_models.write().unwrap() = vec!["amazon.nova-2-lite-v1:0".to_string()];
         p.profile_required_models
@@ -1891,15 +1843,7 @@ mod tests {
     fn ignores_persisted_bedrock_catalog_from_different_region() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         {
             let _region = EnvVarGuard::set(REGION_ENV, "us-east-1");
             BedrockProvider::persist_catalog(
@@ -2016,15 +1960,7 @@ mod tests {
     fn legacy_model_route_is_unavailable_with_reason() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        // XDG_CONFIG_HOME alone does not isolate this: `app_config_dir` honours
-        // JCODE_HOME first and otherwise falls back to `dirs::config_dir()`,
-        // which on macOS is ~/Library/Application Support and ignores XDG. A
-        // developer with a real bedrock.env there therefore saw
-        // `has_credentials()` return true and these assertions fail, while CI
-        // passed. Set JCODE_HOME so the lookup is genuinely redirected, and keep
-        // XDG_CONFIG_HOME for the Linux path.
-        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
+        let _config_home = isolated_config_home(&temp);
         let p = BedrockProvider::new();
         *p.fetched_models.write().unwrap() =
             vec!["anthropic.claude-3-haiku-20240307-v1:0".to_string()];

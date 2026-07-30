@@ -44,15 +44,48 @@ pub fn validate_swarm_tldr(
 
     let body_chars = body.chars().count();
     if body_chars > SWARM_TLDR_REQUIRED_OVER_CHARS {
-        return Err(format!(
-            "'tldr' is required for {context} because the body is {body_chars} chars \
-             (over {SWARM_TLDR_REQUIRED_OVER_CHARS}). Add a one-line 'tldr' (under \
-             {MAX_SWARM_TLDR_CHARS} chars) summarizing it; recipients see the tldr \
-             collapsed with an expand control."
-        ));
+        // Derive one instead of rejecting the call.
+        //
+        // Rejecting was the single largest source of swarm tool failures (43 of
+        // 96 errors across 800 sessions): a worker composed a full report, got
+        // bounced, and had to resend the entire multi-KB body just to add a
+        // summary line the tool can compute itself. That burns a whole
+        // round-trip of the worker's context for zero information gain, and the
+        // models most likely to forget the field are the cheap ones this exists
+        // to supervise.
+        //
+        // A derived tldr is strictly better than a failed report: the recipient
+        // still gets a collapsed one-liner, and an explicit tldr always wins
+        // when the caller supplies one.
+        return Ok(derive_tldr_from_body(body));
     }
 
     Ok(None)
+}
+
+/// First-line summary of a report body, shortened to fit a UI chip.
+///
+/// Shares [`derive_swarm_task_label`]'s shape (first non-empty line, markdown
+/// prefixes stripped, whitespace collapsed, char-boundary truncation) but uses
+/// the larger tldr budget.
+fn derive_tldr_from_body(body: &str) -> Option<String> {
+    let line = body.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = line
+        .trim_start_matches(['#', '-', '*', '>', ' '])
+        .trim_end_matches(':')
+        .trim();
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= MAX_SWARM_TLDR_CHARS {
+        return Some(collapsed);
+    }
+    let truncated: String = collapsed
+        .chars()
+        .take(MAX_SWARM_TLDR_CHARS.saturating_sub(1))
+        .collect();
+    Some(format!("{}…", truncated.trim_end()))
 }
 
 /// Absolute maximum number of live members in a single swarm. Servers also apply
@@ -641,12 +674,44 @@ mod tests {
         assert_eq!(validate_swarm_tldr(None, "quick note", "this DM"), Ok(None));
     }
 
+    /// A long body without a tldr must SUCCEED with a derived one.
+    ///
+    /// This used to be an error, and it was the largest single source of swarm
+    /// tool failures: the worker had already written the report, so bouncing it
+    /// cost a full round-trip of context to add a line the tool can compute.
     #[test]
-    fn validate_swarm_tldr_requires_tldr_for_long_body() {
-        let body = "x".repeat(SWARM_TLDR_REQUIRED_OVER_CHARS + 1);
-        let err = validate_swarm_tldr(None, &body, "this DM").unwrap_err();
-        assert!(err.contains("'tldr' is required"), "{err}");
-        assert!(err.contains("this DM"), "{err}");
+    fn validate_swarm_tldr_derives_a_tldr_for_a_long_body_instead_of_failing() {
+        let body = format!(
+            "Fixed the parser crash on empty input\n\n{}",
+            "detail ".repeat(SWARM_TLDR_REQUIRED_OVER_CHARS)
+        );
+        let derived = validate_swarm_tldr(None, &body, "this DM")
+            .expect("a long body without a tldr must not be rejected")
+            .expect("a tldr must be derived from the body");
+        assert_eq!(derived, "Fixed the parser crash on empty input");
+        assert!(derived.chars().count() <= MAX_SWARM_TLDR_CHARS);
+    }
+
+    /// The derived tldr must respect the same length cap as an explicit one, so
+    /// a single-paragraph body cannot smuggle an oversized chip into the UI.
+    #[test]
+    fn derived_tldr_is_truncated_to_the_tldr_budget() {
+        let body = "word ".repeat(SWARM_TLDR_REQUIRED_OVER_CHARS);
+        let derived = validate_swarm_tldr(None, &body, "this DM")
+            .expect("must not be rejected")
+            .expect("must derive");
+        assert_eq!(derived.chars().count(), MAX_SWARM_TLDR_CHARS);
+        assert!(derived.ends_with('…'), "{derived}");
+    }
+
+    /// An explicit tldr always wins over a derived one.
+    #[test]
+    fn explicit_tldr_takes_precedence_over_derivation() {
+        let body = format!("Ignore this first line\n{}", "x".repeat(500));
+        assert_eq!(
+            validate_swarm_tldr(Some("caller supplied"), &body, "this DM"),
+            Ok(Some("caller supplied".to_string()))
+        );
     }
 
     #[test]
@@ -665,10 +730,15 @@ mod tests {
         assert!(err.contains("too long"), "{err}");
     }
 
+    /// A whitespace-only tldr is treated exactly like an absent one: derived
+    /// from the body for a long message, and simply absent for a short one.
     #[test]
     fn validate_swarm_tldr_blank_tldr_counts_as_missing() {
-        let body = "x".repeat(SWARM_TLDR_REQUIRED_OVER_CHARS + 1);
-        assert!(validate_swarm_tldr(Some("   "), &body, "this DM").is_err());
+        let body = format!("Blank tldr still summarizes\n{}", "x".repeat(500));
+        assert_eq!(
+            validate_swarm_tldr(Some("   "), &body, "this DM"),
+            Ok(Some("Blank tldr still summarizes".to_string()))
+        );
         assert_eq!(
             validate_swarm_tldr(Some("   "), "short", "this DM"),
             Ok(None)

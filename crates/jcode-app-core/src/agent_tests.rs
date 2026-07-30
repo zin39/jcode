@@ -881,6 +881,54 @@ async fn restore_session_rehydrates_injected_memory_ids() {
     crate::memory::clear_all_pending_memory();
 }
 
+/// A spawned worker must NOT be told to delegate.
+///
+/// The guard used to check only whether the `swarm` tool was available, but a
+/// worker keeps `swarm` because it needs `report` to hand results back. So the
+/// check passed for workers, they received the full "delegate everything"
+/// directive, and then hit "Recursive swarm spawning is disabled for light and
+/// ad hoc swarms". Measured across 800 sessions: 31 failed spawn calls, with 17
+/// of the 19 affected sessions carrying agent_role = swarm_worker.
+#[tokio::test]
+async fn spawned_workers_are_not_told_to_delegate() {
+    let _guard = crate::storage::lock_test_env();
+
+    // The directive is gated on `agents.auto_delegate`, which is read from
+    // config, so this test must pin it rather than inherit whatever the ambient
+    // config (or a concurrently-running test's temp home) happens to say.
+    let home = tempfile::tempdir().expect("temp home");
+    let _home = crate::storage::scoped_test_home(home.path());
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[agents]\nauto_delegate = true\n",
+    )
+    .expect("write config");
+    crate::config::invalidate_config_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+
+    let mut coordinator = Agent::new(provider.clone(), registry.clone());
+    coordinator.session.agent_role = None;
+    assert!(
+        coordinator.delegation_directive_emitted_for_test(),
+        "a root coordinator must still receive the delegation directive"
+    );
+
+    for role in [
+        jcode_session_types::SessionAgentRole::SwarmWorker,
+        jcode_session_types::SessionAgentRole::CheapRouteSubtask,
+        jcode_session_types::SessionAgentRole::Subagent,
+    ] {
+        let mut worker = Agent::new(provider.clone(), registry.clone());
+        worker.session.agent_role = Some(role.clone());
+        assert!(
+            !worker.delegation_directive_emitted_for_test(),
+            "{role:?} is itself delegated work and must not be told to delegate again"
+        );
+    }
+}
+
 #[tokio::test]
 async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop() {
     let _guard = crate::storage::lock_test_env();

@@ -269,6 +269,16 @@ impl Agent {
     /// have the tool removed, which also blocks recursive debates), instruct it
     /// to auto-route substantive reasoning work through cheap_route so the user
     /// gets gold debates without saying "use cheap_route" each time.
+    /// Test hook: run only the auto-delegation append and report whether the
+    /// directive was emitted. Keeps the guard testable without constructing a
+    /// full system prompt (which needs skills, memory and a working dir).
+    #[cfg(test)]
+    pub(crate) fn delegation_directive_emitted_for_test(&self) -> bool {
+        let mut split = crate::prompt::SplitSystemPrompt::default();
+        self.append_auto_delegation_directive(&mut split);
+        split.dynamic_part.contains("Delegation policy")
+    }
+
     fn append_gold_mode_directive(&self, split: &mut crate::prompt::SplitSystemPrompt) {
         let gold_on = self.session.gold_mode_enabled.unwrap_or(false)
             && crate::config::config().agents.cheap_route_gold_mode;
@@ -291,15 +301,28 @@ impl Agent {
         if !crate::config::config().agents.auto_delegate {
             return;
         }
-        // Only coordinators get this. A spawned worker has the spawn tool
-        // removed, so it must not be told to delegate work it cannot delegate.
-        //
         // This gate must name the tool the directive actually tells the model to
         // call. It used to check `subagent`, which no longer exists in the
         // registry: the check therefore always passed (it only consults
         // allow/deny lists, not registration) and every coordinator was told to
         // call a deleted tool, producing "Unknown tool: subagent" at runtime.
         if self.validate_tool_allowed("swarm").is_err() {
+            return;
+        }
+
+        // Tool availability is NOT the same as spawn capability. A spawned
+        // worker keeps `swarm` because it needs `report` to hand results back,
+        // so the check above passes for workers too and they received the full
+        // "delegate everything" directive. Recursive spawning is disabled for
+        // light and ad hoc swarms, so those workers then tried to spawn and got
+        // "Recursive swarm spawning is disabled" back. Measured across 800
+        // sessions: 31 failed spawn calls, and 17 of the 19 affected sessions
+        // had agent_role = swarm_worker.
+        //
+        // Any session with an agent_role is itself delegated work. Telling it to
+        // delegate again is either rejected outright or, in deep mode, an
+        // invitation to fan out where the coordinator wanted focused execution.
+        if self.session.agent_role.is_some() {
             return;
         }
         if !split.dynamic_part.is_empty() {

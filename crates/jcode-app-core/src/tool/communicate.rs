@@ -1973,7 +1973,7 @@ impl Tool for CommunicateTool {
                 },
                 "tldr": {
                     "type": "string",
-                    "description": "One-line summary (aim for under 120 chars) of the message/report. Required for message/broadcast/dm/channel/report when the body is longer than 240 chars. The recipient's UI shows this collapsed with an expand control instead of the full body."
+                    "description": "One-line summary (aim for under 120 chars) of the message/report. Strongly preferred for message/broadcast/dm/channel/report when the body exceeds 240 chars; if omitted it is derived from the body's first line, so a missing tldr never fails the call. The recipient's UI shows this collapsed with an expand control instead of the full body."
                 },
                 "status": {
                     "type": "string",
