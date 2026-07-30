@@ -340,10 +340,6 @@ fn todo_change_lines(
     super::todo_changes::render_todo_change_lines(prev.as_deref(), &next, width)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "User prompt rendering updates the prepared-line side tables together"
-)]
 /// Extract the per-process tier, model name, and session display name from the
 /// app state so every `BodyRenderCtx` creation site gets a consistent tuple.
 fn tier_model_session(app: &dyn TuiState) -> (Tier, String, String) {
@@ -362,6 +358,7 @@ fn gutter_glyphs(tier: Tier) -> (&'static str, &'static str) {
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "side tables move together")]
 fn push_user_prompt_lines(
     lines: &mut Vec<Line<'static>>,
     raw_plain_lines: &mut Vec<String>,
@@ -430,6 +427,7 @@ fn push_user_prompt_lines(
 /// WP12: compact user prompt rendering (gutter + text only, no header, no
 /// surface background). Plain tier keeps the ASCII `|` role marker for identity
 /// (spec §3.7, principle 6).
+#[expect(clippy::too_many_arguments, reason = "side tables move together")]
 fn push_user_prompt_lines_compact(
     lines: &mut Vec<Line<'static>>,
     raw_plain_lines: &mut Vec<String>,
@@ -1594,14 +1592,13 @@ fn render_message_into(
     let compact = message_is_compact(ctx, msg_global_idx);
 
     // COMPACT mode: no blank separators between blocks
-    if !compact {
-        if (acc.body_has_content || !acc.lines.is_empty())
-            && role != "tool"
-            && role != "meta"
-            && role != "swarm"
-        {
-            acc.push_blank();
-        }
+    if !compact
+        && (acc.body_has_content || !acc.lines.is_empty())
+        && role != "tool"
+        && role != "meta"
+        && role != "swarm"
+    {
+        acc.push_blank();
     }
 
     match role {

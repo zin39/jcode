@@ -1193,12 +1193,11 @@ fn cached_sidecar_label() -> Option<String> {
     static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(60);
 
-    if let Ok(guard) = CACHE.lock() {
-        if let Some((ts, label)) = guard.as_ref()
-            && ts.elapsed() < TTL
-        {
-            return label.clone();
-        }
+    if let Ok(guard) = CACHE.lock()
+        && let Some((ts, label)) = guard.as_ref()
+        && ts.elapsed() < TTL
+    {
+        return label.clone();
     }
 
     SIDECAR_LABEL_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

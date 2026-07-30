@@ -52,16 +52,23 @@ pub(super) fn coordinator_is_allowed_as_last_resort(current_model: &str, strict:
     !current_model.is_empty() && !strict && !model_is_cheap_route_banned(current_model)
 }
 
-/// The strong-tier model, or an empty string meaning "no strong tier".
+/// The strong-tier model, or `None` when there is no strong tier.
 ///
-/// Empty leaves hard subtasks on the cheapest-first list, which is the intended
-/// strict behaviour: cheap-but-weaker beats expensive-and-unrequested.
-pub(super) fn strong_model_or_empty(current_model: &str, strict: bool) -> String {
+/// `None` leaves hard subtasks on the cheapest-first list, which is the
+/// intended strict behaviour: cheap-but-weaker beats expensive-and-unrequested.
+///
+/// This returns `Option` rather than a sentinel empty `String` because the two
+/// states are genuinely different and the caller has to branch on them. The
+/// sentinel form forced a choice between `unwrap_or_default()`, which the
+/// swallowed-error ratchet counts as discarding a real outcome, and a manual
+/// match, which clippy rewrites straight back to `unwrap_or_default()`. Making
+/// absence part of the type satisfies both because nothing is being defaulted.
+pub(super) fn strong_model(current_model: &str, strict: bool) -> Option<String> {
     let configured = crate::config::config()
         .agents
         .cheap_route_strong_model
         .clone();
-    resolve_strong_model(configured.as_deref(), current_model, strict).unwrap_or_default()
+    resolve_strong_model(configured.as_deref(), current_model, strict)
 }
 
 /// Error for a total cheap-route blackout under strict mode.

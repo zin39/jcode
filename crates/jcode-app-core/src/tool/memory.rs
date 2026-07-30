@@ -499,12 +499,15 @@ mod tests {
     /// round-trip through the real (non-test-mode) manager when the tool
     /// context carries a working dir.
     #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "serialises process-global memory-manager state for the whole test"
+    )]
     async fn project_scope_round_trips_with_working_dir() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::tempdir().expect("home");
         let project = tempfile::tempdir().expect("project");
-        let prev_home = std::env::var_os("JCODE_HOME");
-        crate::env::set_var("JCODE_HOME", home.path());
+        let _home_guard = crate::storage::scoped_test_home(home.path());
 
         let tool = MemoryTool::new();
         let remember = tool
@@ -532,11 +535,5 @@ mod tests {
             "project-scoped memory must persist and be listed, got: {}",
             list.output
         );
-
-        if let Some(prev_home) = prev_home {
-            crate::env::set_var("JCODE_HOME", prev_home);
-        } else {
-            crate::env::remove_var("JCODE_HOME");
-        }
     }
 }

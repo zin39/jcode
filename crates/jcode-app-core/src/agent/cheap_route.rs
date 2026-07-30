@@ -14,7 +14,7 @@ pub mod bus_progress;
 mod route_health;
 mod strict;
 use serde::Deserialize;
-use strict::{blackout_error, coordinator_is_allowed_as_last_resort, strong_model_or_empty};
+use strict::{blackout_error, coordinator_is_allowed_as_last_resort, strong_model};
 
 /// Largest menu the parent is asked to choose from.
 const MAX_MENU: usize = 6;
@@ -653,11 +653,13 @@ pub async fn run_cheap_route(
     let difficulty_threshold = crate::config::config()
         .agents
         .cheap_route_difficulty_threshold;
-    let strong_model = strong_model_or_empty(&current_model, strict);
-    let strong_api = ranked
-        .iter()
-        .find(|c| c.route.model == strong_model)
-        .map(|c| c.route.api_method.clone());
+    let strong_model = strong_model(&current_model, strict);
+    let strong_api = strong_model.as_ref().and_then(|strong| {
+        ranked
+            .iter()
+            .find(|c| &c.route.model == strong)
+            .map(|c| c.route.api_method.clone())
+    });
 
     // Last resort: the parent's own current model. EXCEPT when it is banned via
     // cheap_route_ban (e.g. the user banned Claude): never silently burn an
@@ -715,23 +717,20 @@ pub async fn run_cheap_route(
         // Hard subtasks try the strong model first (then cheap routes as
         // fallback, so a dead strong model still completes). Trivial subtasks
         // use the cheapest-first list directly.
-        let task_candidates: Vec<(String, Option<String>)> =
-            if subtask.difficulty > difficulty_threshold && !strong_model.is_empty() {
-                // Strong model FIRST, then the cheap routes as fallback (skipping
-                // a duplicate of the strong model, which is otherwise present as
-                // the last-resort entry).
-                let mut tiered = Vec::with_capacity(candidates.len() + 1);
-                tiered.push((strong_model.clone(), strong_api.clone()));
-                tiered.extend(
-                    candidates
-                        .iter()
-                        .filter(|(m, _)| m != &strong_model)
-                        .cloned(),
-                );
-                tiered
-            } else {
-                candidates.clone()
-            };
+        let task_candidates: Vec<(String, Option<String>)> = if subtask.difficulty
+            > difficulty_threshold
+            && let Some(strong) = strong_model.as_ref()
+        {
+            // Strong model FIRST, then the cheap routes as fallback (skipping
+            // a duplicate of the strong model, which is otherwise present as
+            // the last-resort entry).
+            let mut tiered = Vec::with_capacity(candidates.len() + 1);
+            tiered.push((strong.clone(), strong_api.clone()));
+            tiered.extend(candidates.iter().filter(|(m, _)| m != strong).cloned());
+            tiered
+        } else {
+            candidates.clone()
+        };
 
         // Circuit breaker: skip routes that have already been tripped by
         // failures on earlier subtasks (e.g. product-not-activated, 2x timeouts).

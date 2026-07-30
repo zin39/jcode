@@ -792,7 +792,7 @@ async fn test_deferred_tool_index_excludes_core_tools() {
         index.iter().map(|(name, _)| name).cloned().collect();
     for core_name in super::CORE_FULL_SCHEMA_TOOLS {
         assert!(
-            !indexed_names.contains(&core_name.to_string()),
+            !indexed_names.iter().any(|name| name == core_name),
             "core tool '{}' should not be in deferred index",
             core_name
         );

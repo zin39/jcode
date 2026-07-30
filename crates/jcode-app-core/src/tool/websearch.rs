@@ -1753,11 +1753,13 @@ mod tests {
 
     #[test]
     fn resolve_tavily_keys_parses_comma_list_and_dedups() {
-        let mut cfg = crate::config::WebSearchConfig::default();
         // Point the env var at a name that is not set so only the inline config
         // key list is used (keeps the test hermetic).
-        cfg.tavily_api_key_env = "JCODE_TEST_TAVILY_UNSET_ENV".to_string();
-        cfg.tavily_api_key = Some(" k1 , k2 ,, k1 , k3 ".to_string());
+        let cfg = crate::config::WebSearchConfig {
+            tavily_api_key_env: "JCODE_TEST_TAVILY_UNSET_ENV".to_string(),
+            tavily_api_key: Some(" k1 , k2 ,, k1 , k3 ".to_string()),
+            ..Default::default()
+        };
 
         let keys = resolve_tavily_keys(&cfg);
         assert_eq!(
@@ -1769,9 +1771,11 @@ mod tests {
 
     #[test]
     fn resolve_tavily_keys_empty_when_unset() {
-        let mut cfg = crate::config::WebSearchConfig::default();
-        cfg.tavily_api_key_env = "JCODE_TEST_TAVILY_UNSET_ENV".to_string();
-        cfg.tavily_api_key = None;
+        let cfg = crate::config::WebSearchConfig {
+            tavily_api_key_env: "JCODE_TEST_TAVILY_UNSET_ENV".to_string(),
+            tavily_api_key: None,
+            ..Default::default()
+        };
         assert!(resolve_tavily_keys(&cfg).is_empty());
     }
 

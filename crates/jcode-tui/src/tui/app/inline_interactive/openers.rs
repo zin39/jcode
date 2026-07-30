@@ -326,10 +326,9 @@ impl App {
                 .display_rows
                 .get(picker.selected)
                 .is_some_and(|r| r.is_header())
+                && let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header())
             {
-                if let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header()) {
-                    picker.selected = first_entry;
-                }
+                picker.selected = first_entry;
             }
         }
     }

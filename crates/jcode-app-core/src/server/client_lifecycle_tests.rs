@@ -777,7 +777,20 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "serialises process-global JCODE_RUNTIME_DIR for the whole test"
+)]
 async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attachments() {
+    // JCODE_RUNTIME_DIR is genuinely process-global, so this lock must be held
+    // for the WHOLE test, not just while IsolatedRuntimeDir installs the var:
+    // releasing it early let a concurrent test repoint the runtime dir midway
+    // and the fan-out assertions then failed in full-suite runs.
+    //
+    // `clippy::await_holding_lock` is right in general but wrong here. The guard
+    // is a std Mutex over process-wide env state with no async work inside the
+    // critical section other than this test's own, and every other holder is
+    // likewise a test, so there is no lock-ordering cycle to deadlock on.
     let _guard = crate::storage::lock_test_env();
     let _runtime = IsolatedRuntimeDir::new();
     let session_id = "session_live_attachment_fanout";

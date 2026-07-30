@@ -218,13 +218,16 @@ fn description_tells_models_to_check_status_before_setup() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "serialises the process-global browser setup marker for the whole test"
+)]
 async fn readiness_does_not_trust_a_stale_setup_marker() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = jcode_base::storage::lock_test_env();
-    let prev_home = std::env::var_os("JCODE_HOME");
     let temp = tempfile::TempDir::new().expect("create temp dir");
-    jcode_base::env::set_var("JCODE_HOME", temp.path());
+    let _home = jcode_base::storage::scoped_test_home(temp.path());
 
     let browser_dir = temp.path().join("browser");
     std::fs::create_dir_all(&browser_dir).expect("create browser dir");
@@ -248,10 +251,4 @@ async fn readiness_does_not_trust_a_stale_setup_marker() {
         "{message}"
     );
     assert!(message.contains("capability discovery"), "{message}");
-
-    if let Some(prev_home) = prev_home {
-        jcode_base::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        jcode_base::env::remove_var("JCODE_HOME");
-    }
 }

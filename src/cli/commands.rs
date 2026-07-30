@@ -2615,21 +2615,20 @@ fn should_skip_auto_poke_for_swarm(session_id: &str, last_poke: &mut Option<Inst
     let now = Instant::now();
 
     // Base cooldown: 60s between any pokes
-    if let Some(last) = *last_poke {
-        if now.duration_since(last) < CLI_AUTO_POKE_COOLDOWN {
-            return true;
-        }
+    if let Some(last) = *last_poke
+        && now.duration_since(last) < CLI_AUTO_POKE_COOLDOWN
+    {
+        return true;
     }
 
     // Swarm activity: if background await_members watches are pending,
     // only poke once per 5 minutes (coordinator legitimately waiting).
     let pending = crate::server::pending_await_members_for_session(session_id);
-    if !pending.is_empty() {
-        if let Some(last) = *last_poke {
-            if now.duration_since(last) < CLI_AUTO_POKE_SWARM_ACTIVE_COOLDOWN {
-                return true;
-            }
-        }
+    if !pending.is_empty()
+        && let Some(last) = *last_poke
+        && now.duration_since(last) < CLI_AUTO_POKE_SWARM_ACTIVE_COOLDOWN
+    {
+        return true;
     }
 
     false

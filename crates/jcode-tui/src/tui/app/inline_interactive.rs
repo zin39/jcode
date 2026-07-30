@@ -1136,10 +1136,9 @@ impl App {
                 .display_rows
                 .get(picker.selected)
                 .is_some_and(|r| r.is_header())
+                && let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header())
             {
-                if let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header()) {
-                    picker.selected = first_entry;
-                }
+                picker.selected = first_entry;
             }
         }
         if !preserve_input {
@@ -2125,10 +2124,9 @@ impl App {
                 .display_rows
                 .get(picker.selected)
                 .is_some_and(|r| r.is_header())
+                && let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header())
             {
-                if let Some(first_entry) = picker.display_rows.iter().position(|r| !r.is_header()) {
-                    picker.selected = first_entry;
-                }
+                picker.selected = first_entry;
             }
         }
 
@@ -3466,17 +3464,14 @@ impl App {
                     }
                     if picker.column == 0 {
                         // Check if on a provider header - collapse it
-                        if let Some(row) = picker.display_rows.get(picker.selected) {
-                            if let crate::tui::PickerDisplayRow::ProviderHeader {
-                                provider, ..
-                            } = row
-                            {
-                                if !picker.collapse_state.is_collapsed(provider) {
-                                    picker.collapse_state.collapse(provider);
-                                    picker.rebuild_display_rows();
-                                    return Ok(());
-                                }
-                            }
+                        if let Some(row) = picker.display_rows.get(picker.selected)
+                            && let crate::tui::PickerDisplayRow::ProviderHeader { provider, .. } =
+                                row
+                            && !picker.collapse_state.is_collapsed(provider)
+                        {
+                            picker.collapse_state.collapse(provider);
+                            picker.rebuild_display_rows();
+                            return Ok(());
                         }
                         // Cycle effort on focused model row
                         if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected)
@@ -3512,17 +3507,14 @@ impl App {
                     }
                     if picker.column == 0 {
                         // Check if on a provider header - expand it
-                        if let Some(row) = picker.display_rows.get(picker.selected) {
-                            if let crate::tui::PickerDisplayRow::ProviderHeader {
-                                provider, ..
-                            } = row
-                            {
-                                if picker.collapse_state.is_collapsed(provider) {
-                                    picker.collapse_state.expand(provider);
-                                    picker.rebuild_display_rows();
-                                    return Ok(());
-                                }
-                            }
+                        if let Some(row) = picker.display_rows.get(picker.selected)
+                            && let crate::tui::PickerDisplayRow::ProviderHeader { provider, .. } =
+                                row
+                            && picker.collapse_state.is_collapsed(provider)
+                        {
+                            picker.collapse_state.expand(provider);
+                            picker.rebuild_display_rows();
+                            return Ok(());
                         }
                         // Cycle effort on focused model row
                         if let Some(entry_idx) = picker.entry_index_for_display_row(picker.selected)

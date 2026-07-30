@@ -2064,11 +2064,19 @@ mod tests {
     }
 
     #[tokio::test]
+    // The guard must span the whole test. It serialises the process-global
+    // config cache that this test invalidates, and dropping it early let
+    // sibling tests observe a half-applied config. clippy's advice to shorten
+    // the critical section is wrong here: every holder is a test, so there is
+    // no lock-ordering cycle to deadlock on.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "serialises the process-global config cache for the whole test"
+    )]
     async fn execute_end_to_end_with_enabled_config_and_local_server() {
         let _guard = crate::storage::lock_test_env();
-        let prev_home = std::env::var_os("JCODE_HOME");
         let temp = tempfile::tempdir().unwrap();
-        crate::env::set_var("JCODE_HOME", temp.path());
+        let _home = crate::storage::scoped_test_home(temp.path());
 
         let body = json!({"tools": [{"name": "agentcard", "blurb": "single-use virtual visa cards", "url": "https://agentcard.example", "setup": "MCP server: npx agentcard-mcp"}]}).to_string();
         let (endpoint, _server) = one_shot_server("HTTP/1.1 200 OK", body).await;
@@ -2117,11 +2125,6 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("disabled"));
 
-        if let Some(prev) = prev_home {
-            crate::env::set_var("JCODE_HOME", prev);
-        } else {
-            crate::env::remove_var("JCODE_HOME");
-        }
         crate::config::Config::invalidate_cache();
     }
 }
