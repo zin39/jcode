@@ -1751,15 +1751,18 @@ mod tests {
         assert_eq!(WebSearchEngine::Hybrid.as_str(), "hybrid");
     }
 
+    /// Env var names something unset, so only the inline list is consulted.
+    fn tavily_cfg(inline_key: Option<&str>) -> crate::config::WebSearchConfig {
+        crate::config::WebSearchConfig {
+            tavily_api_key_env: "JCODE_TEST_TAVILY_UNSET_ENV".to_string(),
+            tavily_api_key: inline_key.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn resolve_tavily_keys_parses_comma_list_and_dedups() {
-        // Point the env var at a name that is not set so only the inline config
-        // key list is used (keeps the test hermetic).
-        let cfg = crate::config::WebSearchConfig {
-            tavily_api_key_env: "JCODE_TEST_TAVILY_UNSET_ENV".to_string(),
-            tavily_api_key: Some(" k1 , k2 ,, k1 , k3 ".to_string()),
-            ..Default::default()
-        };
+        let cfg = tavily_cfg(Some(" k1 , k2 ,, k1 , k3 "));
 
         let keys = resolve_tavily_keys(&cfg);
         assert_eq!(
@@ -1771,11 +1774,7 @@ mod tests {
 
     #[test]
     fn resolve_tavily_keys_empty_when_unset() {
-        let cfg = crate::config::WebSearchConfig {
-            tavily_api_key_env: "JCODE_TEST_TAVILY_UNSET_ENV".to_string(),
-            tavily_api_key: None,
-            ..Default::default()
-        };
+        let cfg = tavily_cfg(None);
         assert!(resolve_tavily_keys(&cfg).is_empty());
     }
 
