@@ -233,6 +233,31 @@ where
     }
 }
 
+/// Directory that holds the deliberately-leaked per-thread test homes.
+///
+/// [`ensure_thread_test_home`] cannot use a scoped guard: the sandbox has to
+/// outlive every guard the test creates, so the directory is leaked on purpose
+/// and the comment there assumed the OS would reclaim it. That assumption
+/// breaks in this repo, because `scripts/dev_cargo.sh` points `TMPDIR` at
+/// `~/.jcode/scratch` to keep cargo's build temp on disk. Nothing ever sweeps
+/// that path, so every `cargo test` thread left a permanent directory behind:
+/// measured at 183,948 leaked homes (~920k files) on one developer machine.
+///
+/// Collecting them under a single, clearly named parent keeps the leak
+/// harmless. One `rm -rf` reclaims every stale home, `scripts/clean_scratch.sh`
+/// automates it, and the name says what the directory is for so it is not
+/// mistaken for live state.
+#[cfg(any(test, feature = "test-support"))]
+fn leaked_test_home_root() -> PathBuf {
+    let root = std::env::temp_dir().join("jcode-test-homes");
+    // Best-effort: if the directory cannot be created, fall back to the plain
+    // temp dir so tests still get a sandbox rather than failing outright.
+    match std::fs::create_dir_all(&root) {
+        Ok(()) => root,
+        Err(_) => std::env::temp_dir(),
+    }
+}
+
 /// Give the calling thread its own hermetic `~/.jcode`, once per thread.
 ///
 /// Test helpers that build an `App` need *some* sandboxed home so they never
@@ -244,7 +269,9 @@ where
 ///
 /// Cargo gives each test its own thread, so allocating the sandbox per thread
 /// makes those writes private. The directory is intentionally leaked: it must
-/// outlive every guard the test creates, and the OS reclaims the temp dir.
+/// outlive every guard the test creates. It is created under
+/// [`leaked_test_home_root`] so those leaks stay collectable in one place
+/// rather than accumulating loose in `TMPDIR`.
 #[cfg(any(test, feature = "test-support"))]
 pub fn ensure_thread_test_home() {
     // Respect a home already scoped to *this* thread: callers nest this inside
@@ -269,7 +296,7 @@ pub fn ensure_thread_test_home() {
         cell.get_or_init(|| {
             let dir = tempfile::Builder::new()
                 .prefix("jcode-test-home-")
-                .tempdir()
+                .tempdir_in(leaked_test_home_root())
                 .expect("test home tempdir");
             dir.keep()
         })
