@@ -526,12 +526,41 @@ impl Agent {
 
         // Apply deferred tool filtering: when deferred mode is on, drop definitions
         // not in CORE_FULL_SCHEMA_TOOLS ∪ expanded set.
-        if self.deferred_tools_active() {
+        //
+        // The measured check is the backstop: the window heuristic assumes a
+        // roughly known payload, so a session with a large MCP catalog can blow
+        // the budget on a window the heuristic calls roomy.
+        if self.deferred_tools_active()
+            || Self::tool_payload_exceeds_window_share(
+                Self::estimated_tool_payload_tokens(&tools),
+                self.provider.context_window(),
+            )
+        {
             let expanded = crate::tool::session_expanded_tools(&self.session.id);
             Self::apply_deferred_filter(&mut tools, &expanded);
         }
 
         tools
+    }
+
+    /// Approximate token cost of serializing `tools` into a request.
+    ///
+    /// Uses the conventional ~4-characters-per-token approximation over the
+    /// name, description, and JSON schema of each tool. This only has to be
+    /// good enough to decide whether the payload is a large share of the
+    /// window, so an exact tokenizer would buy nothing.
+    fn estimated_tool_payload_tokens(tools: &[ToolDefinition]) -> usize {
+        const CHARS_PER_TOKEN: usize = 4;
+        let bytes: usize = tools
+            .iter()
+            .map(|tool| {
+                let schema_len = serde_json::to_string(&tool.input_schema)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                tool.name.len() + tool.description.len() + schema_len
+            })
+            .sum();
+        bytes / CHARS_PER_TOKEN
     }
 
     /// Re-render the `swarm` tool description against this session's working
@@ -570,6 +599,33 @@ impl Agent {
     fn deferred_tools_active(&self) -> bool {
         crate::config::config().tools.deferred
             || Self::context_window_requires_deferred_tools(self.provider.context_window())
+    }
+
+    /// Fraction of the context window the fixed tool payload may occupy before
+    /// schemas are deferred.
+    ///
+    /// Expressed as a share rather than an absolute size because the cost that
+    /// matters is relative: 14k tokens is trivial in a 1M window and fatal in
+    /// an 8k one. A third leaves the majority of the window for the system
+    /// prompt, project instructions, and the actual conversation.
+    const MAX_TOOL_PAYLOAD_WINDOW_SHARE: usize = 3;
+
+    /// Whether a measured tool payload is too large a share of `context_window`.
+    ///
+    /// [`Self::context_window_requires_deferred_tools`] is a fast heuristic
+    /// keyed only on the window, which is right for the common case but assumes
+    /// a roughly known payload size. This is the measured form, used where the
+    /// real serialized size is available, so a large MCP catalog that inflates
+    /// the payload is caught even on a window the heuristic considers roomy.
+    ///
+    /// An unknown (zero) window defers to the caller rather than guessing.
+    pub(crate) fn tool_payload_exceeds_window_share(
+        tool_payload_tokens: usize,
+        context_window: usize,
+    ) -> bool {
+        context_window > 0
+            && tool_payload_tokens.saturating_mul(Self::MAX_TOOL_PAYLOAD_WINDOW_SHARE)
+                > context_window
     }
 
     /// Context window (in tokens) at or below which full tool schemas stop

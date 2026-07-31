@@ -1615,3 +1615,31 @@ fn small_context_windows_force_deferred_tools() {
     // mode; treat it as roomy and let the config flag decide.
     assert!(!Agent::context_window_requires_deferred_tools(0));
 }
+
+/// The window heuristic assumes a roughly known payload size, which held for
+/// the built-in tools but not for a session with a large MCP catalog: that can
+/// blow the budget on a window the heuristic calls roomy. The measured check is
+/// the provider-agnostic backstop, so a gateway whose real cap jcode does not
+/// know still degrades to deferred tools instead of building a doomed request.
+#[test]
+fn measured_tool_payload_defers_when_it_dominates_the_window() {
+    // Measured built-in payload (~14k tokens) against real windows.
+    const FULL: usize = 13_965;
+    assert!(Agent::tool_payload_exceeds_window_share(FULL, 8_192));
+    assert!(Agent::tool_payload_exceeds_window_share(FULL, 32_768));
+    // A third of the window is the budget, so 14k is fine once the window is
+    // comfortably past 41k.
+    assert!(!Agent::tool_payload_exceeds_window_share(FULL, 200_000));
+    assert!(!Agent::tool_payload_exceeds_window_share(FULL, 1_000_000));
+
+    // The core-only payload fits an 8k window, which is what makes the
+    // small-window path usable rather than merely smaller.
+    assert!(!Agent::tool_payload_exceeds_window_share(2_623, 8_192));
+
+    // A huge MCP catalog is caught even on a large window the window-only
+    // heuristic would wave through.
+    assert!(Agent::tool_payload_exceeds_window_share(80_000, 200_000));
+
+    // Unknown window: never guess.
+    assert!(!Agent::tool_payload_exceeds_window_share(FULL, 0));
+}
