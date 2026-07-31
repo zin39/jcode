@@ -842,6 +842,24 @@ impl Agent {
                         text_content = format!("[provider guardrail] {}", notice);
                     }
                 }
+                // Never end a turn in unexplained silence. If the provider gave
+                // us nothing visible and no guardrail notice explained why, say
+                // so: an empty bubble reads as a hung agent, and the user has no
+                // way to tell that from a crash.
+                if text_content.trim().is_empty() && empty_post_tool_continuations > 0 {
+                    logging::warn(&format!(
+                        "Turn ended with no visible output after {} empty-response continuation attempt(s)",
+                        empty_post_tool_continuations
+                    ));
+                    text_content = format!(
+                        "[no response] The model returned an empty reply {} times in a row. \
+                         This is usually a transient provider fault; retry, or switch models with /model.",
+                        empty_post_tool_continuations + 1
+                    );
+                    if print_output {
+                        println!("\n{}", text_content);
+                    }
+                }
                 logging::info("Turn complete - no tool calls, returning");
                 if print_output {
                     println!();
