@@ -788,6 +788,7 @@ impl AuthStatus {
         crate::auth::copilot::invalidate_github_token_cache();
         crate::provider::pricing::invalidate_auth_pricing_memos();
         crate::memory_rerank::clear_failure_backoff();
+        crate::sidecar_retry::clear_demoted_backends(); // new creds, old rejection is moot
         crate::logging::auth_event("auth_status_cache_invalidated", "all", &[]);
     }
 

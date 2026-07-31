@@ -185,24 +185,52 @@ impl Sidecar {
 
     /// Return the currently selected backend label.
     pub fn backend_name(&self) -> &'static str {
-        match self.backend {
+        Self::backend_label(self.backend)
+    }
+
+    /// Stable label, used for demotion bookkeeping and logs.
+    fn backend_label(backend: SidecarBackend) -> &'static str {
+        match backend {
             SidecarBackend::OpenAI => "openai",
             SidecarBackend::Claude => "claude",
             SidecarBackend::Provider => "provider",
         }
     }
 
-    /// Simple completion - send a prompt, get a response.
-    /// Routes to the correct API based on the detected backend.
+    /// Inverse of [`Self::backend_label`].
+    fn backend_from_label(label: &str) -> SidecarBackend {
+        match label {
+            "openai" => SidecarBackend::OpenAI,
+            "claude" => SidecarBackend::Claude,
+            _ => SidecarBackend::Provider,
+        }
+    }
+
+    /// Send a prompt, falling back across backends when one is quota-dead.
+    /// See [`crate::sidecar_retry::with_backend_fallback`] for why.
     pub async fn complete(&self, system: &str, user_message: &str) -> Result<String> {
-        crate::sidecar_retry::with_retries(crate::sidecar_retry::SIDECAR_MAX_ATTEMPTS, || async {
-            match self.backend {
-                SidecarBackend::OpenAI => self.complete_openai(system, user_message).await,
-                SidecarBackend::Claude => self.complete_claude(system, user_message).await,
-                SidecarBackend::Provider => self.complete_via_provider(system, user_message).await,
-            }
-        })
+        let chain = crate::sidecar_retry::backend_chain(Self::backend_label(self.backend));
+        crate::sidecar_retry::with_backend_fallback(
+            &chain,
+            crate::sidecar_retry::SIDECAR_MAX_ATTEMPTS,
+            |label| {
+                self.complete_with_backend(Self::backend_from_label(label), system, user_message)
+            },
+        )
         .await
+    }
+
+    async fn complete_with_backend(
+        &self,
+        backend: SidecarBackend,
+        system: &str,
+        user_message: &str,
+    ) -> Result<String> {
+        match backend {
+            SidecarBackend::OpenAI => self.complete_openai(system, user_message).await,
+            SidecarBackend::Claude => self.complete_claude(system, user_message).await,
+            SidecarBackend::Provider => self.complete_via_provider(system, user_message).await,
+        }
     }
 
     /// Complete via the live agent provider (`complete_simple`).
