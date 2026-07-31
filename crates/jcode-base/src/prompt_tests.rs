@@ -332,6 +332,33 @@ fn test_swarm_prompt_strips_html_comments_before_shipping() {
     }
 }
 
+/// AGENTS.md is injected wholesale into the system prompt of every request in
+/// its project, so comments in it are shipped to the model despite being notes
+/// for human readers. Anthropic has closed reports of the equivalent file
+/// (CLAUDE.md) auto-loading at session start and triggering a usage-policy
+/// block, so keep this content off the wire.
+#[test]
+fn test_agents_md_comments_are_stripped_but_size_reports_raw() {
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("AGENTS.md"),
+        "<!-- internal note: rotate the leaked credential scanner keys -->\nRun the tests before pushing.\n",
+    )
+    .unwrap();
+
+    let (content, info) = load_agents_md_files_from_dir(Some(project.path()));
+    let content = content.expect("project AGENTS.md must load");
+    assert!(content.contains("Run the tests before pushing."));
+    assert!(
+        !content.contains("credential scanner"),
+        "comment content must not reach the prompt: {content}"
+    );
+    assert!(!content.contains("<!--"));
+    // Context accounting still describes the file the user actually wrote.
+    assert!(info.has_project_agents_md);
+    assert_eq!(info.project_agents_md_chars, 96);
+}
+
 #[test]
 fn test_default_swarm_prompt_mentions_model_and_list_models() {
     assert!(DEFAULT_SWARM_PROMPT.contains("list_models"));

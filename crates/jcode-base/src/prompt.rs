@@ -983,11 +983,19 @@ pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<Stri
     let mut info = ContextInfo::default();
 
     // Helper to load a file if it exists, returns (formatted_content, raw_size)
+    //
+    // HTML comments are stripped for the same reason as the swarm prompt: an
+    // AGENTS.md is injected wholesale into the system prompt of every request
+    // in that project, comments in it are notes to human readers rather than
+    // instructions to the model, and provider safety classifiers score the
+    // whole request. Reported size stays the raw file size so context
+    // accounting still describes the file the user actually wrote.
     let load_file = |path: &Path, label: &str| -> Option<(String, usize)> {
         if path.exists() {
             std::fs::read_to_string(path).ok().map(|content| {
                 let raw_size = content.len();
-                let formatted = format!("# {}\n\n{}", label, content.trim());
+                let visible = collapse_blank_runs(&strip_html_comments(&content));
+                let formatted = format!("# {}\n\n{}", label, visible.trim());
                 (formatted, raw_size)
             })
         } else {
