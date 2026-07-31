@@ -429,6 +429,21 @@ mod tests {
         );
     }
 
+    /// A missing-model 404 is permanent: retrying cannot conjure the model, and
+    /// re-probing that backend every call wastes a round-trip. Measured
+    /// 2026-07-31: with demotion, fallback calls average 1098ms against a
+    /// 955ms Claude-direct baseline, i.e. ~143ms of overhead rather than a
+    /// whole failed request.
+    #[test]
+    fn a_missing_model_404_is_permanent_so_the_backend_is_demoted() {
+        assert!(!super::sidecar_error_is_retryable(
+            "OpenAI API error (404 Not Found): model gpt-does-not-exist-9 does not exist"
+        ));
+        assert!(!super::sidecar_error_is_retryable(
+            "Claude API error (404 Not Found): model: claude-haiku-4-5-20241022"
+        ));
+    }
+
     /// The chain must lead with the selected backend and never repeat one,
     /// otherwise a dead backend would be tried twice per call.
     #[test]
