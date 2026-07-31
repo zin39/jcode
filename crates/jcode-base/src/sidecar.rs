@@ -195,11 +195,14 @@ impl Sidecar {
     /// Simple completion - send a prompt, get a response.
     /// Routes to the correct API based on the detected backend.
     pub async fn complete(&self, system: &str, user_message: &str) -> Result<String> {
-        match self.backend {
-            SidecarBackend::OpenAI => self.complete_openai(system, user_message).await,
-            SidecarBackend::Claude => self.complete_claude(system, user_message).await,
-            SidecarBackend::Provider => self.complete_via_provider(system, user_message).await,
-        }
+        crate::sidecar_retry::with_retries(crate::sidecar_retry::SIDECAR_MAX_ATTEMPTS, || async {
+            match self.backend {
+                SidecarBackend::OpenAI => self.complete_openai(system, user_message).await,
+                SidecarBackend::Claude => self.complete_claude(system, user_message).await,
+                SidecarBackend::Provider => self.complete_via_provider(system, user_message).await,
+            }
+        })
+        .await
     }
 
     /// Complete via the live agent provider (`complete_simple`).

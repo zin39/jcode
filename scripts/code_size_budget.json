@@ -33,7 +33,7 @@
     "crates/jcode-base/src/provider/catalog_routes.rs": 1521,
     "crates/jcode-base/src/provider/mod.rs": 2803,
     "crates/jcode-base/src/session.rs": 1712,
-    "crates/jcode-base/src/sidecar.rs": 1319,
+    "crates/jcode-base/src/sidecar.rs": 1322,
     "crates/jcode-base/src/skill.rs": 1431,
     "crates/jcode-compaction-core/src/lib.rs": 1805,
     "crates/jcode-config-types/src/lib.rs": 1808,
