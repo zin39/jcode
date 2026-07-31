@@ -231,16 +231,6 @@ pub fn context_limit_for_model_with_provider_and_cache(
         return Some(copilot_context_limit_for_model(model));
     }
 
-    // Cerebras serves open-weight models far below their published windows, so
-    // the family table below (which assumes the model's own spec) is wrong
-    // here. GLM-4.7 is a 200K model that Cerebras caps at 131K on paid tiers
-    // and 8,192 on the free tier. Taking the family number instead made jcode
-    // build a ~16k-token first request against an 8k endpoint, which the API
-    // rejected outright.
-    if matches!(provider, Some("cerebras")) {
-        return Some(cerebras_context_limit());
-    }
-
     // Claude models: classify long-context behavior centrally. For generations
     // verified against the live API this is authoritative, because the live
     // catalog's `max_input_tokens` over-advertises 1M for models that are
@@ -265,6 +255,21 @@ pub fn context_limit_for_model_with_provider_and_cache(
     // GPT-named models with different context windows). See issue #541.
     if let Some(limit) = cached_context_limit(model) {
         return Some(limit);
+    }
+
+    // Cerebras serves open-weight models far below their published windows, so
+    // the family table below (which assumes the model's own spec) is wrong
+    // here. GLM-4.7 is a 200K model that Cerebras caps at 131K on paid tiers
+    // and 8,192 on the free tier. Taking the family number instead made jcode
+    // build a ~16k-token first request against an 8k endpoint, which the API
+    // rejected outright.
+    //
+    // This sits *after* the cached/configured lookup on purpose: the cap is a
+    // property of the endpoint and tier, which only the user knows, so a paid
+    // user must be able to raise it with an explicit `context_window` config
+    // rather than being pinned to the free-tier assumption.
+    if matches!(provider, Some("cerebras")) {
+        return Some(cerebras_context_limit());
     }
 
     // Spark variant has a smaller context window than the full codex model.
@@ -863,5 +868,27 @@ mod cerebras_context_tests {
             context_limit_for_model_with_provider("glm-4.7", Some("zai")),
             Some(200_000)
         );
+    }
+
+    /// The 8,192 default is the free-tier cap, but the real limit is a property
+    /// of the user's tier, which only they know. A paid user on the 131K tier
+    /// must be able to raise it, so an explicit configured/cached
+    /// `context_window` has to win over the built-in assumption.
+    #[test]
+    fn explicit_context_window_overrides_the_cerebras_default() {
+        let configured =
+            context_limit_for_model_with_provider_and_cache("glm-4.7", Some("cerebras"), |_| {
+                Some(131_072)
+            });
+        assert_eq!(
+            configured,
+            Some(131_072),
+            "an explicit context_window must beat the free-tier assumption"
+        );
+
+        // With no override, the safe free-tier default still applies.
+        let defaulted =
+            context_limit_for_model_with_provider_and_cache("glm-4.7", Some("cerebras"), |_| None);
+        assert_eq!(defaulted, Some(8_192));
     }
 }

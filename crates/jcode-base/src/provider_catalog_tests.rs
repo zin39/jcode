@@ -1191,3 +1191,31 @@ fn minimax_default_provider_applies_openai_api_key_env_not_openrouter() {
         "MiniMax profile must use minimax.env, not openrouter.env"
     );
 }
+
+/// Cerebras is served through the OpenAI-compatible provider, whose context
+/// lookup consults this profile table before the shared model-family
+/// classifier. GLM-4.7's own spec is 200K but Cerebras caps it at 131K paid and
+/// 8,192 free, so the family number would over-budget the request and the
+/// endpoint would reject it. Both the static-limits map (built from this
+/// function) and the direct lookup must report the endpoint cap.
+#[test]
+fn test_cerebras_profile_reports_endpoint_cap_not_model_spec() {
+    let limit = openai_compatible_profile_context_limit("cerebras", "zai-glm-4.7");
+    assert_eq!(limit, Some(8_192));
+
+    // Case and spelling of the model must not matter: the cap belongs to the
+    // endpoint, not to any particular model id.
+    for model in ["GLM-4.7", "zai-glm-4.7", "gpt-oss-120b"] {
+        assert_eq!(
+            openai_compatible_profile_context_limit("cerebras", model),
+            Some(8_192),
+            "cerebras cap must apply to {model}"
+        );
+    }
+
+    // A different gateway serving the same family keeps the model's real window.
+    assert_eq!(
+        openai_compatible_profile_context_limit("zai", "glm-4.7"),
+        Some(200_000)
+    );
+}
