@@ -609,3 +609,44 @@ fn test_skills_section_handles_multibyte_utf8_without_panic() {
     assert!(section.contains("rocket"));
     assert!(section.len() <= 4000);
 }
+
+/// The swarm tool builds its description with `load_swarm_prompt(None)`, which
+/// resolves the project override against `Path::new(".")`, i.e. the process
+/// working directory. Nothing chdirs the process into the session's
+/// `working_dir`, so a per-project `./.jcode/swarm-prompt.md` is silently
+/// ignored whenever the session directory is not the process cwd. This is the
+/// same class of bug already fixed for project-local MCP config (issue #420).
+#[test]
+fn test_swarm_prompt_project_override_needs_explicit_working_dir() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let home = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join(".jcode")).unwrap();
+    std::fs::write(
+        project.path().join(".jcode/swarm-prompt.md"),
+        "PROJECT ROUTING MARKER",
+    )
+    .unwrap();
+
+    // Passing the session's working_dir finds the project override.
+    let scoped = load_swarm_prompt(Some(project.path()));
+    assert_eq!(scoped, "PROJECT ROUTING MARKER");
+
+    // Passing None resolves against the process cwd, which in this test is the
+    // crate directory and therefore cannot see the project override. This is
+    // exactly what the swarm tool does today.
+    let unscoped = load_swarm_prompt(None);
+    assert_ne!(
+        unscoped, "PROJECT ROUTING MARKER",
+        "load_swarm_prompt(None) must not be expected to find a project override"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}

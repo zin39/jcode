@@ -6,7 +6,7 @@ mod batch;
 mod bg;
 mod browser;
 mod cheap_route_tool;
-mod communicate;
+pub(crate) mod communicate;
 #[cfg(target_os = "macos")]
 mod computer;
 mod conversation_search;

@@ -522,6 +522,7 @@ impl Agent {
             tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
         }
         Self::apply_selfdev_tool_surface(&mut tools, self.session.is_canary);
+        self.apply_swarm_prompt_surface(&mut tools);
 
         // Apply deferred tool filtering: when deferred mode is on, drop definitions
         // not in CORE_FULL_SCHEMA_TOOLS ∪ expanded set.
@@ -531,6 +532,27 @@ impl Agent {
         }
 
         tools
+    }
+
+    /// Re-render the `swarm` tool description against this session's working
+    /// directory.
+    ///
+    /// The registry builds one shared `swarm` tool at startup and resolves the
+    /// swarm prompt against the process cwd, because no session exists yet.
+    /// A per-project `./.jcode/swarm-prompt.md` would therefore be ignored for
+    /// any session whose directory is not the process cwd, which is the normal
+    /// case for remote and multi-session use. Resolving it here, where the
+    /// session is known, makes the documented project override actually apply.
+    fn apply_swarm_prompt_surface(&self, tools: &mut [ToolDefinition]) {
+        let Some(tool) = tools.iter_mut().find(|t| t.name == "swarm") else {
+            return;
+        };
+        tool.description = crate::tool::communicate::CommunicateTool::description_for_dir(
+            self.session
+                .working_dir
+                .as_deref()
+                .map(std::path::Path::new),
+        );
     }
 
     /// Whether this turn should send only core tool schemas and defer the rest

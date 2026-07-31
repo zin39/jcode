@@ -1787,16 +1787,35 @@ pub struct CommunicateTool {
 
 impl CommunicateTool {
     pub fn new() -> Self {
-        const BASE_DESCRIPTION: &str = "Coordinate agents. In light-swarm and normal ad hoc use, only the root session may spawn agents, keeping execution to one level of fan-out. Recursive spawning is enabled only when the root session is running in swarm-deep mode; deep descendants may then spawn their own children, bounded by the configured live-agent limit and the absolute swarm member cap. For spawn, prefer providing a prompt so the new agent starts with a concrete task instead of idling. Spawned/assigned agents automatically report their final response back to the agent that spawned them; you can stop any agent in the subtree you spawned.\n\nCommunication: prefer structural dataflow (task-graph artifacts via complete_node) over chat, and DMs for point-to-point coordination. broadcast reaches only your spawned subtree (whole swarm for the coordinator) and should be rare; channels and shared-context are discouraged legacy primitives.";
-        let swarm_prompt = crate::prompt::load_swarm_prompt(None);
-        let description = if swarm_prompt.is_empty() {
-            BASE_DESCRIPTION.to_string()
+        Self {
+            description: Self::description_for_dir(None),
+        }
+    }
+
+    /// Base description without any swarm prompt appended.
+    const BASE_DESCRIPTION: &'static str = "Coordinate agents. In light-swarm and normal ad hoc use, only the root session may spawn agents, keeping execution to one level of fan-out. Recursive spawning is enabled only when the root session is running in swarm-deep mode; deep descendants may then spawn their own children, bounded by the configured live-agent limit and the absolute swarm member cap. For spawn, prefer providing a prompt so the new agent starts with a concrete task instead of idling. Spawned/assigned agents automatically report their final response back to the agent that spawned them; you can stop any agent in the subtree you spawned.\n\nCommunication: prefer structural dataflow (task-graph artifacts via complete_node) over chat, and DMs for point-to-point coordination. broadcast reaches only your spawned subtree (whole swarm for the coordinator) and should be rare; channels and shared-context are discouraged legacy primitives.";
+
+    /// Build the description with the swarm prompt resolved against
+    /// `working_dir`.
+    ///
+    /// The registry builds one shared tool at startup, where the session's
+    /// directory is not known yet, so `new()` resolves against the process cwd.
+    /// That silently ignores a per-project `./.jcode/swarm-prompt.md` whenever
+    /// the session directory differs from the process cwd, which is the normal
+    /// case for remote and multi-session use. The agent re-renders this per
+    /// session with the real working directory, mirroring how project-local MCP
+    /// config is resolved (issue #420).
+    pub fn description_for_dir(working_dir: Option<&std::path::Path>) -> String {
+        let swarm_prompt = crate::prompt::load_swarm_prompt(working_dir);
+        if swarm_prompt.is_empty() {
+            Self::BASE_DESCRIPTION.to_string()
         } else {
             format!(
-                "{BASE_DESCRIPTION}\n\nSwarm prompt (user-tunable via ~/.jcode/swarm-prompt.md):\n{swarm_prompt}"
+                "{}\n\nSwarm prompt (user-tunable via ~/.jcode/swarm-prompt.md):\n{}",
+                Self::BASE_DESCRIPTION,
+                swarm_prompt
             )
-        };
-        Self { description }
+        }
     }
 }
 

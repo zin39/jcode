@@ -2,6 +2,7 @@
   "threshold_loc": 1200,
   "tracked_files": {
     "crates/jcode-app-core/src/agent/cheap_route.rs": 2006,
+    "crates/jcode-app-core/src/agent/turn_execution.rs": 1212,
     "crates/jcode-app-core/src/agent/turn_loops.rs": 1233,
     "crates/jcode-app-core/src/agent/turn_streaming_mpsc.rs": 1722,
     "crates/jcode-app-core/src/overnight.rs": 1275,
@@ -15,7 +16,7 @@
     "crates/jcode-app-core/src/server/provider_control.rs": 1600,
     "crates/jcode-app-core/src/server/swarm.rs": 3180,
     "crates/jcode-app-core/src/tool/bash.rs": 1250,
-    "crates/jcode-app-core/src/tool/communicate.rs": 3358,
+    "crates/jcode-app-core/src/tool/communicate.rs": 3377,
     "crates/jcode-app-core/src/tool/discover.rs": 2130,
     "crates/jcode-app-core/src/tool/session_search.rs": 1892,
     "crates/jcode-app-core/src/tool/todo.rs": 1206,
