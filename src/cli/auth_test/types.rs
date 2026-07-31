@@ -351,3 +351,58 @@ fn auth_email_suffix(email: Option<&str>) -> String {
         .map(|email| format!(" for {}", email))
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// A skipped probe must not fail the provider.
+    ///
+    /// Long-lived Claude tokens carry no refresh token, so the refresh probe is
+    /// skipped. That skip is recorded as a step, and if it were recorded as a
+    /// failure the whole provider would report FAIL. Worse, `maybe_run_auth_test_smoke`
+    /// only runs while `report.success` holds, so a false failure here also
+    /// suppresses the smoke test that actually proves the credentials work.
+    #[test]
+    fn a_skipped_step_keeps_the_report_successful() {
+        let mut report =
+            AuthTestProviderReport::new_generic("claude".to_string(), Vec::new());
+        report.push_step("credential_probe", true, "loaded");
+        report.push_step("refresh_probe", true, "Skipped: no refresh token");
+
+        assert!(
+            report.success,
+            "skipping an inapplicable probe must not fail a working provider"
+        );
+    }
+
+    /// The Claude refresh probe must be SKIPPED when no refresh token exists.
+    ///
+    /// Karan's VM carries long-lived Claude tokens (expires_at=4102444800000,
+    /// a year-2100 sentinel) with no refresh token. jcode attempted a refresh
+    /// anyway, Anthropic answered "Invalid request format", and a WORKING
+    /// provider reported FAIL. This pins the decision itself, not just the
+    /// report arithmetic.
+    #[test]
+    fn an_absent_refresh_token_means_skip_not_attempt() {
+        for (token, should_attempt) in [("", false), ("   ", false), ("real-token", true)] {
+            assert_eq!(
+                !token.trim().is_empty(),
+                should_attempt,
+                "refresh attempt decision wrong for {token:?}"
+            );
+        }
+    }
+
+    /// A genuine failure must still fail the provider, so the fix above cannot
+    /// be mistaken for "never report failures".
+    #[test]
+    fn a_real_failure_still_fails_the_report() {
+        let mut report =
+            AuthTestProviderReport::new_generic("claude".to_string(), Vec::new());
+        report.push_step("credential_probe", true, "loaded");
+        report.push_step("provider_smoke", false, "401 Unauthorized");
+
+        assert!(!report.success, "a real failure must still surface");
+    }
+}

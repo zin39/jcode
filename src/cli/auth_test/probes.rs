@@ -84,23 +84,42 @@ async fn probe_claude_auth(report: &mut AuthTestProviderReport) {
         "credential_probe",
         crate::auth::claude::load_credentials(),
         |creds| {
-            format!(
-                "Loaded Claude credentials (expires_at={}).",
-                creds.expires_at
-            )
+            if creds.refresh_token.trim().is_empty() {
+                "Loaded Claude credentials (long-lived token, no refresh token).".to_string()
+            } else {
+                format!(
+                    "Loaded Claude OAuth credentials (expires_at={}).",
+                    creds.expires_at
+                )
+            }
         },
     ) {
-        push_result_step(
-            report,
-            "refresh_probe",
-            crate::auth::oauth::refresh_claude_tokens(&creds.refresh_token).await,
-            |tokens| {
-                format!(
-                    "Claude token refresh succeeded (new_expires_at={}).",
-                    tokens.expires_at
-                )
-            },
-        );
+        // A long-lived Claude token has no refresh token, so there is nothing to
+        // refresh and Anthropic rejects the attempt with "Invalid request
+        // format". Reporting that as a failure marked a WORKING provider as
+        // FAIL, and because the smoke test only runs when every earlier step
+        // passed, it also suppressed the one probe that actually proves the
+        // credentials work. The OpenAI probe below already guards this; Claude
+        // did not.
+        if creds.refresh_token.trim().is_empty() {
+            report.push_step(
+                "refresh_probe",
+                true,
+                "Skipped: Claude credentials carry no refresh token (long-lived token auth).",
+            );
+        } else {
+            push_result_step(
+                report,
+                "refresh_probe",
+                crate::auth::oauth::refresh_claude_tokens(&creds.refresh_token).await,
+                |tokens| {
+                    format!(
+                        "Claude token refresh succeeded (new_expires_at={}).",
+                        tokens.expires_at
+                    )
+                },
+            );
+        }
     }
 }
 
