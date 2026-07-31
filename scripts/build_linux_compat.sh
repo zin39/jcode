@@ -23,6 +23,29 @@ image="${JCODE_COMPAT_IMAGE:-quay.io/pypa/manylinux2014_x86_64}"
 cache_root="${JCODE_COMPAT_CACHE_DIR:-$HOME/.cache/jcode-linux-compat}"
 target="x86_64-unknown-linux-gnu"
 
+# Parallel codegen jobs inside the container.
+#
+# This used to default to 1 *inside* the container and was never forwarded from
+# the host, so every Linux build compiled serially no matter what the caller
+# set. On a 16-core host that turned a ~10 minute build into roughly an hour.
+#
+# The cap is memory, not CPU: rustc peaks around 1.5-2 GB per codegen unit while
+# linking, and Docker Desktop's VM is far smaller than the host. Default to a
+# job count that fits the VM's RAM rather than the host's core count, so a fast
+# build does not turn into an OOM kill.
+if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
+  docker_mem_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
+  if [[ "$docker_mem_bytes" -gt 0 ]]; then
+    # ~1.8 GB per job, leaving one job's worth of headroom for the linker.
+    build_jobs=$(( docker_mem_bytes / 1932735283 ))
+    [[ "$build_jobs" -lt 1 ]] && build_jobs=1
+  else
+    build_jobs=2
+  fi
+else
+  build_jobs="$CARGO_BUILD_JOBS"
+fi
+
 mkdir -p "$out_dir" \
   "$cache_root/cargo-registry" \
   "$cache_root/cargo-git" \
@@ -69,11 +92,13 @@ trap 'rm -f "$metadata_file"' EXIT
 } > "$metadata_file"
 
 echo "Building portable Linux release in Docker image: $image"
+echo "Parallel codegen jobs: $build_jobs (docker VM RAM caps this, not host cores)"
 echo "Output dir: $out_dir"
 echo "Embedding git metadata: hash=${git_hash:-<none>} tag=${git_tag:-<none>} dirty=$git_dirty changelog_lines=$(printf '%s' "$changelog_raw" | grep -c '' || true)"
 
 docker run --rm \
   -e CARGO_TERM_COLOR=always \
+  -e CARGO_BUILD_JOBS="$build_jobs" \
   -e JCODE_RELEASE_BUILD="${JCODE_RELEASE_BUILD:-1}" \
   -e JCODE_BUILD_SEMVER="${JCODE_BUILD_SEMVER:-}" \
   -e JCODE_BUILD_METADATA_FILE=/jcode-build-meta \
