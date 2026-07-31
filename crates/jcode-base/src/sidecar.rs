@@ -5,7 +5,7 @@
 //!
 //! Automatically selects the best available backend:
 //! - OpenAI (gpt-5.6-luna, reasoning=none) if Codex credentials are available
-//! - Claude (claude-haiku-4-5-20241022) if Claude credentials are available
+//! - Claude (claude-haiku-4-5) if Claude credentials are available
 
 use crate::auth;
 use anyhow::{Context, Result};
@@ -19,7 +19,10 @@ const SIDECAR_OPENAI_OAUTH_FALLBACK_MODEL: &str = "gpt-5.4";
 const SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING: &str = "low";
 
 /// Fast/cheap Claude model used when only Claude credentials are available.
-const SIDECAR_CLAUDE_MODEL: &str = "claude-haiku-4-5-20241022";
+/// Fast/cheap Claude model for sidecar work. Deliberately the BARE id: the
+/// previous `claude-haiku-4-5-20241022` pairs a Haiku 3.5 date with a 4.5 name
+/// and 404s (probed live 2026-07-31), and bare ids survive snapshot rotation.
+const SIDECAR_CLAUDE_MODEL: &str = "claude-haiku-4-5";
 
 /// OpenAI Responses API
 const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
@@ -226,10 +229,8 @@ impl Sidecar {
         system: &str,
         user_message: &str,
     ) -> Result<String> {
-        // A fallback switches the backend, so it must switch the MODEL too.
-        // Sending the primary's model to the fallback made Claude reject
-        // `gpt-5.6-luna` with a 404, which looked like the fallback itself was
-        // broken when it had actually routed correctly.
+        // A fallback switches the backend, so it must switch the MODEL too:
+        // sending the primary's model made Claude 404 on `gpt-5.6-luna`.
         let routed = self.routed_to(backend);
         match backend {
             SidecarBackend::OpenAI => routed.complete_openai(system, user_message).await,
@@ -238,10 +239,9 @@ impl Sidecar {
         }
     }
 
-    /// Self, re-pinned to `backend`'s own default model when falling back.
-    ///
-    /// The originally selected backend keeps the configured model, so an
-    /// explicit `agents.memory_model` is never silently overridden.
+    /// Self, re-pinned to `backend`'s default model when falling back. The
+    /// selected backend keeps its configured model, so `agents.memory_model`
+    /// is never silently overridden.
     fn routed_to(&self, backend: SidecarBackend) -> std::borrow::Cow<'_, Self> {
         if backend == self.backend {
             return std::borrow::Cow::Borrowed(self);
@@ -1375,12 +1375,9 @@ mod tests {
         );
     }
 
-    /// A fallback must re-pin the MODEL, not just the backend.
-    ///
-    /// Falling back from OpenAI to Claude while still sending the OpenAI model
-    /// made Anthropic reject `gpt-5.6-luna` with a 404, so memory kept
-    /// degrading even though the failover had routed correctly. Observed live
-    /// on 2026-07-31, minutes after the failover shipped.
+    /// A fallback must re-pin the MODEL, not just the backend: sending the
+    /// OpenAI model to Claude 404'd, so memory kept degrading even though the
+    /// failover routed correctly. Observed live 2026-07-31.
     #[test]
     fn falling_back_to_another_backend_repins_the_model() {
         let openai = Sidecar::with_openai_model(SIDECAR_OPENAI_MODEL, None);
@@ -1392,8 +1389,11 @@ mod tests {
             openai.model
         );
 
-        // The originally selected backend keeps its configured model, so an
-        // explicit memory_model override is never silently replaced.
+        // Probed live 2026-07-31: the old `-20241022` id 404s, the bare one works.
+        assert_eq!(SIDECAR_CLAUDE_MODEL, "claude-haiku-4-5");
+
+        // The selected backend keeps its configured model, so an explicit
+        // memory_model override is never silently replaced.
         let same = openai.routed_to(SidecarBackend::OpenAI);
         assert_eq!(same.model, openai.model);
     }
