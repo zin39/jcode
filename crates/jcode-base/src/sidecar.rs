@@ -226,11 +226,38 @@ impl Sidecar {
         system: &str,
         user_message: &str,
     ) -> Result<String> {
+        // A fallback switches the backend, so it must switch the MODEL too.
+        // Sending the primary's model to the fallback made Claude reject
+        // `gpt-5.6-luna` with a 404, which looked like the fallback itself was
+        // broken when it had actually routed correctly.
+        let routed = self.routed_to(backend);
         match backend {
-            SidecarBackend::OpenAI => self.complete_openai(system, user_message).await,
-            SidecarBackend::Claude => self.complete_claude(system, user_message).await,
-            SidecarBackend::Provider => self.complete_via_provider(system, user_message).await,
+            SidecarBackend::OpenAI => routed.complete_openai(system, user_message).await,
+            SidecarBackend::Claude => routed.complete_claude(system, user_message).await,
+            SidecarBackend::Provider => routed.complete_via_provider(system, user_message).await,
         }
+    }
+
+    /// Self, re-pinned to `backend`'s own default model when falling back.
+    ///
+    /// The originally selected backend keeps the configured model, so an
+    /// explicit `agents.memory_model` is never silently overridden.
+    fn routed_to(&self, backend: SidecarBackend) -> std::borrow::Cow<'_, Self> {
+        if backend == self.backend {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let model = match backend {
+            SidecarBackend::OpenAI => SIDECAR_OPENAI_MODEL.to_string(),
+            SidecarBackend::Claude => SIDECAR_CLAUDE_MODEL.to_string(),
+            SidecarBackend::Provider => crate::provider::active_provider_fork()
+                .map(|p| p.model())
+                .unwrap_or_else(|| self.model.clone()),
+        };
+        std::borrow::Cow::Owned(Self {
+            backend,
+            model,
+            ..self.clone()
+        })
     }
 
     /// Complete via the live agent provider (`complete_simple`).
@@ -1346,5 +1373,28 @@ mod tests {
             !anthropic_sidecar_prefers_api_key(),
             "claude (oauth) runtime => do not force API key"
         );
+    }
+
+    /// A fallback must re-pin the MODEL, not just the backend.
+    ///
+    /// Falling back from OpenAI to Claude while still sending the OpenAI model
+    /// made Anthropic reject `gpt-5.6-luna` with a 404, so memory kept
+    /// degrading even though the failover had routed correctly. Observed live
+    /// on 2026-07-31, minutes after the failover shipped.
+    #[test]
+    fn falling_back_to_another_backend_repins_the_model() {
+        let openai = Sidecar::with_openai_model(SIDECAR_OPENAI_MODEL, None);
+
+        let claude = openai.routed_to(SidecarBackend::Claude);
+        assert_eq!(
+            claude.model, SIDECAR_CLAUDE_MODEL,
+            "a Claude fallback must send a Claude model, not {}",
+            openai.model
+        );
+
+        // The originally selected backend keeps its configured model, so an
+        // explicit memory_model override is never silently replaced.
+        let same = openai.routed_to(SidecarBackend::OpenAI);
+        assert_eq!(same.model, openai.model);
     }
 }
