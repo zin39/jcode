@@ -191,10 +191,10 @@ impl Agent {
             .unwrap_or("unknown");
         if guardrail {
             let (_, category) = Self::split_guardrail_category(reason_label);
-            let category_hint = category
-                .and_then(Self::guardrail_category_hint)
-                .map(|hint| format!(" {hint}"))
-                .unwrap_or_default();
+            let category_hint = match category.and_then(Self::guardrail_category_hint) {
+                Some(hint) => format!(" {hint}"),
+                None => String::new(),
+            };
             return Some(format!(
                 "Provider guardrail stopped the response (stop_reason: {}). The model declined to answer this request.{} Rephrasing, narrowing the request, or providing more context may help.",
                 reason_label, category_hint

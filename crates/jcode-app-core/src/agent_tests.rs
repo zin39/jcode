@@ -1403,7 +1403,9 @@ fn guardrail_stop_reason_detection() {
 #[test]
 fn guardrail_stop_reason_detection_with_category_suffix() {
     assert!(Agent::is_guardrail_stop_reason(Some("refusal:cyber")));
-    assert!(Agent::is_guardrail_stop_reason(Some("refusal:frontier_llm")));
+    assert!(Agent::is_guardrail_stop_reason(Some(
+        "refusal:frontier_llm"
+    )));
     assert!(Agent::is_guardrail_stop_reason(Some(" REFUSAL:bio ")));
     assert!(Agent::is_guardrail_stop_reason(Some("content_filter:x")));
     // A colon must not turn a normal stop into a guardrail stop.

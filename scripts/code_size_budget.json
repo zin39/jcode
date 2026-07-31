@@ -53,7 +53,7 @@
     "crates/jcode-import-core/src/lib.rs": 1645,
     "crates/jcode-plan/src/lib.rs": 1201,
     "crates/jcode-protocol/src/wire.rs": 1448,
-    "crates/jcode-provider-anthropic-runtime/src/lib.rs": 2402,
+    "crates/jcode-provider-anthropic-runtime/src/lib.rs": 2440,
     "crates/jcode-provider-anthropic/src/lib.rs": 1363,
     "crates/jcode-provider-bedrock/src/lib.rs": 1995,
     "crates/jcode-provider-core/src/lib.rs": 1642,

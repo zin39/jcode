@@ -317,7 +317,11 @@ fn test_swarm_prompt_strips_html_comments_before_shipping() {
     // A file that is nothing but a comment is empty after stripping, so it must
     // fall through to the built-in default rather than shipping a blank tool
     // description.
-    std::fs::write(temp.path().join("swarm-prompt.md"), "<!-- only a note -->\n").unwrap();
+    std::fs::write(
+        temp.path().join("swarm-prompt.md"),
+        "<!-- only a note -->\n",
+    )
+    .unwrap();
     let prompt = load_swarm_prompt(Some(project_dir.path()));
     assert!(prompt.contains("list_models"), "must fall back to default");
 
