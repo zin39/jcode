@@ -121,14 +121,56 @@ impl Agent {
     /// True when the provider's stop reason indicates a model-side
     /// guardrail/safety stop (e.g. Anthropic `refusal`), as opposed to a
     /// normal end-of-turn or truncation.
+    ///
+    /// Anthropic refusals arrive as `refusal:<category>` when the API names the
+    /// policy category, so the reason is matched on the part before the colon.
     pub(crate) fn is_guardrail_stop_reason(stop_reason: Option<&str>) -> bool {
         let Some(reason) = stop_reason else {
             return false;
         };
         let reason = reason.trim().to_ascii_lowercase();
-        matches!(reason.as_str(), "refusal" | "content_filter" | "safety")
+        let base = reason.split(':').next().unwrap_or(&reason);
+        matches!(base, "refusal" | "content_filter" | "safety")
             || reason.contains("guardrail")
             || reason.contains("policy_violation")
+    }
+
+    /// Split an Anthropic-style `refusal:<category>` stop reason into its base
+    /// reason and the policy category, when one was reported.
+    pub(crate) fn split_guardrail_category(stop_reason: &str) -> (&str, Option<&str>) {
+        match stop_reason.trim().split_once(':') {
+            Some((base, category)) if !category.trim().is_empty() => {
+                (base.trim(), Some(category.trim()))
+            }
+            _ => (stop_reason.trim(), None),
+        }
+    }
+
+    /// Plain-language guidance for a documented Anthropic refusal category.
+    ///
+    /// The classifier scores the whole request, tool definitions and injected
+    /// project files included, not just what the user typed. That is why a
+    /// refusal can land on a message as innocuous as "hi", and why the advice
+    /// here points at the surrounding context rather than at the user's words.
+    fn guardrail_category_hint(category: &str) -> Option<&'static str> {
+        match category.trim().to_ascii_lowercase().as_str() {
+            "cyber" => Some(
+                "Category `cyber`: security-adjacent wording somewhere in the request tripped a safeguard. Note that the classifier reads the whole request, including tool definitions and any project files loaded into context, so this can fire on benign defensive work.",
+            ),
+            "bio" => Some(
+                "Category `bio`: the request looked life-sciences sensitive. Benign biology work can also trigger this.",
+            ),
+            "frontier_llm" => Some(
+                "Category `frontier_llm`: something in the request looked like work on competing AI models. Comparisons of rival models or benchmark tables in your prompt files or tool descriptions are a common cause, since they are sent on every request.",
+            ),
+            "reasoning_extraction" => Some(
+                "Category `reasoning_extraction`: the request asked the model to reproduce its internal reasoning as text. Use structured thinking output instead of asking for the chain of thought.",
+            ),
+            "general_harms" => Some(
+                "Category `general_harms`: the request touched an area flagged as harmful. Benign work can also trigger this.",
+            ),
+            _ => None,
+        }
     }
 
     /// Builds the user-facing notice for a turn that ended with no visible
@@ -148,9 +190,14 @@ impl Agent {
             .filter(|r| !r.is_empty())
             .unwrap_or("unknown");
         if guardrail {
+            let (_, category) = Self::split_guardrail_category(reason_label);
+            let category_hint = category
+                .and_then(Self::guardrail_category_hint)
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default();
             return Some(format!(
-                "Provider guardrail stopped the response (stop_reason: {}). The model declined to answer this request. Rephrasing, narrowing the request, or providing more context may help.",
-                reason_label
+                "Provider guardrail stopped the response (stop_reason: {}). The model declined to answer this request.{} Rephrasing, narrowing the request, or providing more context may help.",
+                reason_label, category_hint
             ));
         }
         // Empty visible output with a non-guardrail stop reason: still surface,

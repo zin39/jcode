@@ -77,6 +77,27 @@ pub(crate) struct MessageDeltaEvent {
 #[derive(Deserialize)]
 pub(crate) struct MessageDeltaDelta {
     pub(crate) stop_reason: Option<String>,
+    /// Present only when `stop_reason` is `refusal`. Anthropic names the policy
+    /// category that declined the request (`cyber`, `bio`, `frontier_llm`,
+    /// `reasoning_extraction`, `general_harms`), which is the difference
+    /// between telling the user "the model declined" and telling them which
+    /// safeguard fired so they can act on it.
+    #[serde(default)]
+    pub(crate) stop_details: Option<StopDetails>,
+}
+
+/// Structured detail for a classifier refusal.
+///
+/// Both fields are null when the refusal maps to no named category, which
+/// Anthropic documents as a normal permanent value rather than a placeholder.
+#[derive(Deserialize, Default)]
+pub(crate) struct StopDetails {
+    #[serde(default)]
+    pub(crate) category: Option<String>,
+    /// Human-readable text. Anthropic states it is not stable, so it is
+    /// displayed verbatim and never parsed.
+    #[serde(default)]
+    pub(crate) explanation: Option<String>,
 }
 
 #[derive(Deserialize)]

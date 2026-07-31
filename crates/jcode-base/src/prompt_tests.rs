@@ -247,7 +247,11 @@ fn test_swarm_prompt_prefers_project_then_global_then_default() {
 
     // No override files: built-in default.
     let prompt = load_swarm_prompt(Some(project_dir.path()));
-    assert_eq!(prompt, DEFAULT_SWARM_PROMPT.trim());
+    // The default ships with an editorial HTML comment; the loaded form drops
+    // it, so compare against the default's post-strip shape rather than raw.
+    assert!(!prompt.contains("<!--"), "comments must not reach the wire");
+    assert!(prompt.contains("Model routing guidance for spawned swarm agents"));
+    assert!(prompt.len() < DEFAULT_SWARM_PROMPT.trim().len());
 
     // Global override wins over the default.
     std::fs::write(temp.path().join("swarm-prompt.md"), "global swarm routing").unwrap();
@@ -268,6 +272,54 @@ fn test_swarm_prompt_prefers_project_then_global_then_default() {
     std::fs::write(project_dir.path().join(".jcode/swarm-prompt.md"), "   \n").unwrap();
     let prompt = load_swarm_prompt(Some(project_dir.path()));
     assert_eq!(prompt, "global swarm routing");
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+/// The swarm prompt is embedded verbatim in the `swarm` tool description, so it
+/// rides along on every single request. HTML comments there are notes for the
+/// human maintaining the routing policy, and they are frequently a table
+/// comparing rival models by benchmark score. Anthropic's safety classifiers
+/// score the whole request including tool definitions, and `frontier_llm`
+/// ("could assist the development of competing AI models") is a documented
+/// refusal category, so that commentary can get a bare "hi" refused. Strip it.
+#[test]
+fn test_swarm_prompt_strips_html_comments_before_shipping() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+    let project_dir = tempfile::TempDir::new().unwrap();
+
+    std::fs::write(
+        temp.path().join("swarm-prompt.md"),
+        "<!--\nGLM-5.2 scores 81.0 on Terminal-Bench, beating DeepSeek V4.\n-->\n\nUse the cheap worker for bulk reads.\n",
+    )
+    .unwrap();
+    let prompt = load_swarm_prompt(Some(project_dir.path()));
+    assert_eq!(prompt, "Use the cheap worker for bulk reads.");
+    assert!(!prompt.contains("Terminal-Bench"));
+    assert!(!prompt.contains("DeepSeek"));
+
+    // An unterminated comment must not leak its tail back into the prompt.
+    std::fs::write(
+        temp.path().join("swarm-prompt.md"),
+        "Keep this.\n<!-- oops never closed, GLM-5.2 vs DeepSeek V4",
+    )
+    .unwrap();
+    let prompt = load_swarm_prompt(Some(project_dir.path()));
+    assert_eq!(prompt, "Keep this.");
+
+    // A file that is nothing but a comment is empty after stripping, so it must
+    // fall through to the built-in default rather than shipping a blank tool
+    // description.
+    std::fs::write(temp.path().join("swarm-prompt.md"), "<!-- only a note -->\n").unwrap();
+    let prompt = load_swarm_prompt(Some(project_dir.path()));
+    assert!(prompt.contains("list_models"), "must fall back to default");
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);

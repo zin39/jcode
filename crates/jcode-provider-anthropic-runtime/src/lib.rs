@@ -2193,6 +2193,41 @@ struct SseStreamState {
     warned_model_substitution: bool,
 }
 
+/// Fold a refusal's policy category into the stop-reason string.
+///
+/// `StreamEvent::MessageEnd` carries a single provider-agnostic `stop_reason`
+/// shared by every provider, so widening it for one Anthropic-only field would
+/// ripple through all of them. Instead the category rides along in the reason
+/// itself as `refusal:<category>`. Downstream guardrail detection matches on
+/// the part before the colon, so the extra detail is additive: it reaches the
+/// user-facing notice without changing how a refusal is classified.
+///
+/// A refusal with no named category stays a bare `refusal`, which Anthropic
+/// documents as a normal permanent value rather than missing data.
+fn annotate_stop_reason(stop_reason: String, details: Option<&StopDetails>) -> String {
+    let Some(category) = details
+        .and_then(|d| d.category.as_deref())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    else {
+        return stop_reason;
+    };
+    // Log the provider's own words too. The explanation is deliberately not
+    // part of the stop reason (Anthropic says the text is unstable and must not
+    // be parsed), but it is the most useful thing in the log when a user is
+    // trying to work out why a benign request was declined.
+    if let Some(explanation) = details
+        .and_then(|d| d.explanation.as_deref())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        jcode_base::logging::warn(&format!(
+            "[anthropic] classifier refusal (category={category}): {explanation}"
+        ));
+    }
+    format!("{stop_reason}:{category}")
+}
+
 /// Process an SSE event and return StreamEvents if applicable
 fn process_sse_event(
     event: &SseEvent,
@@ -2325,7 +2360,10 @@ fn process_sse_event(
                 }
                 if let Some(stop_reason) = parsed.delta.stop_reason {
                     events.push(StreamEvent::MessageEnd {
-                        stop_reason: Some(stop_reason),
+                        stop_reason: Some(annotate_stop_reason(
+                            stop_reason,
+                            parsed.delta.stop_details.as_ref(),
+                        )),
                     });
                 }
             }
@@ -2391,7 +2429,7 @@ fn add_message_cache_breakpoint(messages: &mut [ApiMessage]) {
 mod sse_types;
 use sse_types::{
     ApiContentBlockStart, ApiDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    MessageDeltaEvent, MessageStartEvent,
+    MessageDeltaEvent, MessageStartEvent, StopDetails,
 };
 
 mod context_window;

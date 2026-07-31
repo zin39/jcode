@@ -43,9 +43,64 @@ fn base_system_prompt_parts(capabilities: PromptCapabilities) -> Vec<String> {
 /// (project). See [`load_swarm_prompt`].
 pub const DEFAULT_SWARM_PROMPT: &str = include_str!("prompt/swarm_prompt.md");
 
+/// Strip HTML comments (`<!-- ... -->`) from a prompt fragment.
+///
+/// The swarm prompt is a user-editable file whose comments are editorial notes
+/// for whoever maintains the routing policy: rationale, benchmark tables,
+/// dated measurements. That commentary is never guidance the model needs, but
+/// because the swarm prompt is embedded verbatim in the `swarm` tool's
+/// description it was being shipped inside the tool schema of *every* request.
+///
+/// That matters beyond token cost. Anthropic's safety classifiers score the
+/// whole request, system prompt and tool definitions included, and one of the
+/// documented refusal categories is `frontier_llm` ("the request could assist
+/// the development of competing AI models"). A comment block comparing rival
+/// models by benchmark score is exactly that shape, so it can trip a refusal
+/// on a request whose user message is only "hi". Comments are for the human
+/// editing the file, so drop them before they reach the wire.
+///
+/// Unterminated comments are dropped through end-of-input, matching how a
+/// Markdown renderer treats them, so a typo cannot leak the tail back in.
+fn strip_html_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + "-->".len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Collapse runs of 3+ newlines left behind by comment removal into a blank
+/// line, so the shipped prompt keeps its Markdown structure without gaps.
+fn collapse_blank_runs(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut consecutive_newlines = 0usize;
+    for ch in input.chars() {
+        if ch == '\n' {
+            consecutive_newlines += 1;
+            if consecutive_newlines > 2 {
+                continue;
+            }
+        } else if ch != '\r' {
+            consecutive_newlines = 0;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Load the swarm prompt used to steer swarm model routing. Precedence:
 /// project `./.jcode/swarm-prompt.md`, then global `~/.jcode/swarm-prompt.md`,
 /// then the built-in [`DEFAULT_SWARM_PROMPT`].
+///
+/// HTML comments are stripped: they are notes to whoever maintains the file,
+/// not instructions for the model, and shipping them inflates every request's
+/// tool schema (see [`strip_html_comments`]).
 pub fn load_swarm_prompt(working_dir: Option<&Path>) -> String {
     let project_dir = working_dir.unwrap_or(Path::new("."));
     let candidates = [
@@ -56,13 +111,16 @@ pub fn load_swarm_prompt(working_dir: Option<&Path>) -> String {
     ];
     for path in candidates.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            let trimmed = content.trim();
+            let stripped = collapse_blank_runs(&strip_html_comments(&content));
+            let trimmed = stripped.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
             }
         }
     }
-    DEFAULT_SWARM_PROMPT.trim().to_string()
+    collapse_blank_runs(&strip_html_comments(DEFAULT_SWARM_PROMPT))
+        .trim()
+        .to_string()
 }
 
 /// Reasoning-effort sentinel that means "use the strongest reasoning the model

@@ -1396,6 +1396,61 @@ fn guardrail_stop_reason_detection() {
     assert!(!Agent::is_guardrail_stop_reason(None));
 }
 
+/// Anthropic reports the policy category alongside a refusal, which the
+/// provider folds into the stop reason as `refusal:<category>`. Detection must
+/// key off the base reason so the added detail never downgrades a refusal into
+/// an unrecognized stop.
+#[test]
+fn guardrail_stop_reason_detection_with_category_suffix() {
+    assert!(Agent::is_guardrail_stop_reason(Some("refusal:cyber")));
+    assert!(Agent::is_guardrail_stop_reason(Some("refusal:frontier_llm")));
+    assert!(Agent::is_guardrail_stop_reason(Some(" REFUSAL:bio ")));
+    assert!(Agent::is_guardrail_stop_reason(Some("content_filter:x")));
+    // A colon must not turn a normal stop into a guardrail stop.
+    assert!(!Agent::is_guardrail_stop_reason(Some("end_turn:whatever")));
+
+    assert_eq!(
+        Agent::split_guardrail_category("refusal:frontier_llm"),
+        ("refusal", Some("frontier_llm"))
+    );
+    assert_eq!(
+        Agent::split_guardrail_category("refusal"),
+        ("refusal", None)
+    );
+    // A trailing colon carries no category.
+    assert_eq!(
+        Agent::split_guardrail_category("refusal:"),
+        ("refusal:", None)
+    );
+}
+
+/// A refusal on a trivial message is usually caused by something jcode itself
+/// put in the request, not by what the user typed. When the API names the
+/// category, the notice must say so and point at the real surface.
+#[test]
+fn guardrail_notice_explains_reported_category() {
+    let notice = Agent::provider_guardrail_notice(Some("refusal:frontier_llm"), true, false)
+        .expect("categorized refusal must produce a notice");
+    assert!(notice.contains("frontier_llm"), "{notice}");
+    assert!(
+        notice.contains("competing AI models"),
+        "notice must explain the category: {notice}"
+    );
+
+    let cyber = Agent::provider_guardrail_notice(Some("refusal:cyber"), true, false)
+        .expect("categorized refusal must produce a notice");
+    assert!(
+        cyber.contains("tool definitions"),
+        "cyber hint must point at the whole-request surface: {cyber}"
+    );
+
+    // An unknown category degrades to the generic notice rather than guessing.
+    let unknown = Agent::provider_guardrail_notice(Some("refusal:brand_new"), true, false)
+        .expect("notice expected");
+    assert!(unknown.contains("brand_new"), "{unknown}");
+    assert!(unknown.to_lowercase().contains("guardrail"));
+}
+
 #[test]
 fn guardrail_notice_for_refusal_stop() {
     let notice = Agent::provider_guardrail_notice(Some("refusal"), true, true)
