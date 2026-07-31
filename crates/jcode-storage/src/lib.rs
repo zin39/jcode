@@ -571,13 +571,41 @@ fn migrate_stray_env_files_between(jcode_home: &Path, config_dir: &Path) -> usiz
         }
         let dest = config_dir.join(name);
         if dest.exists() {
-            eprintln!(
-                "Warning: credential file {} exists in both {} and {}; using the config-dir copy. \
-                 Remove the one under ~/.jcode to silence this warning.",
-                name,
-                jcode_home.display(),
-                config_dir.display()
-            );
+            // Both copies exist, so the stray one is ignored. Say so in terms
+            // of which file is newer: a user who edits the ignored copy sees
+            // their change have no effect, and the resulting failure surfaces
+            // as whatever the stale credential does at the provider (an
+            // insufficient-balance 402 on a since-replaced key, say), which
+            // points nowhere near the real cause. Comparing mtimes turns that
+            // into a direct statement that the edit is being ignored.
+            let stray_is_newer = match (
+                std::fs::metadata(&path).and_then(|m| m.modified()),
+                std::fs::metadata(&dest).and_then(|m| m.modified()),
+            ) {
+                // Unreadable timestamps mean we cannot tell which copy is
+                // newer, so fall back to the neutral wording rather than
+                // asserting the user's edit is being ignored.
+                (Ok(stray), Ok(active)) => stray > active,
+                _ => false,
+            };
+            if stray_is_newer {
+                eprintln!(
+                    "Warning: credential file {name} exists in both {} and {}, and jcode reads \
+                     ONLY the second one, which is OLDER. Recent edits to the copy under \
+                     ~/.jcode are being ignored. Copy it over {} (then delete the ~/.jcode copy) \
+                     for those changes to take effect.",
+                    jcode_home.display(),
+                    config_dir.display(),
+                    dest.display()
+                );
+            } else {
+                eprintln!(
+                    "Warning: credential file {name} exists in both {} and {}; using the \
+                     config-dir copy. Remove the one under ~/.jcode to silence this warning.",
+                    jcode_home.display(),
+                    config_dir.display()
+                );
+            }
             continue;
         }
         if std::fs::create_dir_all(config_dir).is_err() {
@@ -985,6 +1013,54 @@ mod env_file_tests {
 #[cfg(test)]
 mod migrate_stray_env_tests {
     use super::migrate_stray_env_files_between;
+
+    /// A stray copy that is NEWER than the canonical one means the user edited
+    /// the file jcode does not read. That failure surfaces at the provider (a
+    /// replaced-but-unread API key returning insufficient balance, say), which
+    /// points nowhere near the real cause, so the conflict must be detectable
+    /// rather than silently resolved in favor of the stale file.
+    #[test]
+    fn newer_stray_env_file_does_not_clobber_but_is_left_for_the_user() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let home = sandbox.path();
+        let config_dir = home.join("config").join("jcode");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Canonical (what jcode reads) is written first, so it is older.
+        std::fs::write(config_dir.join("siliconflow.env"), "K=old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Stray copy edited afterwards: this is the user's real intent.
+        std::fs::write(home.join("siliconflow.env"), "K=new").unwrap();
+
+        let migrated = migrate_stray_env_files_between(home, &config_dir);
+
+        assert_eq!(
+            migrated, 0,
+            "a conflicting file must never be auto-migrated"
+        );
+        // The canonical copy is still what jcode would read, unchanged, so the
+        // user's edit genuinely has no effect until they resolve the conflict.
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("siliconflow.env")).unwrap(),
+            "K=old",
+            "canonical copy must not be silently overwritten"
+        );
+        assert!(
+            home.join("siliconflow.env").exists(),
+            "the newer stray copy must be preserved, not deleted"
+        );
+
+        let stray_mtime = std::fs::metadata(home.join("siliconflow.env"))
+            .and_then(|m| m.modified())
+            .unwrap();
+        let canonical_mtime = std::fs::metadata(config_dir.join("siliconflow.env"))
+            .and_then(|m| m.modified())
+            .unwrap();
+        assert!(
+            stray_mtime > canonical_mtime,
+            "test setup must model the newer-stray case the warning detects"
+        );
+    }
 
     #[test]
     fn moves_stray_env_files_and_respects_existing_canonical_copies() {
