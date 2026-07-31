@@ -1747,6 +1747,29 @@ fn build_skills_report(app: &App) -> String {
     out.trim_end().to_string()
 }
 
+/// Actionable note for `/context` when tool schemas dominate the fixed prompt.
+///
+/// `/context` already reports the tool-definition size, but a number alone does
+/// not tell you it is actionable. Tool schemas are the largest fixed cost in a
+/// request and are re-sent every turn, so when they are large this points at
+/// the switch that shrinks them. jcode engages deferral automatically when the
+/// model's context window cannot afford the payload; on a roomy window it stays
+/// off by default (all tools inline avoids a discovery round-trip), which is
+/// exactly the case where a user watching token spend may still want it on.
+fn tool_definition_budget_hint(tool_tokens: usize, tool_count: usize) -> Option<String> {
+    /// Chosen so the hint appears only when deferral would actually pay for
+    /// itself: the core set is ~2.6k tokens, so below this there is little to
+    /// reclaim.
+    const NOTABLE_TOOL_TOKENS: usize = 6_000;
+    if tool_tokens < NOTABLE_TOOL_TOKENS {
+        return None;
+    }
+    Some(format!(
+        "\nTool budget\n- {} tool definitions cost ~{} tokens on every request.\n- Set `deferred = true` under `[tools]` in ~/.jcode/config.toml to send only core schemas and load the rest on demand via `load_tools`.\n- jcode already does this automatically when the model's context window is too small for the full set.\n",
+        tool_count, tool_tokens
+    ))
+}
+
 pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed == "/skills" {
         // Sync from disk first so skills added by agent-side `skill_manage
@@ -2154,6 +2177,11 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
             context.tool_results_chars,
             context.tool_results_count,
         ));
+        if let Some(hint) =
+            tool_definition_budget_hint(context.tool_definition_tokens(), context.tool_defs_count)
+        {
+            context_report.push_str(&hint);
+        }
         context_report.push_str("\nCompaction\n");
         context_report.push_str(&compaction_summary);
         context_report.push_str("\n\nSession State\n");
@@ -2212,4 +2240,26 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tool_budget_hint_tests {
+    use super::tool_definition_budget_hint;
+
+    /// The measured built-in payload is ~14k tokens across 31 tools, which is
+    /// the largest fixed cost in every request. `/context` reported the number
+    /// but never said it was actionable, so surface the switch that shrinks it.
+    #[test]
+    fn hint_appears_only_when_tool_schemas_are_worth_deferring() {
+        // Measured real payload: must produce a hint naming the config switch.
+        let hint = tool_definition_budget_hint(13_965, 31).expect("14k tokens must be flagged");
+        assert!(hint.contains("31 tool definitions"));
+        assert!(hint.contains("13965"));
+        assert!(hint.contains("deferred = true"));
+        assert!(hint.contains("load_tools"));
+
+        // The deferred core set (~2.6k) has little left to reclaim, so staying
+        // quiet avoids nagging about a state that is already optimal.
+        assert!(tool_definition_budget_hint(2_623, 11).is_none());
+    }
 }
