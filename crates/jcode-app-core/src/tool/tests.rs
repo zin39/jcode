@@ -831,3 +831,28 @@ async fn test_deferred_tool_index_excludes_core_tools() {
         "deferred index should be sorted by name"
     );
 }
+
+/// Deferred mode drops non-core tool schemas from the request, so every dropped
+/// tool must still be discoverable through the `load_tools` index. A tool that
+/// is neither core nor indexed is unreachable: the model cannot know it exists,
+/// let alone load it. Measured, the index costs ~295 tokens to save ~11.3k.
+#[tokio::test]
+async fn test_every_deferred_tool_is_reachable_via_index() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let index = registry.deferred_tool_index().await;
+    let defs = registry.definitions(None).await;
+
+    let indexed: std::collections::HashSet<_> = index.iter().map(|(n, _)| n.clone()).collect();
+    let unreachable: Vec<&str> = defs
+        .iter()
+        .map(|d| d.name.as_str())
+        .filter(|name| !super::CORE_FULL_SCHEMA_TOOLS.contains(name) && !indexed.contains(*name))
+        .collect();
+
+    assert!(
+        unreachable.is_empty(),
+        "these tools vanish in deferred mode with no way to load them: {unreachable:?}"
+    );
+    assert!(!index.is_empty(), "deferred index must not be empty");
+}
