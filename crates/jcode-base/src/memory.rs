@@ -1607,12 +1607,11 @@ impl MemoryManager {
         let _ = self.touch_entries(&relevant_ids);
 
         if relevant.is_empty() {
+            let (vstatus, vresult) =
+                crate::memory_judge_metrics::empty_verify_report(verify_latency_ms);
             pipeline_update(|p| {
-                p.verify = StepStatus::Done;
-                p.verify_result = Some(StepResult {
-                    summary: "0 relevant".to_string(),
-                    latency_ms: verify_latency_ms,
-                });
+                p.verify = vstatus;
+                p.verify_result = Some(vresult.clone());
                 p.inject = StepStatus::Skipped;
                 p.maintain = StepStatus::Skipped;
             });

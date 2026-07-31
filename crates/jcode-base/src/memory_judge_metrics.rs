@@ -161,6 +161,7 @@ pub fn record(decision: JudgeDecision, session_id: &str, candidate_count: usize)
         candidate_count,
     );
     if decision.is_degradation() {
+        LAST_DEGRADATION_UNIX.store(unix_now_secs(), Ordering::Relaxed);
         // Loud, rate-limited alarm: a degradation conversion is a bug to fix.
         crate::logging::event_rate_limited(
             crate::logging::LogLevel::Warn,
@@ -176,6 +177,59 @@ pub fn record(decision: JudgeDecision, session_id: &str, candidate_count: usize)
     }
 }
 
+/// Unix seconds of the most recent degradation, or 0 if none this process.
+static LAST_DEGRADATION_UNIX: AtomicU64 = AtomicU64::new(0);
+
+/// How long a degradation stays "recent" for reporting purposes.
+const DEGRADATION_FRESHNESS_SECS: u64 = 600;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether memory recently ran without its LLM judge.
+///
+/// Degradation was previously log-only, so recall could quietly get worse with
+/// no signal outside `~/.jcode/logs`. Measured 2026-07-31: 2,030 degradation
+/// events across 8 of 8 days, none of them visible in the UI. Callers use this
+/// to say memory is degraded instead of letting a judge outage look like an
+/// ordinary "no relevant memories" turn.
+pub fn recently_degraded() -> bool {
+    let at = LAST_DEGRADATION_UNIX.load(Ordering::Relaxed);
+    if at == 0 {
+        return false;
+    }
+    unix_now_secs().saturating_sub(at) <= DEGRADATION_FRESHNESS_SECS
+}
+
+/// Status and summary for a verify step that produced nothing.
+///
+/// An empty verify caused by a judge outage must read as an error, not as an
+/// ordinary "nothing matched".
+pub fn empty_verify_report(
+    latency_ms: u64,
+) -> (
+    crate::memory_types::StepStatus,
+    crate::memory_types::StepResult,
+) {
+    use crate::memory_types::{StepResult, StepStatus};
+    let (status, summary) = if recently_degraded() {
+        (StepStatus::Error, "judge unavailable (degraded)")
+    } else {
+        (StepStatus::Done, "0 relevant")
+    };
+    (
+        status,
+        StepResult {
+            summary: summary.to_string(),
+            latency_ms,
+        },
+    )
+}
+
 /// Per-variant count.
 pub fn count(decision: JudgeDecision) -> u64 {
     COUNTS[decision_index(decision)].load(Ordering::Relaxed)
@@ -186,6 +240,7 @@ pub fn reset() {
     for c in COUNTS.iter() {
         c.store(0, Ordering::Relaxed);
     }
+    LAST_DEGRADATION_UNIX.store(0, Ordering::Relaxed);
 }
 
 /// Aggregate snapshot of all memory-judge decisions seen so far.
@@ -307,6 +362,32 @@ mod tests {
         assert_eq!(snap.no_llm_degraded, 1);
         assert!((snap.conversion_rate - 0.5).abs() < 1e-9);
         assert!((snap.degradation_rate - 0.25).abs() < 1e-9);
+        reset();
+    }
+
+    /// Degradation used to be log-only, so memory recall could quietly get
+    /// worse with no signal outside `~/.jcode/logs`: 2,030 events across 8 of 8
+    /// days, none visible in the UI. A degradation must be queryable so the
+    /// pipeline can report "judge unavailable" rather than an
+    /// indistinguishable "0 relevant".
+    #[test]
+    fn a_degradation_is_queryable_and_an_intended_conversion_is_not() {
+        reset();
+        assert!(!recently_degraded(), "a fresh process has not degraded yet");
+
+        // An INTENDED no-LLM conversion is not a degradation: the user opted
+        // out, so flagging it would cry wolf on a healthy setup.
+        record(JudgeDecision::OptedOut, "s", 3);
+        assert!(
+            !recently_degraded(),
+            "opting out of the judge is not a degradation"
+        );
+
+        record(JudgeDecision::AllJudgesFailed, "s", 10);
+        assert!(
+            recently_degraded(),
+            "an all-judges-failed turn must be visible to the caller"
+        );
         reset();
     }
 }
