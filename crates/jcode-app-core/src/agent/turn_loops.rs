@@ -846,16 +846,14 @@ impl Agent {
                 // us nothing visible and no guardrail notice explained why, say
                 // so: an empty bubble reads as a hung agent, and the user has no
                 // way to tell that from a crash.
-                if text_content.trim().is_empty() && empty_post_tool_continuations > 0 {
+                if let Some(notice) =
+                    Self::empty_turn_notice(&text_content, empty_post_tool_continuations)
+                {
                     logging::warn(&format!(
                         "Turn ended with no visible output after {} empty-response continuation attempt(s)",
                         empty_post_tool_continuations
                     ));
-                    text_content = format!(
-                        "[no response] The model returned an empty reply {} times in a row. \
-                         This is usually a transient provider fault; retry, or switch models with /model.",
-                        empty_post_tool_continuations + 1
-                    );
+                    text_content = notice;
                     if print_output {
                         println!("\n{}", text_content);
                     }
@@ -1169,35 +1167,5 @@ impl Agent {
         }
 
         Ok(final_text)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn user_text(text: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-                cache_control: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }
-    }
-
-    fn tool_result(id: &str, content: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                content: content.to_string(),
-                is_error: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: Some(1),
-        }
     }
 }

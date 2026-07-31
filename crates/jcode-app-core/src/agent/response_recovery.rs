@@ -293,6 +293,23 @@ impl Agent {
         }
     }
 
+    /// Explain a turn that ended with nothing visible.
+    ///
+    /// Returns `None` when the turn produced real text, or when no
+    /// empty-response continuation was ever attempted (an ordinary quiet turn
+    /// is not a fault and must not be annotated). Otherwise returns the notice
+    /// to show the user, so a silent dead end becomes a recoverable one.
+    pub(crate) fn empty_turn_notice(text_content: &str, attempts: u32) -> Option<String> {
+        if !text_content.trim().is_empty() || attempts == 0 {
+            return None;
+        }
+        Some(format!(
+            "[no response] The model returned an empty reply {} times in a row. \
+             This is usually a transient provider fault; retry, or switch models with /model.",
+            attempts + 1
+        ))
+    }
+
     pub(crate) fn messages_end_with_tool_result(messages: &[Message]) -> bool {
         // Walk backwards looking for a real tool result. A trailing
         // `<system-reminder>` (injected memory, file-activity notices, the
@@ -434,5 +451,40 @@ mod tool_continuation_tests {
         ];
 
         assert!(Agent::messages_end_with_tool_result(&messages));
+    }
+
+    /// A normal quiet turn must not be annotated: no continuation was ever
+    /// attempted, so there is no fault to explain.
+    #[test]
+    fn empty_turn_without_continuations_is_not_annotated() {
+        assert_eq!(Agent::empty_turn_notice("", 0), None);
+        assert_eq!(Agent::empty_turn_notice("   \n ", 0), None);
+    }
+
+    /// Real text is never overwritten, even after continuations were attempted.
+    #[test]
+    fn empty_turn_notice_never_replaces_real_text() {
+        assert_eq!(Agent::empty_turn_notice("here is the answer", 3), None);
+    }
+
+    /// The measured failure: continuations ran and nothing visible came back.
+    /// 949 of 950 affected sessions ended exactly here with an empty bubble.
+    #[test]
+    fn exhausted_continuations_explain_the_silence() {
+        let notice = Agent::empty_turn_notice("", 5).expect("silence must be explained");
+        assert!(notice.contains("empty reply"), "notice: {notice}");
+        assert!(
+            notice.contains("6 times"),
+            "counts the original reply too: {notice}"
+        );
+        assert!(
+            notice.contains("/model"),
+            "offers a recovery path: {notice}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_turn_after_continuations_is_explained() {
+        assert!(Agent::empty_turn_notice("  \n\t ", 1).is_some());
     }
 }
