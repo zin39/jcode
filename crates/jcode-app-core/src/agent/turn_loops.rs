@@ -1170,45 +1170,6 @@ impl Agent {
 
         Ok(final_text)
     }
-
-    fn messages_end_with_tool_result(messages: &[Message]) -> bool {
-        // Walk backwards looking for a real tool result. A trailing
-        // `<system-reminder>` (injected memory, file-activity notices, the
-        // per-session context header) is only *continuation* context when it
-        // follows an actual tool result, so it is skipped rather than treated
-        // as proof of one.
-        //
-        // Treating a bare reminder as a tool result made every session look
-        // like a tool continuation, because the session context header is
-        // itself a `<system-reminder>`. That mislabelling fired the
-        // empty-response continuation retry on ordinary prompts that had never
-        // called a tool, which then re-sent the whole context up to five times
-        // and left the user staring at silence.
-        for message in messages.iter().rev() {
-            if !matches!(message.role, Role::User) {
-                return false;
-            }
-            if message
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-            {
-                return true;
-            }
-            let only_system_reminders = !message.content.is_empty()
-                && message.content.iter().all(|block| match block {
-                    ContentBlock::Text { text, .. } => {
-                        text.trim().is_empty() || text.trim().starts_with("<system-reminder>")
-                    }
-                    _ => false,
-                });
-            if only_system_reminders {
-                continue;
-            }
-            return false;
-        }
-        false
-    }
 }
 
 #[cfg(test)]
@@ -1238,79 +1199,5 @@ mod tests {
             timestamp: None,
             tool_duration_ms: Some(1),
         }
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_detects_tool_continuation_context() {
-        let messages = vec![
-            user_text("tell me about the desktop application"),
-            tool_result("functions.read:0", "desktop architecture docs"),
-            tool_result("functions.agentgrep:4", "desktop source summary"),
-        ];
-
-        assert!(Agent::messages_end_with_tool_result(&messages));
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_allows_memory_after_tool_results() {
-        let messages = vec![
-            user_text("tell me about the desktop application"),
-            tool_result("functions.read:0", "desktop architecture docs"),
-            user_text("<system-reminder>Relevant memory</system-reminder>"),
-        ];
-
-        assert!(Agent::messages_end_with_tool_result(&messages));
-    }
-
-    #[test]
-    fn messages_end_with_tool_result_ignores_plain_user_prompt() {
-        let messages = vec![user_text("hello")];
-
-        assert!(!Agent::messages_end_with_tool_result(&messages));
-    }
-
-    /// Every session opens with a `<system-reminder>` context header, so
-    /// treating a bare reminder as tool-continuation context marked *all*
-    /// sessions as continuations. Measured over 7 days of real sessions, 950
-    /// sessions fired the empty-response retry and 100% of them had never
-    /// produced a single tool result.
-    #[test]
-    fn session_context_header_alone_is_not_a_tool_continuation() {
-        let messages = vec![
-            user_text("<system-reminder>\n# Session Context\nDate: 2026-07-31\n</system-reminder>"),
-            user_text("You are a log distiller. Summarize the excerpt."),
-        ];
-
-        assert!(
-            !Agent::messages_end_with_tool_result(&messages),
-            "a plain prompt preceded by the session context header must not look \
-             like a tool continuation"
-        );
-    }
-
-    /// The reminder header is the *first* message, so the backwards walk has to
-    /// keep rejecting even when the reminder is not adjacent to the tail.
-    #[test]
-    fn system_reminder_before_plain_prompt_is_not_a_tool_continuation() {
-        let messages = vec![
-            user_text("<system-reminder>Session Context</system-reminder>"),
-            user_text("just give me a basic html page"),
-        ];
-
-        assert!(!Agent::messages_end_with_tool_result(&messages));
-    }
-
-    /// A reminder that genuinely trails a tool result still counts, so the fix
-    /// does not regress legitimate post-tool continuations.
-    #[test]
-    fn system_reminder_after_real_tool_result_still_counts() {
-        let messages = vec![
-            user_text("<system-reminder>Session Context</system-reminder>"),
-            user_text("read the file"),
-            tool_result("functions.read:0", "file contents"),
-            user_text("<system-reminder>Relevant memory</system-reminder>"),
-        ];
-
-        assert!(Agent::messages_end_with_tool_result(&messages));
     }
 }
