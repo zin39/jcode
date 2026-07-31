@@ -569,6 +569,15 @@ pub fn openai_compatible_profile_context_limit(profile_id: &str, model: &str) ->
         // direct profile runs through the OpenRouter/OpenAI-compatible provider
         // implementation, whose live catalog can be unavailable during startup.
         "deepseek" if model.starts_with("deepseek-v4-") => Some(1_000_000),
+        // Cerebras serves open-weight models far below their published windows,
+        // so the family table is the wrong source here: GLM-4.7 is a 200K model
+        // that Cerebras caps at 131K on paid tiers and 8,192 on the free tier.
+        // The cap belongs to the endpoint and tier, not the model, and is not
+        // advertised up front, so assume the free-tier cap. Erring small is the
+        // safe direction: too high builds a request the endpoint rejects
+        // outright, while too low only makes jcode more frugal. A live catalog
+        // entry or an explicit user `context_window` override still wins.
+        "cerebras" => Some(jcode_provider_core::models::cerebras_context_limit()),
         // Fall back to the shared open-weight family classifier. Many bundled
         // OpenAI-compatible gateways (Z.AI/GLM, Moonshot/Kimi, MiniMax, Qwen,
         // etc.) serve `/v1/models` entries without a `context_length`, so this

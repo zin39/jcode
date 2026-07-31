@@ -104,6 +104,9 @@ pub fn provider_key_from_hint(provider_hint: Option<&str>) -> Option<&'static st
         "antigravity" => Some("antigravity"),
         "gemini" | "google gemini" => Some("gemini"),
         "cursor" => Some("cursor"),
+        // Cerebras caps context far below the served model's own spec, so it
+        // must be recognized here for that override to be reachable.
+        "cerebras" => Some("cerebras"),
         _ => None,
     }
 }
@@ -124,6 +127,25 @@ fn model_id_for_capability_lookup(model: &str, provider: Option<&str>) -> (Strin
     };
 
     (lookup, is_1m)
+}
+
+/// Context window to assume for Cerebras-served models.
+///
+/// Cerebras serves open-weight models well below their published windows, so
+/// the model's own spec is the wrong number here: GLM-4.7 is a 200K model that
+/// Cerebras caps at 131K on paid tiers and 8,192 on the free tier. The cap is
+/// a property of the endpoint and tier rather than the model, and the API does
+/// not advertise it up front, so assume the free-tier cap.
+///
+/// Assuming the smaller value is the safe direction. Guessing too high builds a
+/// request the endpoint rejects outright, which is a hard failure; guessing too
+/// low only makes jcode more frugal with context. A user on a paid tier can
+/// raise it with an explicit `context_window` config override, which takes
+/// precedence over this.
+const CEREBRAS_FREE_TIER_CONTEXT_LIMIT: usize = 8_192;
+
+pub fn cerebras_context_limit() -> usize {
+    CEREBRAS_FREE_TIER_CONTEXT_LIMIT
 }
 
 fn copilot_context_limit_for_model(model: &str) -> usize {
@@ -207,6 +229,16 @@ pub fn context_limit_for_model_with_provider_and_cache(
 
     if matches!(provider, Some("copilot")) {
         return Some(copilot_context_limit_for_model(model));
+    }
+
+    // Cerebras serves open-weight models far below their published windows, so
+    // the family table below (which assumes the model's own spec) is wrong
+    // here. GLM-4.7 is a 200K model that Cerebras caps at 131K on paid tiers
+    // and 8,192 on the free tier. Taking the family number instead made jcode
+    // build a ~16k-token first request against an 8k endpoint, which the API
+    // rejected outright.
+    if matches!(provider, Some("cerebras")) {
+        return Some(cerebras_context_limit());
     }
 
     // Claude models: classify long-context behavior centrally. For generations
@@ -797,5 +829,39 @@ mod tests {
         for pro in OPENAI_API_ONLY_PRO_MODELS {
             assert!(is_openai_api_only_pro_model(pro));
         }
+    }
+}
+
+#[cfg(test)]
+mod cerebras_context_tests {
+    use super::*;
+
+    /// Cerebras serves GLM-4.7 with a far smaller window than the model's own
+    /// 200K spec (131K paid, 8,192 free). Taking the family number made jcode
+    /// build a ~16k-token first request against an 8k endpoint, which the API
+    /// rejected outright. The provider must win over the family table.
+    #[test]
+    fn cerebras_overrides_the_open_weight_family_window() {
+        // The family table still reports the model's own published window.
+        assert_eq!(open_weight_family_context_limit("glm-4.7"), Some(200_000));
+
+        // But asking for it *as served by Cerebras* must yield the endpoint cap.
+        let served = context_limit_for_model_with_provider("glm-4.7", Some("cerebras"));
+        assert_eq!(served, Some(8_192));
+
+        // Model spelling must not matter; the cap is a property of the endpoint.
+        for id in ["zai-glm-4.7", "glm-4.7", "gpt-oss-120b"] {
+            assert_eq!(
+                context_limit_for_model_with_provider(id, Some("cerebras")),
+                Some(8_192),
+                "cerebras cap must apply to {id}"
+            );
+        }
+
+        // Other providers keep the model's real window.
+        assert_eq!(
+            context_limit_for_model_with_provider("glm-4.7", Some("zai")),
+            Some(200_000)
+        );
     }
 }
