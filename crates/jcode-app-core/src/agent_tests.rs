@@ -1591,3 +1591,27 @@ fn a_worker_that_ran_nothing_cannot_claim_it_ran_commands() {
     jcode_swarm_core::forget_session_tool_activity(&session_id);
     assert!(jcode_swarm_core::session_tool_activity(&session_id).is_silent());
 }
+
+/// Full tool schemas measure ~14k tokens, so a small-context model is over
+/// budget before the user types anything: the Cerebras GLM-4.7 8k window
+/// rejected the request outright rather than degrading. Deferred mode already
+/// existed but was opt-in via config, so nobody hit it. The tool payload must
+/// follow the model actually in use.
+#[test]
+fn small_context_windows_force_deferred_tools() {
+    // Measured: ~14k tokens of full schemas vs ~2.6k for the core set, so these
+    // windows cannot afford the full payload.
+    assert!(Agent::context_window_requires_deferred_tools(8_192));
+    assert!(Agent::context_window_requires_deferred_tools(16_384));
+    assert!(Agent::context_window_requires_deferred_tools(32_768));
+
+    // Roomy windows keep every tool inline, so the agent can act without a
+    // discovery round-trip.
+    assert!(!Agent::context_window_requires_deferred_tools(32_769));
+    assert!(!Agent::context_window_requires_deferred_tools(128_000));
+    assert!(!Agent::context_window_requires_deferred_tools(1_000_000));
+
+    // An unknown window must not silently force every session into deferred
+    // mode; treat it as roomy and let the config flag decide.
+    assert!(!Agent::context_window_requires_deferred_tools(0));
+}

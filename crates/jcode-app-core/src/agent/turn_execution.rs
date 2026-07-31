@@ -436,7 +436,7 @@ impl Agent {
         if let Some(ref locked) = self.locked_tools {
             // In deferred mode, check if the expanded tool set has grown.
             // If so, invalidate the snapshot so newly-expanded tools are included.
-            if crate::config::config().tools.deferred {
+            if self.deferred_tools_active() {
                 let current_expanded = crate::tool::session_expanded_tools(&self.session.id);
                 let current_count = current_expanded.len();
                 if current_count > self.last_expanded_count {
@@ -483,7 +483,7 @@ impl Agent {
         let mut tools = self.build_filtered_tool_definitions().await;
 
         // Append deferred tool index to load_tools description when deferred mode is on.
-        if crate::config::config().tools.deferred
+        if self.deferred_tools_active()
             && let Some(lt) = tools.iter_mut().find(|d| d.name == "load_tools")
         {
             let index = self.registry.deferred_tool_index().await;
@@ -506,7 +506,7 @@ impl Agent {
         self.locked_tools = Some(tools.clone());
 
         // Update expanded count when locking a fresh snapshot (deferred mode).
-        if crate::config::config().tools.deferred {
+        if self.deferred_tools_active() {
             let current_expanded = crate::tool::session_expanded_tools(&self.session.id);
             self.last_expanded_count = current_expanded.len();
         }
@@ -525,12 +525,48 @@ impl Agent {
 
         // Apply deferred tool filtering: when deferred mode is on, drop definitions
         // not in CORE_FULL_SCHEMA_TOOLS ∪ expanded set.
-        if crate::config::config().tools.deferred {
+        if self.deferred_tools_active() {
             let expanded = crate::tool::session_expanded_tools(&self.session.id);
             Self::apply_deferred_filter(&mut tools, &expanded);
         }
 
         tools
+    }
+
+    /// Whether this turn should send only core tool schemas and defer the rest
+    /// to `load_tools`.
+    ///
+    /// Sending every tool's full schema costs roughly 14k tokens, of which the
+    /// core set is about 2.6k. On a large context window that is affordable and
+    /// keeping every tool inline is the better default, since the agent can act
+    /// without a discovery round-trip. On a small window it is fatal: the fixed
+    /// overhead alone overflows an 8k model before the user has typed anything,
+    /// and the request is rejected outright rather than degrading.
+    ///
+    /// So the config flag is honored as an explicit opt-in, and otherwise the
+    /// decision follows the model actually in use.
+    fn deferred_tools_active(&self) -> bool {
+        crate::config::config().tools.deferred
+            || Self::context_window_requires_deferred_tools(self.provider.context_window())
+    }
+
+    /// Context window (in tokens) at or below which full tool schemas stop
+    /// being viable.
+    ///
+    /// Full schemas measure ~14k tokens, so anything in this range is already
+    /// over budget before the system prompt, project instructions, and the
+    /// conversation are added. The threshold sits well above the ~4.9k
+    /// deferred-mode floor so the small-window path still leaves usable room
+    /// for actual work.
+    const SMALL_CONTEXT_WINDOW_TOKENS: usize = 32_768;
+
+    /// Pure predicate for [`Self::deferred_tools_active`], split out so the
+    /// threshold behavior is testable without constructing a provider.
+    ///
+    /// A window of zero means "unknown", which must not silently force every
+    /// session into deferred mode, so it is treated as roomy.
+    pub(crate) fn context_window_requires_deferred_tools(context_window: usize) -> bool {
+        context_window > 0 && context_window <= Self::SMALL_CONTEXT_WINDOW_TOKENS
     }
 
     /// Tailor the `selfdev` tool definition to the session mode.
