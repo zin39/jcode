@@ -43,3 +43,83 @@ pub(super) fn is_oauth_catalog_auth_error(error_str: &str) -> bool {
         || lower.contains("403 forbidden")
         || is_oauth_auth_error(&lower)
 }
+
+/// Whether the stored Claude credentials actually carry a refresh token.
+///
+/// Hand-configured `sk-ant-oat01` access tokens are long-lived and have no
+/// refresh token, so a forced refresh can only ever fail. Checking first lets
+/// the caller surface the real authentication error and fall through to
+/// account failover instead of dead-ending on a refresh that was never
+/// possible.
+pub(super) fn claude_refresh_token_available() -> bool {
+    jcode_base::auth::claude::load_credentials()
+        .map(|creds| !creds.refresh_token.is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Long-lived `sk-ant-oat01` tokens carry no refresh token, so the forced
+    /// refresh path must not run for them.
+    ///
+    /// Regression: it did, and its failure ("No refresh token available in
+    /// Claude credentials") replaced the real authentication error and returned
+    /// early, so the user saw a misleading "run jcode login" instead of the
+    /// actual cause. Measured 15 such log entries.
+    #[test]
+    fn credentials_without_a_refresh_token_do_not_advertise_one() {
+        let _env_lock = jcode_base::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("temp home");
+        // Scope HOME as well: load_credentials also consults external sources
+        // such as ~/.claude/.credentials.json, and on a developer machine those
+        // are real and would mask the file under test.
+        let previous_jcode_home = std::env::var_os("JCODE_HOME");
+        let previous_home = std::env::var_os("HOME");
+        jcode_base::env::set_var("JCODE_HOME", temp.path());
+        jcode_base::env::set_var("HOME", temp.path());
+
+        // Ask the auth layer where it will actually look rather than assuming
+        // the temp root: it resolves to a config subdirectory.
+        let auth_path = jcode_base::auth::claude::jcode_path().expect("auth path");
+        if let Some(parent) = auth_path.parent() {
+            std::fs::create_dir_all(parent).expect("create auth dir");
+        }
+        let write_auth = |refresh: &str| {
+            let body = serde_json::json!({
+                "anthropic_accounts": [{
+                    "label": "claude-1",
+                    "access": "sk-ant-oat01-test",
+                    "refresh": refresh,
+                    "expires": 9_999_999_999_999i64,
+                    "scopes": ["user:inference"],
+                }],
+                "active_anthropic_account": "claude-1",
+            });
+            std::fs::write(&auth_path, serde_json::to_string(&body).expect("encode"))
+                .expect("write auth file");
+        };
+
+        write_auth("");
+        assert!(
+            !claude_refresh_token_available(),
+            "an empty refresh token must not be reported as available"
+        );
+
+        write_auth("refresh-token-value");
+        assert!(
+            claude_refresh_token_available(),
+            "a real refresh token must still be reported as available"
+        );
+
+        match previous_jcode_home {
+            Some(value) => jcode_base::env::set_var("JCODE_HOME", value),
+            None => jcode_base::env::remove_var("JCODE_HOME"),
+        }
+        match previous_home {
+            Some(value) => jcode_base::env::set_var("HOME", value),
+            None => jcode_base::env::remove_var("HOME"),
+        }
+    }
+}

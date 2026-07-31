@@ -20,8 +20,8 @@ use jcode_base::auth;
 use jcode_base::auth::oauth;
 use jcode_provider_core::{EventStream, NativeToolResultSender, Provider};
 use oauth_errors::{
-    OAUTH_ORG_POLICY_GUIDANCE, is_oauth_auth_error, is_oauth_catalog_auth_error,
-    is_oauth_org_policy_error,
+    OAUTH_ORG_POLICY_GUIDANCE, claude_refresh_token_available, is_oauth_auth_error,
+    is_oauth_catalog_auth_error, is_oauth_org_policy_error,
 };
 fn oauth_beta_headers(model: &str) -> &'static str {
     jcode_provider_core::anthropic_oauth_beta_headers(model)
@@ -1548,8 +1548,15 @@ async fn run_stream_with_retries(
                     return;
                 }
 
-                // OAuth auth failures: force refresh and retry once immediately.
-                if is_oauth && is_oauth_auth_error(&error_str) && !attempted_forced_refresh {
+                // OAuth auth failures: force refresh and retry once. Skipped
+                // when the credentials carry no refresh token (hand-configured
+                // long-lived `sk-ant-oat01`), where refreshing cannot succeed
+                // and its failure masked the real authentication error.
+                if is_oauth
+                    && is_oauth_auth_error(&error_str)
+                    && !attempted_forced_refresh
+                    && claude_refresh_token_available()
+                {
                     attempted_forced_refresh = true;
                     jcode_base::logging::info(
                         "Anthropic OAuth authentication failed, forcing token refresh...",
