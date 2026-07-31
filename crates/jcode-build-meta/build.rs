@@ -169,6 +169,16 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=JCODE_RELEASE_BUILD");
     println!("cargo:rerun-if-env-changed=JCODE_BUILD_SEMVER");
+    // The metadata file is the authoritative source for release builds (the
+    // containerised Linux build computes git metadata on the host and passes it
+    // in, because in-container git trips the dubious-ownership guard). Without
+    // these two triggers cargo happily reused a cached build-script output and
+    // shipped a release binary stamped with a week-old commit: a Linux artifact
+    // built from c6acb9d3b reported `v0.60.203 (01a7f71f7)`.
+    println!("cargo:rerun-if-env-changed=JCODE_BUILD_METADATA_FILE");
+    if let Ok(metadata_path) = std::env::var("JCODE_BUILD_METADATA_FILE") {
+        println!("cargo:rerun-if-changed={metadata_path}");
+    }
     // Allow callers to force a metadata refresh (e.g. install scripts) without a
     // full clean, by bumping this env var.
     println!("cargo:rerun-if-env-changed=JCODE_BUILD_GIT_HASH");
