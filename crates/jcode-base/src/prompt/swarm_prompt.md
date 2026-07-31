@@ -3,6 +3,16 @@ This file IS the swarm config. Swarms are complicated, dynamic systems, so
 routing policy is passed to the models as a prompt rather than as options in
 a standard config file. Edit freely: override globally at
 ~/.jcode/swarm-prompt.md or per-project at ./.jcode/swarm-prompt.md.
+
+NOTE: everything outside HTML comments is embedded verbatim in the `swarm`
+tool's description, so it is sent to the model on EVERY request. Comments like
+this one are stripped before the prompt reaches the wire, so put rationale,
+dated measurements, and benchmark tables in comments and keep the live text to
+the routing decision itself. This is not only about tokens: provider safety
+classifiers score the whole request including tool definitions, and a table
+comparing rival models by benchmark score can trip a refusal (Anthropic
+documents a `frontier_llm` category for exactly that) on a request whose user
+message is just "hi".
 -->
 
 Model routing guidance for spawned swarm agents. Pass `model` (and optionally
