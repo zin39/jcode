@@ -129,10 +129,58 @@ semver="$(echo "$version_line" | sed 's/^v//; s/ .*//')"
 echo "  new binary runs here and reports: $version_line"
 echo "  will install as version: $semver"
 
-# ------------------------------------------------------------ 4. stop the fleet
+# --------------------------------------------------------- 4. confirm the purge
+# Ask before anything destructive happens, and in particular before any process
+# is killed. An earlier version asked here but *after* the kill step, so a
+# declined prompt still left the host with its servers stopped: an "abort" that
+# aborted nothing. A refusal must now be a complete no-op.
+#
+# The prompt reads from the terminal if there is one, else stdin. It must never
+# hard-require /dev/tty: over `ssh host 'bash script'` there is no controlling
+# terminal, so opening /dev/tty fails and the run dies at the confirmation.
+say "4. confirming"
+confirm_purge() {
+    local reply
+
+    if [[ "$assume_yes" == "--yes" ]]; then
+        echo "  --yes given, proceeding without confirmation"
+        return 0
+    fi
+
+    # Probe /dev/tty in a subshell so a failed open cannot print to stderr and
+    # cannot leave this shell's own stderr redirected. `[[ -r /dev/tty ]]` is
+    # not a sufficient test: the device node exists under ssh even when the
+    # session has no controlling terminal to open.
+    if ( exec 3</dev/tty ) 2>/dev/null; then
+        exec 3</dev/tty
+        printf '  stop all jcode processes and delete %s? [y/N] ' "$builds_dir"
+        read -r reply <&3 || reply=""
+        exec 3<&-
+    elif read -r -p "  stop all jcode processes and delete $builds_dir? [y/N] " reply; then
+        : # answered over a pipe, e.g. `echo y | bash script`
+    else
+        # No terminal and no answer on stdin. This is the plain
+        # `ssh host 'bash script'` case. Refuse rather than guess, and name the
+        # flag that makes the intent explicit.
+        echo
+        echo "error: no terminal available to confirm a destructive purge." >&2
+        echo "       nothing was changed. Re-run with --yes to proceed:" >&2
+        echo "         bash $0 $artifact --yes" >&2
+        return 1
+    fi
+
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+        echo "  aborted; nothing was changed"
+        return 1
+    fi
+    return 0
+}
+confirm_purge || exit 1
+
+# ------------------------------------------------------------ 5. stop the fleet
 # Every jcode process must die, including detached shared servers. A survivor
 # both serves stale code to new clients and re-points the symlinks.
-say "4. stopping every jcode process"
+say "5. stopping every jcode process"
 
 # Identify jcode processes by the executable they are actually running, not by
 # a substring of their command line. A command-line match also catches this
@@ -187,16 +235,11 @@ else
     echo "  all jcode processes stopped"
 fi
 
-# ------------------------------------------------------------- 5. purge builds
+# ------------------------------------------------------------- 6. purge builds
 # Only ~/.jcode/builds is removed. Sessions, logs, auth and config stay put.
-say "5. removing all previously installed jcode binaries"
+say "6. removing all previously installed jcode binaries"
 if [[ -d "$builds_dir" ]]; then
     du -sh "$builds_dir" 2>/dev/null | sed 's/^/  freeing: /'
-    if [[ "$assume_yes" != "--yes" ]]; then
-        printf '  delete %s and every version in it? [y/N] ' "$builds_dir"
-        read -r reply </dev/tty || reply=n
-        [[ "$reply" =~ ^[Yy]$ ]] || { echo "  aborted"; exit 1; }
-    fi
     rm -rf "$builds_dir"
     echo "  removed $builds_dir"
 else
@@ -210,8 +253,8 @@ for stray in "$launcher" "$HOME/bin/jcode" /usr/local/bin/jcode; do
     fi
 done
 
-# ------------------------------------------------------------ 6. install fresh
-say "6. installing the new build"
+# ------------------------------------------------------------ 7. install fresh
+say "7. installing the new build"
 install_dir="$builds_dir/versions/$semver"
 mkdir -p "$install_dir" "$builds_dir/current" "$builds_dir/stable" "$builds_dir/shared-server"
 cp "$new_bin" "$install_dir/jcode"
@@ -225,12 +268,12 @@ for ch in current stable shared-server; do
 done
 echo "  installed to $install_dir/jcode"
 
-# ------------------------------------------------- 7. launcher that cannot self-update
+# ------------------------------------------------- 8. launcher that cannot self-update
 # These are release builds (JCODE_RELEASE_BUILD=1), so the background update
 # check is active and will happily replace this binary with whatever GitHub
 # publishes. The launcher pins --no-update so the version stays exactly what
 # was deployed here.
-say "7. installing an update-proof launcher"
+say "8. installing an update-proof launcher"
 mkdir -p "$(dirname "$launcher")"
 cat > "$launcher" <<'LAUNCHER'
 #!/usr/bin/env sh
@@ -256,8 +299,8 @@ case ":$PATH:" in
     *) echo "  NOTE: $HOME/.local/bin is not on PATH; add it to your shell rc" ;;
 esac
 
-# ------------------------------------------------------------------ 8. verify
-say "8. verification"
+# ------------------------------------------------------------------ 9. verify
+say "9. verification"
 hash -r 2>/dev/null || true
 echo "-- resolved launcher --"
 command -v jcode || echo "  jcode not on PATH"

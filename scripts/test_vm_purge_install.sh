@@ -148,5 +148,56 @@ check "$($HOME/.local/bin/jcode --version 2>&1 | grep -c '0.60.264')" "1" "D: la
 # the launcher must not double-add --no-update when the user passes it
 check "$($HOME/.local/bin/jcode --no-update --version 2>&1 | grep -c '0.60.264')" "1" "D: explicit --no-update still works"
 
+
+echo
+echo "########## CONFIRMATION-PATH SUITE ##########"
+# Regression: over `ssh host 'bash script'` there is no controlling terminal.
+# The prompt used to read from /dev/tty unconditionally, which failed with
+# "No such device or address" and aborted the run. Worse, it aborted AFTER the
+# kill step, so a declined/failed prompt still left the host's jcode servers
+# stopped. A refusal must be a complete no-op.
+rm -rf "$HOME/.jcode/builds" "$HOME/.local/bin/jcode"
+mkdir -p "$HOME/.jcode/builds/versions/0.64.2" "$HOME/.jcode/builds/current" "$HOME/.local/bin"
+cp /bin/sleep "$HOME/.jcode/builds/versions/0.64.2/jcode"
+ln -sfn "$HOME/.jcode/builds/versions/0.64.2/jcode" "$HOME/.jcode/builds/current/jcode"
+
+echo "=== CASE E: no tty (ssh non-interactive), no --yes ==="
+"$HOME/.jcode/builds/versions/0.64.2/jcode" 600 & E_SRV=$!
+sleep 1
+setsid bash /tmp/vm_purge_install.sh /tmp/good.tar.gz < /dev/null > /tmp/e.log 2>&1
+rcE=$?
+check "$([ "$rcE" != "0" ] && echo nonzero)" "nonzero" "E: refuses without a tty"
+check "$(grep -c 'No such device' /tmp/e.log)" "0" "E: no raw /dev/tty error leaks"
+check "$(grep -c -- "--yes to proceed" /tmp/e.log)" "1" "E: tells the user to pass --yes"
+# The whole point of the fix: refusing must not have killed anything.
+check "$(kill -0 $E_SRV 2>/dev/null && echo alive || echo dead)" "alive" "E: refusal did NOT kill running jcode"
+check "$([ -e $HOME/.jcode/builds/versions/0.64.2/jcode ] && echo present)" "present" "E: refusal did NOT delete builds"
+kill $E_SRV 2>/dev/null
+
+echo "=== CASE F: answered 'n' on a pipe ==="
+"$HOME/.jcode/builds/versions/0.64.2/jcode" 600 & F_SRV=$!
+sleep 1
+echo n | setsid bash /tmp/vm_purge_install.sh /tmp/good.tar.gz > /tmp/f.log 2>&1
+rcF=$?
+check "$([ "$rcF" != "0" ] && echo nonzero)" "nonzero" "F: declining exits nonzero"
+check "$(kill -0 $F_SRV 2>/dev/null && echo alive || echo dead)" "alive" "F: declining did NOT kill running jcode"
+check "$([ -e $HOME/.jcode/builds/versions/0.64.2/jcode ] && echo present)" "present" "F: declining did NOT delete builds"
+kill $F_SRV 2>/dev/null
+
+echo "=== CASE G: answered 'y' on a pipe ==="
+echo y | setsid bash /tmp/vm_purge_install.sh /tmp/good.tar.gz > /tmp/g.log 2>&1
+rcG=$?
+check "$rcG" "0" "G: accepting completes"
+check "$(ls -1 $HOME/.jcode/builds/versions | tr -d ' \n')" "0.60.264" "G: only the new version remains"
+
+echo "=== CASE H: --yes over non-interactive ssh (the documented path) ==="
+rm -rf "$HOME/.jcode/builds" "$HOME/.local/bin/jcode"
+mkdir -p "$HOME/.jcode/builds/versions/0.64.2"
+cp /bin/sleep "$HOME/.jcode/builds/versions/0.64.2/jcode"
+setsid bash /tmp/vm_purge_install.sh /tmp/good.tar.gz --yes < /dev/null > /tmp/h.log 2>&1
+rcH=$?
+check "$rcH" "0" "H: --yes works with no tty"
+check "$(ls -1 $HOME/.jcode/builds/versions | tr -d ' \n')" "0.60.264" "H: purge+install completed"
+
 echo "=== RESULT: $([ $fail -eq 0 ] && echo ALL PASS || echo FAILURES) ==="
 exit $fail
