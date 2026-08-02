@@ -82,7 +82,72 @@ impl BatchTool {
 
 #[derive(Deserialize)]
 struct BatchInput {
-    tool_calls: Vec<ToolCallInput>,
+    tool_calls: Vec<BatchEntry>,
+}
+
+/// One entry of a batch, parsed so that a single malformed entry cannot
+/// discard the entries beside it.
+///
+/// A batch is a bundle of *independent* calls, so one entry failing to parse
+/// says nothing about the others. Deserializing straight into
+/// `Vec<ToolCallInput>` made the whole tool call fail with a message like
+/// "missing field `tool`" that named neither the offending entry nor the work
+/// that was thrown away, so the model had to re-issue every sibling call to
+/// retry the one it got wrong.
+#[derive(Clone)]
+enum BatchEntry {
+    Call(ToolCallInput),
+    /// Entry that could not be understood, kept so it can be reported in place
+    /// (with its original position) instead of aborting its siblings.
+    Malformed(String),
+}
+
+impl<'de> Deserialize<'de> for BatchEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let keys = describe_entry_keys(&value);
+        Ok(match serde_json::from_value::<ToolCallInput>(value) {
+            Ok(call) => BatchEntry::Call(call),
+            Err(e) => BatchEntry::Malformed(format!(
+                "{e}. Each entry needs a \"tool\" naming the tool to run, with that tool's own \
+                 arguments beside it{keys}"
+            )),
+        })
+    }
+}
+
+/// Render an entry's keys so a malformed-entry message points at the actual
+/// payload the model sent rather than making it guess which entry broke.
+fn describe_entry_keys(value: &Value) -> String {
+    let Some(obj) = value.as_object() else {
+        return String::new();
+    };
+    if obj.is_empty() {
+        return String::new();
+    }
+    let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    format!(" (this entry only had: {})", keys.join(", "))
+}
+
+/// One line per malformed entry, in the order the caller sent them.
+fn ordered_malformed_report(malformed: &HashMap<usize, String>) -> String {
+    let mut entries: Vec<(&usize, &String)> = malformed.iter().collect();
+    entries.sort_by_key(|(i, _)| **i);
+    entries
+        .into_iter()
+        .map(|(i, reason)| format!("[{}] {}", i + 1, reason))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+impl BatchEntry {
+    fn as_call(&self) -> Option<&ToolCallInput> {
+        match self {
+            BatchEntry::Call(call) => Some(call),
+            BatchEntry::Malformed(_) => None,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -103,10 +168,21 @@ impl ToolCallInput {
 }
 
 /// Try to fix common LLM mistakes in batch tool_calls:
+/// - `tool_calls` sent as a JSON-encoded string instead of a real array
 /// - Parameters placed at the same level as "tool" instead of nested under "parameters"
 /// - "name" used instead of "tool" for the tool name key
 /// - "arguments", "args", or "input" used instead of "parameters"
 fn normalize_batch_input(mut input: Value) -> Value {
+    // Some providers hand back tool arguments with the array re-encoded as a
+    // string ("[{\"tool\": ...}]"). The payload is otherwise well formed, so
+    // decode it rather than failing the call with "invalid type: string".
+    if let Some(obj) = input.as_object_mut()
+        && let Some(raw) = obj.get("tool_calls").and_then(Value::as_str)
+        && let Ok(decoded @ Value::Array(_)) = serde_json::from_str::<Value>(raw)
+    {
+        obj.insert("tool_calls".to_string(), decoded);
+    }
+
     if let Some(calls) = input.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
         for call in calls.iter_mut() {
             if let Some(obj) = call.as_object_mut() {
@@ -194,7 +270,9 @@ impl Tool for BatchTool {
 
         // Check for disallowed tools
         for tc in &params.tool_calls {
-            if Registry::resolve_tool_name(&tc.tool) == "batch" {
+            if let BatchEntry::Call(tc) = tc
+                && Registry::resolve_tool_name(&tc.tool) == "batch"
+            {
                 return Err(anyhow::anyhow!("Cannot batch the 'batch' tool"));
             }
         }
@@ -202,16 +280,33 @@ impl Tool for BatchTool {
         // Execute all tools in parallel, emitting progress events as each completes
         let num_tools = params.tool_calls.len();
         use futures::StreamExt;
+        // Malformed entries keep their slot so results stay aligned with the
+        // positions the caller sent, and so each bad entry is reported next to
+        // the sibling results that did run.
+        let mut malformed: HashMap<usize, String> = HashMap::new();
         let subcalls: Vec<(usize, String, Value)> = params
             .tool_calls
             .into_iter()
             .enumerate()
-            .map(|(i, tc)| {
-                let (tool_name, parameters) = tc.resolved_parameters();
-                let tool_name = Registry::resolve_tool_name(&tool_name).to_string();
-                (i, tool_name, parameters)
+            .filter_map(|(i, tc)| match tc {
+                BatchEntry::Call(tc) => {
+                    let (tool_name, parameters) = tc.resolved_parameters();
+                    let tool_name = Registry::resolve_tool_name(&tool_name).to_string();
+                    Some((i, tool_name, parameters))
+                }
+                BatchEntry::Malformed(reason) => {
+                    malformed.insert(i, reason);
+                    None
+                }
             })
             .collect();
+
+        if subcalls.is_empty() {
+            let detail = ordered_malformed_report(&malformed);
+            return Err(anyhow::anyhow!(
+                "No usable tool calls in this batch.\n{detail}"
+            ));
+        }
 
         let mut running: HashMap<usize, ToolCall> = subcalls
             .iter()
@@ -286,7 +381,23 @@ impl Tool for BatchTool {
         let mut error_count = 0;
         let mut failed_tools = Vec::new();
 
-        for (i, tool_name, result) in results {
+        // Merge executed results with the malformed entries that never ran, so
+        // the caller sees one entry per slot it sent, in the order it sent them.
+        let mut results = results.into_iter().peekable();
+        for i in 0..num_tools {
+            if let Some(reason) = malformed.get(&i) {
+                error_count += 1;
+                failed_tools.push(format!("[{}] <malformed>", i + 1));
+                output.push_str(&format!(
+                    "--- [{}] (malformed entry, not run) ---\nError: {}\n\n",
+                    i + 1,
+                    reason
+                ));
+                continue;
+            }
+            let Some((_, tool_name, result)) = results.next() else {
+                continue;
+            };
             output.push_str(&format!("--- [{}] {} ---\n", i + 1, tool_name));
             match result {
                 Ok(out) => {
