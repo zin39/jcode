@@ -69,3 +69,55 @@ fn transport_only_openai_compatible_spec_never_falls_through_to_the_active_provi
         );
     });
 }
+
+/// The resolver must handle profiles defined in config (`[providers.<name>]`),
+/// not just built-in catalog profiles.
+///
+/// This is the user's real setup: `dashscope` is a named config profile, so its
+/// routes carry `api_method = "openai-compatible:dashscope"` but
+/// `openai_compatible_profile_by_id("dashscope")` finds nothing in the static
+/// catalog. A catalog-only lookup would resolve the route id and then drop it,
+/// sending the switch back to the active provider.
+#[test]
+fn transport_only_spec_resolves_a_named_config_profile() {
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+
+        let owning = model_pin::openai_compatible_profile_id_owning_model(
+            "qwen3.7-max",
+            None,
+            || {
+                vec![ModelRoute {
+                    model: "qwen3.7-max".to_string(),
+                    provider: "DashScope".to_string(),
+                    api_method: "openai-compatible:dashscope".to_string(),
+                    available: true,
+                    detail: String::new(),
+                    cheapness: None,
+                }]
+            },
+        );
+
+        assert_eq!(
+            owning.as_deref(),
+            Some("dashscope"),
+            "a route whose api_method names a config-defined profile must resolve; \
+             a catalog-only lookup dropped it and the switch fell back to the active provider"
+        );
+
+        // And the resolver must hand it to the named-profile binding path,
+        // since `dashscope` has no catalog entry.
+        let resolved = model_pin::resolve_openai_compatible_target(
+            "openai-compatible:qwen3.7-max",
+            |_| Some("dashscope".to_string()),
+        )
+        .expect("resolution should succeed")
+        .expect("spec names an OpenAI-compatible target");
+        assert!(
+            matches!(resolved.0, model_pin::OpenAiCompatibleTarget::Named(ref n) if n == "dashscope"),
+            "a config-defined profile must route to the named-profile path"
+        );
+        assert_eq!(resolved.1, "qwen3.7-max");
+    });
+}

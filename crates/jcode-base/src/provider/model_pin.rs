@@ -82,11 +82,11 @@ pub(super) fn openai_compatible_transport_only_model(model: &str) -> Option<&str
 /// hand-typed `/model <id>` and saved sessions can carry the bare id. The
 /// active profile wins when several profiles serve the same id, so a re-select
 /// of the current model never silently hops endpoints.
-pub(super) fn openai_compatible_profile_owning_model(
+pub(super) fn openai_compatible_profile_id_owning_model(
     model: &str,
     active_profile_id: Option<&str>,
     routes: impl FnOnce() -> Vec<crate::provider::ModelRoute>,
-) -> Option<crate::provider_catalog::OpenAiCompatibleProfile> {
+) -> Option<String> {
     let model = model.trim();
     if model.is_empty() {
         return None;
@@ -106,15 +106,13 @@ pub(super) fn openai_compatible_profile_owning_model(
             continue;
         };
         if active_profile_id == Some(profile_id) {
-            fallback = Some(profile_id.to_string());
-            break;
+            return Some(profile_id.to_string());
         }
         if fallback.is_none() {
             fallback = Some(profile_id.to_string());
         }
     }
-
-    crate::provider_catalog::openai_compatible_profile_by_id(&fallback?)
+    fallback
 }
 
 /// Resolve an OpenAI-compatible route spec to the profile that should serve it.
@@ -135,14 +133,25 @@ pub(super) fn openai_compatible_profile_owning_model(
 /// provider serves.
 pub(super) fn resolve_openai_compatible_target(
     requested_model: &str,
-    owning_profile: impl FnOnce(&str) -> Option<crate::provider_catalog::OpenAiCompatibleProfile>,
-) -> anyhow::Result<Option<(crate::provider_catalog::OpenAiCompatibleProfile, &str)>> {
+    owning_profile_id: impl FnOnce(&str) -> Option<String>,
+) -> anyhow::Result<Option<(OpenAiCompatibleTarget, &str)>> {
     let Some(target_model) = openai_compatible_transport_only_model(requested_model) else {
         // Not transport-only: fall back to the ordinary `<profile>:<model>` pin.
-        return Ok(openai_compatible_model_prefix(requested_model));
+        return Ok(openai_compatible_model_prefix(requested_model)
+            .map(|(profile, model)| (OpenAiCompatibleTarget::Catalog(profile), model)));
     };
-    match owning_profile(target_model) {
-        Some(profile) => Ok(Some((profile, target_model))),
+    match owning_profile_id(target_model) {
+        Some(profile_id) => Ok(Some((
+            // A config-defined profile has no catalog entry, so keep the id and
+            // let the caller dispatch to the named-profile binding path. A
+            // catalog-only lookup silently dropped these and sent the switch
+            // back to the active provider.
+            match crate::provider_catalog::openai_compatible_profile_by_id(&profile_id) {
+                Some(profile) => OpenAiCompatibleTarget::Catalog(profile),
+                None => OpenAiCompatibleTarget::Named(profile_id),
+            },
+            target_model,
+        ))),
         // Naming the route that could not be resolved beats blaming a provider
         // the user never asked for.
         None => Err(anyhow::anyhow!(
@@ -153,6 +162,14 @@ pub(super) fn resolve_openai_compatible_target(
             target_model
         )),
     }
+}
+
+/// Which binding path serves a resolved OpenAI-compatible route.
+pub(super) enum OpenAiCompatibleTarget {
+    /// A built-in catalog profile.
+    Catalog(crate::provider_catalog::OpenAiCompatibleProfile),
+    /// A `[providers.<name>]` profile from config, which has no catalog entry.
+    Named(String),
 }
 
 /// Parse a `<name>:<model>` spec whose prefix is a user-defined named provider

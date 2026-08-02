@@ -883,19 +883,35 @@ impl MultiProvider {
     ) -> Option<(crate::provider_catalog::OpenAiCompatibleProfile, &str)> {
         model_pin::openai_compatible_model_prefix(model)
     }
-    /// Find the configured OpenAI-compatible profile that serves a bare model
-    /// id, using the live route catalog as the source of truth.
-    fn openai_compatible_profile_owning_model(
-        &self,
-        model: &str,
-    ) -> Option<crate::provider_catalog::OpenAiCompatibleProfile> {
-        model_pin::openai_compatible_profile_owning_model(
+    /// Profile id serving a bare model id, from the live route catalog.
+    ///
+    /// Returns the id rather than a catalog profile because
+    /// `[providers.<name>]` profiles from config have no catalog entry and must
+    /// reach the named-profile binding path instead.
+    fn openai_compatible_profile_id_owning_model(&self, model: &str) -> Option<String> {
+        model_pin::openai_compatible_profile_id_owning_model(
             model,
             ProviderRegistry::new(self)
                 .active_compatible_profile_id()
                 .as_deref(),
             || self.fresh_routes_memo_entry().routes,
         )
+    }
+
+    /// Select `model` on whichever binding path owns `target`.
+    fn set_model_on_openai_compatible_target(
+        &self,
+        target: model_pin::OpenAiCompatibleTarget,
+        model: &str,
+    ) -> Result<()> {
+        match target {
+            model_pin::OpenAiCompatibleTarget::Catalog(profile) => {
+                self.set_model_on_openai_compatible_profile(profile, model)
+            }
+            model_pin::OpenAiCompatibleTarget::Named(name) => {
+                self.set_model_on_named_provider_profile(&name, model)
+            }
+        }
     }
 
     fn named_provider_profile_model_prefix(model: &str) -> Option<(String, String)> {
@@ -1785,12 +1801,12 @@ impl Provider for MultiProvider {
             anyhow::bail!("Model cannot be empty");
         }
 
-        if let Some((profile, target_model)) =
+        if let Some((target, target_model)) =
             model_pin::resolve_openai_compatible_target(requested_model, |m| {
-                self.openai_compatible_profile_owning_model(m)
+                self.openai_compatible_profile_id_owning_model(m)
             })?
         {
-            return self.set_model_on_openai_compatible_profile(profile, target_model);
+            return self.set_model_on_openai_compatible_target(target, target_model);
         }
 
         // User-defined named provider profiles from config (`[providers.<name>]`).
@@ -1885,13 +1901,16 @@ impl Provider for MultiProvider {
             && let Some(target) = provider_from_model_key(target_provider)
         {
             self.set_model_on_provider(target, model)
-        } else if let Some(profile) = self.openai_compatible_profile_owning_model(model) {
+        } else if let Some(profile_id) = self.openai_compatible_profile_id_owning_model(model) {
             // Bare ids from an OpenAI-compatible catalog (`celeris-1`,
             // `mimo-v2.5`, ...) match none of the built-in model-name
             // heuristics. Without this, `/model <bare-id>` fell through to
             // whichever provider happened to be active and failed with a
             // misleading "not supported by <active provider>" error.
-            self.set_model_on_openai_compatible_profile(profile, model)
+            match crate::provider_catalog::openai_compatible_profile_by_id(&profile_id) {
+                Some(profile) => self.set_model_on_openai_compatible_profile(profile, model),
+                None => self.set_model_on_named_provider_profile(&profile_id, model),
+            }
         } else {
             // Unknown model - try current provider.
             self.set_model_on_provider(self.active_provider(), model)
