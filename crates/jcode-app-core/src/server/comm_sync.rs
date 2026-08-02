@@ -222,6 +222,61 @@ async fn lock_or_busy<T>(lock: &Mutex<T>) -> Option<tokio::sync::MutexGuard<'_, 
     None
 }
 
+/// Tool-call summaries read from the target's persisted session.
+///
+/// `summarize_tool_calls` is a pure function of `session.messages`, and those
+/// messages are journaled as the turn runs, so a busy agent's recent activity is
+/// already on disk. Reading it there keeps inspection working during the exact
+/// window the in-memory lock is unavailable.
+///
+/// `None` means nothing is persisted yet (a session that has not journaled a
+/// turn), which is the only case that still has to report busy.
+fn persisted_tool_call_summaries(
+    session_id: &str,
+    limit: usize,
+) -> Option<Vec<crate::protocol::ToolCallSummary>> {
+    let session = load_persisted_session(session_id)?;
+    let calls = crate::session::summarize_tool_calls(&session, limit);
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// Load a session from disk for a lock-free inspection fallback.
+///
+/// A load failure is reported rather than dropped: it means the caller gets the
+/// "busy" error even though the agent's history exists, so a persistently
+/// unreadable journal would otherwise look like ordinary lock contention.
+fn load_persisted_session(session_id: &str) -> Option<crate::session::Session> {
+    match crate::replay::load_session(session_id) {
+        Ok(session) => Some(session),
+        Err(e) => {
+            crate::logging::warn(&format!(
+                "swarm inspect: cannot read persisted session {session_id}: {e}; \
+                 falling back to the busy response"
+            ));
+            None
+        }
+    }
+}
+
+/// Rendered history read from the target's persisted session.
+///
+/// Mirrors [`persisted_tool_call_summaries`]: `get_history` renders
+/// `session.messages`, which are journaled during the turn, so the same data is
+/// reachable without the agent lock.
+fn persisted_history(session_id: &str) -> Option<Vec<crate::protocol::HistoryMessage>> {
+    let session = load_persisted_session(session_id)?;
+    let messages: Vec<crate::protocol::HistoryMessage> = crate::session::render_messages(&session)
+        .into_iter()
+        .map(|msg| crate::protocol::HistoryMessage {
+            role: msg.role,
+            content: msg.content,
+            tool_calls: (!msg.tool_calls.is_empty()).then_some(msg.tool_calls),
+            tool_data: msg.tool_data,
+        })
+        .collect();
+    (!messages.is_empty()).then_some(messages)
+}
+
 pub(super) async fn handle_comm_summary(
     id: u64,
     req_session_id: String,
@@ -248,11 +303,17 @@ pub(super) async fn handle_comm_summary(
     if let Some(agent) = agent_sessions.get(&target_session) {
         let tool_calls = if let Some(agent) = lock_or_busy(agent).await {
             agent.get_tool_call_summaries(limit)
+        } else if let Some(calls) = persisted_tool_call_summaries(&target_session, limit) {
+            // A turn can hold the lock for minutes, and a coordinator inspects a
+            // worker precisely while it is working, so waiting alone cannot fix
+            // this. The summary is a pure read over persisted session messages,
+            // so serve it from the journal instead of failing the call.
+            calls
         } else {
             let _ = client_event_tx.send(ServerEvent::Error {
                 id,
                 message: format!(
-                    "Session '{}' is busy; try summary again shortly",
+                    "Session '{}' is busy and has no persisted history yet; try summary again shortly",
                     target_session
                 ),
                 retry_after_secs: Some(1),
@@ -387,11 +448,16 @@ pub(super) async fn handle_comm_read_context(
     if let Some(agent) = agent_sessions.get(&target_session) {
         let messages = if let Some(agent) = lock_or_busy(agent).await {
             agent.get_history()
+        } else if let Some(history) = persisted_history(&target_session) {
+            // Same reasoning as the summary path: the history is a pure read
+            // over journaled messages, so a mid-turn lock does not have to make
+            // the call fail.
+            history
         } else {
             let _ = client_event_tx.send(ServerEvent::Error {
                 id,
                 message: format!(
-                    "Session '{}' is busy; try read_context again shortly",
+                    "Session '{}' is busy and has no persisted history yet; try read_context again shortly",
                     target_session
                 ),
                 retry_after_secs: Some(1),
@@ -600,5 +666,75 @@ mod busy_lock_tests {
             "must give up promptly, took {:?}",
             start.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod persisted_fallback_tests {
+    use super::*;
+
+    /// A session that was never persisted has nothing to serve, so the caller
+    /// must still be told the target is busy rather than shown empty results
+    /// that look like "this agent did nothing".
+    #[test]
+    fn unknown_session_yields_no_persisted_fallback() {
+        assert!(persisted_tool_call_summaries("session_does_not_exist_12345", 10).is_none());
+        assert!(persisted_history("session_does_not_exist_12345").is_none());
+    }
+
+    /// The fallback must render the SAME data the locked path does, otherwise a
+    /// busy inspection would silently disagree with an unlocked one.
+    ///
+    /// Builds its own session file rather than scanning ~/.jcode/sessions: the
+    /// first version of this test picked a live session id, and the file could
+    /// be rotated away between the probe and the read, failing the whole suite
+    /// with "No such file or directory".
+    #[test]
+    fn persisted_fallback_renders_the_same_data_as_the_locked_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fixture.json");
+
+        // Written as JSON so the test exercises the real on-disk format and
+        // loader rather than an in-memory shortcut.
+        let raw = serde_json::json!({
+            "id": "fixture",
+            "created_at": "2026-08-02T00:00:00Z",
+            "updated_at": "2026-08-02T00:00:00Z",
+            "messages": [{
+                "id": "msg_fixture_1",
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "running a read"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_fixture_1",
+                        "name": "read",
+                        "input": {"file_path": "/tmp/a.rs"}
+                    }
+                ]
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec(&raw).expect("serialize")).expect("write fixture");
+        let path_str = path.to_str().expect("utf8 path");
+
+        // load_session accepts a path, so this drives the real loader.
+        let loaded = crate::replay::load_session(path_str).expect("fixture session loads");
+        let expected = crate::session::summarize_tool_calls(&loaded, 10);
+        assert_eq!(expected.len(), 1, "fixture should hold one tool call");
+
+        let actual = persisted_tool_call_summaries(path_str, 10)
+            .expect("fallback should serve the persisted tool call");
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "fallback must render the same summaries as the locked path"
+        );
+        assert_eq!(
+            actual[0].tool_name, "read",
+            "tool name must survive the fallback"
+        );
+
+        let history = persisted_history(path_str).expect("fallback should serve history");
+        assert!(!history.is_empty(), "history fallback must return messages");
     }
 }

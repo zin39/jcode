@@ -232,10 +232,27 @@ pub fn tui_policy_for(
     profile: &SystemProfile,
     display: &crate::config::DisplayConfig,
 ) -> TuiPerfPolicy {
+    tui_policy_with_no_animation(profile, display, no_animation_enabled())
+}
+
+/// [`tui_policy_for`] with the reduced-motion decision supplied by the caller.
+///
+/// `no_animation_enabled()` reads process-global env vars, so a test that wants
+/// the flag ON had to `set_var` it, which every concurrently running test could
+/// observe. That made `test_non_fragile_terminal_keeps_decorative_animations`
+/// fail depending on scheduling: it asserts animations stay enabled while a
+/// sibling test briefly forced `JCODE_NO_ANIMATION=1` process-wide.
+///
+/// Taking the flag as an argument makes the dependency explicit and lets those
+/// tests cover both states without touching shared state.
+pub fn tui_policy_with_no_animation(
+    profile: &SystemProfile,
+    display: &crate::config::DisplayConfig,
+    no_animation: bool,
+) -> TuiPerfPolicy {
     let mut redraw_fps = display.redraw_fps.clamp(1, 120);
     let mut animation_fps = display.animation_fps.clamp(1, 120);
     let mut enable_decorative_animations = !matches!(profile.tier, PerformanceTier::Minimal);
-    let no_animation = no_animation_enabled();
     let mut enable_focus_change = true;
     let enable_mouse_capture = display.mouse_capture;
     let mut enable_keyboard_enhancement = true;
@@ -934,7 +951,9 @@ mod tests {
         let mut display = crate::config::DisplayConfig::default();
         display.redraw_fps = 60;
         display.animation_fps = 60;
-        let policy = tui_policy_for(&profile, &display);
+        // Pin the reduced-motion input rather than inheriting the developer's
+        // environment, so this asserts the profile logic and nothing else.
+        let policy = tui_policy_with_no_animation(&profile, &display, false);
         assert!(policy.enable_decorative_animations);
         assert_eq!(policy.redraw_fps, 60);
     }
@@ -977,20 +996,10 @@ mod tests {
         display.redraw_fps = 60;
         display.animation_fps = 60;
 
-        // Temporarily set JCODE_NO_ANIMATION=1 and verify the policy.
-        let prev = std::env::var("JCODE_NO_ANIMATION").ok();
-        unsafe {
-            std::env::set_var("JCODE_NO_ANIMATION", "1");
-        }
-        let policy = tui_policy_for(&profile, &display);
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("JCODE_NO_ANIMATION", &v);
-            },
-            None => unsafe {
-                std::env::remove_var("JCODE_NO_ANIMATION");
-            },
-        }
+        // Inject the flag instead of exporting JCODE_NO_ANIMATION: set_var is
+        // process-global, so forcing it here made sibling tests that assert
+        // animations stay ON fail depending on thread scheduling.
+        let policy = tui_policy_with_no_animation(&profile, &display, true);
 
         assert!(policy.no_animation);
         assert!(!policy.enable_decorative_animations);
