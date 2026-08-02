@@ -482,20 +482,10 @@ impl Agent {
 
         let mut tools = self.build_filtered_tool_definitions().await;
 
-        // Append deferred tool index to load_tools description when deferred mode is on.
-        if self.deferred_tools_active()
-            && let Some(lt) = tools.iter_mut().find(|d| d.name == "load_tools")
-        {
-            let index = self.registry.deferred_tool_index().await;
-            if !index.is_empty() {
-                let mut desc = lt.description.clone();
-                desc.push_str("\n\nDeferred tools available to load:\n");
-                for (name, summary) in &index {
-                    desc.push_str(&format!("- {name} — {summary}\n"));
-                }
-                lt.description = desc;
-            }
-        }
+        // Without this a withheld tool is invisible rather than deferred, so
+        // the capability is lost instead of traded for a round-trip.
+        let index = self.registry.deferred_tool_index().await;
+        crate::tool::deferral_policy::advertise_deferred_tools(&mut tools, index);
 
         // Lock the tool list to prevent cache invalidation when more tools
         // arrive asynchronously mid-session.
@@ -524,6 +514,16 @@ impl Agent {
         Self::apply_selfdev_tool_surface(&mut tools, self.session.is_canary);
         self.apply_swarm_prompt_surface(&mut tools);
 
+        // Trim the measured long tail on every window size. Full deferral only
+        // triggers on a small window, so a roomy model kept paying ~5.4k tokens
+        // per request for tools used in under 3% of sessions. Anything the
+        // session has explicitly expanded via `load_tools` stays.
+        let expanded = crate::tool::session_expanded_tools(&self.session.id);
+        tools.retain(|tool| {
+            !crate::tool::RARELY_USED_DEFERRED_TOOLS.contains(&tool.name.as_str())
+                || expanded.contains(&tool.name)
+        });
+
         // Apply deferred tool filtering: when deferred mode is on, drop definitions
         // not in CORE_FULL_SCHEMA_TOOLS ∪ expanded set.
         //
@@ -536,7 +536,6 @@ impl Agent {
                 self.provider.context_window(),
             )
         {
-            let expanded = crate::tool::session_expanded_tools(&self.session.id);
             Self::apply_deferred_filter(&mut tools, &expanded);
         }
 

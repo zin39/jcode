@@ -1795,27 +1795,21 @@ impl CommunicateTool {
     /// Base description without any swarm prompt appended.
     const BASE_DESCRIPTION: &'static str = "Coordinate agents. In light-swarm and normal ad hoc use, only the root session may spawn agents, keeping execution to one level of fan-out. Recursive spawning is enabled only when the root session is running in swarm-deep mode; deep descendants may then spawn their own children, bounded by the configured live-agent limit and the absolute swarm member cap. For spawn, prefer providing a prompt so the new agent starts with a concrete task instead of idling. Spawned/assigned agents automatically report their final response back to the agent that spawned them; you can stop any agent in the subtree you spawned.\n\nCommunication: prefer structural dataflow (task-graph artifacts via complete_node) over chat, and DMs for point-to-point coordination. broadcast reaches only your spawned subtree (whole swarm for the coordinator) and should be rare; channels and shared-context are discouraged legacy primitives.";
 
-    /// Build the description with the swarm prompt resolved against
-    /// `working_dir`.
+    /// The tool description.
     ///
-    /// The registry builds one shared tool at startup, where the session's
-    /// directory is not known yet, so `new()` resolves against the process cwd.
-    /// That silently ignores a per-project `./.jcode/swarm-prompt.md` whenever
-    /// the session directory differs from the process cwd, which is the normal
-    /// case for remote and multi-session use. The agent re-renders this per
-    /// session with the real working directory, mirroring how project-local MCP
-    /// config is resolved (issue #420).
-    pub fn description_for_dir(working_dir: Option<&std::path::Path>) -> String {
-        let swarm_prompt = crate::prompt::load_swarm_prompt(working_dir);
-        if swarm_prompt.is_empty() {
-            Self::BASE_DESCRIPTION.to_string()
-        } else {
-            format!(
-                "{}\n\nSwarm prompt (user-tunable via ~/.jcode/swarm-prompt.md):\n{}",
-                Self::BASE_DESCRIPTION,
-                swarm_prompt
-            )
-        }
+    /// The user's `swarm-prompt.md` used to be appended here, which put it in
+    /// the tool schema of every request in every session, including the 62%
+    /// that never spawn an agent (1,052 tokens per request as measured on a
+    /// real machine). It is model-routing guidance only a coordinator acts on,
+    /// so it now ships in the system prompt's dynamic part next to the
+    /// auto-delegation directive, which is already gated to sessions that can
+    /// actually spawn. See `Agent::append_auto_delegation_directive`.
+    ///
+    /// `working_dir` is retained so a per-project `./.jcode/swarm-prompt.md`
+    /// still resolves against the session directory rather than the process cwd
+    /// (issue #420); the loading now happens on the prompt side.
+    pub fn description_for_dir(_working_dir: Option<&std::path::Path>) -> String {
+        Self::BASE_DESCRIPTION.to_string()
     }
 }
 

@@ -857,14 +857,14 @@ async fn test_every_deferred_tool_is_reachable_via_index() {
     assert!(!index.is_empty(), "deferred index must not be empty");
 }
 
-/// The registry builds one shared `swarm` tool at startup and resolves the
-/// swarm prompt against the process cwd, so a per-project
-/// `./.jcode/swarm-prompt.md` was ignored for any session whose directory is
-/// not the process cwd (the normal case for remote and multi-session use).
-/// `description_for_dir` resolves it against a caller-supplied directory so the
-/// agent can re-render it per session.
+/// The tool description must stay free of the user's swarm-prompt.md.
+///
+/// It previously embedded that file, which shipped project routing guidance in
+/// the tool schema of every request. The project-local override still applies;
+/// it is now emitted in the system prompt, and
+/// `swarm_prompt_reaches_coordinators_only` covers that path.
 #[test]
-fn test_swarm_description_honors_project_working_dir() {
+fn test_swarm_description_excludes_user_swarm_prompt() {
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(project.path().join(".jcode")).unwrap();
     std::fs::write(
@@ -874,18 +874,14 @@ fn test_swarm_description_honors_project_working_dir() {
     .unwrap();
 
     let scoped = super::communicate::CommunicateTool::description_for_dir(Some(project.path()));
-    assert!(
-        scoped.contains("PROJECT ROUTING MARKER"),
-        "project override must reach the tool description"
-    );
-
-    // The shared/default rendering resolves against the process cwd and so must
-    // not pick up this project's override.
     let unscoped = super::communicate::CommunicateTool::description_for_dir(None);
-    assert!(!unscoped.contains("PROJECT ROUTING MARKER"));
 
-    // Both keep the base description, so scoping never drops the tool's own docs.
     for desc in [&scoped, &unscoped] {
+        assert!(
+            !desc.contains("PROJECT ROUTING MARKER"),
+            "routing guidance must not ride along in the tool schema"
+        );
+        // The tool's own contract must survive the change.
         assert!(desc.contains("Coordinate agents."));
     }
 }

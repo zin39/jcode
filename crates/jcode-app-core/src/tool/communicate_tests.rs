@@ -1090,26 +1090,6 @@ async fn spawn_execute_rejects_missing_label_before_sending_request() {
 }
 
 #[test]
-fn description_includes_swarm_prompt_guidance() {
-    let tool = CommunicateTool::new();
-    let description = tool.description();
-    assert!(
-        description.contains("Swarm prompt"),
-        "description should embed the swarm prompt section"
-    );
-    assert!(
-        description.contains("only the root session may spawn agents"),
-        "description should advertise the enforced light/ad hoc spawn boundary"
-    );
-    assert!(
-        description.contains(
-            "Recursive spawning is enabled only when the root session is running in swarm-deep mode"
-        ),
-        "description should reserve recursive spawning for deep-swarm roots"
-    );
-}
-
-#[test]
 fn format_swarm_model_list_renders_routes_and_pin() {
     let routes = vec![
         jcode_provider_core::ModelRoute {
@@ -1780,3 +1760,5 @@ fn run_plan_terminal_summary_includes_recorded_failure_reasons() {
 include!("communicate_tests/input_format.rs");
 include!("communicate_tests/end_to_end.rs");
 include!("communicate_tests/assignment.rs");
+
+include!("communicate_description_tests.rs");

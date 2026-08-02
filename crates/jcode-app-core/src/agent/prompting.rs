@@ -274,9 +274,17 @@ impl Agent {
     /// full system prompt (which needs skills, memory and a working dir).
     #[cfg(test)]
     pub(crate) fn delegation_directive_emitted_for_test(&self) -> bool {
+        self.delegation_block_for_test()
+            .contains("Delegation policy")
+    }
+
+    /// Test hook: the full dynamic block this session would receive from the
+    /// auto-delegation append, including the user's swarm prompt.
+    #[cfg(test)]
+    pub(crate) fn delegation_block_for_test(&self) -> String {
         let mut split = crate::prompt::SplitSystemPrompt::default();
         self.append_auto_delegation_directive(&mut split);
-        split.dynamic_part.contains("Delegation policy")
+        split.dynamic_part
     }
 
     fn append_gold_mode_directive(&self, split: &mut crate::prompt::SplitSystemPrompt) {
@@ -329,6 +337,27 @@ impl Agent {
             split.dynamic_part.push_str("\n\n");
         }
         split.dynamic_part.push_str(AUTO_DELEGATION_DIRECTIVE);
+
+        // The user's swarm-prompt.md is model-routing guidance that only a
+        // session which can spawn will ever act on. It used to be appended to
+        // the `swarm` tool description, so it shipped on every request in every
+        // session, including the 62% that never spawn an agent. Measured on
+        // this machine it is 1,052 tokens per request.
+        //
+        // Emitting it here instead keeps it byte-identical for coordinators
+        // while removing it from workers and from sessions that never delegate.
+        let swarm_prompt = crate::prompt::load_swarm_prompt(
+            self.session
+                .working_dir
+                .as_deref()
+                .map(std::path::Path::new),
+        );
+        if !swarm_prompt.is_empty() {
+            split
+                .dynamic_part
+                .push_str("\n\nSwarm prompt (user-tunable via ~/.jcode/swarm-prompt.md):\n");
+            split.dynamic_part.push_str(&swarm_prompt);
+        }
     }
 
     /// Non-blocking memory prompt - takes pending result and spawns check for next turn

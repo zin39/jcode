@@ -51,6 +51,9 @@ pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMod
 pub use jcode_tool_types::{ToolImage, ToolOutput};
 pub(crate) use session_search::spawn_recent_index_warmup;
 
+pub mod deferral_policy;
+pub use deferral_policy::RARELY_USED_DEFERRED_TOOLS;
+
 /// Tools that always ship full schemas even in deferred mode (spec:
 /// deferred-tool-schemas). load_tools must stay here or the model could
 /// never expand anything.

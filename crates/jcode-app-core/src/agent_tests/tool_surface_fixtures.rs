@@ -94,15 +94,26 @@ async fn gmail_is_exposed_by_default_and_can_be_explicitly_disabled() {
     let tool_names = agent.tool_names().await;
     let tool_name = "gmail";
 
+    // gmail is in RARELY_USED_DEFERRED_TOOLS (measured: 2 calls across 789
+    // sessions), so it is deferred rather than inlined. "Available by default"
+    // must still hold: the model has to be able to see it and run it.
     assert!(
-        definitions
+        !definitions
             .iter()
             .any(|definition| definition.name == tool_name),
-        "{tool_name} must be sent in model-visible tool definitions by default"
+        "{tool_name} is rarely used and should not ship its full schema by default"
+    );
+    let load_tools = definitions
+        .iter()
+        .find(|d| d.name == "load_tools")
+        .expect("load_tools must be inline so deferred tools can be expanded");
+    assert!(
+        load_tools.description.contains(tool_name),
+        "{tool_name} must stay discoverable via the load_tools index"
     );
     assert!(
         tool_names.iter().any(|name| name == tool_name),
-        "{tool_name} must be listed as model-visible by default"
+        "{tool_name} must remain registered and callable by default"
     );
     agent
         .validate_tool_allowed(tool_name)
@@ -294,5 +305,101 @@ async fn mcp_late_registration_rebuild_happens_at_most_once() {
     assert!(
         unlocked_names.iter().any(|n| n == "mcp__test__second"),
         "after explicit unlock, the second-wave MCP tool must finally surface"
+    );
+}
+
+/// The user's `swarm-prompt.md` must still reach a coordinator after moving out
+/// of the `swarm` tool description, and must NOT reach a spawned worker.
+///
+/// It used to ride in the tool schema, so it was billed on every request in
+/// every session (1,052 tokens as measured on a real machine) including the
+/// majority that never spawn an agent. Moving it must not silently drop the
+/// guidance for the sessions that actually route models with it.
+#[tokio::test]
+async fn swarm_prompt_reaches_coordinators_only() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("home");
+    let _home = crate::storage::scoped_test_home(home.path());
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[agents]\nauto_delegate = true\n",
+    )
+    .expect("write config");
+    std::fs::write(
+        home.path().join("swarm-prompt.md"),
+        "ROUTING MARKER: prefer the cheap model",
+    )
+    .expect("write swarm prompt");
+    crate::config::invalidate_config_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(RoomyWindowProvider);
+    let registry = Registry::new(provider.clone()).await;
+
+    let mut coordinator = Agent::new(provider.clone(), registry.clone());
+    coordinator.session.agent_role = None;
+    let block = coordinator.delegation_block_for_test();
+    assert!(
+        block.contains("ROUTING MARKER"),
+        "a coordinator must still receive the swarm prompt, got: {block}"
+    );
+
+    let mut worker = Agent::new(provider, registry);
+    worker.session.agent_role = Some(jcode_session_types::SessionAgentRole::SwarmWorker);
+    assert!(
+        !worker.delegation_block_for_test().contains("ROUTING MARKER"),
+        "a spawned worker must not be billed for coordinator routing guidance"
+    );
+}
+
+/// The rarely-used trim must DEFER capability, never delete it.
+///
+/// Each withheld tool has to stay (a) discoverable, by appearing in the
+/// `load_tools` index the model can read, and (b) recoverable, by returning to
+/// the inline schema set once the session expands it. Otherwise the token
+/// saving is really a capability regression.
+#[tokio::test]
+async fn rarely_used_tools_are_deferred_not_deleted() {
+    let _guard = crate::storage::lock_test_env();
+    let provider: Arc<dyn Provider> = Arc::new(RoomyWindowProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.session.id = format!("trim-test-{}", std::process::id());
+
+    let tools = agent.tool_definitions().await;
+    let names: std::collections::HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+    // A representative withheld tool: measured at 0% of sessions, 1 call ever.
+    assert!(
+        !names.contains("discover_tools"),
+        "a rarely-used tool should not ship its full schema by default"
+    );
+
+    // Discoverable: the model can see it exists via load_tools.
+    let load_tools = tools
+        .iter()
+        .find(|t| t.name == "load_tools")
+        .expect("load_tools must always be inline, or nothing can be expanded");
+    assert!(
+        load_tools.description.contains("discover_tools"),
+        "a withheld tool must be listed in the load_tools index, or it is invisible \
+         rather than deferred: {}",
+        load_tools.description
+    );
+
+    // Frequently-used tools must NOT be withheld.
+    for keep in ["bash", "read", "edit", "swarm", "todo", "batch"] {
+        assert!(
+            names.contains(keep),
+            "{keep} is used in a large share of sessions and must stay inline"
+        );
+    }
+
+    // Recoverable: expanding restores the full schema.
+    crate::tool::expand_session_tools(&agent.session.id, &["discover_tools".to_string()]);
+    agent.unlock_tools();
+    let after = agent.tool_definitions().await;
+    assert!(
+        after.iter().any(|t| t.name == "discover_tools"),
+        "load_tools must restore a deferred tool's full schema"
     );
 }
