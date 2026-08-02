@@ -883,47 +883,19 @@ impl MultiProvider {
     ) -> Option<(crate::provider_catalog::OpenAiCompatibleProfile, &str)> {
         model_pin::openai_compatible_model_prefix(model)
     }
-
     /// Find the configured OpenAI-compatible profile that serves a bare model
     /// id, using the live route catalog as the source of truth.
-    ///
-    /// Route specs from the picker carry a `<profile>:<model>` prefix, but
-    /// hand-typed `/model <id>` and saved sessions can carry the bare id. The
-    /// active profile wins when several profiles serve the same id, so a
-    /// re-select of the current model never silently hops endpoints.
     fn openai_compatible_profile_owning_model(
         &self,
         model: &str,
     ) -> Option<crate::provider_catalog::OpenAiCompatibleProfile> {
-        let model = model.trim();
-        if model.is_empty() {
-            return None;
-        }
-
-        let active_profile_id = ProviderRegistry::new(self).active_compatible_profile_id();
-        let mut fallback: Option<String> = None;
-        for route in self.fresh_routes_memo_entry().routes {
-            if !route.available || route.model != model {
-                continue;
-            }
-            let Some(profile_id) = route
-                .api_method
-                .strip_prefix("openai-compatible:")
-                .map(str::trim)
-                .filter(|profile_id| !profile_id.is_empty())
-            else {
-                continue;
-            };
-            if active_profile_id.as_deref() == Some(profile_id) {
-                fallback = Some(profile_id.to_string());
-                break;
-            }
-            if fallback.is_none() {
-                fallback = Some(profile_id.to_string());
-            }
-        }
-
-        crate::provider_catalog::openai_compatible_profile_by_id(&fallback?)
+        model_pin::openai_compatible_profile_owning_model(
+            model,
+            ProviderRegistry::new(self)
+                .active_compatible_profile_id()
+                .as_deref(),
+            || self.fresh_routes_memo_entry().routes,
+        )
     }
 
     fn named_provider_profile_model_prefix(model: &str) -> Option<(String, String)> {
@@ -1813,7 +1785,10 @@ impl Provider for MultiProvider {
             anyhow::bail!("Model cannot be empty");
         }
 
-        if let Some((profile, target_model)) = Self::openai_compatible_model_prefix(requested_model)
+        if let Some((profile, target_model)) =
+            model_pin::resolve_openai_compatible_target(requested_model, |m| {
+                self.openai_compatible_profile_owning_model(m)
+            })?
         {
             return self.set_model_on_openai_compatible_profile(profile, target_model);
         }
