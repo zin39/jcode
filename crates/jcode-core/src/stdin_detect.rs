@@ -263,9 +263,17 @@ mod macos {
             return StdinState::NotReading;
         }
 
-        // Check thread states - if any thread is in WAITING state,
-        // the process might be blocked on I/O
-        if is_thread_waiting(pid as i32) {
+        // "Some thread is waiting" is far too weak to mean "blocked reading
+        // stdin". Any multi-threaded process parks idle threads in
+        // TH_STATE_WAITING, so this reported Reading for a process that never
+        // touched stdin: the test runner itself trips it, which is why
+        // test_own_process_not_reading_stdin failed on macOS.
+        //
+        // Require instead that the process look single-threaded-blocked: every
+        // thread waiting AND no thread burning CPU. A process genuinely parked
+        // in read(0) has nothing runnable; one merely holding idle workers has
+        // a live thread doing work.
+        if all_threads_idle(pid as i32) {
             return StdinState::Reading;
         }
 
@@ -308,8 +316,15 @@ mod macos {
         false
     }
 
-    fn is_thread_waiting(pid: i32) -> bool {
-        // Get thread list
+    /// Whether every thread is parked and none is consuming CPU.
+    ///
+    /// This is the macOS stand-in for Linux's `/proc/PID/syscall` check, which
+    /// can name the exact syscall and fd. libproc exposes no equivalent, so the
+    /// closest safe approximation is "nothing is runnable". Returning false
+    /// when unsure keeps the failure direction safe: callers treat Reading as
+    /// "wait for the user", so a false positive would stall on a process that
+    /// is merely busy.
+    fn all_threads_idle(pid: i32) -> bool {
         let mut thread_ids = vec![0u64; 64];
         let ret = unsafe {
             proc_pidinfo(
@@ -326,8 +341,11 @@ mod macos {
         }
 
         let num_threads = ret as usize / mem::size_of::<u64>();
+        if num_threads == 0 {
+            return false;
+        }
 
-        // Check each thread's state
+        let mut inspected = 0usize;
         for &thread_id in thread_ids.iter().take(num_threads) {
             let mut tinfo: proc_threadinfo = unsafe { mem::zeroed() };
             let ret = unsafe {
@@ -339,13 +357,18 @@ mod macos {
                     mem::size_of::<proc_threadinfo>() as i32,
                 )
             };
-
-            if ret > 0 && tinfo.pth_run_state == TH_STATE_WAITING {
-                return true;
+            if ret <= 0 {
+                // Could not classify this thread, so we cannot claim the
+                // process is fully parked.
+                return false;
+            }
+            inspected += 1;
+            if tinfo.pth_run_state != TH_STATE_WAITING || tinfo.pth_cpu_usage > 0 {
+                return false;
             }
         }
 
-        false
+        inspected > 0
     }
 }
 
