@@ -191,6 +191,36 @@ async fn can_read_full_context(
         .unwrap_or(false)
 }
 
+/// How long a read-only swarm inspection waits for a busy agent's lock.
+///
+/// An agent holds its lock for the duration of a turn, so `try_lock` fails
+/// whenever the target is mid-work, which is exactly when a coordinator wants
+/// to look at it. Rejecting immediately turned a normal contention window into
+/// a tool failure the caller had to notice and retry by hand: "is busy; try
+/// summary again shortly" is the single most common swarm tool error in
+/// ~/.jcode/logs (41 occurrences across the retained logs).
+///
+/// A short bounded wait absorbs the common case where the lock frees in
+/// milliseconds. It stays short because these handlers are awaited inline in
+/// the per-client request loop, so this delays only the requesting client, and
+/// a genuinely long-running turn still reports busy rather than hanging.
+const BUSY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Acquire a lock, waiting up to [`BUSY_LOCK_WAIT`] rather than failing on
+/// contention. `None` means the holder is still working, which callers turn
+/// into the "busy, retry shortly" response.
+///
+/// Generic over the guarded type so the waiting behavior is testable without
+/// constructing a whole [`Agent`].
+async fn lock_or_busy<T>(lock: &Mutex<T>) -> Option<tokio::sync::MutexGuard<'_, T>> {
+    match tokio::time::timeout(BUSY_LOCK_WAIT, lock.lock()).await {
+        Ok(guard) => Some(guard),
+        // Elapsing is the expected outcome for a target that is mid-turn, not
+        // an error to report.
+        Err(_elapsed) => None,
+    }
+}
+
 pub(super) async fn handle_comm_summary(
     id: u64,
     req_session_id: String,
@@ -215,7 +245,7 @@ pub(super) async fn handle_comm_summary(
     let limit = limit.unwrap_or(10);
     let agent_sessions = sessions.read().await;
     if let Some(agent) = agent_sessions.get(&target_session) {
-        let tool_calls = if let Ok(agent) = agent.try_lock() {
+        let tool_calls = if let Some(agent) = lock_or_busy(agent).await {
             agent.get_tool_call_summaries(limit)
         } else {
             let _ = client_event_tx.send(ServerEvent::Error {
@@ -354,7 +384,7 @@ pub(super) async fn handle_comm_read_context(
 
     let agent_sessions = sessions.read().await;
     if let Some(agent) = agent_sessions.get(&target_session) {
-        let messages = if let Ok(agent) = agent.try_lock() {
+        let messages = if let Some(agent) = lock_or_busy(agent).await {
             agent.get_history()
         } else {
             let _ = client_event_tx.send(ServerEvent::Error {
@@ -495,5 +525,79 @@ pub(super) async fn handle_comm_resync_plan(
             message: "Not in a swarm.".to_string(),
             retry_after_secs: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod busy_lock_tests {
+    use super::*;
+
+    /// An uncontended lock must be returned immediately, so the bounded wait
+    /// adds no latency to the normal path.
+    #[tokio::test]
+    async fn uncontended_lock_is_acquired_immediately() {
+        let agent: Arc<Mutex<u32>> = Arc::new(Mutex::new(7));
+        let start = std::time::Instant::now();
+        let guard = lock_or_busy(&agent).await;
+        assert!(guard.is_some(), "an uncontended lock must be acquired");
+        assert!(
+            start.elapsed() < BUSY_LOCK_WAIT / 2,
+            "should not wait when free, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The failure this fixes: a lock held briefly by an in-flight turn used to
+    /// reject the caller outright. Waiting absorbs that contention window.
+    #[tokio::test]
+    async fn briefly_held_lock_is_waited_for_rather_than_rejected() {
+        let agent: Arc<Mutex<u32>> = Arc::new(Mutex::new(7));
+        let holder = agent.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Hold the lock on another task so the guard's lifetime is owned there,
+        // mirroring an agent that holds its lock across an in-flight turn.
+        tokio::spawn(async move {
+            let guard = holder.lock().await;
+            let _ = held_tx.send(());
+            let _ = release_rx.await;
+            drop(guard);
+        });
+        held_rx.await.expect("holder should take the lock");
+
+        // try_lock is what the old code did, and it fails here.
+        assert!(
+            agent.try_lock().is_err(),
+            "precondition: the lock is contended"
+        );
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = release_tx.send(());
+        });
+
+        let acquired = lock_or_busy(&agent).await;
+        assert!(
+            acquired.is_some(),
+            "a briefly held lock should be waited for, not rejected"
+        );
+    }
+
+    /// A genuinely long-running turn must still report busy rather than hang
+    /// the requesting client.
+    #[tokio::test]
+    async fn long_held_lock_still_reports_busy() {
+        let agent: Arc<Mutex<u32>> = Arc::new(Mutex::new(7));
+        let _held = agent.lock().await;
+
+        let start = std::time::Instant::now();
+        let acquired = lock_or_busy(&agent).await;
+        assert!(acquired.is_none(), "a held lock must time out");
+        assert!(
+            start.elapsed() < BUSY_LOCK_WAIT * 3,
+            "must give up promptly, took {:?}",
+            start.elapsed()
+        );
     }
 }
