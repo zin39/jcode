@@ -213,12 +213,13 @@ const BUSY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(750
 /// Generic over the guarded type so the waiting behavior is testable without
 /// constructing a whole [`Agent`].
 async fn lock_or_busy<T>(lock: &Mutex<T>) -> Option<tokio::sync::MutexGuard<'_, T>> {
-    match tokio::time::timeout(BUSY_LOCK_WAIT, lock.lock()).await {
-        Ok(guard) => Some(guard),
-        // Elapsing is the expected outcome for a target that is mid-turn, not
-        // an error to report.
-        Err(_elapsed) => None,
+    // Elapsing is the expected outcome for a target that is mid-turn, not an
+    // error to report, so the timeout result is deliberately reduced to
+    // "did we get the lock?".
+    if let Ok(guard) = tokio::time::timeout(BUSY_LOCK_WAIT, lock.lock()).await {
+        return Some(guard);
     }
+    None
 }
 
 pub(super) async fn handle_comm_summary(
