@@ -530,13 +530,11 @@ pub fn named_provider_profile_routes(
             }
         }
 
-        // Schedule background refresh if cache missing or stale.
-        // Note: Named providers from config.toml don't have OpenAiCompatibleProfile entries,
-        // so we can't schedule refresh through the profile-based mechanism. The cache will
-        // be populated when the provider is actually used by the runtime.
+        // Cache miss: have the runtime fetch this profile's catalog in the
+        // background. See `named_profile_catalog` for why skipping it stranded
+        // profiles that declare no static models.
         if !from_live_catalog {
-            // The cache refresh is handled by the runtime when the provider is used.
-            // For now, we just fall back to static models.
+            super::named_profile_catalog::schedule_refresh(profile_name, profile_config);
         }
     }
 

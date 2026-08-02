@@ -2793,5 +2793,7 @@ pub fn cache_ttl_for_provider_model(provider: &str, model: Option<&str>) -> Opti
     }
 }
 
+mod named_profile_catalog;
+
 #[cfg(test)]
 mod tests;

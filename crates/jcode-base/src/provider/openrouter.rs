@@ -47,7 +47,10 @@ pub(crate) fn maybe_schedule_openai_compatible_profile_catalog_refresh(
     profile: crate::provider_catalog::OpenAiCompatibleProfile,
     context: &'static str,
 ) -> bool {
-    super::external::maybe_schedule_profile_catalog_refresh(profile, context)
+    super::external::maybe_schedule_profile_catalog_refresh(
+        resolve_openai_compatible_profile(profile),
+        context,
+    )
 }
 
 /// Schedule a background refresh of the standard public OpenRouter catalog

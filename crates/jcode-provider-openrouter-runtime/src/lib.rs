@@ -758,11 +758,11 @@ fn finish_profile_catalog_refresh(profile_id: &str) {
     }
 }
 
+/// Background `/models` fetch. Resolved input lets config-only profiles share it.
 pub fn maybe_schedule_openai_compatible_profile_catalog_refresh(
-    profile: jcode_base::provider_catalog::OpenAiCompatibleProfile,
+    resolved: jcode_base::provider_catalog::ResolvedOpenAiCompatibleProfile,
     context: &'static str,
 ) -> bool {
-    let resolved = jcode_base::provider_catalog::resolve_openai_compatible_profile(profile);
     if !begin_profile_catalog_refresh(&resolved.id) {
         return false;
     }

@@ -88,7 +88,9 @@ where
 /// route-building path calls this on a display cache miss; when unregistered
 /// (e.g. minimal test binaries) the refresh is skipped gracefully.
 type ProfileCatalogRefresh = Arc<
-    dyn Fn(crate::provider_catalog::OpenAiCompatibleProfile, &'static str) -> bool + Send + Sync,
+    dyn Fn(crate::provider_catalog::ResolvedOpenAiCompatibleProfile, &'static str) -> bool
+        + Send
+        + Sync,
 >;
 
 fn profile_catalog_refresh_slot() -> &'static RwLock<Option<ProfileCatalogRefresh>> {
@@ -99,7 +101,7 @@ fn profile_catalog_refresh_slot() -> &'static RwLock<Option<ProfileCatalogRefres
 /// Register the background profile-catalog refresh scheduler.
 pub fn register_profile_catalog_refresh<F>(refresh: F)
 where
-    F: Fn(crate::provider_catalog::OpenAiCompatibleProfile, &'static str) -> bool
+    F: Fn(crate::provider_catalog::ResolvedOpenAiCompatibleProfile, &'static str) -> bool
         + Send
         + Sync
         + 'static,
@@ -145,7 +147,7 @@ pub(crate) fn maybe_schedule_standard_openrouter_catalog_refresh(context: &'stat
 /// profile. Returns false when no scheduler is registered or the refresh was
 /// not started.
 pub(crate) fn maybe_schedule_profile_catalog_refresh(
-    profile: crate::provider_catalog::OpenAiCompatibleProfile,
+    profile: crate::provider_catalog::ResolvedOpenAiCompatibleProfile,
     context: &'static str,
 ) -> bool {
     let refresh = profile_catalog_refresh_slot()

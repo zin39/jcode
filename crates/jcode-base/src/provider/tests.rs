@@ -1066,3 +1066,5 @@ include!("tests/model_resolution.rs");
 include!("tests/transport_only_routing.rs");
 include!("tests/fallback_failover.rs");
 include!("tests/catalog_subscription.rs");
+
+include!("tests/named_profile_catalog_fetch.rs");
