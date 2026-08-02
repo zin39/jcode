@@ -25,7 +25,18 @@ const DEFAULT_BACKOFF: Duration = Duration::from_secs(900);
 const MAX_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
 
 fn backoff_dir() -> Option<PathBuf> {
-    Some(crate::storage::jcode_dir().ok()?.join("usage-backoff"))
+    match crate::storage::jcode_dir() {
+        Ok(dir) => Some(dir.join("usage-backoff")),
+        Err(e) => {
+            // No home means no shared window, so the poller silently reverts to
+            // the per-process backoff this module replaces. Say so once here
+            // rather than letting it look like the backoff is working.
+            crate::logging::warn(&format!(
+                "usage backoff: no jcode home ({e}); falling back to per-process backoff"
+            ));
+            None
+        }
+    }
 }
 
 /// Path of `provider`'s marker file inside `dir`.
@@ -33,7 +44,16 @@ fn backoff_dir() -> Option<PathBuf> {
 /// Takes the directory rather than resolving it, so the window logic below is
 /// testable against a tempdir without reaching for the process-wide jcode home.
 fn backoff_path_in(dir: &Path, provider: &str) -> Option<PathBuf> {
-    std::fs::create_dir_all(dir).ok()?;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        // Without a usable directory the whole cross-process backoff silently
+        // degrades to the per-process one this module exists to replace, so
+        // say it rather than failing quietly.
+        crate::logging::warn(&format!(
+            "usage backoff: cannot create {}: {e}; falling back to per-process backoff",
+            dir.display()
+        ));
+        return None;
+    }
     // Provider labels come from a fixed internal set, but keep the filename
     // sanitized so a future caller cannot escape the directory.
     let safe: String = provider
@@ -67,22 +87,44 @@ fn record_rate_limited_in(dir: &Path, provider: &str, backoff: Option<Duration>)
     {
         return;
     }
-    if let Ok(epoch) = until.duration_since(SystemTime::UNIX_EPOCH) {
-        let _ = std::fs::write(&path, epoch.as_secs().to_string());
+    let Ok(epoch) = until.duration_since(SystemTime::UNIX_EPOCH) else {
+        // Only reachable if the clock is before the epoch; nothing sane to persist.
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, epoch.as_secs().to_string()) {
+        crate::logging::warn(&format!(
+            "usage backoff: cannot record window at {}: {e}; other processes will keep polling",
+            path.display()
+        ));
+    }
+}
+
+/// Remove a marker file, tolerating a concurrent remover.
+///
+/// Several processes can retire the same expired window at once, so a missing
+/// file is the expected outcome rather than a failure worth reporting.
+fn remove_marker(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logging::warn(&format!(
+            "usage backoff: cannot clear {}: {e}",
+            path.display()
+        ));
     }
 }
 
 /// Clear the window once a request succeeds again.
 pub(super) fn clear_rate_limited(provider: &str) {
     if let Some(path) = backoff_path(provider) {
-        let _ = std::fs::remove_file(path);
+        remove_marker(&path);
     }
 }
 
 #[cfg(test)]
 fn clear_rate_limited_in(dir: &Path, provider: &str) {
     if let Some(path) = backoff_path_in(dir, provider) {
-        let _ = std::fs::remove_file(path);
+        remove_marker(&path);
     }
 }
 
@@ -105,19 +147,41 @@ fn rate_limited_for_in(dir: &Path, provider: &str) -> Option<Duration> {
         // Window elapsed (or the clock moved backwards past it): drop the file
         // so a stale marker cannot linger.
         _ => {
-            let _ = std::fs::remove_file(&path);
+            remove_marker(&path);
             None
         }
     }
 }
 
 fn read_until(path: &Path) -> Option<SystemTime> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        // No marker is the normal "not throttled" state, not a problem.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            crate::logging::warn(&format!(
+                "usage backoff: cannot read {}: {e}; treating as not throttled",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let Ok(secs) = raw.trim().parse::<u64>() else {
+        crate::logging::warn(&format!(
+            "usage backoff: discarding unreadable window at {}",
+            path.display()
+        ));
+        remove_marker(path);
+        return None;
+    };
     let until = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
     // Guard against a corrupt or far-future value pinning the backoff forever.
     if until > SystemTime::now() + MAX_BACKOFF {
-        let _ = std::fs::remove_file(path);
+        crate::logging::warn(&format!(
+            "usage backoff: discarding implausible window at {}",
+            path.display()
+        ));
+        remove_marker(path);
         return None;
     }
     Some(until)
@@ -132,13 +196,21 @@ pub(super) fn looks_rate_limited(error: &str) -> bool {
 
 /// Backoff requested by a `retry-after` header, clamped to a sane window.
 pub(super) fn retry_after_backoff(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let secs: u64 = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    // An absent header is the common case and carries no information. A present
+    // but unparsable one means we are ignoring a server instruction, so name it
+    // and fall back to the default window rather than pretending it was absent.
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?;
+    let Ok(text) = raw.to_str() else {
+        crate::logging::warn("usage backoff: retry-after header is not valid text; using default");
+        return None;
+    };
+    let Ok(secs) = text.trim().parse::<u64>() else {
+        // HTTP also allows an HTTP-date here; we only understand delta-seconds.
+        crate::logging::warn(&format!(
+            "usage backoff: cannot parse retry-after {text:?}; using default"
+        ));
+        return None;
+    };
     Some(Duration::from_secs(secs).min(MAX_BACKOFF))
 }
 
