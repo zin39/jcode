@@ -121,3 +121,56 @@ fn transport_only_spec_resolves_a_named_config_profile() {
         assert_eq!(resolved.1, "qwen3.7-max");
     });
 }
+
+/// End-to-end against the REAL user config: the model the user actually
+/// selected must resolve to the profile that actually serves it.
+///
+/// The synthetic tests above build their own routes, so they cannot catch a
+/// mismatch between the resolver and the shape real config produces. This one
+/// reads `[providers.*]` from the live config and asserts that a profile
+/// declaring a model is reachable from the transport-only spec the picker emits.
+///
+/// Skips (rather than fails) when no OpenAI-compatible profile with declared
+/// models is configured, so it stays meaningful on a clean checkout.
+#[test]
+fn transport_only_spec_resolves_against_real_config_profiles() {
+    let config = crate::config::config();
+    let Some((profile_name, model_id)) = config.providers.iter().find_map(|(name, cfg)| {
+        cfg.models
+            .first()
+            .map(|m| (name.clone(), m.id.clone()))
+            .or_else(|| cfg.default_model.clone().map(|m| (name.clone(), m)))
+    }) else {
+        return;
+    };
+
+    let api_method = crate::provider_catalog::openai_compatible_api_method(&profile_name);
+    assert!(
+        api_method.starts_with("openai-compatible:"),
+        "named profiles must emit a profile-qualified api_method, got {api_method}"
+    );
+
+    let spec = format!("openai-compatible:{model_id}");
+    let resolved = model_pin::resolve_openai_compatible_target(&spec, |m| {
+        model_pin::openai_compatible_profile_id_owning_model(m, None, || {
+            vec![ModelRoute {
+                model: model_id.clone(),
+                provider: profile_name.clone(),
+                api_method: api_method.clone(),
+                available: true,
+                detail: String::new(),
+                cheapness: None,
+            }]
+        })
+    })
+    .expect("a configured profile serving the model must resolve, not error")
+    .expect("the spec names an OpenAI-compatible target");
+
+    assert_eq!(resolved.1, model_id);
+    // Whichever kind it is, it must carry the profile that serves the model
+    // rather than falling back to the generic catch-all endpoint.
+    match resolved.0 {
+        model_pin::OpenAiCompatibleTarget::Named(ref n) => assert_eq!(n, &profile_name),
+        model_pin::OpenAiCompatibleTarget::Catalog(p) => assert_eq!(p.id, profile_name),
+    }
+}
