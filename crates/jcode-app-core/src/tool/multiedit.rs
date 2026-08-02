@@ -81,7 +81,7 @@ impl Tool for MultiEditTool {
         let path = ctx.resolve_path(Path::new(&params.file_path));
 
         if !path.exists() {
-            return Err(anyhow::anyhow!("File not found: {}", params.file_path));
+            return Err(super::read::file_not_found_error(&path, &params.file_path));
         }
 
         let original_content = tokio::fs::read_to_string(&path).await?;

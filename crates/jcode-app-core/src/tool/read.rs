@@ -156,17 +156,7 @@ impl Tool for ReadTool {
 
         // Check if file exists
         if !path.exists() {
-            // Try to find similar files
-            let suggestions = find_similar_files(&path);
-            if suggestions.is_empty() {
-                return Err(anyhow::anyhow!("File not found: {}", params.file_path));
-            } else {
-                return Err(anyhow::anyhow!(
-                    "File not found: {}\nDid you mean: {}",
-                    params.file_path,
-                    suggestions.join(", ")
-                ));
-            }
+            return Err(file_not_found_error(&path, &params.file_path));
         }
 
         // Check for image files and display in terminal if supported
@@ -304,7 +294,7 @@ fn is_binary_file(path: &Path) -> bool {
     false
 }
 
-fn find_similar_files(path: &Path) -> Vec<String> {
+pub(super) fn find_similar_files(path: &Path) -> Vec<String> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let filename = path.file_name().map(|s| s.to_string_lossy().to_lowercase());
 
@@ -326,7 +316,140 @@ fn find_similar_files(path: &Path) -> Vec<String> {
         }
     }
 
+    if suggestions.is_empty() {
+        suggestions.extend(find_path_under_existing_ancestor(path));
+    }
+
     suggestions
+}
+
+/// Suggest the real path when a wrong root, not a wrong filename, caused the miss.
+///
+/// The scan above reads `path.parent()`, so it finds nothing when the parent
+/// itself does not exist. That is the dominant shape in the logs: a path whose
+/// tail is correct but whose root is not, such as
+/// `/Users/karangupta/crates/jcode-tui/...` for a file that lives under
+/// `/Users/karangupta/new_projects/jcode/crates/jcode-tui/...`, or a typo'd home
+/// (`/Users/karagupta/...`). Those produced a bare "File not found" with no hint,
+/// and the model usually guessed again rather than locating the file.
+///
+/// Walk up to the nearest ancestor that does exist, then re-attach the missing
+/// tail beneath each of its immediate subdirectories. That reattaches a dropped
+/// path segment without a filesystem-wide search.
+fn find_path_under_existing_ancestor(path: &Path) -> Vec<String> {
+    // Find the deepest existing ancestor and the components below it.
+    let mut missing_tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    let existing = loop {
+        let Some(parent) = cursor.parent() else {
+            return Vec::new();
+        };
+        if let Some(name) = cursor.file_name() {
+            missing_tail.push(name.to_os_string());
+        }
+        if parent.is_dir() {
+            break parent;
+        }
+        if parent.as_os_str().is_empty() {
+            return Vec::new();
+        }
+        cursor = parent;
+    };
+    missing_tail.reverse();
+    if missing_tail.is_empty() {
+        return Vec::new();
+    }
+    let tail: std::path::PathBuf = missing_tail.iter().collect();
+
+    let Ok(entries) = std::fs::read_dir(existing) else {
+        return Vec::new();
+    };
+    // A dropped prefix is usually more than one directory deep
+    // ("new_projects/jcode" for this repo), so scan a few levels below the
+    // existing ancestor. The depth is small and the breadth is capped so a
+    // miss stays cheap instead of turning into a filesystem-wide search.
+    const MAX_PREFIX_DEPTH: usize = 3;
+    const MAX_DIRS_SCANNED: usize = 400;
+
+    let mut frontier: Vec<std::path::PathBuf> = readable_subdirs(entries, false);
+    let mut suggestions = Vec::new();
+    let mut scanned = 0usize;
+
+    for _ in 0..MAX_PREFIX_DEPTH {
+        let mut next = Vec::new();
+        for dir in frontier {
+            scanned += 1;
+            if scanned > MAX_DIRS_SCANNED {
+                return suggestions;
+            }
+            let candidate = dir.join(&tail);
+            if candidate.exists() {
+                suggestions.push(candidate.display().to_string());
+                if suggestions.len() >= 3 {
+                    return suggestions;
+                }
+                // The tail resolved here, so descending further only finds
+                // deeper copies of the same thing.
+                continue;
+            }
+            if let Ok(children) = std::fs::read_dir(&dir) {
+                next.extend(readable_subdirs(children, true));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    suggestions
+}
+
+/// Subdirectories of an already-open directory handle.
+///
+/// Unreadable entries are skipped on purpose: this is a best-effort hint, and a
+/// permission-denied directory simply cannot contain a suggestion, so there is
+/// nothing for the caller to act on.
+fn readable_subdirs(entries: std::fs::ReadDir, skip_ignored: bool) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if skip_ignored && is_ignored_search_dir(&path) {
+            continue;
+        }
+        dirs.push(path);
+    }
+    dirs
+}
+
+/// Directories that never hold a source file the caller meant and would
+/// otherwise dominate the scan budget.
+fn is_ignored_search_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(".git" | "node_modules" | "target" | "vendor" | ".venv" | "venv" | "build" | "dist")
+    )
+}
+
+/// The "File not found" error, including a suggestion when one can be found.
+///
+/// Shared so `read`, `edit`, and `multiedit` all offer the hint. Only `read`
+/// used to, which meant an edit against a wrong root reported a dead end while
+/// a read of the same path would have pointed at the real file.
+pub(super) fn file_not_found_error(path: &Path, displayed: &str) -> anyhow::Error {
+    let suggestions = find_similar_files(path);
+    if suggestions.is_empty() {
+        anyhow::anyhow!("File not found: {}", displayed)
+    } else {
+        anyhow::anyhow!(
+            "File not found: {}\nDid you mean: {}",
+            displayed,
+            suggestions.join(", ")
+        )
+    }
 }
 
 /// Check if a file is an image based on extension

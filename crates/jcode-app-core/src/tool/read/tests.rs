@@ -342,3 +342,91 @@ async fn read_tool_prefers_end_line_over_limit() {
         output.output
     );
 }
+
+/// The logged failure shape: a path whose tail is right but whose root is
+/// wrong. `path.parent()` does not exist, so the sibling scan reads nothing and
+/// the caller used to get a bare "File not found" with no way forward.
+#[test]
+fn suggests_the_real_path_when_the_root_is_wrong() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("new_projects/jcode/crates/tui/src/app.rs");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "fn main() {}").unwrap();
+
+    // Mirrors "/Users/karangupta/crates/..." for a file that actually lives
+    // under "/Users/karangupta/new_projects/jcode/crates/...".
+    let wrong = dir.path().join("crates/tui/src/app.rs");
+    assert!(
+        !wrong.exists(),
+        "precondition: the wrong path must not exist"
+    );
+
+    let suggestions = find_similar_files(&wrong);
+    assert!(
+        suggestions.iter().any(|s| s.contains("new_projects")),
+        "should point at the real file, got {suggestions:?}"
+    );
+}
+
+/// The suggestion has to reach the message the caller actually sees.
+#[test]
+fn file_not_found_error_includes_the_suggestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("repo/src/app.rs");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "fn main() {}").unwrap();
+
+    let wrong = dir.path().join("src/app.rs");
+    let err = file_not_found_error(&wrong, "src/app.rs").to_string();
+    assert!(err.contains("Did you mean"), "should offer a hint: {err}");
+    assert!(err.contains("repo"), "should name the real path: {err}");
+}
+
+/// A genuinely absent file must still report a plain not-found rather than an
+/// invented suggestion.
+#[test]
+fn absent_file_reports_no_suggestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nothing/like/this.rs");
+    let err = file_not_found_error(&missing, "nothing/like/this.rs").to_string();
+    assert!(err.contains("File not found"), "{err}");
+    assert!(
+        !err.contains("Did you mean"),
+        "must not invent a hint: {err}"
+    );
+}
+
+/// The search must stay bounded: a deep tree with no match should return
+/// nothing promptly rather than walking the whole filesystem.
+#[test]
+fn suggestion_search_is_bounded_on_a_deep_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    // Wide and deeper than the scan depth, with no matching tail anywhere.
+    for i in 0..40 {
+        std::fs::create_dir_all(dir.path().join(format!("d{i}/a/b/c/d/e"))).unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    let missing = dir.path().join("absent/deep/target.rs");
+    let suggestions = find_similar_files(&missing);
+
+    assert!(
+        suggestions.is_empty(),
+        "should find nothing: {suggestions:?}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "search must stay bounded, took {:?}",
+        start.elapsed()
+    );
+}
+
+/// Ignored build/vendor directories must not consume the scan budget.
+#[test]
+fn suggestion_search_skips_ignored_dirs() {
+    assert!(is_ignored_search_dir(Path::new("/repo/target")));
+    assert!(is_ignored_search_dir(Path::new("/repo/node_modules")));
+    assert!(is_ignored_search_dir(Path::new("/repo/.git")));
+    assert!(!is_ignored_search_dir(Path::new("/repo/crates")));
+    assert!(!is_ignored_search_dir(Path::new("/repo/src")));
+}
