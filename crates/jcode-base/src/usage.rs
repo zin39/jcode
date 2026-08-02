@@ -10,6 +10,7 @@ mod display;
 mod model;
 mod openai_helpers;
 mod provider_fetch;
+mod rate_limit;
 pub use accessors::*;
 use api_keys::enqueue_api_key_usage_tasks;
 use cache::*;
@@ -45,6 +46,9 @@ const MAX_BACKOFF_SECS: u64 = 1800;
 /// Consecutive Anthropic usage fetch failures for exponential backoff.
 static CONSECUTIVE_ANTHROPIC_FAILURES: AtomicU32 = AtomicU32::new(0);
 
+/// Key for the cross-process Anthropic usage backoff window.
+const ANTHROPIC_USAGE_PROVIDER: &str = "anthropic";
+
 /// Consecutive OpenAI usage fetch failures for exponential backoff.
 pub(super) static CONSECUTIVE_OPENAI_FAILURES: AtomicU32 = AtomicU32::new(0);
 
@@ -60,6 +64,22 @@ static PROVIDER_USAGE_CACHE: std::sync::OnceLock<
 async fn fetch_anthropic_usage_data(access_token: String, cache_key: String) -> Result<UsageData> {
     if let Some(cached) = cached_anthropic_usage(&cache_key) {
         return Ok(cached);
+    }
+
+    // A 429 is a property of the account/IP, not of this process, so respect a
+    // window any jcode process on the machine recorded. Without this, every new
+    // launch re-probed a throttled endpoint: 123 of 139 usage 429s logged on
+    // 2026-08-02 were a process's first attempt.
+    if let Some(remaining) = rate_limit::rate_limited_for(ANTHROPIC_USAGE_PROVIDER) {
+        let err = anthropic_usage_error(format!(
+            "Usage API rate limited; retrying in {}s",
+            remaining.as_secs()
+        ));
+        store_anthropic_usage(cache_key, err.clone());
+        anyhow::bail!(
+            err.last_error
+                .unwrap_or_else(|| "Usage API rate limited".into())
+        );
     }
 
     let client = crate::provider::shared_http_client();
@@ -93,8 +113,14 @@ async fn fetch_anthropic_usage_data(access_token: String, cache_key: String) -> 
 
     if !response.status().is_success() {
         let status = response.status();
+        // Read the server's own retry hint before consuming the body.
+        let retry_after = rate_limit::retry_after_backoff(response.headers());
         let error_text = response.text().await.unwrap_or_default();
-        let err = anthropic_usage_error(format!("Usage API error ({}): {}", status, error_text));
+        let message = format!("Usage API error ({}): {}", status, error_text);
+        if status.as_u16() == 429 || rate_limit::looks_rate_limited(&message) {
+            rate_limit::record_rate_limited(ANTHROPIC_USAGE_PROVIDER, retry_after);
+        }
+        let err = anthropic_usage_error(message);
         store_anthropic_usage(cache_key, err.clone());
         anyhow::bail!(err.last_error.unwrap_or_else(|| "Usage API error".into()));
     }
@@ -134,6 +160,7 @@ async fn fetch_anthropic_usage_data(access_token: String, cache_key: String) -> 
     };
 
     store_anthropic_usage(cache_key, usage.clone());
+    rate_limit::clear_rate_limited(ANTHROPIC_USAGE_PROVIDER);
     Ok(usage)
 }
 
