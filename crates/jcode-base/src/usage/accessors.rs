@@ -46,7 +46,12 @@ async fn refresh_usage(usage: Arc<RwLock<UsageData>>) {
             let mut data = usage.write().await;
             data.last_error = Some(err_msg.clone());
             data.fetched_at = Some(Instant::now());
-            if consecutive == 1 {
+            if super::rate_limit::is_deliberate_backoff(&err_msg) {
+                // Declining to poll inside a known backoff window is the
+                // feature working, not a failure. Logging it at ERROR made the
+                // fix for the 429 storm look like the storm it replaced.
+                crate::logging::info(&format!("Usage fetch skipped: {}", err_msg));
+            } else if consecutive == 1 {
                 crate::logging::error(&format!("Usage fetch error: {}", err_msg));
             } else {
                 crate::logging::warn(&format!(

@@ -187,6 +187,19 @@ fn read_until(path: &Path) -> Option<SystemTime> {
     Some(until)
 }
 
+/// Prefix of the error produced when we decline to poll inside a known backoff
+/// window.
+///
+/// Shared so the producer and the log-level decision cannot drift apart and
+/// start reporting a deliberate wait as a failure again.
+pub(super) const DELIBERATE_BACKOFF_PREFIX: &str = "Usage API rate limited";
+
+/// Whether this error is us honoring our own backoff rather than a real
+/// upstream failure.
+pub(super) fn is_deliberate_backoff(error: &str) -> bool {
+    error.starts_with(DELIBERATE_BACKOFF_PREFIX)
+}
+
 /// Whether an error string describes rate limiting rather than a real failure.
 pub(super) fn looks_rate_limited(error: &str) -> bool {
     error.contains("429")
@@ -340,6 +353,21 @@ mod tests {
             path.starts_with(d.path()),
             "sanitized name escaped the directory: {path:?}"
         );
+    }
+
+    /// A deliberate backoff must be distinguishable from a real failure, or it
+    /// gets logged as an error and looks like the storm it prevents.
+    #[test]
+    fn deliberate_backoff_is_distinguished_from_real_failures() {
+        assert!(is_deliberate_backoff(
+            "Usage API rate limited; retrying in 2695s"
+        ));
+        assert!(!is_deliberate_backoff(
+            "Usage API error (429 Too Many Requests): {}"
+        ));
+        assert!(!is_deliberate_backoff(
+            "Failed to fetch usage data: timeout"
+        ));
     }
 
     #[test]

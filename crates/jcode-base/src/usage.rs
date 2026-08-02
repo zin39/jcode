@@ -72,7 +72,8 @@ async fn fetch_anthropic_usage_data(access_token: String, cache_key: String) -> 
     // 2026-08-02 were a process's first attempt.
     if let Some(remaining) = rate_limit::rate_limited_for(ANTHROPIC_USAGE_PROVIDER) {
         let err = anthropic_usage_error(format!(
-            "Usage API rate limited; retrying in {}s",
+            "{}; retrying in {}s",
+            rate_limit::DELIBERATE_BACKOFF_PREFIX,
             remaining.as_secs()
         ));
         store_anthropic_usage(cache_key, err.clone());
