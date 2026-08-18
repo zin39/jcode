@@ -1935,7 +1935,7 @@ fn is_retryable_error(error_str: &str) -> bool {
     // generic 429/rate-limit matching below so we fail fast instead of burning
     // the retry budget hammering the Anthropic endpoint (e.g. Fable when the
     // usage-credit allowance is exhausted).
-    if is_out_of_credits_error(error_str) {
+    if is_out_of_credits_error(error_str) || is_account_rate_limit_error(error_str) {
         return false;
     }
     jcode_provider_core::is_transient_transport_error(error_str)
@@ -1967,6 +1967,20 @@ fn is_out_of_credits_error(error_str: &str) -> bool {
         || error_str.contains("out_of_credits")
         || error_str.contains("usage credits are required")
         || error_str.contains("out of usage credits")
+}
+
+/// Detect an Anthropic account-level rate-limit rejection.
+///
+/// Anthropic returns HTTP 429 for both short-lived transient throttles and
+/// account-budget throttles. The account-level message (e.g. "This request
+/// would exceed your account's rate limit. Please try again later.") is not
+/// fixed by the immediate retry loop, so retrying only leaves the UI in
+/// Connecting/Retrying before surfacing the same error. Let it fail fast
+/// with the original message. `error_str` is expected to already be
+/// lowercased.
+fn is_account_rate_limit_error(error_str: &str) -> bool {
+    error_str.contains("would exceed your account's rate limit")
+        || error_str.contains("would exceed your account\u{2019}s rate limit")
 }
 
 /// Detect an Anthropic "model not found" rejection.

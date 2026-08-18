@@ -747,6 +747,28 @@ fn out_of_credits_429_is_not_retryable() {
 }
 
 #[test]
+fn account_rate_limit_429_is_not_retryable() {
+    // This is the live Anthropic account-throttle body observed when Claude
+    // sessions sat in Connecting/Retrying without streaming any bytes. Retrying
+    // immediately just delays surfacing the same account-level rejection.
+    let real = "anthropic api error (429 too many requests): {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"this request would exceed your account's rate limit. please try again later.\"}}";
+
+    assert!(
+        is_account_rate_limit_error(real),
+        "should detect Anthropic account-level rate limit messages"
+    );
+    assert!(
+        !is_retryable_error(real),
+        "account-level rate limits must fail fast instead of staying in Connecting/Retrying"
+    );
+
+    // A generic transient rate limit remains retryable.
+    assert!(is_retryable_error(
+        "anthropic api error (429 too many requests): {\"type\":\"rate_limit_error\",\"message\":\"rate limit exceeded, please retry\"}"
+    ));
+}
+
+#[test]
 fn anthropic_fallback_prefers_best_available_and_skips_tried_and_retired() {
     // The fallback logic reads the process-global model catalog; lock and
     // reset it so fixture models hydrated by other tests cannot leak in.
