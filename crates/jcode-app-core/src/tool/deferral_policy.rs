@@ -25,9 +25,11 @@ pub const RARELY_USED_DEFERRED_TOOLS: &[&str] = &[
     "browser",
     "cheap_route",
     "conversation_search",
-    "discover_tools",
     "gmail",
     "initiative",
+    // Upstream renamed `discover_tools` to `integration_tools`; it is also
+    // only registered when sponsors discovery is enabled.
+    "integration_tools",
     "invalid",
     "macos_computer_use",
     "memory",

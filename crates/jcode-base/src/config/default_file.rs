@@ -10,7 +10,16 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
 
-        let default_content = r#"# jcode configuration file
+        std::fs::write(&path, Self::default_config_file_contents())?;
+        Ok(path)
+    }
+
+    /// The commented config template written by [`Self::create_default_config_file`].
+    ///
+    /// Exposed separately so tests can check that the template we ship actually
+    /// parses and documents the options it claims to.
+    pub fn default_config_file_contents() -> String {
+        let default_content = r##"# jcode configuration file
 # Location: ~/.jcode/config.toml
 #
 # Environment variables override these settings.
@@ -46,6 +55,9 @@ scroll_prompt_down = "ctrl+]"
 
 # Scroll bookmark toggle (stash position, jump to bottom, press again to return)
 scroll_bookmark = "ctrl+g"
+
+# Auto-poke toggle. Set "" to disable.
+auto_poke_toggle = "ctrl+p"
 
 # Optional fallback scroll bindings (useful on macOS terminals that forward Command)
 # Leave unset by default; on macOS Cmd+K / Cmd+J move up / down by prompt instead.
@@ -121,6 +133,10 @@ centered = false
 # Pin read images to a side pane (default: true)
 pin_images = true
 
+# Pin the full session todo list to the top of the chat transcript while it
+# scrolls, like the sticky previous-prompt preview (default: false)
+# pin_todos = true
+
 # Wrap long lines in the pinned diff pane (default: true)
 # Set to false for horizontal scrolling instead of wrapping
 diff_line_wrap = true
@@ -141,6 +157,9 @@ debug_socket = false
 # Set false here or set JCODE_NO_EMOJI=1 for ASCII fallbacks.
 emoji = true
 
+# Usage percentage wording: "left" (default) or "used".
+usage_display = "left"
+
 # Show thinking/reasoning content (default: false)
 show_thinking = false
 
@@ -160,8 +179,8 @@ reasoning_display = "off"
 # When neither toolchain is available, formulas fall back to Unicode.
 latex_rendering = "image"
 
-# Show idle animation before first prompt (default: true)
-idle_animation = true
+# Show idle animation before first prompt (default: false)
+idle_animation = false
 
 # Briefly animate a user prompt line when it enters the viewport (default: true)
 prompt_entry_animation = true
@@ -174,6 +193,10 @@ prompt_entry_animation = true
 # the one-line summary (default: false). Useful when you want to read search
 # results directly in the chat.
 # show_agentgrep_output = false
+
+# Show up to the last three non-empty lines of bash output beneath the tool
+# summary (default: false).
+# show_bash_output = false
 
 # Show the dimmed technical detail (command, file path, args) next to the
 # model-provided intent on tool rows (default: false). When false, tool rows
@@ -191,6 +214,11 @@ prompt_entry_animation = true
 # response and which are ready for input (default: false). The /active
 # command is always available regardless of this setting.
 # active_sessions_manager = false
+
+# Include transcripts from other agent CLIs (Claude Code, Codex, Pi, OpenCode,
+# Cursor) in the session picker so they can be resumed or imported
+# (default: true). Set false to list only jcode's own sessions.
+# external_sessions = true
 
 # Overscroll status line (model/provider/context info below the input):
 #   "overscroll" - elastic reveal when scrolling past the bottom (default)
@@ -222,13 +250,39 @@ prompt_entry_animation = true
 # Empty = auto ("⌥" on macOS, "Alt" elsewhere). Examples: "Option", "Alt", "⌥".
 # copy_badge_alt_label = ""
 
+# Color theme: "auto" (query the terminal background), "dark", or "light".
+# theme = "auto"
+
+# Per-role color overrides. Every color the TUI renders is configurable: the
+# named roles below are substituted directly, and the ad hoc shades individual
+# widgets use follow whichever role they belong to.
+#
+# Easiest path: run `/colors generate #8ab4f8` to derive a whole harmonious
+# palette from one color you like, then `/colors harmony` to score it and see
+# exactly what to fix. `/colors` lists every role, and `/colors export` prints
+# this section for you.
+#
+# [display.colors]
+# user = "#8ab4f8"
+# ai = "#81c784"
+# accent = "#ba8bff"
+# success = "#64c864"
+# warning = "#ffc864"
+# error = "#ff6464"
+
 [features]
+# Check for and install updates during startup. Set to false for the persistent
+# equivalent of passing --no-update on every invocation.
+check_updates = true
 # Memory: retrieval + extraction sidecar features
 memory = true
 # Swarm: multi-session coordination features
 swarm = true
 # Mermaid: render Mermaid code blocks and tell the model that diagrams are supported
 mermaid = true
+# Auto-poke: automatically nudge the model to continue when it stops with
+# incomplete todos. /poke on and /poke off still override this per session.
+auto_poke = true
 # Inject timestamps into user messages and tool results sent to the model
 message_timestamps = true
 # Persist memory injections into session history instead of sending them as request-only ephemeral context
@@ -292,7 +346,7 @@ tool_profile = "acp"
 [provider]
 # Default model (optional, uses provider default if not set)
 # Set via /model picker with Ctrl+B to save as default
-# default_model = "claude-fable-5"
+# default_model = "claude-opus-5"
 # Default provider (optional: claude|anthropic-api|openai|openai-api|copilot|openrouter|...)
 # When set, this provider is preferred on startup if available.
 #   claude        = Claude via OAuth/subscription (token in ~/.jcode/auth.json)
@@ -342,6 +396,11 @@ cross_provider_failover = "countdown"
 # This is the base budget: high reasoning efforts scale it up automatically
 # (high 2x, xhigh 3x, max/swarm 4x) since they think silently for much longer.
 # stream_idle_timeout_secs = 600
+# Maximum attempts for transient 429/5xx/network failures, including the first
+# request. Retries honor Retry-After and use capped exponential backoff.
+# Env overrides: JCODE_MAX_RETRIES, JCODE_RETRY_BACKOFF_CAP_SECS.
+# max_retries = 8
+# retry_backoff_cap_secs = 30
 
 [agents]
 # Defaults for spawned helper agents (swarm workers, subagents, sidecars).
@@ -618,16 +677,16 @@ desktop_notifications = true
 # jade_relay_launch_working_dir = "" # Optional default cwd for launched sessions.
 
 # [sponsors] # Legacy config section name retained for compatibility.
-# Tool partner discovery (enabled by default; set enabled = false to opt out).
+# Integration discovery (enabled by default; set enabled = false to opt out).
 # When enabled, the agent gains a `discover_tools` tool listing third-party
-# developer tools from Jcode's hosted partner directory. Some partners may
-# share revenue with Jcode when a referred user becomes a customer, but
-# partnership status never influences recommendations. Each session's first
-# use of discover_tools shows a concise disclosure with a learn-more link.
+# developer tools from Jcode's hosted integration directory. These providers
+# have integrated with the agent to make setup and use seamless. Some providers
+# may share revenue with Jcode when a referred user becomes a customer, but
+# commercial relationships never influence recommendations.
 # See https://jcode.sh/discovery-tools
 # enabled = true
 # endpoint = "https://api.jcode.sh/v1/discovery"
-	"#;
+	"##;
 
         // Substitute platform-specific defaults from the keybinding registry.
         let p = jcode_config_types::KeybindingPlatform::current();
@@ -635,11 +694,72 @@ desktop_notifications = true
             jcode_config_types::default_binding("effort_increase", p).unwrap_or("alt+right");
         let effort_decrease =
             jcode_config_types::default_binding("effort_decrease", p).unwrap_or("alt+left");
-        let default_content = default_content
+        default_content
             .replace("@EFFORT_INCREASE@", effort_increase)
-            .replace("@EFFORT_DECREASE@", effort_decrease);
+            .replace("@EFFORT_DECREASE@", effort_decrease)
+    }
+}
 
-        std::fs::write(&path, default_content)?;
-        Ok(path)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped template is a hand-maintained string, so a typo in it ships
+    /// a config file that jcode itself cannot read. Parse it here.
+    #[test]
+    fn default_config_template_parses() {
+        let template = Config::default_config_file_contents();
+        toml::from_str::<Config>(&template).expect("the shipped config template must parse");
+    }
+
+    /// Colors are only discoverable if the template mentions them, since most
+    /// users read the generated config rather than the docs.
+    #[test]
+    fn default_config_template_documents_colors() {
+        let template = Config::default_config_file_contents();
+        assert!(
+            template.contains("[display.colors]"),
+            "the template should show how to configure colors"
+        );
+        assert!(
+            template.contains("/colors"),
+            "the template should point at the /colors command"
+        );
+    }
+
+    /// Uncommenting the documented color example must actually work, which is
+    /// the thing a user will literally do.
+    #[test]
+    fn documented_color_example_is_valid_when_uncommented() {
+        let template = Config::default_config_file_contents();
+        let start = template
+            .find("# [display.colors]")
+            .expect("template documents a colors section");
+        let example: String = template[start..]
+            .lines()
+            .take_while(|line| line.starts_with("# ") || line == &"#")
+            .map(|line| {
+                format!(
+                    "{}\n",
+                    line.trim_start_matches("# ").trim_start_matches('#')
+                )
+            })
+            .collect();
+
+        let parsed: Config = toml::from_str(&example).expect("uncommented example must parse");
+        assert!(
+            !parsed.display.colors.is_empty(),
+            "the example should set some colors, got {:?}",
+            parsed.display.colors
+        );
+        for (role, value) in &parsed.display.colors {
+            assert!(
+                jcode_config_types::DisplayConfig::default()
+                    .colors
+                    .is_empty(),
+                "colors should default to empty"
+            );
+            assert_eq!(value.len(), 7, "{role} example should be #rrggbb: {value}");
+        }
     }
 }

@@ -522,13 +522,15 @@ fn test_remote_jcode_subscription_catalog_is_not_augmented_with_local_auth_route
 
 #[test]
 fn test_remote_mixed_catalog_keeps_jcode_subscription_separate_from_other_providers() {
-    // Hold the shared env lock: this test calls clear_persisted_test_ui_state(),
-    // which deletes files under $JCODE_HOME/ambient/. Unlocked, it could delete
-    // another test's hermetic tempdir contents (or read a tempdir that a sibling
-    // had already dropped), which made unrelated tests fail at random under
-    // parallel execution while passing with --test-threads=1.
-    let _env_lock = crate::storage::lock_test_env();
-    ensure_test_jcode_home_if_unset();
+    // The route count asserted here depends on `AuthStatus::check_fast()`,
+    // which reads real credentials from the environment. Without isolation the
+    // test observes whatever auth state a concurrently running test happens to
+    // have set, so it intermittently found extra provider routes (20 not 5).
+    // `with_temp_jcode_home` takes the shared env lock and points auth at an
+    // empty home, which is what the sibling subscription-catalog test already
+    // does for exactly this reason.
+    with_temp_jcode_home(|| {
+    crate::auth::AuthStatus::invalidate_cache();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
 
@@ -622,6 +624,7 @@ fn test_remote_mixed_catalog_keeps_jcode_subscription_separate_from_other_provid
                 "claude-opus-4-8" | "gpt-5.5" | "gpt-5.6-sol"
             )
     }));
+    });
 }
 
 #[test]
@@ -782,7 +785,6 @@ fn test_remote_non_jcode_catalog_repairs_poisoned_all_jcode_routes() {
                     && route.api_method == crate::subscription_catalog::JCODE_ROUTE_API_METHOD
             })
             .collect::<Vec<_>>();
-        assert_eq!(jcode_routes.len(), 3);
         assert_eq!(
             jcode_routes
                 .iter()
@@ -790,6 +792,7 @@ fn test_remote_non_jcode_catalog_repairs_poisoned_all_jcode_routes() {
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from([
                 "claude-opus-4-8",
+                "claude-fable-5",
                 "gpt-5.5",
                 "gpt-5.6-sol",
             ])
@@ -802,7 +805,7 @@ fn test_remote_non_jcode_catalog_repairs_poisoned_all_jcode_routes() {
             route.provider != crate::subscription_catalog::JCODE_PROVIDER_DISPLAY_NAME
                 || matches!(
                     route.model.as_str(),
-                    "claude-opus-4-8" | "gpt-5.5" | "gpt-5.6-sol"
+                    "claude-fable-5" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.6-sol"
                 )
         }));
     });
@@ -1296,7 +1299,7 @@ fn test_ctrl_p_toggles_auto_poke_locally() {
     assert_eq!(app.status_notice(), Some("Poke: ON".to_string()));
     assert!(app.display_messages().iter().any(|msg| {
         msg.content
-            .contains("Auto-poke enabled. No incomplete todos found right now.")
+            .contains("Auto-poke enabled. Nothing unfinished right now")
     }));
 }
 
@@ -1717,6 +1720,23 @@ fn test_send_action_modes() {
 }
 
 #[test]
+fn test_interleave_submission_preserves_pending_images() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+    app.queue_mode = false;
+    app.input = "[image 1] describe this".to_string();
+    app.cursor_pos = app.input.len();
+    let images = vec![("image/png".to_string(), "ZmFrZQ==".to_string())];
+    app.pending_images = images.clone();
+
+    assert!(input::handle_enter(&mut app));
+
+    assert_eq!(app.interleave_message.as_deref(), Some("[image 1] describe this"));
+    assert_eq!(app.interleave_images, images);
+    assert!(app.pending_images.is_empty());
+}
+
+#[test]
 fn test_send_action_submits_bang_commands_while_processing() {
     let mut app = create_test_app();
     app.is_processing = true;
@@ -2030,6 +2050,31 @@ fn test_model_switch_notice_omits_placeholder_route_details() {
         );
         assert!(notice.starts_with("Model → "), "got {notice}");
         assert!(!notice.contains(" via "), "got {notice}");
+    });
+}
+
+#[test]
+fn test_favorite_hotkey_does_not_confirm_remote_placeholder_without_matching_favorite() {
+    with_temp_jcode_home(|| {
+        let model = "placeholder-favorite-hotkey-model";
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.remote_provider_name = Some("Some Server".to_string());
+        app.remote_provider_model = Some(model.to_string());
+        app.remote_available_entries = vec![model.to_string()];
+        app.remote_model_options = vec![crate::provider::ModelRoute {
+            model: model.to_string(),
+            provider: "Some Server".to_string(),
+            api_method: "remote-catalog".to_string(),
+            available: true,
+            detail: "refreshing route details…".to_string(),
+            cheapness: None,
+        }];
+
+        app.cycle_model_favorite_hotkey();
+
+        assert!(app.inline_interactive_state.is_some());
+        assert!(app.pending_model_switch.is_none());
     });
 }
 

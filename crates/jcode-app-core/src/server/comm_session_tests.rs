@@ -415,9 +415,11 @@ fn prepare_visible_spawn_session_persists_requested_effort() {
 
     assert!(launched);
     let session = crate::session::Session::load(&session_id).expect("prepared session should save");
-    // The spawn persists a route-pinned switch request (auth route preserved),
-    // not the bare name; the provider key is guessed from the model family.
-    assert_eq!(session.model.as_deref(), Some("openai-oauth:gpt-5.5"));
+    // The spawn persists a route-pinned switch request, not the bare name; the
+    // provider key is guessed from the model family. Upstream's auth fix means
+    // a guessed (non-explicit) provider emits the bare `openai:` prefix rather
+    // than hard-pinning `openai-oauth:`, so OAuth -> API-key fallback survives.
+    assert_eq!(session.model.as_deref(), Some("openai:gpt-5.5"));
     assert_eq!(
         session.reasoning_effort.as_deref(),
         Some("low"),

@@ -17,17 +17,26 @@ fn display_message_from_stored_message(
     if text.trim().is_empty() {
         return None;
     }
+    if is_background_task_lifecycle_message(&text) {
+        return None;
+    }
     match message.display_role {
         Some(crate::session::StoredDisplayRole::System) => Some(DisplayMessage::system(text)),
-        Some(crate::session::StoredDisplayRole::BackgroundTask) => {
-            Some(DisplayMessage::background_task(text))
-        }
+        Some(crate::session::StoredDisplayRole::BackgroundTask) => None,
         None => match message.role {
             Role::User => {
+                if crate::session::is_scheduled_task_message(message) {
+                    return Some(DisplayMessage::system(text));
+                }
                 // Synthetic auto-poke continuations are persisted as user
                 // turns for the model but must not display as user prompts.
                 if crate::todo::is_auto_poke_message(&text) {
-                    Some(DisplayMessage::system(text))
+                    // Gate continuations are written for the model; the user
+                    // only needs to know the check happened.
+                    match crate::todo::auto_poke_display_summary(&text) {
+                        Some(summary) => Some(DisplayMessage::system(summary.to_string())),
+                        None => Some(DisplayMessage::system(text)),
+                    }
                 } else {
                     Some(DisplayMessage::user(text))
                 }
@@ -35,6 +44,14 @@ fn display_message_from_stored_message(
             Role::Assistant => Some(DisplayMessage::assistant(text)),
         },
     }
+}
+
+fn is_background_task_lifecycle_message(content: &str) -> bool {
+    let content = content.trim_start();
+    content.starts_with("**Background task**")
+        || content.starts_with("**Background task started**")
+        || content.starts_with("**Background task progress**")
+        || content.starts_with("**Background task stalled**")
 }
 
 fn stored_message_visible_text(message: &crate::session::StoredMessage) -> String {
@@ -68,7 +85,22 @@ fn stored_message_visible_text(message: &crate::session::StoredMessage) -> Strin
 
 impl App {
     pub fn push_display_message(&mut self, mut message: DisplayMessage) {
+        if is_background_task_lifecycle_message(&message.content) {
+            return;
+        }
         compact_display_message_tool_data(&mut message);
+        // A trailing Ctrl+L spacer only exists to keep the screen clear while
+        // idle. The moment real content arrives, drop it so the transcript
+        // stays contiguous instead of keeping a screenful of blank rows
+        // embedded in the scrollback.
+        if message.role != "spacer"
+            && self
+                .display_messages
+                .last()
+                .is_some_and(|last| last.role == "spacer")
+        {
+            self.display_messages.pop();
+        }
         if self.try_coalesce_repeated_display_message(&message) {
             return;
         }
@@ -95,6 +127,7 @@ impl App {
     }
 
     pub(super) fn replace_display_messages(&mut self, mut messages: Vec<DisplayMessage>) {
+        messages.retain(|message| !is_background_task_lifecycle_message(&message.content));
         compact_display_messages_for_storage(&mut messages);
         self.display_messages = messages;
         self.attempt_committed_assistant_messages = 0;
@@ -145,30 +178,98 @@ impl App {
             return false;
         };
 
+        // A tool moved to the background finishes its foreground card with the
+        // background lifecycle notification returned by the tool. The same
+        // notification also drives the retained row in the pinned status band,
+        // so remove the transient tool card instead of turning it into a second
+        // transcript representation.
+        if is_background_task_lifecycle_message(&content) {
+            self.remove_display_message(idx);
+            return true;
+        }
+
         self.replace_display_message_title_and_content(idx, title, content)
     }
 
-    pub(super) fn upsert_background_task_progress_message(&mut self, content: String) {
-        let Some(progress) =
-            crate::message::parse_background_task_progress_notification_markdown(&content)
-        else {
-            self.push_display_message(DisplayMessage::background_task(content));
+    pub(super) fn background_task_rows_ref(&self) -> &[crate::tui::BackgroundTaskRow] {
+        &self.background_task_rows
+    }
+
+    pub(super) fn upsert_running_background_task(
+        &mut self,
+        task_id: String,
+        label: String,
+        percent: Option<f32>,
+    ) {
+        if let Some(task) = self
+            .background_task_rows
+            .iter_mut()
+            .find(|task| task.task_id == task_id)
+        {
+            task.label = label;
+            task.percent = percent;
+            task.status = crate::tui::BackgroundTaskRowStatus::Running;
             return;
-        };
-
-        let idx = self.display_messages.iter().rposition(|message| {
-            message.role == "background_task"
-                && crate::message::parse_background_task_progress_notification_markdown(
-                    &message.content,
-                )
-                .is_some_and(|existing| existing.task_id == progress.task_id)
-        });
-
-        if let Some(idx) = idx {
-            self.replace_display_message_content(idx, content);
-        } else {
-            self.push_display_message(DisplayMessage::background_task(content));
         }
+        self.background_task_rows
+            .push(crate::tui::BackgroundTaskRow {
+                task_id,
+                label,
+                percent,
+                status: crate::tui::BackgroundTaskRowStatus::Running,
+            });
+    }
+
+    pub(super) fn upsert_running_background_task_progress(&mut self, content: &str) -> bool {
+        let Some(progress) =
+            crate::message::parse_background_task_progress_notification_markdown(content)
+        else {
+            return false;
+        };
+        let label = crate::message::background_task_display_label(
+            &progress.tool_name,
+            progress.display_name.as_deref(),
+        );
+        self.upsert_running_background_task(progress.task_id, label, progress.percent);
+        true
+    }
+
+    pub(super) fn upsert_running_background_task_started(&mut self, content: &str) -> bool {
+        let Some(started) =
+            crate::message::parse_background_task_started_notification_markdown(content)
+        else {
+            return false;
+        };
+        self.upsert_running_background_task(started.task_id, started.label, None);
+        true
+    }
+
+    pub(super) fn finish_background_task(
+        &mut self,
+        task_id: String,
+        label: String,
+        status: crate::tui::BackgroundTaskRowStatus,
+    ) {
+        if let Some(task) = self
+            .background_task_rows
+            .iter_mut()
+            .find(|task| task.task_id == task_id)
+        {
+            task.label = label;
+            task.status = status;
+            if status == crate::tui::BackgroundTaskRowStatus::Completed {
+                task.percent = Some(100.0);
+            }
+            return;
+        }
+        self.background_task_rows
+            .push(crate::tui::BackgroundTaskRow {
+                task_id,
+                label,
+                percent: (status == crate::tui::BackgroundTaskRowStatus::Completed)
+                    .then_some(100.0),
+                status,
+            });
     }
 
     pub(super) fn upsert_overnight_display_card(
@@ -367,6 +468,61 @@ impl App {
             self.display_messages.clear();
             self.bump_display_messages_version();
         }
+    }
+
+    /// Terminal-style clear (Ctrl+L): append a viewport-height blank spacer
+    /// and snap to the bottom, so the screen shows a clean prompt while the
+    /// whole transcript stays one scroll-up away, exactly like a terminal's
+    /// clear-with-scrollback. Nothing is deleted; context, queue, and draft
+    /// are untouched. Contrast with `/cls` (`clear_view_keep_context`), which
+    /// actually wipes the rendered transcript.
+    pub(super) fn clear_view_terminal_style(&mut self) {
+        let rows = super::super::ui::last_chat_viewport_height();
+        // Pressing Ctrl+L repeatedly (or on an already-empty screen) should
+        // not stack blank pages: with a trailing spacer and nothing after it,
+        // the viewport is already visually clear, so just re-snap.
+        let already_clear = self
+            .display_messages
+            .last()
+            .is_some_and(|message| message.role == "spacer");
+        if rows > 0 && !already_clear && !self.display_messages.is_empty() {
+            self.push_display_message(DisplayMessage::spacer(rows));
+        }
+        self.follow_chat_bottom();
+    }
+
+    /// Whether the view is in the terminal-style cleared state: the transcript
+    /// ends in a Ctrl+L spacer, the viewport is pinned to the bottom, and no
+    /// new output has arrived since. In that state every visible transcript row
+    /// is blank, so the renderer collapses the messages area and the numbered
+    /// prompt sits at the top of the screen like a terminal after `clear`.
+    /// Any new message, stream, or scroll-up immediately ends it.
+    pub(crate) fn terminal_clear_collapsed(&self) -> bool {
+        !self.auto_scroll_paused
+            && self.pending_history_anchor.is_none()
+            && !self.is_processing
+            && self.streaming.streaming_text.is_empty()
+            && self
+                .display_messages
+                .last()
+                .is_some_and(|message| message.role == "spacer")
+    }
+
+    /// View-only clear (`/cls`): wipe the rendered transcript while
+    /// keeping provider context, queued messages, and the input draft intact,
+    /// so the model still remembers everything. Contrast with `/clear`
+    /// (`reset_current_session`), which discards context too, and Ctrl+L,
+    /// which merely snaps to the bottom of the chat.
+    pub(super) fn clear_view_keep_context(&mut self) {
+        self.clear_display_messages();
+        // The rendered transcript is gone, so every entry in the
+        // process-global ACTIVE_DIAGRAMS registry is orphaned (same rationale
+        // as reset_current_session; partial-retention paths like /rewind must
+        // NOT do this).
+        crate::tui::mermaid::clear_active_diagrams();
+        self.scroll_offset = 0;
+        self.auto_scroll_paused = false;
+        self.set_status_notice("View cleared (context kept)");
     }
 
     pub(super) fn apply_compacted_history_window(

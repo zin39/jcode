@@ -252,7 +252,7 @@ fn test_remote_non_retryable_error_stops_auto_poke_after_short_retry_budget() {
     assert!(
         app.display_messages()
             .iter()
-            .any(|m| m.role == "system" && m.content.contains("Auto-poke stopped"))
+            .any(|m| m.role == "system" && m.content.contains("we stopped poking"))
     );
 }
 
@@ -425,7 +425,7 @@ fn test_remote_connectivity_error_without_auto_retry_still_waits_for_network() {
     assert!(
         !app.display_messages()
             .iter()
-            .any(|m| m.role == "system" && m.content.contains("Auto-poke stopped"))
+            .any(|m| m.role == "system" && m.content.contains("we stopped poking"))
     );
 }
 
@@ -1202,6 +1202,29 @@ fn test_tui_login_providers_have_real_tui_handlers() {
             );
         }
     }
+}
+
+#[test]
+fn test_tui_grok_build_login_starts_managed_oauth_flow() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let _guard = runtime.enter();
+    let mut app = create_test_app();
+
+    app.start_login_provider(crate::provider_catalog::GROK_BUILD_LOGIN_PROVIDER);
+
+    assert!(matches!(
+        app.pending_login,
+        Some(PendingLogin::GrokBuild)
+    ));
+    let rendered = app
+        .display_messages()
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("xAI sign-in URL and device code"));
+    assert!(rendered.contains("You do not need to install the Grok CLI"));
+    assert!(!rendered.contains("run `jcode login"));
 }
 
 #[test]

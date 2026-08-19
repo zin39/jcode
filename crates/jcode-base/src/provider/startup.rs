@@ -86,8 +86,10 @@ impl MultiProvider {
         let provider_init_start = std::time::Instant::now();
         let cfg = crate::config::config();
         let provider_state = ProviderState::from_parts(cfg, &auth_status);
+        let initial_provider = Self::initial_provider_from_env();
         let mut default_named_provider_profile: Option<String> = None;
-        if std::env::var_os("JCODE_PROVIDER_PROFILE_ACTIVE").is_none()
+        if initial_provider.is_none()
+            && std::env::var_os("JCODE_PROVIDER_PROFILE_ACTIVE").is_none()
             && std::env::var_os("JCODE_NAMED_PROVIDER_PROFILE").is_none()
             && let Some(pref) = provider_state.default_provider_key()
         {
@@ -144,7 +146,21 @@ impl MultiProvider {
         };
 
         let anthropic = if has_claude_creds && !use_claude_cli {
-            external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME)
+            let provider =
+                external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME);
+            let active_profile_is_anthropic = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+                .ok()
+                .and_then(|name| cfg.providers.get(&name))
+                .is_some_and(|profile| {
+                    matches!(
+                        profile.provider_type,
+                        crate::config::NamedProviderType::AnthropicCompatible
+                    )
+                });
+            if active_profile_is_anthropic {
+                crate::provider_catalog::clear_anthropic_profile_env();
+            }
+            provider
         } else {
             None
         };
@@ -198,7 +214,17 @@ impl MultiProvider {
             None
         };
 
-        let openrouter = if has_openrouter_creds {
+        let active_named_profile_is_anthropic = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+            .ok()
+            .or_else(|| default_named_provider_profile.clone())
+            .and_then(|name| cfg.providers.get(&name))
+            .is_some_and(|profile| {
+                matches!(
+                    profile.provider_type,
+                    crate::config::NamedProviderType::AnthropicCompatible
+                )
+            });
+        let openrouter = if has_openrouter_creds && !active_named_profile_is_anthropic {
             let named_profile = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
                 .ok()
                 .or_else(|| default_named_provider_profile.clone());
@@ -247,7 +273,6 @@ impl MultiProvider {
             );
         }
 
-        let initial_provider = Self::initial_provider_from_env();
         if let Some(initial) = initial_provider {
             active = initial;
             let is_configured = availability.is_configured(initial);
@@ -317,7 +342,12 @@ impl MultiProvider {
             post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
-        if let Some(model) = provider_state.default_model() {
+        // An explicit CLI/environment provider selection owns startup routing.
+        // Applying the configured default model here can reactivate its configured
+        // provider/profile before the caller pins a dual-auth credential mode.
+        if result.initial_provider.is_none()
+            && let Some(model) = provider_state.default_model()
+        {
             if let Err(e) =
                 result.set_config_default_model(model, provider_state.default_provider_key())
             {

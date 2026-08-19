@@ -92,10 +92,21 @@ pub enum ProviderChoice {
     Minimax,
     #[value(alias = "x.ai", alias = "x-ai", alias = "grok")]
     Xai,
+    /// Grok Build subscription via the authenticated Grok CLI ACP transport.
+    #[value(name = "grok-build")]
+    GrokBuild,
     #[value(alias = "nvidia", alias = "nim")]
     NvidiaNim,
     #[value(alias = "xiaomi", alias = "mimo", alias = "xiaomi-mimo-api")]
     XiaomiMimo,
+    #[value(
+        alias = "meta",
+        alias = "muse",
+        alias = "muse-spark",
+        alias = "meta-model-api",
+        alias = "meta-ai"
+    )]
+    MetaMuse,
     #[value(alias = "celeris-ai", alias = "celeris1", alias = "celeris-1")]
     Celeris,
     #[value(alias = "lm-studio")]
@@ -166,8 +177,10 @@ impl ProviderChoice {
             Self::Fireworks => "fireworks",
             Self::Minimax => "minimax",
             Self::Xai => "xai",
+            Self::GrokBuild => "grok-build",
             Self::NvidiaNim => "nvidia-nim",
             Self::XiaomiMimo => "xiaomi-mimo",
+            Self::MetaMuse => "meta-muse",
             Self::Celeris => "celeris",
             Self::Lmstudio => "lmstudio",
             Self::Ollama => "ollama",
@@ -325,12 +338,20 @@ const PROVIDER_CHOICE_LOGIN_PROVIDERS: &[(ProviderChoice, LoginProviderDescripto
         crate::provider_catalog::XAI_LOGIN_PROVIDER,
     ),
     (
+        ProviderChoice::GrokBuild,
+        crate::provider_catalog::GROK_BUILD_LOGIN_PROVIDER,
+    ),
+    (
         ProviderChoice::NvidiaNim,
         crate::provider_catalog::NVIDIA_NIM_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::XiaomiMimo,
         crate::provider_catalog::XIAOMI_MIMO_LOGIN_PROVIDER,
+    ),
+    (
+        ProviderChoice::MetaMuse,
+        crate::provider_catalog::META_MUSE_LOGIN_PROVIDER,
     ),
     (
         ProviderChoice::Celeris,
@@ -628,7 +649,16 @@ fn maybe_enable_config_default_provider_for_auto() -> Result<bool> {
 }
 
 async fn detect_auto_provider_flags() -> AutoProviderAvailability {
-    let auth_status = auth::AuthStatus::check_fast();
+    // An exec-based daemon reload inherits this one-shot, non-secret snapshot
+    // from its predecessor. Consuming it avoids repeating credential discovery
+    // on the reload critical path while ensuring later processes cannot reuse it.
+    let auth_status = std::env::var("JCODE_RELOAD_AUTH_STATUS")
+        .ok()
+        .and_then(|snapshot| {
+            crate::env::remove_var("JCODE_RELOAD_AUTH_STATUS");
+            serde_json::from_str::<auth::AuthStatus>(&snapshot).ok()
+        })
+        .unwrap_or_else(auth::AuthStatus::check_fast);
     AutoProviderAvailability {
         has_claude: auth_status.anthropic.has_oauth || auth_status.anthropic.has_api_key,
         has_openai: auth_status.openai_has_oauth || auth_status.openai_has_api_key,
@@ -1218,6 +1248,11 @@ fn disable_subscription_runtime_mode_preserving_active_provider_profile() {
 }
 
 pub fn apply_login_provider_profile_env(provider: LoginProviderDescriptor) {
+    // #712: the arms below clear an explicitly selected named profile, which
+    // made auth-test probe (and false-negative) the generic compatible slot.
+    if std::env::var_os("JCODE_NAMED_PROVIDER_PROFILE").is_some() {
+        return;
+    }
     match provider.target {
         LoginProviderTarget::OpenAiCompatible(profile) => {
             force_apply_openai_compatible_profile_env(Some(profile));
@@ -1264,6 +1299,13 @@ pub async fn login_and_bootstrap_provider(
         LoginProviderTarget::OpenAi => {
             disable_subscription_runtime_mode();
             Arc::new(provider::MultiProvider::with_preference(true))
+        }
+        LoginProviderTarget::GrokBuild => {
+            disable_subscription_runtime_mode();
+            crate::provider::external::instantiate_external_provider(
+                crate::provider::external::GROK_BUILD_RUNTIME,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Grok Build runtime is not registered"))?
         }
         LoginProviderTarget::OpenAiApiKey => {
             disable_subscription_runtime_mode();
@@ -1489,6 +1531,16 @@ async fn init_provider_with_options(
             crate::env::set_var("JCODE_ACTIVE_PROVIDER", "gemini");
             Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new())
         }
+        ProviderChoice::GrokBuild => {
+            disable_subscription_runtime_mode();
+            init_notice("Using Grok Build subscription via the authenticated Grok CLI");
+            clear_initial_model_provider();
+            crate::env::set_var("JCODE_ACTIVE_PROVIDER", "grok-build");
+            crate::provider::external::instantiate_external_provider(
+                crate::provider::external::GROK_BUILD_RUNTIME,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Grok Build runtime is not registered"))?
+        }
         ProviderChoice::Openrouter => {
             disable_subscription_runtime_mode();
             ensure_external_api_key_auth_allowed_for_explicit_choice("OPENROUTER_API_KEY")?;
@@ -1539,6 +1591,7 @@ async fn init_provider_with_options(
         | ProviderChoice::Xai
         | ProviderChoice::NvidiaNim
         | ProviderChoice::XiaomiMimo
+        | ProviderChoice::MetaMuse
         | ProviderChoice::Celeris
         | ProviderChoice::Lmstudio
         | ProviderChoice::Ollama

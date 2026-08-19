@@ -1980,18 +1980,18 @@ impl Tool for CommunicateTool {
                              "task_graph", "expand_node", "complete_node", "inject_gap",
                              "start", "start_task", "wake", "resume", "retry", "reassign", "replace", "salvage",
                              "subscribe_channel", "unsubscribe_channel", "await_members", "list_models"],
-                    "description": "Action. Spawn requires a nonblank label and should include prompt with the initial task so the new agent starts useful work immediately. Use list_models to see which models/routes are available for per-spawn model selection."
+                    "description": "Action. spawn requires label and should include prompt. list_models shows available models/routes."
                 },
                 "key": {
                     "type": "string",
-                    "description": "Shared-context key for share/share_append/read. Discouraged: prefer the repo and typed node artifacts as the shared medium; use shared context only for small non-repo state."
+                    "description": "Shared-context key for share/share_append/read. Discouraged: prefer the repo and node artifacts."
                 },
                 "value": {
                     "type": "string"
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message body. For action=message, routes by fields provided: with to_session it is a DM, with channel it posts to that channel, with neither it broadcasts to your spawned subtree. For action=report, this is the completion report body."
+                    "description": "Message body: DM with to_session, channel post with channel, else broadcast. For report, the body."
                 },
                 "tldr": {
                     "type": "string",
@@ -1999,7 +1999,7 @@ impl Tool for CommunicateTool {
                 },
                 "status": {
                     "type": "string",
-                    "description": "For action=report: completion status to record, usually ready, blocked, failed, or completed. Defaults to ready."
+                    "description": "For report: usually ready, blocked, failed, or completed. Defaults to ready."
                 },
                 "validation": {
                     "type": "string",
@@ -2011,17 +2011,17 @@ impl Tool for CommunicateTool {
                 },
                 "to_session": {
                     "type": "string",
-                    "description": "Target session for actions that address one agent (dm, and as an alias for target_session). Accepts an exact session ID or a unique friendly name within the swarm. Interchangeable with target_session. If a friendly name is ambiguous, run swarm list and use the exact session ID."
+                    "description": "Session ID or unique friendly name of one agent. Alias of target_session."
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Channel name. For action=channel (or action=message with a channel) the message goes to subscribers of this channel. Also used by subscribe_channel/unsubscribe_channel/channel_members. Discouraged: prefer DMs and task-graph artifacts over ad hoc channels."
+                    "description": "Channel name for channel actions. Discouraged: prefer DMs and task-graph artifacts."
                 },
                 "proposer_session": { "type": "string" },
                 "reason": { "type": "string" },
                 "target_session": {
                     "type": "string",
-                    "description": "Target session for management actions (assign_role, summary, status, stop, start, resume, wake, etc.). Accepts an exact session ID or a unique friendly name. Interchangeable with to_session."
+                    "description": "Session ID or unique friendly name for management actions. Alias of to_session."
                 },
                 "role": {
                     "type": "string",
@@ -2030,7 +2030,7 @@ impl Tool for CommunicateTool {
                 "label": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Required for spawn. Short nonblank label shown on the spawned agent's chip in swarm UI (e.g. 'api reviewer')."
+                    "description": "Required for spawn. Short label shown on the agent's chip (e.g. 'api reviewer')."
                 },
                 "working_dir": {
                     "type": "string",
@@ -2038,11 +2038,11 @@ impl Tool for CommunicateTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Preferred for spawn. Initial task/instructions for the new agent. Spawning without prompt usually creates an idle agent that needs follow-up assignment."
+                    "description": "Initial task/instructions for spawn. Spawning without it creates an idle agent."
                 },
                 "initial_message": {
                     "type": "string",
-                    "description": "Explicit initial task/instructions for spawn. If both initial_message and prompt are supplied, initial_message wins."
+                    "description": "Alias of prompt for spawn; wins when both are set."
                 },
                 "output_schema": {
                     "type": "object",
@@ -2055,29 +2055,29 @@ impl Tool for CommunicateTool {
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Optional plan task ID. If omitted for assign_task/assign_next, the coordinator picks a runnable task. If omitted for resume/wake/retry/start with target_session, the server resumes the unique assigned task for that session."
+                    "description": "Optional plan task ID. When omitted the coordinator picks or resumes the relevant task."
                 },
                 "spawn_if_needed": {
                     "type": "boolean",
-                    "description": "For assign_task without an explicit target_session: if no reusable agent is available, spawn a fresh agent and retry the assignment automatically."
+                    "description": "For assign_task: spawn a fresh agent when no reusable one is available."
                 },
                 "prefer_spawn": {
                     "type": "boolean",
-                    "description": "For assign_task without an explicit target_session: prefer a fresh spawned agent even if reusable workers are available."
+                    "description": "For assign_task: prefer spawning fresh over reusing an idle worker."
                 },
                 "spawn_mode": {
                     "type": "string",
                     "enum": ["visible", "headless", "inline", "auto"],
-                    "description": "Per-call spawn mode for swarm-created agents. Overrides agents.swarm_spawn_mode config when set. 'visible' opens a terminal window, 'headless' runs in-process with no UI, 'inline' runs in-process and renders a live gallery viewport in the coordinator, 'auto' tries visible then falls back to headless. Defaults to inline."
+                    "description": "Spawn UI mode: visible terminal, headless, inline gallery, or auto. Defaults to inline."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional model for the spawned agent (spawn, and spawns triggered by assign_task/assign_next/run_plan). Overrides the agents.swarm_model config pin for this call. Accepts a bare model name (e.g. 'gpt-5.5') or an auth-route-prefixed form (e.g. 'openai-api:gpt-5.5', 'claude-api:claude-fable-5'). Use 'inherit' to force coordinator inheritance. Omit to use the configured/coordinator default. Run action=list_models to see available models and routes."
+                    "description": "Model for spawned agents, e.g. 'gpt-5.5' or 'claude-api:opus'. Omit to inherit; see list_models."
                 },
                 "effort": {
                     "type": "string",
                     "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-                    "description": "Optional reasoning effort for the spawned agent. Omit for the model's default. Only meaningful with spawn-creating actions."
+                    "description": "Optional reasoning effort for spawned agents. Omit for the model default."
                 },
                 "session_ids": {
                     "type": "array",
@@ -2086,7 +2086,7 @@ impl Tool for CommunicateTool {
                 "mode": {
                     "type": "string",
                     "enum": ["all", "any", "deep", "light"],
-                    "description": "For task_graph: deep enables comprehensive gated execution and light enables simple fan-out. For await_members: wait for all targeted members or wake when any targeted member matches."
+                    "description": "task_graph: deep (gated) or light (fan-out). await_members: all or any."
                 },
                 "target_status": {
                     "type": "array",
@@ -2100,16 +2100,16 @@ impl Tool for CommunicateTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "For run_plan: run as a detached background task (default true); set false to block until the plan resolves. await_members is always asynchronous and ignores false so the agent stays responsive; its result is delivered later via notify/wake."
+                    "description": "For run_plan: detach as a background task (default true); false blocks until the plan resolves."
                 },
                 "notify": {
                     "type": "boolean",
-                    "description": "For await_members/run_plan: surface a notification card when the background task resolves. Defaults to true."
+                    "description": "For await_members/run_plan: show a notification when resolved. Defaults to true."
                 },
                 "concurrency_limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Max swarm worker agents active at once. For fill_slots this is required. For run_plan it is optional and overrides the mode-based default (deep uses agents.swarm_max_concurrent_agents; light uses a small default). The server also applies agents.swarm_max_concurrent_agents to recursive ad hoc spawning as a live-worker RAM safety limit, plus an absolute hard member cap."
+                    "description": "Max live workers. Required for fill_slots; optional override for run_plan."
                 },
                 "force": {
                     "type": "boolean",
@@ -2117,11 +2117,11 @@ impl Tool for CommunicateTool {
                 },
                 "retain_agents": {
                     "type": "boolean",
-                    "description": "For run_plan: keep spawned workers after the plan reaches a terminal state. Defaults to false, so owned workers are cleaned up."
+                    "description": "For run_plan: keep spawned workers after the plan finishes. Defaults to false."
                 },
                 "wake": {
                     "type": "boolean",
-                    "description": "Optional wake hint for messages. For await_members/run_plan: wake this agent with the result when the background task resolves (default true); if false, only notify."
+                    "description": "Wake this agent when a message or awaited background task resolves (default true)."
                 },
                 "delivery": {
                     "type": "string",
@@ -2162,7 +2162,7 @@ impl Tool for CommunicateTool {
                 "nodes".to_string(),
                 json!({
                     "type": "array",
-                    "description": "Task-DAG node specs for task_graph (seed), expand_node (children), or inject_gap (gap/fix nodes). Each: {id, content, kind?, depends_on?, priority?}. kind is one of explore|implement|verify|fix|synthesize.",
+                    "description": "Node specs for task_graph/expand_node/inject_gap. Each: {id, content, kind?, depends_on?, priority?}.",
                     "items": { "type": "object", "additionalProperties": true }
                 }),
             );
@@ -2170,7 +2170,7 @@ impl Tool for CommunicateTool {
                 "artifact".to_string(),
                 json!({
                     "type": "object",
-                    "description": "Typed handoff artifact for complete_node. In deep mode requires non-empty 'findings', a 'what_i_did_not_check' list, and a 'confidence' of low|medium|high (report low honestly; it routes follow-up work). Deep gates cannot pass while a low-confidence sibling is unaddressed: inject_gap or name the id in findings. Fields: findings, evidence[], edge_cases_considered[], validation, open_questions[], confidence, what_i_did_not_check[].",
+                    "description": "Handoff artifact for complete_node: findings, evidence[], validation, open_questions[], confidence.",
                     "additionalProperties": true
                 }),
             );
@@ -2194,7 +2194,12 @@ impl Tool for CommunicateTool {
                 "type": "object",
                 "required": ["action", "label"],
                 "properties": {
-                    "action": { "type": "string", "enum": ["spawn"] }
+                    "action": { "type": "string", "enum": ["spawn"] },
+                    // Gemini validates that every `required` name is defined in
+                    // the same object's `properties` and rejects the whole
+                    // request otherwise (issue #655), so declare `label` here
+                    // instead of relying on the parent schema's declaration.
+                    "label": { "type": "string", "minLength": 1 }
                 }
             },
             {

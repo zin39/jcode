@@ -8,6 +8,22 @@ pub struct ContextSnapshot {
     pub fresh: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskRowStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Compact presentation state for one retained background task.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundTaskRow {
+    pub task_id: String,
+    pub label: String,
+    pub percent: Option<f32>,
+    pub status: BackgroundTaskRowStatus,
+}
+
 pub mod backend;
 pub(crate) mod color_support;
 mod core;
@@ -35,7 +51,8 @@ mod redraw_schedule;
 #[allow(unused_imports)]
 pub(crate) use redraw_schedule::{
     REDRAW_DEEP_IDLE, REDRAW_DEEP_IDLE_AFTER, REDRAW_IDLE, REDRAW_PASSIVE_LIVENESS,
-    REDRAW_REMOTE_STARTUP, REDRAW_SWARM_SPINNER, idle_donut_active, periodic_redraw_required,
+    REDRAW_REMOTE_STARTUP, REDRAW_SWARM_SPINNER, current_full_frame_redraw_reason,
+    idle_donut_active, last_full_frame_redraw_reason, periodic_redraw_required,
     periodic_redraw_required_excluding_idle_animation, redraw_interval,
     redraw_interval_with_policy,
 };
@@ -44,6 +61,7 @@ pub mod screenshot;
 pub(crate) mod session_facts;
 pub mod session_picker;
 mod stream_buffer;
+pub mod terminal_setup;
 pub mod test_harness;
 pub mod theme_detect;
 mod ui;
@@ -92,6 +110,7 @@ fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
 
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
 /// Display row for the picker: either a section header or an entry.
@@ -349,6 +368,20 @@ pub trait TuiState {
         50
     }
     fn streaming_text(&self) -> &str;
+    /// JSON payload for the pinned todo band rendered at the top of the chat
+    /// viewport when `display.pin_todos` is enabled. `None` when the feature
+    /// is off or the session has no todos.
+    fn pinned_todos_payload(&self) -> Option<&str> {
+        None
+    }
+    /// Whether the pinned todo band is temporarily expanded to show every row.
+    fn pinned_todos_expanded(&self) -> bool {
+        false
+    }
+    /// Running and recently completed background tasks rendered beneath pinned todos.
+    fn background_task_rows(&self) -> &[BackgroundTaskRow] {
+        &[]
+    }
 
     // ---- Input ----
     fn input(&self) -> &str;
@@ -363,6 +396,16 @@ pub trait TuiState {
     fn scroll_offset(&self) -> usize;
     /// Whether auto-scroll to bottom is paused (user scrolled up during streaming)
     fn auto_scroll_paused(&self) -> bool;
+    /// Whether the screen is currently in the terminal-style cleared state
+    /// produced by Ctrl+L / Cmd+L: the transcript ends in a blank spacer, the
+    /// view is pinned to the bottom, and nothing is streaming. In that state
+    /// the renderer collapses the (entirely blank) messages viewport so the
+    /// status line and numbered prompt sit at the *top* of the screen, exactly
+    /// like a terminal after `clear`, instead of floating at the bottom under
+    /// a screenful of blanks.
+    fn terminal_clear_collapsed(&self) -> bool {
+        false
+    }
     /// When older compacted history is being loaded in, this is the reader's
     /// captured distance (in wrapped lines) from the bottom of the transcript.
     /// The renderer uses it to keep the viewport anchored to the same content as
@@ -406,6 +449,21 @@ pub trait TuiState {
     fn status_detail(&self) -> Option<String>;
     fn mcp_servers(&self) -> Vec<(String, usize)>;
     fn available_skills(&self) -> Vec<String>;
+    /// Authoritative active credential (OAuth vs API key) for a dual-auth
+    /// provider, as resolved from the live provider / remote server rather than
+    /// from the `JCODE_RUNTIME_PROVIDER` env var. The header must prefer this
+    /// over its own env-based heuristic: the TUI client process often does not
+    /// inherit `JCODE_RUNTIME_PROVIDER` (it is set inside the agent/server
+    /// process), so the env heuristic silently falls back to "auto prefers
+    /// OAuth" and the header claimed OAuth while the info widget correctly
+    /// reported an API key. Returns `None` when the credential cannot be
+    /// determined, in which case callers fall back to the cached `AuthStatus`.
+    fn active_dual_credential(
+        &self,
+        _provider: jcode_provider_core::ActiveProvider,
+    ) -> Option<crate::auth::ActiveCredential> {
+        None
+    }
 
     // ---- Stream / status ----
     fn streaming_tokens(&self) -> (u64, u64);
@@ -424,8 +482,21 @@ pub trait TuiState {
     }
     fn status(&self) -> ProcessingStatus;
     fn command_suggestions(&self) -> Vec<(String, &'static str)>;
+    /// Invalidate any per-frame memo backing [`Self::command_suggestions`].
+    ///
+    /// Called once at the top of each rendered frame. The suggestion list is
+    /// read many times while composing a single frame; implementations may
+    /// cache within a frame but must not serve that cache across frames, since
+    /// the list also depends on mutable session state. Defaults to a no-op for
+    /// impls that do not cache.
+    fn advance_command_suggestions_epoch(&self) {}
     fn command_suggestion_selected(&self) -> usize {
         0
+    }
+    /// Snapshot of the Ctrl+R reverse prompt-history search overlay, or None
+    /// when the overlay is closed.
+    fn prompt_history_search(&self) -> Option<PromptHistorySearchView> {
+        None
     }
     fn active_skill(&self) -> Option<String>;
     fn subagent_status(&self) -> Option<String>;
@@ -477,6 +548,15 @@ pub trait TuiState {
     fn connected_clients(&self) -> Option<usize>;
     /// Short-lived notice shown in the status line (e.g., model switch, toggle diff)
     fn status_notice(&self) -> Option<String>;
+    /// How long since the user last pressed a key, scrolled, or pasted, or
+    /// `None` when they have not interacted yet.
+    ///
+    /// Distinct from [`time_since_activity`], which tracks provider output:
+    /// typing into an idle session produces no stream events, so only this can
+    /// tell "actively composing" from "sitting untouched".
+    fn time_since_user_interaction(&self) -> Option<Duration> {
+        None
+    }
     /// Distinct learned-keybinding nudge shown in its own pop-out color, e.g.
     /// "you usually do X the slow way, press <key>". Separate from
     /// [`status_notice`] so the UI can style it differently.
@@ -1014,6 +1094,15 @@ pub enum PickerKind {
     Usage,
 }
 
+/// Render snapshot of the Ctrl+R reverse prompt-history search overlay.
+/// `matches` are single-line previews, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHistorySearchView {
+    pub query: String,
+    pub matches: Vec<String>,
+    pub selected: usize,
+}
+
 /// What the first-run onboarding welcome screen should render in its body,
 /// driven by the active onboarding flow phase. `Suggestions` is the default
 /// resting state (the starter prompt cards).
@@ -1086,11 +1175,13 @@ pub struct LoginImportPrompt {
     pub seconds_left: u64,
 }
 
-/// The three actions on the import summary screen, left to right.
+/// The actions on the import summary screen, left to right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportSummaryPill {
     /// Import everything we detected (default).
     Continue,
+    /// Sign in with a Jcode subscription instead of importing.
+    Subscription,
     /// Open the per-login checkbox list to import fewer logins.
     ImportLess,
     /// Open the telemetry settings sub-page.
@@ -2319,6 +2410,7 @@ mod tests {
 
         assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 }

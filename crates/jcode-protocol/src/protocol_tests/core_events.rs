@@ -5,10 +5,47 @@ fn test_request_roundtrip() -> Result<()> {
         content: "hello".to_string(),
         images: vec![],
         system_reminder: None,
+        active_skill: Some("verification".to_string()),
+        no_reply: false,
     };
     let json = serde_json::to_string(&req)?;
     let decoded = parse_request_json(&json)?;
     assert_eq!(decoded.id(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_soft_interrupt_images_roundtrip_and_legacy_default() -> Result<()> {
+    let req = Request::SoftInterrupt {
+        id: 2,
+        content: "look at this".to_string(),
+        images: vec![("image/png".to_string(), "ZmFrZQ==".to_string())],
+        urgent: true,
+    };
+    let json = serde_json::to_string(&req)?;
+    let decoded = parse_request_json(&json)?;
+    let Request::SoftInterrupt {
+        content,
+        images,
+        urgent,
+        ..
+    } = decoded
+    else {
+        return Err(anyhow!("wrong request type"));
+    };
+    assert_eq!(content, "look at this");
+    assert_eq!(
+        images,
+        vec![("image/png".to_string(), "ZmFrZQ==".to_string())]
+    );
+    assert!(urgent);
+
+    let legacy = r#"{"type":"soft_interrupt","id":3,"content":"legacy","urgent":false}"#;
+    let decoded = parse_request_json(legacy)?;
+    let Request::SoftInterrupt { images, .. } = decoded else {
+        return Err(anyhow!("wrong legacy request type"));
+    };
+    assert!(images.is_empty());
     Ok(())
 }
 
@@ -111,10 +148,15 @@ fn test_notify_auth_changed_typed_auth_payload_roundtrip() -> Result<()> {
     assert!(!prefer_strongest);
     let auth = auth.expect("typed auth payload should roundtrip");
     assert_eq!(auth.provider.as_str(), "cerebras");
-    assert_eq!(auth.credential_source, Some(AuthCredentialSource::ApiKeyFile));
+    assert_eq!(
+        auth.credential_source,
+        Some(AuthCredentialSource::ApiKeyFile)
+    );
     assert_eq!(auth.auth_method, Some(AuthMethod::RemoteTuiPasteApiKey));
     assert_eq!(
-        auth.expected_runtime.as_ref().map(RuntimeProviderKey::as_str),
+        auth.expected_runtime
+            .as_ref()
+            .map(RuntimeProviderKey::as_str),
         Some("openai-compatible")
     );
     assert_eq!(
@@ -203,6 +245,19 @@ fn test_event_roundtrip() -> Result<()> {
         return Err(anyhow!("wrong event type"));
     };
     assert_eq!(text, "hello");
+    Ok(())
+}
+
+#[test]
+fn test_context_message_added_event_roundtrip() -> Result<()> {
+    let event = ServerEvent::ContextMessageAdded { id: 42 };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"context_message_added\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::ContextMessageAdded { id } = decoded else {
+        return Err(anyhow!("wrong event type"));
+    };
+    assert_eq!(id, 42);
     Ok(())
 }
 

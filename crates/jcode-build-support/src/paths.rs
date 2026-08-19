@@ -171,34 +171,56 @@ pub fn selfdev_build_command_for_target(
     repo_dir: &Path,
     target: SelfDevBuildTarget,
 ) -> SelfDevBuildCommand {
+    selfdev_build_command_for_target_on_platform(repo_dir, target, cfg!(windows))
+}
+
+fn selfdev_build_command_for_target_on_platform(
+    repo_dir: &Path,
+    target: SelfDevBuildTarget,
+    is_windows: bool,
+) -> SelfDevBuildCommand {
     let target = match target {
         SelfDevBuildTarget::Auto => infer_selfdev_build_target(repo_dir),
         explicit => explicit,
     };
     let specs = match target {
         SelfDevBuildTarget::Tui => vec![("jcode", "jcode")],
-        SelfDevBuildTarget::Desktop => vec![("jcode-desktop", "jcode-desktop")],
-        SelfDevBuildTarget::Desktop2 => vec![("jcode-desktop2", "jcode-desktop2")],
+        // desktop2 launches the harness API bridge as a sibling executable.
+        // Building only the app leaves a fresh target directory unable to
+        // start its runtime because the bridge is neither beside it nor on
+        // PATH.
+        SelfDevBuildTarget::Desktop2 => vec![
+            ("jcode-desktop2", "jcode-desktop2"),
+            ("jcode-harness-api-server", "jcode-harness-api-bridge"),
+        ],
         SelfDevBuildTarget::All | SelfDevBuildTarget::Auto => {
             vec![
                 ("jcode", "jcode"),
-                ("jcode-desktop", "jcode-desktop"),
                 ("jcode-desktop2", "jcode-desktop2"),
+                ("jcode-harness-api-server", "jcode-harness-api-bridge"),
             ]
         }
     };
     let wrapper = repo_dir.join("scripts").join("dev_cargo.sh");
-    if wrapper.is_file() {
+    // `bash` on Windows may resolve to WSL, which cannot use the native Rust
+    // toolchain or produce the Windows executable we publish. Avoid both that
+    // ambiguity and native-vs-POSIX path translation by invoking Cargo directly.
+    if wrapper.is_file() && !is_windows {
         let script = wrapper.to_string_lossy();
         let command = specs
             .iter()
             .map(|(package, binary)| {
                 format!(
-                    "{} build --profile {} -p {} --bin {}",
+                    "{} build --profile {} -p {} --bin {}{}",
                     shell_escape(&script),
                     SELFDEV_CARGO_PROFILE,
                     package,
-                    binary
+                    binary,
+                    if *package == "jcode-desktop2" {
+                        " --lib"
+                    } else {
+                        ""
+                    }
                 )
             })
             .collect::<Vec<_>>()
@@ -211,6 +233,14 @@ pub fn selfdev_build_command_for_target(
     }
 
     let command = display_build_command("cargo", &specs);
+    if is_windows {
+        return SelfDevBuildCommand {
+            program: "cargo".to_string(),
+            args: cargo_build_args(&specs),
+            display: command,
+        };
+    }
+
     SelfDevBuildCommand {
         program: "bash".to_string(),
         args: vec!["-lc".to_string(), command.clone()],
@@ -218,13 +248,41 @@ pub fn selfdev_build_command_for_target(
     }
 }
 
+fn cargo_build_args(specs: &[(&str, &str)]) -> Vec<String> {
+    let mut args = vec![
+        "build".to_string(),
+        "--profile".to_string(),
+        SELFDEV_CARGO_PROFILE.to_string(),
+    ];
+    for (package, binary) in specs {
+        args.extend([
+            "-p".to_string(),
+            (*package).to_string(),
+            "--bin".to_string(),
+            (*binary).to_string(),
+        ]);
+        if *package == "jcode-desktop2" {
+            args.push("--lib".to_string());
+        }
+    }
+    args
+}
+
 fn display_build_command(program: &str, specs: &[(&str, &str)]) -> String {
     specs
         .iter()
         .map(|(package, binary)| {
             format!(
-                "{} build --profile {} -p {} --bin {}",
-                program, SELFDEV_CARGO_PROFILE, package, binary
+                "{} build --profile {} -p {} --bin {}{}",
+                program,
+                SELFDEV_CARGO_PROFILE,
+                package,
+                binary,
+                if *package == "jcode-desktop2" {
+                    " --lib"
+                } else {
+                    ""
+                }
             )
         })
         .collect::<Vec<_>>()
@@ -260,7 +318,6 @@ fn porcelain_path(line: &str) -> String {
 /// routing is testable: getting this wrong means `selfdev build` silently
 /// builds the wrong binary and a reload appears to do nothing.
 fn build_target_for_paths<'a>(paths: impl Iterator<Item = &'a str>) -> SelfDevBuildTarget {
-    let mut desktop = false;
     let mut desktop2 = false;
     let mut other = false;
     for path in paths {
@@ -270,22 +327,17 @@ fn build_target_for_paths<'a>(paths: impl Iterator<Item = &'a str>) -> SelfDevBu
         }
         if path == "Cargo.toml" || path == "Cargo.lock" || path.starts_with(".cargo/") {
             // Workspace-wide changes can affect every binary.
-            desktop = true;
             desktop2 = true;
             other = true;
         } else if path.starts_with("crates/jcode-desktop2/") {
-            // Checked before jcode-desktop/ so desktop2 is not misattributed.
             desktop2 = true;
-        } else if path.starts_with("crates/jcode-desktop/") {
-            desktop = true;
         } else {
             other = true;
         }
     }
-    match (desktop, desktop2, other) {
-        (true, false, false) => SelfDevBuildTarget::Desktop,
-        (false, true, false) => SelfDevBuildTarget::Desktop2,
-        (false, false, _) => SelfDevBuildTarget::Tui,
+    match (desktop2, other) {
+        (true, false) => SelfDevBuildTarget::Desktop2,
+        (false, _) => SelfDevBuildTarget::Tui,
         _ => SelfDevBuildTarget::All,
     }
 }
@@ -648,11 +700,17 @@ mod tests {
         let repo = repo_fixture(false);
         let cases = [
             (SelfDevBuildTarget::Tui, vec!["-p jcode "]),
-            (SelfDevBuildTarget::Desktop, vec!["-p jcode-desktop "]),
-            (SelfDevBuildTarget::Desktop2, vec!["-p jcode-desktop2 "]),
+            (
+                SelfDevBuildTarget::Desktop2,
+                vec!["-p jcode-desktop2 ", "--bin jcode-harness-api-bridge"],
+            ),
             (
                 SelfDevBuildTarget::All,
-                vec!["-p jcode ", "-p jcode-desktop ", "-p jcode-desktop2 "],
+                vec![
+                    "-p jcode ",
+                    "-p jcode-desktop2 ",
+                    "--bin jcode-harness-api-bridge",
+                ],
             ),
         ];
         for (target, expected) in cases {
@@ -677,7 +735,93 @@ mod tests {
         assert!(!tui.display.contains("jcode-desktop"));
         let desktop2 = selfdev_build_command_for_target(repo.path(), SelfDevBuildTarget::Desktop2);
         assert!(!desktop2.display.contains("-p jcode "));
-        assert!(!desktop2.display.contains("-p jcode-desktop "));
+    }
+
+    #[test]
+    fn windows_selfdev_build_invokes_native_cargo_without_a_shell() {
+        let repo = repo_fixture(false);
+        let scripts = repo.path().join("scripts");
+        std::fs::create_dir_all(&scripts).expect("scripts dir");
+        std::fs::write(scripts.join("dev_cargo.sh"), "#!/usr/bin/env bash\n").expect("wrapper");
+
+        let command = selfdev_build_command_for_target_on_platform(
+            repo.path(),
+            SelfDevBuildTarget::Tui,
+            true,
+        );
+
+        assert_eq!(command.program, "cargo");
+        assert_eq!(
+            command.args,
+            [
+                "build",
+                "--profile",
+                "selfdev",
+                "-p",
+                "jcode",
+                "--bin",
+                "jcode"
+            ]
+        );
+        assert!(
+            !command.args.iter().any(|arg| arg.contains("dev_cargo.sh")),
+            "Windows must not pass a native script path through bash"
+        );
+    }
+
+    #[test]
+    fn unix_selfdev_build_keeps_using_the_wrapper() {
+        let repo = repo_fixture(false);
+        let scripts = repo.path().join("scripts");
+        std::fs::create_dir_all(&scripts).expect("scripts dir");
+        std::fs::write(scripts.join("dev_cargo.sh"), "#!/usr/bin/env bash\n").expect("wrapper");
+
+        let command = selfdev_build_command_for_target_on_platform(
+            repo.path(),
+            SelfDevBuildTarget::Tui,
+            false,
+        );
+
+        assert_eq!(command.program, "bash");
+        assert_eq!(command.args.first().map(String::as_str), Some("-lc"));
+        assert!(
+            command
+                .args
+                .last()
+                .is_some_and(|arg| arg.contains("scripts/dev_cargo.sh"))
+        );
+    }
+
+    #[test]
+    fn windows_cargo_args_build_every_requested_target() {
+        let repo = repo_fixture(false);
+        let command = selfdev_build_command_for_target_on_platform(
+            repo.path(),
+            SelfDevBuildTarget::All,
+            true,
+        );
+
+        assert_eq!(
+            command.args,
+            [
+                "build",
+                "--profile",
+                "selfdev",
+                "-p",
+                "jcode",
+                "--bin",
+                "jcode",
+                "-p",
+                "jcode-desktop2",
+                "--bin",
+                "jcode-desktop2",
+                "--lib",
+                "-p",
+                "jcode-harness-api-server",
+                "--bin",
+                "jcode-harness-api-bridge",
+            ]
+        );
     }
 
     /// `auto` must route a change to the binary that contains it. Before
@@ -689,22 +833,11 @@ mod tests {
             (vec!["src/main.rs"], SelfDevBuildTarget::Tui),
             (vec!["crates/jcode-tui/src/lib.rs"], SelfDevBuildTarget::Tui),
             (
-                vec!["crates/jcode-desktop/src/main.rs"],
-                SelfDevBuildTarget::Desktop,
-            ),
-            (
                 vec!["crates/jcode-desktop2/src/main.rs"],
                 SelfDevBuildTarget::Desktop2,
             ),
             (
                 vec!["crates/jcode-desktop2/src/editor.rs", "src/main.rs"],
-                SelfDevBuildTarget::All,
-            ),
-            (
-                vec![
-                    "crates/jcode-desktop/src/main.rs",
-                    "crates/jcode-desktop2/src/main.rs",
-                ],
                 SelfDevBuildTarget::All,
             ),
             // Workspace manifests can affect everything.
@@ -737,8 +870,7 @@ mod tests {
     fn build_targets_parse_from_their_names() {
         for (name, expected) in [
             ("tui", SelfDevBuildTarget::Tui),
-            ("desktop", SelfDevBuildTarget::Desktop),
-            ("jcode-desktop", SelfDevBuildTarget::Desktop),
+            ("desktop", SelfDevBuildTarget::Desktop2),
             ("desktop2", SelfDevBuildTarget::Desktop2),
             ("jcode-desktop2", SelfDevBuildTarget::Desktop2),
             ("all", SelfDevBuildTarget::All),

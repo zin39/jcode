@@ -1,5 +1,5 @@
 use super::*;
-use jcode_tui_style::palette::detect_tier;
+use jcode_tui_style::tiered::detect_tier;
 use ratatui::widgets::Wrap;
 
 impl SessionPicker {

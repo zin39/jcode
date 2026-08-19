@@ -196,13 +196,11 @@ fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
 #[test]
 fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_international_default() {
     let _lock = crate::storage::lock_test_env();
-    let _guard = EnvGuard::save(&["MINIMAX_API_KEY", "JCODE_HOME"]);
+    let _guard = EnvGuard::save(&["JCODE_HOME", "MINIMAX_API_KEY", "OPENAI_API_KEY"]);
+    let home = tempfile::tempdir().expect("temporary JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", home.path());
     crate::env::remove_var("MINIMAX_API_KEY");
-    // Isolate from the developer's real config dir: a genuine minimax.env
-    // holding an sk-cp- (China plan) key would flip the "international
-    // default" half of this test through the config-file fallback.
-    let temp_home = tempfile::tempdir().expect("create temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path().to_string_lossy().to_string());
+    crate::env::remove_var("OPENAI_API_KEY");
 
     let international = resolve_openai_compatible_profile(MINIMAX_PROFILE);
     assert_eq!(international.api_base, "https://api.minimax.io/v1");
@@ -217,6 +215,11 @@ fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_internatio
     );
     assert_eq!(china.api_base, MINIMAX_CHINA_API_BASE);
     assert_eq!(china.setup_url, MINIMAX_CHINA_SETUP_URL);
+
+    crate::env::set_var("OPENAI_API_KEY", "sk-cp-legacy-token");
+    let legacy = resolve_openai_compatible_profile(MINIMAX_PROFILE);
+    assert_eq!(legacy.api_key_env, "OPENAI_API_KEY");
+    assert_eq!(legacy.api_base, MINIMAX_CHINA_API_BASE);
 }
 
 #[test]
@@ -541,8 +544,18 @@ fn named_provider_config_accepts_openai_compatible_spelling() {
 }
 
 #[test]
-fn named_provider_profile_reports_malformed_config_instead_of_unknown_profile() {
+fn named_anthropic_compatible_profile_maps_endpoint_auth_headers_and_model() {
     let _lock = crate::storage::lock_test_env();
+    let _guard = EnvGuard::save(&[
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_ANTHROPIC_API_BASE",
+        "JCODE_ANTHROPIC_API_KEY_NAME",
+        "JCODE_ANTHROPIC_AUTH",
+        "JCODE_ANTHROPIC_AUTH_HEADER",
+        "JCODE_ANTHROPIC_HEADERS",
+        "JCODE_ANTHROPIC_MODEL",
+        "JCODE_RUNTIME_PROVIDER",
+    ]);
     let previous_home = std::env::var_os("JCODE_HOME");
     let temp = tempfile::TempDir::new().expect("tempdir");
     crate::env::set_var("JCODE_HOME", temp.path());
@@ -554,32 +567,53 @@ fn named_provider_profile_reports_malformed_config_instead_of_unknown_profile() 
     std::fs::write(
         &config_path,
         r#"
-        [providers.antigravity]
+        [providers.corporate-claude]
         type = "anthropic-compatible"
-        base_url = "http://192.168.1.202:8080"
-        api_key_env = "ANTIGRAVITY_API_KEY"
-        default_model = "gemini-3.1-pro-low"
+        base_url = "https://gateway.example.com/anthropic/v1/"
+        auth = "bearer"
+        api_key_env = "CORPORATE_CLAUDE_TOKEN"
+        default_model = "claude-custom"
 
-        [[providers.antigravity.models]]
-        id = "gemini-3.1-pro-low"
+        [providers.corporate-claude.headers]
+        x-tenant-id = "tenant-42"
+
+        [[providers.corporate-claude.models]]
+        id = "claude-custom"
         context_window = 128000
         "#,
     )
     .expect("write config");
 
-    let err = apply_named_provider_profile_env("antigravity").expect_err("malformed config");
-    let message = err.to_string();
-    assert!(
-        message.contains("Failed to parse config file"),
-        "unexpected error: {message}"
+    apply_named_provider_profile_env("corporate-claude").expect("apply Anthropic profile");
+    assert_eq!(
+        std::env::var("JCODE_ANTHROPIC_API_BASE").ok().as_deref(),
+        Some("https://gateway.example.com/anthropic/v1")
     );
-    assert!(
-        message.contains("anthropic-compatible"),
-        "unexpected error: {message}"
+    assert_eq!(
+        std::env::var("JCODE_ANTHROPIC_API_KEY_NAME")
+            .ok()
+            .as_deref(),
+        Some("CORPORATE_CLAUDE_TOKEN")
     );
-    assert!(
-        !message.contains("Unknown provider profile"),
-        "unexpected error: {message}"
+    assert_eq!(
+        std::env::var("JCODE_ANTHROPIC_AUTH").ok().as_deref(),
+        Some("bearer")
+    );
+    assert_eq!(
+        std::env::var("JCODE_ANTHROPIC_MODEL").ok().as_deref(),
+        Some("claude-custom")
+    );
+    let headers: std::collections::BTreeMap<String, String> = serde_json::from_str(
+        &std::env::var("JCODE_ANTHROPIC_HEADERS").expect("custom headers env"),
+    )
+    .expect("headers JSON");
+    assert_eq!(
+        headers.get("x-tenant-id").map(String::as_str),
+        Some("tenant-42")
+    );
+    assert_eq!(
+        std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
+        Some("anthropic-api")
     );
 
     if let Some(previous_home) = previous_home {
@@ -1102,6 +1136,7 @@ fn open_weight_family_context_limits_match_published_windows() {
     assert_eq!(f("kimi-k2.5"), Some(262_144));
     assert_eq!(f("minimax-m2.7"), Some(204_800));
     assert_eq!(f("mimo-v2.5"), Some(262_144));
+    assert_eq!(f("muse-spark-1.2"), Some(1_048_576));
     assert_eq!(f("deepseek-v3.2"), Some(163_840));
     assert_eq!(f("deepseek-v4-pro"), Some(1_000_000));
     assert_eq!(f("qwen3-235b-a22b-instruct-2507"), Some(262_144));
@@ -1141,10 +1176,10 @@ fn moonshotai_static_models_have_no_retired_ids() {
 }
 
 #[test]
-fn minimax_default_provider_applies_openai_api_key_env_not_openrouter() {
+fn minimax_default_provider_applies_minimax_api_key_env_not_openrouter() {
     // Regression for #407: `default_provider = "minimax"` (the built-in MiniMax
     // profile) must resolve credentials from the profile's documented
-    // OPENAI_API_KEY / minimax.env, not the generic OPENROUTER_API_KEY /
+    // MINIMAX_API_KEY / minimax.env, not the generic OPENROUTER_API_KEY /
     // openrouter.env. The earlier bug surfaced as
     // "OPENROUTER_API_KEY not found ..." when applying the configured
     // default_model.
@@ -1182,8 +1217,7 @@ fn minimax_default_provider_applies_openai_api_key_env_not_openrouter() {
             .ok()
             .as_deref(),
         Some("MINIMAX_API_KEY"),
-        "MiniMax must use its own MINIMAX_API_KEY: not OPENROUTER_API_KEY, and \
-         not OPENAI_API_KEY (which would shadow the real OpenAI platform key)"
+        "MiniMax profile must use MINIMAX_API_KEY, not OPENROUTER_API_KEY"
     );
     assert_eq!(
         std::env::var("JCODE_OPENROUTER_ENV_FILE").ok().as_deref(),

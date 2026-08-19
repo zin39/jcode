@@ -25,6 +25,35 @@ fn ch(c: char) -> Key {
 }
 
 #[test]
+fn ctrl_m_resolves_to_the_model_picker() {
+    assert_eq!(
+        keymap::resolve(&ch('m'), ModifiersState::CONTROL),
+        Some(Action::ToggleModelPicker)
+    );
+    assert_eq!(
+        keymap::resolve(&ch('m'), ModifiersState::SUPER),
+        Some(Action::ToggleModelPicker)
+    );
+}
+
+#[test]
+fn ctrl_alt_space_opens_the_session_overview() {
+    use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+    assert_eq!(
+        keymap::resolve(
+            &Key::Named(NamedKey::Space),
+            ModifiersState::CONTROL | ModifiersState::ALT,
+        ),
+        Some(keymap::Action::ToggleOverview)
+    );
+
+    let mut app = app_with("");
+    app.apply(keymap::Action::ToggleOverview, None);
+    assert!(app.model.overview.is_visible());
+}
+
+#[test]
 fn escape_clears_the_input_instead_of_quitting() {
     // The starter quit the app on Escape, silently losing typed work.
     let mut app = app_with("a draft message");
@@ -96,8 +125,24 @@ fn ctrl_c_quits_only_when_idle_and_empty() {
 #[test]
 fn editing_chords_reach_the_editor() {
     let mut app = app_with("alpha beta");
+    // Web binding: Ctrl+A selects all rather than jumping the caret home.
     press(&mut app, ch('a'), ModifiersState::CONTROL, None);
-    assert_eq!(app.model.editor.cursor(), 0, "Ctrl+A did not go home");
+    assert_eq!(
+        app.model.editor.selected_text(),
+        Some("alpha beta"),
+        "Ctrl+A did not select all"
+    );
+    press(
+        &mut app,
+        Key::Named(NamedKey::Home),
+        ModifiersState::empty(),
+        None,
+    );
+    assert_eq!(
+        app.model.editor.cursor(),
+        0,
+        "Home did not go to line start"
+    );
     press(&mut app, ch('e'), ModifiersState::CONTROL, None);
     assert_eq!(
         app.model.editor.cursor(),
@@ -126,6 +171,58 @@ fn cut_then_paste_round_trips_through_the_clipboard() {
         app.model.editor.text(),
         "cut me",
         "paste did not restore the cut"
+    );
+}
+
+/// Web Ctrl+C: with something selected it copies, and it must not interrupt a
+/// running turn behind the user's back. Only an unselected Ctrl+C interrupts.
+#[test]
+fn ctrl_c_copies_when_there_is_a_selection_instead_of_interrupting() {
+    let mut app = app_with("copy me");
+    app.model.busy = true;
+    press(&mut app, ch('a'), ModifiersState::CONTROL, None);
+    assert!(press(&mut app, ch('c'), ModifiersState::CONTROL, None));
+    assert!(
+        app.model.busy,
+        "Ctrl+C interrupted while copying a selection"
+    );
+    assert_eq!(
+        app.model.editor.text(),
+        "copy me",
+        "Ctrl+C on a selection must not clear the composer"
+    );
+    // Now with nothing selected it falls back to interrupting.
+    press(
+        &mut app,
+        Key::Named(NamedKey::ArrowRight),
+        ModifiersState::empty(),
+        None,
+    );
+    assert!(press(&mut app, ch('c'), ModifiersState::CONTROL, None));
+    assert!(!app.model.busy, "unselected Ctrl+C did not interrupt");
+}
+
+/// Ctrl+Z then Ctrl+Shift+Z round-trips an edit, as in any browser field.
+#[test]
+fn undo_and_redo_round_trip_through_the_app() {
+    let mut app = app_with("alpha");
+    press(&mut app, ch('x'), ModifiersState::CONTROL, None);
+    assert!(app.model.editor.is_empty());
+    press(&mut app, ch('z'), ModifiersState::CONTROL, None);
+    assert_eq!(
+        app.model.editor.text(),
+        "alpha",
+        "Ctrl+Z did not undo the cut"
+    );
+    press(
+        &mut app,
+        ch('z'),
+        ModifiersState::CONTROL | ModifiersState::SHIFT,
+        None,
+    );
+    assert!(
+        app.model.editor.is_empty(),
+        "Ctrl+Shift+Z did not redo the cut"
     );
 }
 
@@ -187,34 +284,98 @@ fn submitting_without_a_session_keeps_the_text_and_says_why() {
 }
 
 #[test]
+fn local_help_aliases_work_before_attachment_and_never_reach_the_harness() {
+    for alias in crate::help::ALIASES {
+        let mut app = App::default();
+        app.apply(Action::Insert, Some(alias));
+        app.submit_input();
+        assert!(app.model.help_open, "{alias} did not open help");
+        assert!(
+            app.model.editor.is_empty(),
+            "{alias} stayed in the composer"
+        );
+        assert!(app.model.transcript.is_empty(), "{alias} became a message");
+        assert_eq!(app.model.session_id, None, "test unexpectedly attached");
+    }
+
+    // Repeat while attached to prove interception happens before the outgoing
+    // command path, not merely because an unattached submit is rejected.
+    let mut app = app_with("/commands");
+    let (_updates_tx, updates_rx) = std::sync::mpsc::channel();
+    let (commands_tx, commands_rx) = std::sync::mpsc::channel();
+    app.harness = Some((
+        updates_rx,
+        crate::harness::CommandSender::for_test(commands_tx),
+    ));
+    app.submit_input();
+    assert!(app.model.help_open);
+    assert!(matches!(
+        commands_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn f1_help_is_keyboard_modal_and_escape_or_f1_closes_it() {
+    let mut app = app_with("draft stays put");
+    assert_eq!(
+        keymap::resolve(&Key::Named(NamedKey::F1), ModifiersState::empty()),
+        Some(Action::ToggleHelp)
+    );
+    assert!(app.key_pressed(&Key::Named(NamedKey::F1), None));
+    assert!(app.model.help_open);
+
+    assert!(app.key_pressed(&ch('x'), Some("x")));
+    assert_eq!(app.model.editor.text(), "draft stays put");
+    assert!(app.model.help_open, "an unrelated key closed help");
+
+    assert!(app.key_pressed(&Key::Named(NamedKey::Escape), None));
+    assert!(!app.model.help_open);
+    assert_eq!(app.model.editor.text(), "draft stays put");
+
+    assert!(app.key_pressed(&Key::Named(NamedKey::F1), None));
+    assert!(app.model.help_open);
+    assert!(app.key_pressed(&Key::Named(NamedKey::F1), None));
+    assert!(!app.model.help_open);
+}
+
+/// A conversation long enough to overflow any test region.
+fn long_transcript(turns: usize) -> crate::transcript::Transcript {
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    for n in 1..=turns {
+        transcript.push(Message::user(format!("question {n}")));
+        transcript.push(Message::assistant(format!(
+            "answer {n}. {}",
+            "prose that wraps at any sensible width ".repeat(3)
+        )));
+    }
+    transcript
+}
+
+#[test]
 fn scrolling_clamps_and_returns_to_the_tail() {
     let mut app = App::default();
-    app.model.transcript = (1..=100)
-        .map(|n| format!("line {n}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    app.model.transcript = long_transcript(60);
     app.apply(Action::ScrollTop, None);
     let top = app.model.scroll;
-    assert!(top > 0, "scrolling up did nothing");
+    assert!(top > 0.0, "scrolling up did nothing");
     app.apply(Action::ScrollUp, None);
     assert_eq!(app.model.scroll, top, "scroll ran past the top of history");
     app.apply(Action::ScrollBottom, None);
-    assert_eq!(app.model.scroll, 0, "did not return to the live tail");
+    assert_eq!(app.model.scroll, 0.0, "did not return to the live tail");
     app.apply(Action::ScrollDown, None);
-    assert_eq!(app.model.scroll, 0, "scrolled below the tail");
+    assert_eq!(app.model.scroll, 0.0, "scrolled below the tail");
 }
 
 #[test]
 fn submitting_jumps_back_to_the_live_tail() {
     let mut app = app_with("question");
-    app.model.transcript = (1..=100)
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    app.model.transcript = long_transcript(60);
     app.apply(Action::PageUp, None);
-    assert!(app.model.scroll > 0);
+    assert!(app.model.scroll > 0.0);
     app.submit_input();
-    assert_eq!(app.model.scroll, 0, "reply would stream in off-screen");
+    assert_eq!(app.model.scroll, 0.0, "reply would stream in off-screen");
 }
 
 #[test]
@@ -254,7 +415,7 @@ fn composer_layout(
     frame: crate::layout::Frame,
 ) -> crate::input::InputLayout {
     crate::input::InputLayout::new(
-        &mut app.text,
+        &mut app.painter.text,
         source,
         frame.composer_text_width(),
         crate::scene::composer_text_style(&app.model),
@@ -480,7 +641,11 @@ fn the_recorded_frame_matches_the_rendered_geometry() {
         ((2400, 1400), 1.75),
         ((800, 600), 2.0),
     ] {
-        let recorded = App::frame_for_model(size, scale, &Model::default());
+        // Keep this baseline on a genuinely single-line hint. Wrapped hints
+        // intentionally grow the well and are covered by the dedicated test.
+        let mut model = Model::default();
+        model.hint = 2; // "describe the bug, not the fix"
+        let recorded = App::frame_for_model(size, scale, &model);
         let rendered = crate::layout::Frame::new(size, scale);
         assert_eq!(
             recorded, rendered,
@@ -608,7 +773,7 @@ fn shift_enter_makes_a_new_line_and_enter_still_submits() {
         app.model.editor.is_empty(),
         "Enter did not submit a multi-line message"
     );
-    assert!(app.model.transcript.contains("first\nsecond"));
+    assert!(app.model.transcript.plain_text().contains("first\nsecond"));
 }
 
 #[test]
@@ -669,6 +834,34 @@ fn wrapped_rows_fit_inside_the_composer_well() {
 }
 
 #[test]
+fn every_hint_fits_inside_the_composer_at_every_supported_geometry() {
+    // This is deliberately a state-space invariant rather than a snapshot of
+    // one hint at one width. Copy changes, narrow windows, and HiDPI scaling
+    // are exactly how a harmless-looking placeholder starts escaping its box.
+    for (hint_index, hint) in crate::hints::HINTS.iter().enumerate() {
+        for &(size, scale) in &[
+            ((320u32, 480u32), 1.0f64),
+            ((360, 800), 1.0),
+            ((800, 600), 2.0),
+            ((1200, 900), 1.5),
+            ((2200, 1440), 2.0),
+        ] {
+            let mut app = app_with("");
+            app.model.hint = hint_index;
+            let probe = crate::layout::Frame::new(size, scale);
+            let measured = composer_layout(&mut app, hint, probe).line_count();
+            let frame = App::frame_for_model(size, scale, &app.model);
+            assert!(
+                frame.composer_lines() >= measured,
+                "hint escaped its composer at {size:?} @ {scale}x: {hint:?} needs \
+                 {measured} rows, but the field reserved {}",
+                frame.composer_lines()
+            );
+        }
+    }
+}
+
+#[test]
 fn a_long_line_wraps_into_multiple_rows_and_grows_the_well() {
     let long = "word ".repeat(60);
     let app = app_with(&long);
@@ -678,10 +871,10 @@ fn a_long_line_wraps_into_multiple_rows_and_grows_the_well() {
     let lines = composer_layout(&mut app, &source, single).line_count();
     assert!(lines > 1, "a long line did not wrap");
     let frame = App::frame_for_model((1400, 900), 1.0, &app.model);
-    assert!(
-        frame.composer_top < single.composer_top,
-        "the well did not grow for wrapped rows"
-    );
+    // Height, not an edge: a hero page grows the well downward.
+    let grew =
+        frame.composer_bottom - frame.composer_top > single.composer_bottom - single.composer_top;
+    assert!(grew, "the well did not grow for wrapped rows");
     // Wrapping is a view concern: it must not touch the buffer.
     assert_eq!(app.model.editor.text(), long);
     assert_eq!(app.model.editor.line_count(), 1);
@@ -719,10 +912,10 @@ fn the_composer_frame_follows_the_input_line_count() {
     app.apply(Action::InsertNewline, None);
     app.apply(Action::Insert, Some("two"));
     let double = App::frame_for_model((1400, 900), 1.0, &app.model);
-    assert!(
-        double.composer_top < single.composer_top,
-        "the composer did not grow when a line was added"
-    );
+    // Height, not an edge: a hero page grows the well downward.
+    let grew =
+        double.composer_bottom - double.composer_top > single.composer_bottom - single.composer_top;
+    assert!(grew, "the composer did not grow when a line was added");
 }
 
 #[test]
@@ -740,15 +933,12 @@ fn hit_testing_uses_the_frame_that_was_actually_drawn() {
 #[test]
 fn the_wheel_scrolls_and_clamps_like_the_keyboard() {
     let mut app = App::default();
-    app.model.transcript = (1..=100)
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let visible = app.visible_lines();
-    app.model.scroll_up(3, visible);
-    assert_eq!(app.model.scroll, 3);
-    app.model.scroll_down(99);
-    assert_eq!(app.model.scroll, 0, "wheel scrolled past the tail");
+    app.model.transcript = long_transcript(60);
+    let max = app.max_scroll();
+    app.model.scroll_up(30.0, max);
+    assert_eq!(app.model.scroll, 30.0);
+    app.model.scroll_down(9_000.0);
+    assert_eq!(app.model.scroll, 0.0, "wheel scrolled past the tail");
 }
 
 #[test]
@@ -922,7 +1112,10 @@ mod donut {
     fn the_donut_stands_down_once_there_is_a_transcript() {
         let mut app = app_on_empty_session();
         assert!(app.donut_visible());
-        app.model.transcript.push_str("\n> hi\n\nhello\n");
+        app.model
+            .transcript
+            .push(crate::transcript::Message::user("hi"));
+        app.model.transcript.append_assistant("hello");
         assert!(!app.donut_visible(), "content must take the donut's space");
         // And a press where the donut was is inert, not a hidden hit target.
         let (cx, cy) = donut_centre(&app);
@@ -1007,4 +1200,595 @@ fn a_reported_model_reaches_the_model() {
             .as_deref(),
         Some("gpt-5.6")
     );
+}
+
+/// R6: the session strip. Moving must actually switch the conversation, not
+/// merely recolour a bar, and it must never leak the previous session's
+/// transcript into the new one.
+mod session_strip {
+    use super::*;
+    use crate::strip::{Panel, Strips};
+
+    fn app_with_sessions(focused: &str) -> App {
+        let mut app = App::default();
+        let entries = vec![
+            Panel {
+                session_id: "s_a1".into(),
+                title: None,
+                working_dir: Some("/home/j/jcode".into()),
+                busy: false,
+                weight: 0.0,
+            },
+            Panel {
+                session_id: "s_a2".into(),
+                title: None,
+                working_dir: Some("/home/j/jcode".into()),
+                busy: false,
+                weight: 0.0,
+            },
+            Panel {
+                session_id: "s_b1".into(),
+                title: None,
+                working_dir: Some("/home/j/site".into()),
+                busy: false,
+                weight: 0.0,
+            },
+        ];
+        app.model.strips = Strips::build(entries, Some(focused));
+        app.model.session_id = Some(focused.into());
+        app
+    }
+
+    /// Switching sessions must never leave the previous session's directory on
+    /// screen: the caption and title would then name the wrong project while
+    /// you type into a different one.
+    #[test]
+    fn switching_sessions_renames_the_place() {
+        let mut app = app_with_sessions("s_a1");
+        app.model.working_dir = Some("/home/j/jcode".into());
+        app.apply(Action::SessionDown, None);
+        assert_eq!(app.model.session_id.as_deref(), Some("s_b1"));
+        assert_eq!(app.model.working_dir.as_deref(), Some("/home/j/site"));
+        assert!(
+            crate::place::window_title(app.model.working_dir.as_deref())
+                .starts_with("/home/j/site")
+        );
+    }
+
+    /// R2 revisited: the top row is also earned by having a directory to name,
+    /// so a single-session window still says where it is.
+    #[test]
+    fn a_lone_session_with_a_directory_gets_the_top_row() {
+        let mut app = App::default();
+        app.model.working_dir = Some("/home/j/jcode".into());
+        assert!(
+            App::frame_for_model((1400, 900), 1.0, &app.model)
+                .strip()
+                .is_some(),
+            "a lone attached session had nowhere to show its directory"
+        );
+    }
+
+    #[test]
+    fn moving_right_switches_the_attached_session() {
+        let mut app = app_with_sessions("s_a1");
+        app.model
+            .transcript
+            .push(crate::transcript::Message::assistant(
+                "output from the old session",
+            ));
+        app.model.busy = true;
+        app.model.scroll = 4.0;
+
+        app.apply(Action::SessionRight, None);
+
+        assert_eq!(
+            app.model.session_id.as_deref(),
+            Some("s_a2"),
+            "the highlight moved but the session did not"
+        );
+        assert!(
+            app.model.transcript.is_empty(),
+            "the previous session's transcript leaked into the new one"
+        );
+        assert!(!app.model.busy, "carried the old session's busy state");
+        assert_eq!(app.model.scroll, 0.0, "carried the old session's scroll");
+        assert!(
+            app.model.workspace.is_animating(),
+            "horizontal navigation did not start the camera transition"
+        );
+        assert_eq!(
+            app.model
+                .peeks
+                .get("s_a1")
+                .map(crate::transcript::Transcript::plain_text)
+                .as_deref()
+                .map(str::trim),
+            Some("output from the old session"),
+            "the outgoing live model was not cached for its inactive column"
+        );
+    }
+
+    #[test]
+    fn moving_down_switches_to_the_other_working_directory() {
+        let mut app = app_with_sessions("s_a1");
+        app.apply(Action::SessionDown, None);
+        assert_eq!(app.model.session_id.as_deref(), Some("s_b1"));
+        assert_eq!(app.model.strips.strip_index(), 1);
+    }
+
+    fn panel_point(app: &App, wanted_strip: usize, wanted_panel: usize) -> (f64, f64) {
+        let (top, bottom) = app.frame.strip().expect("strip missing");
+        crate::strip::layout_items(&app.model.strips, app.frame.left, app.frame.right)
+            .into_iter()
+            .find_map(|item| match item {
+                crate::strip::Item::Panel {
+                    strip,
+                    panel,
+                    x,
+                    width,
+                    ..
+                } if strip == wanted_strip && panel == wanted_panel => {
+                    Some((x + width / 2.0, (top + bottom) / 2.0))
+                }
+                _ => None,
+            })
+            .expect("panel was not laid out")
+    }
+
+    #[test]
+    fn clicking_a_strip_block_switches_to_that_session() {
+        let mut app = app_with_sessions("s_a1");
+        app.frame = App::frame_for_model((1400, 900), 1.0, &app.model);
+        app.pointer = panel_point(&app, 0, 1);
+
+        app.on_pointer_pressed();
+
+        assert_eq!(app.model.session_id.as_deref(), Some("s_a2"));
+        assert!(app.model.workspace.is_animating());
+    }
+
+    #[test]
+    fn clicking_a_strip_block_in_another_group_switches_workspace() {
+        let mut app = app_with_sessions("s_a1");
+        app.frame = App::frame_for_model((1400, 900), 1.0, &app.model);
+        app.pointer = panel_point(&app, 1, 0);
+
+        app.on_pointer_pressed();
+
+        assert_eq!(app.model.session_id.as_deref(), Some("s_b1"));
+        assert_eq!(
+            app.model.workspace.row_change(),
+            Some(crate::workspace::Direction::Down)
+        );
+    }
+
+    #[test]
+    fn hovering_a_strip_block_uses_the_pointer_cursor() {
+        let mut app = app_with_sessions("s_a1");
+        app.frame = App::frame_for_model((1400, 900), 1.0, &app.model);
+        app.pointer = panel_point(&app, 0, 1);
+
+        app.update_cursor_icon();
+
+        assert_eq!(app.cursor_icon, winit::window::CursorIcon::Pointer);
+    }
+
+    /// With one session there is nowhere to go, so the keys must leave the
+    /// attached session completely alone rather than "switching" to itself
+    /// and wiping the transcript.
+    #[test]
+    fn navigation_is_inert_with_a_single_session() {
+        let mut app = App::default();
+        app.model.strips = Strips::build(
+            vec![Panel {
+                session_id: "solo".into(),
+                title: None,
+                working_dir: Some("/tmp".into()),
+                busy: false,
+                weight: 0.0,
+            }],
+            Some("solo"),
+        );
+        app.model.session_id = Some("solo".into());
+        app.model
+            .transcript
+            .push(crate::transcript::Message::assistant("keep me"));
+
+        for action in [
+            Action::SessionLeft,
+            Action::SessionRight,
+            Action::SessionUp,
+            Action::SessionDown,
+        ] {
+            app.apply(action, None);
+        }
+
+        assert_eq!(app.model.session_id.as_deref(), Some("solo"));
+        assert_eq!(
+            app.model.transcript.plain_text().trim(),
+            "keep me",
+            "an inert move still wiped the transcript"
+        );
+    }
+
+    /// R2 at the model level: the strip only claims a row once there is
+    /// somewhere to move to.
+    #[test]
+    fn the_strip_band_appears_only_with_more_than_one_session() {
+        let mut app = App::default();
+        assert_eq!(
+            App::frame_for_model((1400, 900), 1.0, &app.model).strip(),
+            None,
+            "an empty session list still reserved a strip row"
+        );
+
+        app.model.strips = Strips::build(
+            vec![Panel {
+                session_id: "solo".into(),
+                title: None,
+                working_dir: Some("/tmp".into()),
+                busy: false,
+                weight: 0.0,
+            }],
+            Some("solo"),
+        );
+        assert_eq!(
+            App::frame_for_model((1400, 900), 1.0, &app.model).strip(),
+            None,
+            "a single session still reserved a strip row"
+        );
+
+        app = app_with_sessions("s_a1");
+        assert!(
+            App::frame_for_model((1400, 900), 1.0, &app.model)
+                .strip()
+                .is_some(),
+            "several sessions did not get a strip"
+        );
+    }
+
+    /// A poll must not yank the user somewhere else: the refreshed strip has
+    /// to stay pointed at the conversation on screen.
+    #[test]
+    fn a_session_list_refresh_keeps_the_current_session_focused() {
+        let mut app = app_with_sessions("s_a1");
+        app.apply(Action::SessionDown, None);
+        assert_eq!(app.model.session_id.as_deref(), Some("s_b1"));
+
+        // A later poll reports the same sessions in the same order.
+        app.model.strips = Strips::build(
+            vec![
+                Panel {
+                    session_id: "s_a1".into(),
+                    title: None,
+                    working_dir: Some("/home/j/jcode".into()),
+                    busy: false,
+                    weight: 0.0,
+                },
+                Panel {
+                    session_id: "s_a2".into(),
+                    title: None,
+                    working_dir: Some("/home/j/jcode".into()),
+                    busy: false,
+                    weight: 0.0,
+                },
+                Panel {
+                    session_id: "s_b1".into(),
+                    title: None,
+                    working_dir: Some("/home/j/site".into()),
+                    busy: false,
+                    weight: 0.0,
+                },
+            ],
+            app.model.session_id.as_deref(),
+        );
+        assert_eq!(
+            app.model.strips.focused_session(),
+            Some("s_b1"),
+            "a refresh moved the highlight off the visible session"
+        );
+    }
+}
+
+/// Ctrl+plus / Ctrl+minus resize the whole UI, and Ctrl+0 puts it back. The
+/// chord arrives spelled differently depending on the layout and on whether
+/// Shift is held, so every spelling has to land on the same action.
+#[test]
+fn ctrl_plus_and_minus_change_the_ui_zoom() {
+    let mut app = App::default();
+    let start = app.geometry.zoom;
+
+    for spelling in ['+', '='] {
+        app.geometry.zoom = 1.0;
+        press(&mut app, ch(spelling), ModifiersState::CONTROL, None);
+        assert!(
+            app.geometry.zoom > 1.0,
+            "ctrl+{spelling} did not grow the UI"
+        );
+    }
+    for spelling in ['-', '_'] {
+        app.geometry.zoom = 1.0;
+        press(&mut app, ch(spelling), ModifiersState::CONTROL, None);
+        assert!(
+            app.geometry.zoom < 1.0,
+            "ctrl+{spelling} did not shrink the UI"
+        );
+    }
+    // Shifted, as a US layout actually reports Ctrl+plus and Ctrl+underscore.
+    app.geometry.zoom = 1.0;
+    press(
+        &mut app,
+        ch('='),
+        ModifiersState::CONTROL | ModifiersState::SHIFT,
+        None,
+    );
+    assert!(app.geometry.zoom > 1.0, "ctrl+shift+= did not grow the UI");
+
+    press(&mut app, ch('0'), ModifiersState::CONTROL, None);
+    assert_eq!(app.geometry.zoom, start, "ctrl+0 did not reset the zoom");
+}
+
+#[test]
+fn ctrl_alt_shift_arrows_resize_only_the_session_panel() {
+    let mut app = App::default();
+    let window_zoom = app.geometry.zoom;
+    let initial = app.model.workspace.column_width(1000, 3);
+
+    press(
+        &mut app,
+        Key::Named(NamedKey::ArrowRight),
+        ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT,
+        None,
+    );
+    assert!(app.model.workspace.column_width(1000, 3) > initial);
+    assert_eq!(
+        app.geometry.zoom, window_zoom,
+        "panel resize changed UI zoom"
+    );
+
+    press(
+        &mut app,
+        Key::Named(NamedKey::ArrowLeft),
+        ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT,
+        None,
+    );
+    assert_eq!(app.model.workspace.column_width(1000, 3), initial);
+    assert_eq!(
+        app.geometry.zoom, window_zoom,
+        "panel resize changed UI zoom"
+    );
+}
+
+/// Zoom is bounded on both sides: unreadably small and absurdly large are both
+/// states a user cannot get out of by eye.
+#[test]
+fn zoom_is_clamped_at_both_ends() {
+    let mut app = App::default();
+    for _ in 0..100 {
+        press(&mut app, ch('='), ModifiersState::CONTROL, None);
+    }
+    assert_eq!(app.geometry.zoom, crate::window_state::MAX_ZOOM);
+    for _ in 0..200 {
+        press(&mut app, ch('-'), ModifiersState::CONTROL, None);
+    }
+    assert_eq!(app.geometry.zoom, crate::window_state::MIN_ZOOM);
+}
+
+/// The zoom has to reach the pixels: the frame the renderer and hit-testing
+/// share is resolved at the window's scale times the zoom, so a larger zoom
+/// means fewer logical units across the same window (bigger text).
+#[test]
+fn zooming_in_narrows_the_logical_page() {
+    // A window narrower than the measure cap, so the column is a function of
+    // the window rather than pinned at MEASURE.
+    let size = (700u32, 720u32);
+    let base = crate::layout::Frame::new(size, 1.0);
+    let zoomed = crate::layout::Frame::new(size, 1.25);
+    assert!(
+        zoomed.column() < base.column(),
+        "zooming in did not shrink the logical measure ({} vs {})",
+        zoomed.column(),
+        base.column()
+    );
+}
+
+/// Zoom survives a restart, like the window size it is saved beside.
+#[test]
+fn zoom_round_trips_through_the_saved_geometry() {
+    let saved = crate::window_state::Geometry {
+        width: 1100.0,
+        height: 720.0,
+        position: None,
+        zoom: 1.331,
+    };
+    assert_eq!(
+        crate::window_state::Geometry::parse(&saved.serialize()).zoom,
+        saved.zoom
+    );
+}
+
+/// A new session has to be reachable from the keyboard. The strip and the
+/// overview can only walk sessions that already exist, so without a chord the
+/// app can never add one: it inherits whatever the daemon happens to be
+/// running and is stuck there.
+#[test]
+fn ctrl_shift_n_starts_a_new_session() {
+    assert_eq!(
+        keymap::resolve(&ch('n'), ModifiersState::CONTROL | ModifiersState::SHIFT),
+        Some(Action::SessionNew),
+        "Ctrl+Shift+N did not resolve to a new session"
+    );
+    // Unshifted Ctrl+N must stay out of the way: it is a typing reflex, and
+    // silently swapping the conversation under a keystroke is unrecoverable.
+    assert_ne!(
+        keymap::resolve(&ch('n'), ModifiersState::CONTROL),
+        Some(Action::SessionNew),
+        "plain Ctrl+N started a session"
+    );
+}
+
+#[test]
+fn browser_new_tab_shortcuts_start_a_new_session_panel() {
+    assert_eq!(
+        keymap::resolve(&ch('t'), ModifiersState::CONTROL),
+        Some(Action::SessionNew)
+    );
+    assert_eq!(
+        keymap::resolve(&ch('t'), ModifiersState::SUPER),
+        Some(Action::SessionNew)
+    );
+    assert_ne!(
+        keymap::resolve(&ch('t'), ModifiersState::CONTROL | ModifiersState::SHIFT),
+        Some(Action::SessionNew),
+        "Ctrl+Shift+T should remain available for reopen-closed-panel behavior"
+    );
+}
+
+/// Starting a session must leave the current panel visible while creation is
+/// in flight. Once the new id attaches, the live page becomes the new blank
+/// panel and the old transcript remains cached as its spatial neighbor.
+#[test]
+fn a_new_session_preserves_the_old_panel_until_the_new_one_attaches() {
+    use std::sync::mpsc::channel;
+
+    let mut app = app_with("a draft");
+    app.model
+        .transcript
+        .append_assistant("previous session output");
+    app.model.session_id = Some("old".into());
+    app.model.working_dir = Some("/work".into());
+    app.model.busy = true;
+    app.model.scroll = 120.0;
+    let before = app.model.transcript.streaming_len();
+    let (updates_tx, updates_rx) = channel();
+    let (commands_tx, _commands_rx) = channel();
+    let commands = crate::harness::CommandSender::for_test(commands_tx);
+    app.harness = Some((updates_rx, commands.clone()));
+
+    app.new_session();
+
+    assert!(commands.new_requested_for_test());
+    assert_eq!(app.model.session_id.as_deref(), Some("old"));
+    assert_eq!(app.model.transcript.streaming_len(), before);
+    assert!(app.model.peeks.get("old").is_some());
+
+    // The periodic session poll can beat the create response. Seeing the old
+    // panel again must not finish the transition or blank it.
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Sessions(vec![
+            crate::strip::Panel::new("old", Some("/work")),
+        ]))
+        .unwrap();
+    app.drain_harness_updates();
+    assert!(app.new_session_transition_pending);
+    assert_eq!(app.model.transcript.streaming_len(), before);
+
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Attached {
+            session_id: "new".into(),
+            working_dir: Some("/work".into()),
+        })
+        .unwrap();
+    app.drain_harness_updates();
+
+    assert_eq!(app.model.session_id.as_deref(), Some("new"));
+    assert!(!app.model.busy, "the new session inherited a running turn");
+    assert_eq!(
+        app.model.scroll, 0.0,
+        "the new session kept a scroll offset"
+    );
+    assert_eq!(
+        app.model.transcript.streaming_len(),
+        0,
+        "the new session inherited the old transcript"
+    );
+    assert_eq!(app.model.peeks.get("old").unwrap().streaming_len(), before);
+}
+
+#[test]
+fn a_fresh_window_requests_exactly_one_neighboring_panel() {
+    use std::sync::mpsc::channel;
+
+    let mut app = App::default();
+    let (updates_tx, updates_rx) = channel();
+    let (commands_tx, _commands_rx) = channel();
+    let commands = crate::harness::CommandSender::for_test(commands_tx);
+    app.harness = Some((updates_rx, commands.clone()));
+
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Attached {
+            session_id: "first".into(),
+            working_dir: Some("/work".into()),
+        })
+        .unwrap();
+    app.drain_harness_updates();
+
+    assert!(commands.new_requested_for_test());
+    assert!(app.new_session_transition_pending);
+    assert!(!app.startup_panel_pending);
+}
+
+/// With no harness there is nothing to create a session on. Clearing the page
+/// anyway would throw the conversation away in exchange for nothing, so the
+/// request is refused out loud instead.
+#[test]
+fn a_new_session_without_a_connection_keeps_the_page_and_says_why() {
+    let mut app = app_with("a draft");
+    app.model
+        .transcript
+        .append_assistant("previous session output");
+    let before = app.model.transcript.streaming_len();
+    app.apply(Action::SessionNew, None);
+    assert_eq!(
+        app.model.transcript.streaming_len(),
+        before,
+        "a failed session start still cleared the transcript"
+    );
+    assert!(
+        app.model
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("not connected")),
+        "a failed session start said nothing: {:?}",
+        app.model.notice
+    );
+}
+
+/// Session creation crosses two asynchronous boundaries: attach identifies the
+/// new conversation, then the session poll adds its panel. The niri-style slide
+/// must begin at the second boundary, when both panels can actually be drawn.
+#[test]
+fn a_created_session_slides_in_when_its_panel_arrives() {
+    use std::sync::mpsc::channel;
+
+    let mut app = app_with("a draft");
+    app.model.strips = crate::strip::Strips::build(
+        vec![crate::strip::Panel::new("old", Some("/work"))],
+        Some("old"),
+    );
+    app.model.session_id = Some("new".into());
+    app.new_session_transition_pending = true;
+
+    let (updates_tx, updates_rx) = channel();
+    let (commands_tx, _commands_rx) = channel();
+    app.harness = Some((
+        updates_rx,
+        crate::harness::CommandSender::for_test(commands_tx),
+    ));
+    updates_tx
+        .send(crate::harness::HarnessUpdate::Sessions(vec![
+            crate::strip::Panel::new("old", Some("/work")),
+            crate::strip::Panel::new("new", Some("/work")),
+        ]))
+        .unwrap();
+
+    app.drain_harness_updates();
+
+    assert_eq!(app.model.strips.focused_session(), Some("new"));
+    assert!(
+        app.model.workspace.is_animating(),
+        "the new panel appeared without a workspace slide"
+    );
+    assert!(!app.new_session_transition_pending);
 }

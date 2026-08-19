@@ -9,7 +9,7 @@ use crate::tui::{DisplayMessage, markdown};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use jcode_session_types::SessionStatus;
-use jcode_tui_style::palette::{Role, Tier, role_color};
+use jcode_tui_style::tiered::{Role, Tier, role_color};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -2451,7 +2451,7 @@ impl SessionPicker {
         if keyboard_enhanced {
             super::disable_keyboard_enhancement();
         }
-        ratatui::restore();
+        jcode_tui_style::restore_terminal_quietly();
         super::mermaid::clear_image_state();
 
         result

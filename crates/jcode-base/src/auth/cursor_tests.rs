@@ -132,6 +132,33 @@ fn cursor_auth_file_path_respects_jcode_home() {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn cursor_auth_file_path_does_not_escape_jcode_home_on_windows() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().unwrap();
+    let old_home = std::env::var_os("JCODE_HOME");
+    let old_appdata = std::env::var_os("APPDATA");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::set_var("APPDATA", r"C:\real-user-profile");
+
+    let path = cursor_auth_file_path().unwrap();
+
+    match old_home {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    }
+    match old_appdata {
+        Some(value) => crate::env::set_var("APPDATA", value),
+        None => crate::env::remove_var("APPDATA"),
+    }
+    assert_eq!(
+        path,
+        temp.path()
+            .join("external/AppData/Roaming/Cursor/auth.json")
+    );
+}
+
 #[test]
 fn cursor_vscdb_paths_respect_jcode_home() {
     let _guard = crate::storage::lock_test_env();
@@ -206,44 +233,28 @@ fn load_access_token_from_auth_file_does_not_change_external_permissions() {
 }
 
 #[test]
-fn status_output_detects_authenticated_session() {
-    assert!(status_output_indicates_authenticated(
-        true,
-        b"Authenticated\nAccount: user@example.com\nEndpoint: production",
-        b""
-    ));
-}
+fn reads_cursor_state_with_embedded_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.vscdb");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            ("cursorAuth/accessToken", "native-token"),
+        )
+        .unwrap();
+    drop(connection);
 
-#[test]
-fn status_output_detects_missing_authentication() {
-    assert!(!status_output_indicates_authenticated(
-        true,
-        b"Not authenticated. Run cursor-agent login.",
-        b""
-    ));
-}
-
-#[test]
-fn status_output_requires_successful_exit_for_authentication_keywords() {
-    assert!(!status_output_indicates_authenticated(
-        false,
-        b"Account: user@example.com\nEndpoint: production",
-        b"cursor-agent status failed"
-    ));
-}
-
-#[cfg(unix)]
-#[test]
-fn external_auth_command_timeout_returns_none() {
-    let mut command = std::process::Command::new("sh");
-    command.arg("-c").arg("sleep 2; echo late");
-
-    let start = std::time::Instant::now();
-    let output = command_output_with_timeout(&mut command, std::time::Duration::from_millis(50))
-        .expect("timeout helper should not error");
-
-    assert!(output.is_none());
-    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(
+        read_vscdb_key(&path, "cursorAuth/accessToken").unwrap(),
+        "native-token"
+    );
 }
 
 fn load_key_from_file(path: &PathBuf) -> Result<String> {

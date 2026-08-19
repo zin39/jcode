@@ -14,3 +14,4 @@ include!("basic/image_regions.rs");
 include!("basic/input_layout.rs");
 include!("basic/idle_animation_partial.rs");
 include!("basic/economy_compact.rs");
+include!("basic/redraw_cadence.rs");

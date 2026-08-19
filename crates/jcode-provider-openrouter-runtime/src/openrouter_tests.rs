@@ -356,9 +356,65 @@ fn named_openai_compatible_provider_uses_per_model_image_input_support() {
 }
 
 #[test]
+fn named_openai_compatible_model_with_omitted_input_defaults_to_text_only() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+
+    let profile = jcode_base::config::NamedProviderConfig {
+        base_url: "http://localhost:1234/v1".to_string(),
+        auth: jcode_base::config::NamedProviderAuth::None,
+        default_model: Some("text-model".to_string()),
+        models: vec![jcode_base::config::NamedProviderModelConfig {
+            id: "text-model".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("local-compat", &profile)
+        .expect("local named profile should initialize without auth");
+
+    assert!(!provider.supports_image_input());
+}
+
+#[test]
+fn named_openai_compatible_model_with_empty_input_defaults_to_text_only() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+
+    let profile = jcode_base::config::NamedProviderConfig {
+        base_url: "http://localhost:1234/v1".to_string(),
+        auth: jcode_base::config::NamedProviderAuth::None,
+        default_model: Some("text-model".to_string()),
+        models: vec![jcode_base::config::NamedProviderModelConfig {
+            id: "text-model".to_string(),
+            input: Vec::new(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("local-compat", &profile)
+        .expect("local named profile should initialize without auth");
+
+    assert!(!provider.supports_image_input());
+}
+
+#[test]
 fn direct_deepseek_profile_does_not_advertise_image_input_support() {
     let provider = OpenRouterProvider {
         profile_id: Some("deepseek".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+
+    assert!(!provider.supports_image_input());
+}
+
+#[test]
+fn direct_zai_profile_does_not_advertise_image_input_support() {
+    let provider = OpenRouterProvider {
+        profile_id: Some("zai".to_string()),
         supports_provider_features: false,
         ..make_custom_compatible_provider()
     };
@@ -713,6 +769,106 @@ fn kimi_for_coding_tool_call_message_includes_reasoning_content() {
     );
 }
 
+/// Regression for issue #815: DeepSeek-family models on direct
+/// OpenAI-compatible profiles require the reasoning returned alongside an
+/// assistant tool call to be replayed on the next request. These routes do not
+/// enable OpenRouter provider features, so model-family detection must unlock
+/// the stored `reasoning_content` without adding a top-level thinking config.
+#[test]
+fn direct_compatible_deepseek_tool_call_replays_reasoning_content() {
+    let _lock = ENV_LOCK.lock();
+    let _thinking = EnvVarGuard::remove("JCODE_OPENROUTER_THINKING");
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        profile_id: Some("opencode-zen".to_string()),
+        supports_provider_features: false,
+        supports_model_catalog: false,
+        model: Arc::new(RwLock::new("deepseek-v4-flash-free".to_string())),
+        ..make_custom_compatible_provider()
+    };
+
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "list the files".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: "I should inspect the workspace first.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "ls"}),
+                    thought_signature: None,
+                },
+            ],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "a.txt\nb.txt".to_string(),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &[], "", None)
+            .await
+            .expect("fake chat request should start");
+        while let Some(event) = stream.next().await {
+            if event.is_err() {
+                break;
+            }
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture fake provider request");
+    let body = parse_captured_request_body(&request);
+    let assistant = body["messages"]
+        .as_array()
+        .expect("request should contain messages array")
+        .iter()
+        .find(|message| {
+            message.get("role").and_then(|value| value.as_str()) == Some("assistant")
+                && message.get("tool_calls").is_some()
+        })
+        .expect("request should retain the assistant tool-call turn");
+
+    assert_eq!(
+        assistant
+            .get("reasoning_content")
+            .and_then(|value| value.as_str()),
+        Some("I should inspect the workspace first."),
+        "direct DeepSeek request must replay stored reasoning_content (issue #815): {assistant}"
+    );
+    assert!(
+        body.get("thinking").is_none(),
+        "server-managed thinking must not add OpenRouter's top-level thinking field: {body}"
+    );
+}
+
 #[test]
 fn minimax_profile_exposes_static_models_before_catalog_refresh() {
     let models = jcode_base::provider_catalog::openai_compatible_profile_static_models(
@@ -789,6 +945,7 @@ fn openai_compatible_profiles_with_unverified_live_catalogs_have_static_fallback
             "accounts/fireworks/routers/kimi-k2p5-turbo",
         ),
         (jcode_provider_metadata::XIAOMI_MIMO_PROFILE, "mimo-v2.5"),
+        (jcode_provider_metadata::META_MUSE_PROFILE, "muse-spark-1.2"),
         (
             jcode_provider_metadata::ALIBABA_CODING_PLAN_PROFILE,
             "qwen3-coder-plus",
@@ -806,7 +963,7 @@ fn openai_compatible_profiles_with_unverified_live_catalogs_have_static_fallback
 }
 
 #[test]
-fn comtegra_profile_uses_endpoint_default_max_tokens() {
+fn profiles_use_endpoint_default_max_tokens() {
     let _lock = ENV_LOCK.lock();
     let _override = EnvVarGuard::remove("JCODE_OPENROUTER_MAX_TOKENS");
 
@@ -816,6 +973,10 @@ fn comtegra_profile_uses_endpoint_default_max_tokens() {
     );
     assert_eq!(
         OpenRouterProvider::configured_max_tokens(Some("deepseek")),
+        None
+    );
+    assert_eq!(
+        OpenRouterProvider::configured_max_tokens(Some("celeris")),
         None
     );
 }
@@ -1045,7 +1206,7 @@ fn test_parse_model_spec() {
     assert_eq!(model, "anthropic/claude-sonnet-4");
     let provider = provider.expect("provider");
     assert_eq!(provider.name, "Fireworks");
-    assert!(provider.allow_fallbacks);
+    assert!(!provider.allow_fallbacks);
 
     let (model, provider) = parse_model_spec("anthropic/claude-sonnet-4@Fireworks!");
     assert_eq!(model, "anthropic/claude-sonnet-4");
@@ -1061,6 +1222,22 @@ fn test_parse_model_spec() {
     let (model, provider) = parse_model_spec("anthropic/claude-sonnet-4@auto");
     assert_eq!(model, "anthropic/claude-sonnet-4");
     assert!(provider.is_none());
+}
+
+#[test]
+fn fork_preserves_explicit_provider_pin() {
+    let provider = make_provider();
+    provider
+        .set_model("z-ai/glm-5.2@Novita")
+        .expect("set explicitly pinned model");
+
+    let fork = provider.fork();
+
+    assert_eq!(fork.model(), "z-ai/glm-5.2");
+    assert_eq!(
+        fork.explicit_provider_pin_for_current_model().as_deref(),
+        Some("Novita")
+    );
 }
 
 fn make_endpoint(name: &str, throughput: f64, uptime: f64, cache: bool, cost: f64) -> EndpointInfo {
@@ -1227,6 +1404,24 @@ fn direct_deepseek_profile_exposes_max_reasoning_effort() {
         .set_reasoning_effort("max")
         .expect("DeepSeek direct profile should accept max effort");
     assert_eq!(provider.reasoning_effort().as_deref(), Some("max"));
+}
+
+#[test]
+fn direct_zai_profile_exposes_openai_reasoning_effort_ladder() {
+    let provider = OpenRouterProvider {
+        profile_id: Some("zai".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+
+    assert_eq!(
+        provider.available_efforts(),
+        jcode_provider_core::OPENAI_SELECTABLE_EFFORTS
+    );
+    provider
+        .set_reasoning_effort("xhigh")
+        .expect("Z.AI Coding Plan should accept xhigh effort");
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
 }
 
 #[test]
@@ -3026,4 +3221,40 @@ fn generic_openai_compatible_profile_does_not_stutter_its_route_prefix() {
         api_method, "openai-compatible",
         "the generic profile is the unprefixed transport itself"
     );
+}
+
+include!("openrouter_stream_options_tests.rs");
+
+/// A named OpenAI-compatible profile keeps the stable machine-facing
+/// `Provider::name()` and surfaces its identity through `display_name()`.
+///
+/// Issue #691 proposed returning `profile_id` from `name()`. That would regress
+/// the contract documented on the trait and settled in #329: billing, routing,
+/// and provider-class matching key off `name()`, so it must stay constant for a
+/// provider class, while user-visible labels come from `display_name()`. This
+/// pins both halves so the split cannot be undone by accident.
+#[test]
+fn named_openai_compatible_provider_keeps_stable_name_and_profile_display_name() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+
+    let profile = jcode_base::config::NamedProviderConfig {
+        base_url: "https://llm.example.com/v1".to_string(),
+        auth: jcode_base::config::NamedProviderAuth::None,
+        default_model: Some("example-model".to_string()),
+        ..Default::default()
+    };
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("example-compat", &profile)
+        .expect("named profile should initialize");
+
+    // Machine-facing identity: stable per provider class.
+    assert_eq!(
+        Provider::name(&provider),
+        "openrouter",
+        "billing/routing key off name(); it must not become the profile id"
+    );
+    // User-facing identity: the profile the user configured.
+    assert_eq!(provider.runtime_display_name(), "example-compat");
+    assert_eq!(Provider::display_name(&provider), "example-compat");
 }

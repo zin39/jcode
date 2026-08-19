@@ -421,6 +421,7 @@ impl RemoteConnection {
                 id,
                 content,
                 urgent,
+                ..
             } => Some(format!(
                 "{} urgent={} content_bytes={} content_chars={}",
                 base("soft_interrupt", *id),
@@ -551,6 +552,17 @@ impl RemoteConnection {
         images: Vec<(String, String)>,
         system_reminder: Option<String>,
     ) -> Result<u64> {
+        self.send_message_with_images_reminder_and_skill(content, images, system_reminder, None)
+            .await
+    }
+
+    pub async fn send_message_with_images_reminder_and_skill(
+        &mut self,
+        content: String,
+        images: Vec<(String, String)>,
+        system_reminder: Option<String>,
+        active_skill: Option<String>,
+    ) -> Result<u64> {
         // Output token usage snapshots are cumulative within a single API call.
         // Reset per-call watermark before sending the next user request.
         self.reset_call_output_tokens_seen();
@@ -561,6 +573,8 @@ impl RemoteConnection {
             content,
             images,
             system_reminder,
+            active_skill,
+            no_reply: false,
         };
         self.next_request_id += 1;
         self.send_request(request).await?;
@@ -626,7 +640,17 @@ impl RemoteConnection {
             allow_session_takeover: false,
         };
         self.next_request_id += 1;
-        self.send_request(request).await
+        self.send_request(request).await?;
+        // An explicit picker/workspace switch must accept the target's History
+        // even when a SessionId event (or reload-time local restore) associated
+        // this connection with the target before History arrived. Otherwise
+        // `has_loaded_history` still describes the source session and the TUI
+        // drops the target replay as a duplicate, leaving an orphan resume with
+        // an empty transcript despite its intact persisted messages (#753).
+        // History application replaces the display vector, so repeated payloads
+        // remain idempotent rather than appending duplicate messages.
+        self.has_loaded_history = false;
+        Ok(())
     }
 
     /// Request a wider compacted-history window for the active session.
@@ -873,11 +897,17 @@ impl RemoteConnection {
 
     /// Queue a soft interrupt message to be injected at the next safe point
     /// This doesn't cancel anything - the message is naturally incorporated
-    pub async fn soft_interrupt(&mut self, content: String, urgent: bool) -> Result<u64> {
+    pub async fn soft_interrupt(
+        &mut self,
+        content: String,
+        images: Vec<(String, String)>,
+        urgent: bool,
+    ) -> Result<u64> {
         let id = self.next_request_id;
         let request = Request::SoftInterrupt {
             id,
             content,
+            images,
             urgent,
         };
         self.next_request_id += 1;
@@ -1436,6 +1466,38 @@ mod tests {
             elapsed
         );
         assert_eq!(remote.next_request_id, 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_rearms_history_replay_without_appending_locally() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+        remote.mark_history_loaded();
+
+        remote
+            .resume_session("session_orphaned_after_reload")
+            .await
+            .expect("resume request should send");
+
+        assert!(
+            !remote.has_loaded_history(),
+            "target persisted History must not be mistaken for the source session's replay"
+        );
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("resume request should be readable by peer");
+        assert!(matches!(
+            serde_json::from_str::<Request>(&line).expect("resume request should deserialize"),
+            Request::ResumeSession { session_id, .. }
+                if session_id == "session_orphaned_after_reload"
+        ));
     }
 
     #[tokio::test]

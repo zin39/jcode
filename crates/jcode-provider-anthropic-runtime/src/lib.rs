@@ -50,6 +50,7 @@ use jcode_provider_core::{
     anthropic_strip_1m_suffix as strip_1m_suffix,
 };
 use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -63,6 +64,103 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// OAuth endpoint (with beta=true query param)
 const API_URL_OAUTH: &str = "https://api.anthropic.com/v1/messages?beta=true";
+
+fn direct_api_url() -> String {
+    let base = std::env::var("JCODE_ANTHROPIC_API_BASE")
+        .ok()
+        .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+    match base {
+        Some(base) if base.ends_with("/messages") => base,
+        Some(base) => format!("{base}/messages"),
+        None => API_URL.to_string(),
+    }
+}
+
+fn configured_direct_headers() -> Result<HeaderMap> {
+    let Some(raw) = std::env::var("JCODE_ANTHROPIC_HEADERS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(HeaderMap::new());
+    };
+    let headers: std::collections::BTreeMap<String, String> = serde_json::from_str(&raw)
+        .context("JCODE_ANTHROPIC_HEADERS must be a JSON object of string values")?;
+    let mut result = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("invalid Anthropic-compatible header name '{name}'"))?;
+        let value = HeaderValue::from_str(&value)
+            .with_context(|| format!("invalid value for Anthropic-compatible header '{name}'"))?;
+        result.insert(name, value);
+    }
+    Ok(result)
+}
+
+fn direct_auth_mode() -> String {
+    std::env::var("JCODE_ANTHROPIC_AUTH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if std::env::var("ANTHROPIC_AUTH_TOKEN")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                "bearer".to_string()
+            } else {
+                "header".to_string()
+            }
+        })
+        .trim()
+        .to_ascii_lowercase()
+}
+
+#[derive(Clone)]
+struct DirectTransportConfig {
+    api_url: String,
+    headers: std::result::Result<HeaderMap, String>,
+    auth_mode: String,
+    auth_header: String,
+}
+
+impl DirectTransportConfig {
+    fn from_env() -> Self {
+        Self {
+            api_url: direct_api_url(),
+            headers: configured_direct_headers().map_err(|err| format!("{err:#}")),
+            auth_mode: direct_auth_mode(),
+            auth_header: std::env::var("JCODE_ANTHROPIC_AUTH_HEADER")
+                .unwrap_or_else(|_| "x-api-key".to_string()),
+        }
+    }
+}
+
+fn active_anthropic_profile_models() -> Option<Vec<String>> {
+    let Ok(profile_name) = std::env::var("JCODE_NAMED_PROVIDER_PROFILE") else {
+        return None;
+    };
+    let Some(profile) = jcode_base::config::config().providers.get(&profile_name) else {
+        return None;
+    };
+    if !matches!(
+        profile.provider_type,
+        jcode_base::config::NamedProviderType::AnthropicCompatible
+    ) {
+        return None;
+    }
+    let mut models = profile
+        .models
+        .iter()
+        .map(|configured| configured.id.clone())
+        .collect::<Vec<_>>();
+    if let Some(default) = &profile.default_model
+        && !models.contains(default)
+    {
+        models.push(default.clone());
+    }
+    Some(models)
+}
 
 #[cfg(test)]
 pub(crate) const OAUTH_BETA_HEADERS_1M: &str = jcode_provider_core::ANTHROPIC_OAUTH_BETA_HEADERS_1M;
@@ -383,12 +481,66 @@ pub struct AnthropicProvider {
     max_tokens_override: Option<u32>,
     oauth_session_id: String,
     oauth_preflight_done: Arc<AtomicBool>,
+    direct_transport: DirectTransportConfig,
+    /// Named profiles pin their credential at runtime construction so another
+    /// session/profile cannot redirect this runtime to a different process env.
+    profile_api_key: Option<std::result::Result<String, String>>,
+    profile_models: Option<Vec<String>>,
 }
 
 impl AnthropicProvider {
     fn is_usage_exhausted() -> bool {
         let usage = jcode_base::usage::get_sync();
         usage.five_hour >= 0.99 && usage.seven_day >= 0.99
+    }
+
+    fn best_available_opus_model(exclude: &str) -> Option<String> {
+        let mut models = jcode_base::provider::cached_anthropic_model_ids()
+            .unwrap_or_else(jcode_base::provider::known_anthropic_model_ids);
+        models.retain(|model| {
+            let key = strip_1m_suffix(model).to_ascii_lowercase();
+            key.contains("claude-opus")
+                && strip_1m_suffix(model) != strip_1m_suffix(exclude)
+                && !anthropic_model_is_retired(model)
+        });
+        models.sort_by_key(|model| anthropic_model_quality_rank(model));
+        models.into_iter().next()
+    }
+
+    fn fallback_for_model_scoped_usage(
+        selected_model: &str,
+        usage: &jcode_base::usage::UsageData,
+    ) -> Option<String> {
+        (selected_model.to_ascii_lowercase().contains("fable")
+            && usage.model_scoped_exhausted(selected_model))
+        .then(|| Self::best_available_opus_model(selected_model))
+        .flatten()
+    }
+
+    async fn model_after_oauth_quota_check(
+        &self,
+        token: &str,
+        is_oauth: bool,
+        selected_model: String,
+    ) -> String {
+        if !is_oauth || !selected_model.to_ascii_lowercase().contains("fable") {
+            return selected_model;
+        }
+        let Ok(usage) = jcode_base::usage::fetch_usage_for_access_token(token).await else {
+            return selected_model;
+        };
+        let Some(fallback) = Self::fallback_for_model_scoped_usage(&selected_model, &usage) else {
+            return selected_model;
+        };
+        jcode_base::logging::warn(&format!(
+            "Anthropic OAuth model-scoped weekly quota for '{}' is exhausted; routing to '{}'",
+            selected_model, fallback
+        ));
+        *self
+            .model
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = fallback.clone();
+        fallback
     }
 
     /// Resolve a usable access token (OAuth or API key) and whether it is OAuth.
@@ -474,6 +626,11 @@ impl AnthropicProvider {
             .and_then(Self::normalize_reasoning_effort)
             .map(|effort| Self::store_effort_for_model(&model, &effort));
 
+        let direct_transport = DirectTransportConfig::from_env();
+        let profile_api_key = std::env::var_os("JCODE_ANTHROPIC_API_BASE")
+            .map(|_| load_anthropic_api_key().map_err(|err| format!("{err:#}")));
+        let profile_models = active_anthropic_profile_models();
+
         Self {
             client: jcode_provider_core::shared_http_client(),
             model: Arc::new(std::sync::RwLock::new(model)),
@@ -486,6 +643,17 @@ impl AnthropicProvider {
             max_tokens_override,
             oauth_session_id: Uuid::new_v4().to_string(),
             oauth_preflight_done: Arc::new(AtomicBool::new(false)),
+            direct_transport,
+            profile_api_key,
+            profile_models,
+        }
+    }
+
+    fn direct_api_key(&self) -> Result<String> {
+        match &self.profile_api_key {
+            Some(Ok(key)) => Ok(key.clone()),
+            Some(Err(err)) => anyhow::bail!(err.clone()),
+            None => load_anthropic_api_key(),
         }
     }
 
@@ -586,17 +754,22 @@ impl AnthropicProvider {
     }
 
     /// Default reasoning effort to apply when the user has *not* explicitly
-    /// configured one. Claude Opus models are reasoning-heavy flagships, so we
-    /// default them to `xhigh` where supported (Opus 4.7/4.8), clamped to
-    /// `high` on older Opus. Deliberately NOT `max`: Anthropic recommends
-    /// `xhigh` as the starting point for coding/agentic work and reserves
-    /// `max` for frontier problems (it costs much more and can overthink).
-    /// Claude Fable 5 defaults to `high`: it benefits from deeper reasoning
-    /// on coding/agentic work. Every other model keeps the model's own
-    /// default (no forced effort) so cheaper models stay cheap.
+    /// configured one. Claude Opus 5 defaults to `low`: it is strong enough
+    /// at low effort for day-to-day coding/agentic work, and users can cycle
+    /// up when they want deeper reasoning. Older Claude Opus models are
+    /// reasoning-heavy flagships, so we default them to `xhigh` where
+    /// supported (Opus 4.7/4.8), clamped to `high` on older Opus.
+    /// Deliberately NOT `max`: Anthropic recommends `xhigh` as the starting
+    /// point for coding/agentic work and reserves `max` for frontier problems
+    /// (it costs much more and can overthink). Claude Fable 5 defaults to
+    /// `high`: it benefits from deeper reasoning on coding/agentic work.
+    /// Every other model keeps the model's own default (no forced effort) so
+    /// cheaper models stay cheap.
     fn default_reasoning_effort_for_model(model: &str) -> Option<String> {
         let key = Self::normalized_model_key(model);
-        if key.contains("claude-opus") {
+        if key.contains("claude-opus-5") {
+            Some("low".to_string())
+        } else if key.contains("claude-opus") {
             Some(if Self::model_supports_xhigh_effort(model) {
                 "xhigh".to_string()
             } else {
@@ -760,7 +933,7 @@ impl AnthropicProvider {
         // Explicit API-key mode: use the direct API key and surface an error if
         // one is not configured (never silently fall back to OAuth).
         if matches!(mode, AnthropicCredentialMode::ApiKey) {
-            let key = load_anthropic_api_key()?;
+            let key = self.direct_api_key()?;
             return Ok((key, false)); // false = not OAuth
         }
 
@@ -773,7 +946,7 @@ impl AnthropicProvider {
         if matches!(mode, AnthropicCredentialMode::Auto) {
             match self.get_oauth_access_token().await {
                 Ok(token) => return Ok(token),
-                Err(oauth_err) => match load_anthropic_api_key() {
+                Err(oauth_err) => match self.direct_api_key() {
                     Ok(key) => {
                         jcode_base::logging::warn(&format!(
                             "Claude OAuth is unusable in automatic credential mode ({oauth_err:#}); falling back to the configured Anthropic API key"
@@ -818,6 +991,19 @@ impl AnthropicProvider {
 
         // Check if token needs refresh (expired or expiring within 5 minutes)
         if fresh_creds.expires_at < now + 300_000 && !fresh_creds.refresh_token.is_empty() {
+            // A refresh token the provider already rejected as unrecoverable
+            // cannot start working again. Retrying it added a doomed network
+            // round-trip to the critical path of every single turn, so fail
+            // straight through to the caller's API-key fallback instead.
+            if auth::refresh_state::refresh_token_is_known_rejected(
+                "claude",
+                &fresh_creds.refresh_token,
+            ) {
+                anyhow::bail!(
+                    "Claude OAuth refresh token was previously rejected by Anthropic and cannot be refreshed. Run `jcode login --provider claude` to mint a fresh token."
+                );
+            }
+
             jcode_base::logging::info(
                 "OAuth token expired or expiring soon, attempting refresh...",
             );
@@ -1007,11 +1193,14 @@ impl Provider for AnthropicProvider {
             )
             .await?;
         }
-        let model = self
+        let selected_model = self
             .model
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let model = self
+            .model_after_oauth_quota_check(&token, is_oauth, selected_model)
+            .await;
         let api_model = strip_1m_suffix(&model).to_string();
 
         // Format request
@@ -1057,6 +1246,7 @@ impl Provider for AnthropicProvider {
         let credentials = Arc::clone(&self.credentials);
         let oauth_session_id = self.oauth_session_id.clone();
         let model_state = Arc::clone(&self.model);
+        let direct_transport = self.direct_transport.clone();
 
         // Spawn task to handle streaming with retry logic.
         // This includes forced OAuth refresh on auth failures.
@@ -1080,6 +1270,7 @@ impl Provider for AnthropicProvider {
                 model,
                 oauth_session_id,
                 model_state,
+                direct_transport,
             )
             .await;
         });
@@ -1116,9 +1307,13 @@ impl Provider for AnthropicProvider {
         } else {
             model
         };
-        if !jcode_base::provider::known_anthropic_model_ids()
-            .iter()
-            .any(|known| known == model)
+        if !self
+            .profile_models
+            .as_ref()
+            .is_some_and(|models| models.iter().any(|configured| configured == model))
+            && !jcode_base::provider::known_anthropic_model_ids()
+                .iter()
+                .any(|known| known == model)
         {
             anyhow::bail!("Model {} not supported by Anthropic provider", model);
         }
@@ -1263,6 +1458,12 @@ impl Provider for AnthropicProvider {
     }
 
     async fn prefetch_models(&self) -> Result<()> {
+        if self.direct_transport.api_url != API_URL {
+            // Named Anthropic-compatible profiles use their configured static
+            // model list. Never send gateway credentials to Anthropic's
+            // official hard-coded model-catalog endpoint.
+            return Ok(());
+        }
         let (token, is_oauth) = self.get_access_token().await?;
         if token.trim().is_empty() {
             return Ok(());
@@ -1336,6 +1537,9 @@ impl Provider for AnthropicProvider {
             oauth_preflight_done: Arc::new(AtomicBool::new(
                 self.oauth_preflight_done.load(Ordering::Relaxed),
             )),
+            direct_transport: self.direct_transport.clone(),
+            profile_api_key: self.profile_api_key.clone(),
+            profile_models: self.profile_models.clone(),
         })
     }
 
@@ -1368,11 +1572,14 @@ impl Provider for AnthropicProvider {
             )
             .await?;
         }
-        let model = self
+        let selected_model = self
             .model
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let model = self
+            .model_after_oauth_quota_check(&token, is_oauth, selected_model)
+            .await;
         let api_model = strip_1m_suffix(&model).to_string();
 
         // Format request
@@ -1418,6 +1625,7 @@ impl Provider for AnthropicProvider {
         let credentials = Arc::clone(&self.credentials);
         let oauth_session_id = self.oauth_session_id.clone();
         let model_state = Arc::clone(&self.model);
+        let direct_transport = self.direct_transport.clone();
 
         // Spawn task to handle streaming with retry logic
         tokio::spawn(async move {
@@ -1440,6 +1648,7 @@ impl Provider for AnthropicProvider {
                 model,
                 oauth_session_id,
                 model_state,
+                direct_transport,
             )
             .await;
         });
@@ -1462,6 +1671,7 @@ async fn run_stream_with_retries(
     model_name: String,
     oauth_session_id: String,
     model_state: Arc<std::sync::RwLock<String>>,
+    direct_transport: DirectTransportConfig,
 ) {
     let mut token = initial_token;
     let mut last_error = None;
@@ -1522,6 +1732,7 @@ async fn run_stream_with_retries(
             attempt_tx,
             &model_name,
             &oauth_session_id,
+            &direct_transport,
         )
         .await
         {
@@ -1611,6 +1822,38 @@ async fn run_stream_with_retries(
                         .send(Ok(StreamEvent::StatusDetail {
                             detail: format!(
                                 "⚠ '{}' is unavailable; falling back to '{}'",
+                                strip_1m_suffix(&model_name),
+                                strip_1m_suffix(&fallback)
+                            ),
+                        }))
+                        .await;
+                    request.model = strip_1m_suffix(&fallback).to_string();
+                    *model_state
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = fallback.clone();
+                    tried_models.push(fallback.clone());
+                    model_name = fallback;
+                    last_error = Some(e);
+                    continue;
+                }
+
+                // Anthropic OAuth can reject Fable with a model-scoped weekly
+                // quota error before the usage cache observes the exhausted
+                // window. This is terminal for Fable, not a transient 429.
+                if is_oauth
+                    && !saw_output
+                    && is_fable_scoped_limit_error(&model_name, &error_str)
+                    && let Some(fallback) =
+                        AnthropicProvider::best_available_opus_model(&model_name)
+                {
+                    jcode_base::logging::warn(&format!(
+                        "Anthropic Fable weekly quota is exhausted ({}); retrying with '{}'",
+                        e, fallback
+                    ));
+                    let _ = tx
+                        .send(Ok(StreamEvent::StatusDetail {
+                            detail: format!(
+                                "⚠ '{}' weekly limit reached; switching to '{}'",
                                 strip_1m_suffix(&model_name),
                                 strip_1m_suffix(&fallback)
                             ),
@@ -1762,6 +2005,7 @@ async fn stream_response(
     tx: mpsc::Sender<Result<StreamEvent>>,
     model_name: &str,
     oauth_session_id: &str,
+    direct_transport: &DirectTransportConfig,
 ) -> Result<()> {
     use jcode_message_types::ConnectionPhase;
     let requested_model_base = strip_1m_suffix(&request.model).to_ascii_lowercase();
@@ -1780,11 +2024,24 @@ async fn stream_response(
         .await;
 
     let connect_start = std::time::Instant::now();
+    let stream_idle_timeout = jcode_base::provider::stream_idle_timeout();
     // Build request with appropriate auth headers
-    let url = if is_oauth { API_URL_OAUTH } else { API_URL };
+    let url = if is_oauth {
+        API_URL_OAUTH
+    } else {
+        direct_transport.api_url.as_str()
+    };
 
-    let mut req = client
-        .post(url)
+    let mut req = client.post(url);
+    if !is_oauth {
+        req = req.headers(
+            direct_transport
+                .headers
+                .clone()
+                .map_err(anyhow::Error::msg)?,
+        );
+    }
+    req = req
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
         .header(
@@ -1822,16 +2079,27 @@ async fn stream_response(
         };
         let beta_header =
             anthropic_beta_header_with_thinking(beta_header, request.thinking.is_some());
-        req = req
-            .header("x-api-key", &token)
-            .header("anthropic-beta", beta_header);
+        req = match direct_transport.auth_mode.as_str() {
+            "none" => req,
+            "bearer" => req.header("Authorization", format!("Bearer {token}")),
+            "header" => {
+                let header = HeaderName::from_bytes(direct_transport.auth_header.trim().as_bytes())
+                    .context("invalid JCODE_ANTHROPIC_AUTH_HEADER")?;
+                req.header(header, &token)
+            }
+            value => anyhow::bail!(
+                "invalid JCODE_ANTHROPIC_AUTH value '{value}' (expected bearer, header, or none)"
+            ),
+        };
+        req = req.header("anthropic-beta", beta_header);
     }
 
-    let response = req
-        .json(&request)
-        .send()
-        .await
-        .context("Failed to send request to Anthropic API")?;
+    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+        req.json(&request),
+        stream_idle_timeout,
+    )
+    .await
+    .context("Failed to send request to Anthropic API")?;
 
     let connect_ms = connect_start.elapsed().as_millis();
     jcode_base::logging::info(&format!(
@@ -1867,20 +2135,18 @@ async fn stream_response(
     // Idle timeout between streamed chunks. Configurable via
     // `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`
     // so slow reasoning models don't trip a premature timeout (issue #434).
-    let sse_chunk_timeout = jcode_base::provider::stream_idle_timeout();
-
     loop {
-        let chunk = match tokio::time::timeout(sse_chunk_timeout, stream.next()).await {
+        let chunk = match tokio::time::timeout(stream_idle_timeout, stream.next()).await {
             Ok(Some(chunk_result)) => chunk_result.context("Error reading stream chunk")?,
             Ok(None) => break, // stream ended normally
             Err(_) => {
                 jcode_base::logging::warn(&format!(
                     "Anthropic SSE stream timed out (no data for {}s)",
-                    sse_chunk_timeout.as_secs()
+                    stream_idle_timeout.as_secs()
                 ));
                 anyhow::bail!(
                     "Stream read timeout: no data received for {} seconds",
-                    sse_chunk_timeout.as_secs()
+                    stream_idle_timeout.as_secs()
                 );
             }
         };
@@ -1981,6 +2247,24 @@ fn is_out_of_credits_error(error_str: &str) -> bool {
 fn is_account_rate_limit_error(error_str: &str) -> bool {
     error_str.contains("would exceed your account's rate limit")
         || error_str.contains("would exceed your account\u{2019}s rate limit")
+}
+
+fn is_fable_scoped_limit_error(model: &str, error: &str) -> bool {
+    let model = strip_1m_suffix(model).to_ascii_lowercase();
+    if !model.contains("fable") {
+        return false;
+    }
+    let error = error.to_ascii_lowercase();
+    let is_limit = error.contains("rate_limit")
+        || error.contains("rate limit")
+        || error.contains("usage_limit")
+        || error.contains("usage limit");
+    let is_scoped = error.contains("fable")
+        || error.contains("weekly")
+        || error.contains("week limit")
+        || error.contains("7-day")
+        || error.contains("7 day");
+    is_limit && is_scoped
 }
 
 /// Detect an Anthropic "model not found" rejection.
@@ -2333,6 +2617,14 @@ fn process_sse_event(
                             id,
                             name: mapped_name,
                         });
+                    }
+                    ApiContentBlockStart::Unknown => {
+                        // Newer/unsupported block type. Parsing succeeded, so
+                        // the rest of the stream stays intact; there is simply
+                        // nothing for this build to surface.
+                        jcode_base::logging::warn(
+                            "Anthropic stream sent an unrecognized content_block_start type; ignoring the block",
+                        );
                     }
                 }
             }

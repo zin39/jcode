@@ -27,6 +27,7 @@ impl Config {
 - Prompt up: `{}`
 - Prompt down: `{}`
 - Scroll bookmark: `{}`
+- Auto-poke toggle: `{}`
 - Workspace left: `{}`
 - Workspace down: `{}`
 - Workspace up: `{}`
@@ -62,10 +63,14 @@ impl Config {
 - Copy badge Alt label: {}
 - Show agentgrep output: {}
 - Tool call details: {}
+- Theme: {}
+- Custom colors: {}
 
 **Features:**
+- Check updates: {}
 - Memory: {}
 - Swarm: {}
+- Auto-poke: {}
 - Message timestamps: {}
 - Persist memory injections: {}
 - KV cache miss notices: {}
@@ -139,6 +144,11 @@ impl Config {
             self.keybindings.scroll_prompt_up,
             self.keybindings.scroll_prompt_down,
             self.keybindings.scroll_bookmark,
+            if self.keybindings.auto_poke_toggle.trim().is_empty() {
+                "disabled"
+            } else {
+                self.keybindings.auto_poke_toggle.trim()
+            },
             self.keybindings.workspace_left,
             self.keybindings.workspace_down,
             self.keybindings.workspace_up,
@@ -191,8 +201,29 @@ impl Config {
             },
             self.display.show_agentgrep_output,
             self.display.tool_call_details,
+            if self.display.theme.trim().is_empty() {
+                "auto"
+            } else {
+                self.display.theme.trim()
+            },
+            if self.display.colors.is_empty() {
+                "default (run /colors to customize)".to_string()
+            } else {
+                format!(
+                    "{} custom ({})",
+                    self.display.colors.len(),
+                    self.display
+                        .colors
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+            self.features.check_updates,
             self.features.memory,
             self.features.swarm,
+            self.features.auto_poke,
             self.features.message_timestamps,
             self.features.persist_memory_injections,
             self.features.kv_cache_miss_notices,

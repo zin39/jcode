@@ -119,13 +119,15 @@ pub(super) async fn stream_response(
 
     emit_connection_phase(&tx, ConnectionPhase::SendingRequest).await;
     let connect_start = std::time::Instant::now();
+    let idle_timeout = effective_https_idle_timeout(&request);
 
-    let response = builder
-        .json(&request)
-        .send()
-        .await
-        .context("Failed to send request to OpenAI API")
-        .map_err(OpenAIStreamFailure::Other)?;
+    let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+        builder.json(&request),
+        idle_timeout,
+    )
+    .await
+    .context("Failed to send request to OpenAI API")
+    .map_err(OpenAIStreamFailure::Other)?;
 
     let connect_ms = connect_start.elapsed().as_millis();
     jcode_base::logging::info(&format!(
@@ -257,8 +259,6 @@ pub(super) async fn stream_response(
     // minutes get cancelled prematurely. Resolved from
     // `[provider] stream_idle_timeout_secs` / `JCODE_STREAM_IDLE_TIMEOUT_SECS`
     // (issue #434).
-    let idle_timeout = effective_https_idle_timeout(&request);
-
     use futures::StreamExt;
     loop {
         let result = match tokio::time::timeout(idle_timeout, stream.next()).await {
@@ -769,6 +769,7 @@ pub(super) async fn try_persistent_ws_continuation(
 
     // Stream the response, extracting the new response_id
     let mut saw_text_delta = false;
+    let mut saw_thinking_delta = false;
     let mut streaming_tool_calls = HashMap::new();
     let mut completed_tool_items = HashSet::new();
     let mut saw_response_completed = false;
@@ -880,6 +881,7 @@ pub(super) async fn try_persistent_ws_continuation(
                 if let Some(event) = parse_openai_response_event(
                     &text,
                     &mut saw_text_delta,
+                    &mut saw_thinking_delta,
                     &mut streaming_tool_calls,
                     &mut completed_tool_items,
                     &mut pending,
@@ -1185,6 +1187,7 @@ pub(super) async fn stream_response_websocket_persistent(
     ));
 
     let mut saw_text_delta = false;
+    let mut saw_thinking_delta = false;
     let mut streaming_tool_calls = HashMap::new();
     let mut completed_tool_items = HashSet::new();
     let mut saw_response_completed = false;
@@ -1304,6 +1307,7 @@ pub(super) async fn stream_response_websocket_persistent(
                     if let Some(event) = parse_openai_response_event(
                         &text,
                         &mut saw_text_delta,
+                        &mut saw_thinking_delta,
                         &mut streaming_tool_calls,
                         &mut completed_tool_items,
                         &mut pending,

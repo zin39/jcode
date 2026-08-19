@@ -1013,7 +1013,7 @@ fn schema_requires_a_nonblank_label_for_spawn() {
         schema["properties"]["action"]["description"]
             .as_str()
             .expect("action description")
-            .contains("Spawn requires a nonblank label")
+            .contains("spawn requires label")
     );
 
     let branches = schema["anyOf"]
@@ -1034,6 +1034,29 @@ fn schema_requires_a_nonblank_label_for_spawn() {
         })
         .expect("non-spawn schema branch");
     assert_eq!(non_spawn_branch["required"], json!(["action"]));
+}
+
+#[test]
+fn schema_branches_only_require_properties_they_declare() {
+    // Gemini rejects the entire request when a `required` entry names a property
+    // the same object does not define, which made every tool-enabled Gemini call
+    // fail on this tool's spawn branch (issue #655).
+    let schema = CommunicateTool::new().parameters_schema();
+    for branch in schema["anyOf"].as_array().expect("schema branches") {
+        let declared = branch["properties"]
+            .as_object()
+            .expect("branch properties")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for required in branch["required"].as_array().expect("branch required") {
+            let name = required.as_str().expect("required name");
+            assert!(
+                declared.iter().any(|known| known == name),
+                "branch requires '{name}' without declaring it: {branch}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1090,6 +1113,46 @@ async fn spawn_execute_rejects_missing_label_before_sending_request() {
 }
 
 #[test]
+fn description_includes_swarm_prompt_guidance() {
+    let tool = CommunicateTool::new();
+    let description = tool.description();
+    assert!(
+        description.starts_with("Coordinate agents"),
+        "description should lead with the short coordination summary"
+    );
+    // Our fork ships the swarm prompt in the system prompt's dynamic part
+    // (gated to sessions that can spawn) instead of the tool schema, which
+    // billed ~1k tokens per request to the 62% of sessions that never spawn.
+    // See `CommunicateTool::description_for_dir`.
+    assert!(
+        !description.contains("Swarm prompt"),
+        "the default description must NOT embed the swarm prompt; it lives in the system prompt"
+    );
+}
+
+#[test]
+fn existing_tool_keeps_prompt_while_new_tool_loads_edit() {
+    // Our fork ships the swarm prompt in the system prompt instead of the tool
+    // description (see `CommunicateTool::description_for_dir`), so the
+    // "editing swarm-prompt.md takes effect for new sessions" guarantee now
+    // lives in the prompt-side loader. Assert the loader observes edits and
+    // that a previously loaded string is naturally unaffected.
+    let project = tempfile::tempdir().unwrap();
+    let prompt_dir = project.path().join(".jcode");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
+    let prompt_path = prompt_dir.join("swarm-prompt.md");
+    std::fs::write(&prompt_path, "first routing version").unwrap();
+
+    let existing = crate::prompt::load_swarm_prompt(Some(project.path()));
+    std::fs::write(&prompt_path, "second routing version").unwrap();
+    let newly_created = crate::prompt::load_swarm_prompt(Some(project.path()));
+
+    assert!(existing.contains("first routing version"));
+    assert!(!existing.contains("second routing version"));
+    assert!(newly_created.contains("second routing version"));
+}
+
+#[test]
 fn format_swarm_model_list_renders_routes_and_pin() {
     let routes = vec![
         jcode_provider_core::ModelRoute {
@@ -1140,9 +1203,7 @@ fn schema_advertises_supported_swarm_fields() {
     assert!(props.contains_key("to_session"));
     assert_eq!(
         props["to_session"]["description"],
-        json!(
-            "Target session for actions that address one agent (dm, and as an alias for target_session). Accepts an exact session ID or a unique friendly name within the swarm. Interchangeable with target_session. If a friendly name is ambiguous, run swarm list and use the exact session ID."
-        )
+        json!("Session ID or unique friendly name of one agent. Alias of target_session.")
     );
     assert!(props.contains_key("channel"));
     assert!(props.contains_key("proposer_session"));
@@ -1150,9 +1211,7 @@ fn schema_advertises_supported_swarm_fields() {
     assert!(props.contains_key("target_session"));
     assert_eq!(
         props["target_session"]["description"],
-        json!(
-            "Target session for management actions (assign_role, summary, status, stop, start, resume, wake, etc.). Accepts an exact session ID or a unique friendly name. Interchangeable with to_session."
-        )
+        json!("Session ID or unique friendly name for management actions. Alias of to_session.")
     );
     assert!(props.contains_key("role"));
     assert!(props.contains_key("prompt"));
@@ -1408,6 +1467,8 @@ impl RawClient {
             content: content.to_string(),
             images: vec![],
             system_reminder: None,
+            active_skill: None,
+            no_reply: false,
         })
         .await
     }

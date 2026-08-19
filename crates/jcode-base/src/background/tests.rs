@@ -156,6 +156,137 @@ async fn update_progress_persists_status_and_emits_bus_event() -> Result<()> {
 }
 
 #[tokio::test]
+async fn update_progress_keeps_the_determinate_high_water_mark() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+    let info = manager
+        .spawn_with_notify(
+            "bash",
+            None,
+            "session-monotonic-progress",
+            false,
+            false,
+            |_output_path| async move {
+                sleep(Duration::from_secs(2)).await;
+                Ok(TaskResult::completed(Some(0)))
+            },
+        )
+        .await;
+
+    let progress = |percent| BackgroundTaskProgress {
+        kind: BackgroundTaskProgressKind::Determinate,
+        percent: Some(percent),
+        message: None,
+        current: None,
+        total: None,
+        unit: None,
+        eta_seconds: None,
+        updated_at: Utc::now().to_rfc3339(),
+        source: BackgroundTaskProgressSource::Reported,
+    };
+
+    manager.update_progress(&info.task_id, progress(60.0)).await?;
+    let status = manager
+        .update_progress(&info.task_id, progress(25.0))
+        .await?
+        .ok_or_else(|| anyhow!("task should exist"))?;
+
+    assert_eq!(status.progress.and_then(|value| value.percent), Some(60.0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_progress_preserves_high_water_mark_through_reported_checkpoint() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+    let info = manager
+        .spawn_with_notify(
+            "bash",
+            None,
+            "session-checkpoint-progress",
+            false,
+            false,
+            |_output_path| async move {
+                sleep(Duration::from_secs(2)).await;
+                Ok(TaskResult::completed(Some(0)))
+            },
+        )
+        .await;
+
+    let mut progress = BackgroundTaskProgress {
+        kind: BackgroundTaskProgressKind::Determinate,
+        percent: Some(60.0),
+        message: Some("running".into()),
+        current: Some(6),
+        total: Some(10),
+        unit: Some("tests".into()),
+        eta_seconds: None,
+        updated_at: Utc::now().to_rfc3339(),
+        source: BackgroundTaskProgressSource::Reported,
+    };
+    manager.update_progress(&info.task_id, progress.clone()).await?;
+
+    progress.kind = BackgroundTaskProgressKind::Indeterminate;
+    progress.percent = None;
+    progress.current = None;
+    progress.total = None;
+    progress.unit = None;
+    progress.message = Some("linking".into());
+    let status = manager
+        .update_checkpoint(&info.task_id, progress)
+        .await?
+        .ok_or_else(|| anyhow!("task should exist"))?;
+    let stored = status.progress.ok_or_else(|| anyhow!("progress missing"))?;
+
+    assert_eq!(stored.percent, Some(60.0));
+    assert_eq!(stored.current, Some(6));
+    assert_eq!(stored.total, Some(10));
+    assert_eq!(stored.message.as_deref(), Some("linking"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_progress_updates_cannot_overwrite_the_high_water_mark() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = Arc::new(BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf()));
+    let info = manager
+        .spawn_with_notify(
+            "bash",
+            None,
+            "session-concurrent-progress",
+            false,
+            false,
+            |_output_path| async move {
+                sleep(Duration::from_secs(2)).await;
+                Ok(TaskResult::completed(Some(0)))
+            },
+        )
+        .await;
+
+    let update = |percent| BackgroundTaskProgress {
+        kind: BackgroundTaskProgressKind::Determinate,
+        percent: Some(percent),
+        message: None,
+        current: None,
+        total: None,
+        unit: None,
+        eta_seconds: None,
+        updated_at: Utc::now().to_rfc3339(),
+        source: BackgroundTaskProgressSource::Reported,
+    };
+    let first = manager.update_progress(&info.task_id, update(80.0));
+    let second = manager.update_progress(&info.task_id, update(20.0));
+    tokio::try_join!(first, second)?;
+
+    let status = manager
+        .status(&info.task_id)
+        .await
+        .ok_or_else(|| anyhow!("task should exist"))?;
+    assert_eq!(status.progress.and_then(|value| value.percent), Some(80.0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn wait_returns_when_task_finishes() -> Result<()> {
     let tmp = tempdir()?;
     let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
@@ -287,6 +418,7 @@ fn running_status_fixture(task_id: &str, session_id: &str) -> TaskStatusFile {
         wake: false,
         progress: None,
         event_history: Vec::new(),
+        stall_wake_seconds: None,
     }
 }
 
@@ -606,5 +738,129 @@ async fn concurrent_readers_never_observe_a_torn_status_file() -> Result<()> {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let torn = reader.await.expect("reader task should finish");
     assert_eq!(torn, 0, "readers observed {torn} torn status files");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn stall_watchdog_fires_and_wait_returns_stalled() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+
+    let info = manager
+        .spawn_with_notify(
+            "bash",
+            Some("quiet task".to_string()),
+            "session-stall-fire",
+            false,
+            false,
+            |_output_path| async move {
+                // Hang well past the stall window without producing output.
+                sleep(Duration::from_secs(3600)).await;
+                Ok(TaskResult::completed(Some(0)))
+            },
+        )
+        .await;
+
+    // Requested window below the minimum is clamped up.
+    let effective = manager
+        .arm_stall_watchdog(&info.task_id, 1)
+        .await
+        .ok_or_else(|| anyhow!("watchdog should arm on a running task"))?;
+    assert_eq!(effective, BackgroundTaskManager::MIN_STALL_WAKE_SECONDS);
+
+    let status = manager
+        .status(&info.task_id)
+        .await
+        .ok_or_else(|| anyhow!("status should exist"))?;
+    assert_eq!(status.stall_wake_seconds, Some(effective));
+
+    let wait_result = manager
+        .wait(&info.task_id, Duration::from_secs(600), false)
+        .await
+        .ok_or_else(|| anyhow!("task should exist"))?;
+    assert_eq!(wait_result.reason, BackgroundTaskWaitReason::Stalled);
+    assert_eq!(wait_result.task.status, BackgroundTaskStatus::Running);
+
+    manager.cancel(&info.task_id).await?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn stall_watchdog_does_not_fire_for_task_that_finishes() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+    let mut bus_rx = Bus::global().subscribe();
+
+    let info = manager
+        .spawn_with_notify(
+            "bash",
+            None,
+            "session-stall-no-fire",
+            false,
+            false,
+            |output_path| async move {
+                sleep(Duration::from_secs(10)).await;
+                tokio::fs::write(&output_path, "done").await?;
+                Ok(TaskResult::completed(Some(0)))
+            },
+        )
+        .await;
+
+    manager
+        .arm_stall_watchdog(&info.task_id, 30)
+        .await
+        .ok_or_else(|| anyhow!("watchdog should arm on a running task"))?;
+
+    let wait_result = manager
+        .wait(&info.task_id, Duration::from_secs(600), false)
+        .await
+        .ok_or_else(|| anyhow!("task should exist"))?;
+    assert_eq!(wait_result.reason, BackgroundTaskWaitReason::Finished);
+
+    // Give the watchdog time to notice the terminal status and exit.
+    sleep(Duration::from_secs(30)).await;
+    while let Ok(event) = bus_rx.try_recv() {
+        if let BusEvent::BackgroundTaskStalled(event) = event {
+            assert_ne!(
+                event.task_id, info.task_id,
+                "watchdog must not fire for a task that finished within its window"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn disarm_stall_watchdog_clears_state() -> Result<()> {
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+
+    let info = manager
+        .spawn_with_notify(
+            "bash",
+            None,
+            "session-stall-disarm",
+            false,
+            false,
+            |_output_path| async move {
+                sleep(Duration::from_secs(3600)).await;
+                Ok(TaskResult::completed(Some(0)))
+            },
+        )
+        .await;
+
+    manager
+        .arm_stall_watchdog(&info.task_id, 45)
+        .await
+        .ok_or_else(|| anyhow!("watchdog should arm"))?;
+    assert!(manager.disarm_stall_watchdog(&info.task_id).await);
+
+    let status = manager
+        .status(&info.task_id)
+        .await
+        .ok_or_else(|| anyhow!("status should exist"))?;
+    assert_eq!(status.stall_wake_seconds, None);
+
+    manager.cancel(&info.task_id).await?;
     Ok(())
 }

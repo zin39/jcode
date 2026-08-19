@@ -294,7 +294,12 @@ impl App {
             return Some(resolved.into());
         }
 
-        let auth_status = crate::auth::AuthStatus::check_fast();
+        // Render path: use the non-blocking probe. `check_fast` blocks on a
+        // cold/expired snapshot (~20-30ms of credential-file reads) directly on
+        // the frame thread, which shows up as a periodic stall while typing.
+        // `auth_status()` above already made this choice; these sibling
+        // per-frame lookups must match it.
+        let auth_status = crate::auth::AuthStatus::check_fast_nonblocking();
         let runtime_provider = active_runtime_provider_key();
         crate::auth::resolve_dual_credential_auth(
             provider,
@@ -350,7 +355,8 @@ impl App {
             WidgetProviderKind::CostBasedApiKey => crate::tui::info_widget::AuthMethod::ApiKey,
             WidgetProviderKind::Copilot => crate::tui::info_widget::AuthMethod::CopilotOAuth,
             WidgetProviderKind::Gemini => {
-                let auth_status = crate::auth::AuthStatus::check_fast();
+                // Per-frame: never block the render thread on a credential probe.
+                let auth_status = crate::auth::AuthStatus::check_fast_nonblocking();
                 if auth_status.gemini == crate::auth::AuthState::Available {
                     crate::tui::info_widget::AuthMethod::GeminiOAuth
                 } else {
@@ -602,6 +608,18 @@ impl crate::tui::TuiState for App {
         &self.streaming.streaming_text
     }
 
+    fn pinned_todos_payload(&self) -> Option<&str> {
+        self.pinned_todos_payload_ref()
+    }
+
+    fn pinned_todos_expanded(&self) -> bool {
+        self.pinned_todos_expanded
+    }
+
+    fn background_task_rows(&self) -> &[crate::tui::BackgroundTaskRow] {
+        self.background_task_rows_ref()
+    }
+
     fn input(&self) -> &str {
         &self.input
     }
@@ -632,6 +650,10 @@ impl crate::tui::TuiState for App {
 
     fn auto_scroll_paused(&self) -> bool {
         self.auto_scroll_paused
+    }
+
+    fn terminal_clear_collapsed(&self) -> bool {
+        self.terminal_clear_collapsed()
     }
 
     fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
@@ -774,8 +796,16 @@ impl crate::tui::TuiState for App {
         App::command_suggestions(self)
     }
 
+    fn advance_command_suggestions_epoch(&self) {
+        App::advance_command_suggestions_epoch(self)
+    }
+
     fn command_suggestion_selected(&self) -> usize {
         self.command_suggestion_selected
+    }
+
+    fn prompt_history_search(&self) -> Option<crate::tui::PromptHistorySearchView> {
+        self.prompt_history_search_view()
     }
 
     fn active_skill(&self) -> Option<String> {
@@ -807,6 +837,10 @@ impl crate::tui::TuiState for App {
 
     fn client_focused(&self) -> bool {
         App::client_focused(self)
+    }
+
+    fn time_since_user_interaction(&self) -> Option<std::time::Duration> {
+        self.last_user_interaction.map(|at| at.elapsed())
     }
 
     fn stream_message_ended(&self) -> bool {
@@ -1278,14 +1312,20 @@ impl crate::tui::TuiState for App {
         };
 
         let todos_are_swarm_plan = self.swarm_enabled && !self.swarm_plan_items.is_empty();
-        let (todos, todo_goals) = if todos_are_swarm_plan {
-            (
-                crate::tui::info_widget::swarm_plan_todos(&self.swarm_plan_items),
-                Vec::new(),
-            )
-        } else {
-            gather_todos_and_goals_for_session(session_id)
-        };
+        let (todos, todo_goals) =
+            if crate::config::config().display.pin_todos && !todos_are_swarm_plan {
+                // The pinned band is the single source of truth while enabled. Do
+                // not duplicate the same session todos in a margin or overview
+                // info widget.
+                (Vec::new(), Vec::new())
+            } else if todos_are_swarm_plan {
+                (
+                    crate::tui::info_widget::swarm_plan_todos(&self.swarm_plan_items),
+                    Vec::new(),
+                )
+            } else {
+                gather_todos_and_goals_for_session(session_id)
+            };
 
         let context_snapshot = self.context_snapshot();
         let context_info = if let Some(context_info) = context_snapshot.info.clone() {
@@ -1331,8 +1371,6 @@ impl crate::tui::TuiState for App {
                 name
             }
         });
-
-        let memory_info = gather_memory_info(self.memory_enabled, self.session.working_dir.clone());
 
         // Gather swarm info
         let swarm_info = if self.swarm_enabled {
@@ -1587,10 +1625,13 @@ impl crate::tui::TuiState for App {
             session_name,
             working_dir: self.session.working_dir.clone(),
             client_count,
-            memory_info,
+            // Memory remains available through commands and tools, but no longer
+            // occupies a dedicated info widget.
+            memory_info: None,
             swarm_info,
             background_info,
             usage_info,
+            usage_display_used: crate::config::config().display.usage_display_used(),
             tokens_per_second,
             provider_name: if uses_remote_widget_metadata {
                 self.remote_provider_name
@@ -1651,7 +1692,21 @@ impl crate::tui::TuiState for App {
     }
 
     fn auth_status(&self) -> crate::auth::AuthStatus {
-        crate::auth::AuthStatus::check_fast()
+        // Render path: never pay a cold credential probe on the frame thread.
+        // A TTL lapse serves the previous snapshot and refreshes in the
+        // background; the auth generation bump repaints the header when the
+        // refreshed snapshot differs.
+        crate::auth::AuthStatus::check_fast_nonblocking()
+    }
+
+    fn active_dual_credential(
+        &self,
+        provider: jcode_provider_core::ActiveProvider,
+    ) -> Option<crate::auth::ActiveCredential> {
+        // Reuse the same resolution the info widget uses so the header tag and
+        // the widget's auth line can never disagree.
+        let route = self.widget_route_info(None);
+        self.dual_credential_active(route, provider)
     }
 
     fn diagram_mode(&self) -> crate::config::DiagramDisplayMode {
@@ -2170,6 +2225,11 @@ pub(crate) fn swarm_panel_action_for_key(
     // macOS Option+letter often arrives as a transformed glyph with no ALT
     // modifier; normalize through the shared shortcut helper.
     let macos_letter = crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    let macos_shift_letter =
+        crate::tui::keybind::shortcut_char_for_macos_option_shift_key(code, modifiers);
+    if macos_shift_letter == Some('p') {
+        return Some(SwarmPanelAction::OpenPrompt);
+    }
     match code {
         KeyCode::Down | KeyCode::Char('j') if alt => Some(SwarmPanelAction::SelectNext),
         KeyCode::Up | KeyCode::Char('k') if alt => Some(SwarmPanelAction::SelectPrev),

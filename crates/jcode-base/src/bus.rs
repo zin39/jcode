@@ -3,7 +3,8 @@ use crate::side_panel::SidePanelSnapshot;
 use crate::todo::TodoItem;
 pub use jcode_background_types::{
     BackgroundTaskCompleted, BackgroundTaskProgress, BackgroundTaskProgressEvent,
-    BackgroundTaskProgressKind, BackgroundTaskProgressSource, BackgroundTaskStatus,
+    BackgroundTaskProgressKind, BackgroundTaskProgressSource, BackgroundTaskStalled,
+    BackgroundTaskStatus,
 };
 pub use jcode_batch_types::{BatchProgress, BatchSubcallProgress, BatchSubcallState};
 use serde::{Deserialize, Serialize};
@@ -323,10 +324,23 @@ pub struct SidePanelUpdated {
 #[derive(Clone, Debug)]
 pub enum UpdateStatus {
     Checking,
-    Available { current: String, latest: String },
-    Downloading { version: String },
-    Installing { version: String },
-    Installed { version: String },
+    Available {
+        current: String,
+        latest: String,
+    },
+    Downloading {
+        version: String,
+        /// Bytes downloaded so far (0 before the transfer starts).
+        downloaded: u64,
+        /// Total asset size when known, for progress-bar rendering.
+        total: Option<u64>,
+    },
+    Installing {
+        version: String,
+    },
+    Installed {
+        version: String,
+    },
     UpToDate,
     Error(String),
 }
@@ -392,6 +406,8 @@ pub enum BusEvent {
     BackgroundTaskCompleted(BackgroundTaskCompleted),
     /// Background task reported progress
     BackgroundTaskProgress(BackgroundTaskProgressEvent),
+    /// Background task stall watchdog fired: no output/progress for its window
+    BackgroundTaskStalled(BackgroundTaskStalled),
     /// A backgrounded `swarm await_members` watcher reached a terminal result.
     SwarmAwaitCompleted(SwarmAwaitCompleted),
     /// Usage report fetched from providers
@@ -527,6 +543,11 @@ impl Bus {
     }
 
     pub fn publish_models_updated(&self) {
+        // A models-updated publish means some provider catalog changed
+        // out-of-band. Invalidate memoized route catalogs so the next render
+        // rebuilds from the new cache instead of serving a stale memo.
+        crate::provider::catalog_scheduler::bump_catalog_generation();
+
         let delay = {
             let now = Instant::now();
             let mut state = self

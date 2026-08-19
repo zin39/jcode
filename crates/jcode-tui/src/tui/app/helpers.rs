@@ -1,9 +1,10 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
+mod clipboard_helper;
 pub(crate) mod model_names;
 
 use crate::todo::TodoItem;
-use crate::tui::info_widget::{AmbientWidgetData, GitInfo, MemoryInfo};
+use crate::tui::info_widget::{AmbientWidgetData, GitInfo};
 use crate::tui::session_picker::ResumeTarget;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ type GitInfoCacheEntry = (std::time::Instant, Option<GitInfo>, bool);
 static GIT_INFO_CACHE: Mutex<Option<GitInfoCacheEntry>> = Mutex::new(None);
 
 /// Stale-while-revalidate cache for per-session todos plus their goal-level
-/// assessments (hill-climbability etc.). Module-level so the app can force a
+/// assessments (closed feedback loop etc.). Module-level so the app can force a
 /// refresh the moment it persists a todo write locally, instead of showing
 /// the previous list until the TTL lapses.
 type TodosCacheEntry = (
@@ -138,6 +139,19 @@ pub(crate) fn invalidate_git_info_cache() {
         // returning the last-known value (no flicker to empty).
         *ts = backdated_now(Duration::from_secs(3600));
         *refreshing = false;
+    }
+}
+
+/// Pin the git-status widget to a fixed value for deterministic renders.
+///
+/// Full-frame artifact generators (onboarding screenshots) would otherwise
+/// capture the live ahead/behind/dirty counts of whatever repo the generator
+/// happens to run in. Marking the entry as `refreshing` keeps the TTL path
+/// from spawning a background probe that overwrites the seed mid-render.
+#[cfg(test)]
+pub(crate) fn seed_git_info_cache_for_tests(info: Option<GitInfo>) {
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), info, true));
     }
 }
 
@@ -447,100 +461,124 @@ pub(crate) fn stop_capturing_clipboard_for_tests() {
 
 /// Copy text to clipboard. On Windows and macOS, the native clipboard API
 /// (arboard) is authoritative, with OSC 52 as a remote-session fallback.
-/// Elsewhere, try wl-copy first (Wayland), then OSC 52 (works over SSH /
-/// Docker / tmux), then arboard as a final fallback.
+/// Elsewhere, try wl-copy (Wayland), then xclip/xsel (X11, which keep owning
+/// the selection unlike arboard), then arboard, then OSC 52 as the
+/// remote-session fallback (SSH / Docker / tmux).
 pub(super) fn copy_to_clipboard(text: &str) -> bool {
-    // Tests that opted into capture never touch the real clipboard, so they
-    // behave identically on a desktop and on a headless runner.
+    // Under test, never touch the OS clipboard. Beyond making results identical
+    // on a desktop and a headless runner, the Linux path below spawns `wl-copy`,
+    // which forks a clipboard server that does not exit; waiting on it hangs the
+    // test binary indefinitely. Tests that assert copied text call
+    // `capture_clipboard_for_tests` first and then read the sink; tests that
+    // only assert "a copy happened" get a truthy result either way.
+    //
+    // The OS paths are cfg'd out (not merely skipped) so the test build does
+    // not carry an unreachable tail after this block's `return`.
     #[cfg(test)]
-    if let Ok(mut sink) = TEST_CLIPBOARD.lock()
-        && let Some(captured) = sink.as_mut()
     {
-        captured.clear();
-        captured.push_str(text);
+        if let Ok(mut sink) = TEST_CLIPBOARD.lock() {
+            match sink.as_mut() {
+                Some(captured) => {
+                    captured.clear();
+                    captured.push_str(text);
+                }
+                None => *sink = Some(text.to_string()),
+            }
+        }
         return true;
     }
 
-    // On Windows, the native clipboard API must run before OSC 52. Writing an
-    // OSC 52 sequence to stdout "succeeds" even when the console (conhost,
-    // older Windows Terminal) silently ignores it, which reported "Copied"
-    // while leaving the clipboard empty (issue #497). arboard talks to the
-    // Win32 clipboard directly and is authoritative there.
-    #[cfg(windows)]
+    #[cfg(not(test))]
     {
-        if arboard::Clipboard::new()
-            .and_then(|mut cb| cb.set_text(text.to_string()))
-            .is_ok()
+        // On Windows, the native clipboard API must run before OSC 52. Writing an
+        // OSC 52 sequence to stdout "succeeds" even when the console (conhost,
+        // older Windows Terminal) silently ignores it, which reported "Copied"
+        // while leaving the clipboard empty (issue #497). arboard talks to the
+        // Win32 clipboard directly and is authoritative there.
+        #[cfg(windows)]
         {
-            return true;
-        }
-        return copy_to_clipboard_osc52(text);
-    }
-
-    // Same class of bug on macOS: Apple Terminal (Terminal.app) silently
-    // ignores OSC 52, yet writing the sequence to stdout "succeeds", so we
-    // reported "Copied" while leaving the clipboard untouched. NSPasteboard
-    // via arboard (with pbcopy as a belt-and-braces fallback) is authoritative
-    // for local sessions; OSC 52 remains as the final remote-session fallback.
-    #[cfg(target_os = "macos")]
-    {
-        if arboard::Clipboard::new()
-            .and_then(|mut cb| cb.set_text(text.to_string()))
-            .is_ok()
-        {
-            return true;
-        }
-        if let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut()
-                && stdin.write_all(text.as_bytes()).is_ok()
+            if arboard::Clipboard::new()
+                .and_then(|mut cb| cb.set_text(text.to_string()))
+                .is_ok()
             {
-                drop(child.stdin.take());
-                if child.wait().map(|s| s.success()).unwrap_or(false) {
-                    return true;
+                return true;
+            }
+            return copy_to_clipboard_osc52(text);
+        }
+
+        // Same class of bug on macOS: Apple Terminal (Terminal.app) silently
+        // ignores OSC 52, yet writing the sequence to stdout "succeeds", so we
+        // reported "Copied" while leaving the clipboard untouched. NSPasteboard
+        // via arboard (with pbcopy as a belt-and-braces fallback) is authoritative
+        // for local sessions; OSC 52 remains as the final remote-session fallback.
+        #[cfg(target_os = "macos")]
+        {
+            if arboard::Clipboard::new()
+                .and_then(|mut cb| cb.set_text(text.to_string()))
+                .is_ok()
+            {
+                return true;
+            }
+            if let Ok(mut child) = std::process::Command::new("pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                use std::io::Write;
+                if let Some(stdin) = child.stdin.as_mut()
+                    && stdin.write_all(text.as_bytes()).is_ok()
+                {
+                    drop(child.stdin.take());
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return true;
+                    }
                 }
             }
+            return copy_to_clipboard_osc52(text);
         }
-        copy_to_clipboard_osc52(text)
-    }
 
-    // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
-    // outside Wayland, and many terminals (xterm, older VTE) silently ignore
-    // OSC 52 while the stdout write still "succeeds", so the arboard fallback
-    // never ran. Prefer native clipboards when a display is available: wl-copy
-    // (Wayland), then arboard (X11), and only then OSC 52 for genuinely
-    // headless/remote sessions (SSH, Docker, tmux) where both native paths
-    // fail fast for lack of a display server.
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        if let Ok(mut child) = std::process::Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
+        // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
+        // outside Wayland, and many terminals (xterm, older VTE) silently ignore
+        // OSC 52 while the stdout write still "succeeds", so the arboard fallback
+        // never ran. Prefer native clipboards when a display is available:
+        // wl-copy (Wayland), then xclip/xsel (X11, which keep owning the
+        // selection), then arboard, and only then OSC 52 for genuinely
+        // headless/remote sessions (SSH, Docker, tmux) where the native paths
+        // fail fast for lack of a display server.
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut()
-                && stdin.write_all(text.as_bytes()).is_ok()
-            {
-                drop(child.stdin.take());
-                if child.wait().map(|s| s.success()).unwrap_or(false) {
-                    return true;
-                }
+            if clipboard_helper::copy_via_clipboard_helper("wl-copy", &[], text) {
+                return true;
             }
+            // X11: prefer xclip/xsel over arboard. arboard's X11 backend sets the
+            // selection on a connection it owns and then closes it when the
+            // `Clipboard` is dropped, so the selection owner disappears and the
+            // clipboard silently reverts (issue #684) even though `set_text`
+            // returned Ok. xclip and xsel fork a background process that keeps
+            // owning the selection until a paste, which is what users expect.
+            if clipboard_helper::copy_via_clipboard_helper(
+                "xclip",
+                &["-selection", "clipboard"],
+                text,
+            ) {
+                return true;
+            }
+            if clipboard_helper::copy_via_clipboard_helper(
+                "xsel",
+                &["--clipboard", "--input"],
+                text,
+            ) {
+                return true;
+            }
+            if arboard::Clipboard::new()
+                .and_then(|mut cb| cb.set_text(text.to_string()))
+                .is_ok()
+            {
+                return true;
+            }
+            copy_to_clipboard_osc52(text)
         }
-        if arboard::Clipboard::new()
-            .and_then(|mut cb| cb.set_text(text.to_string()))
-            .is_ok()
-        {
-            return true;
-        }
-        copy_to_clipboard_osc52(text)
     }
 }
 
@@ -840,7 +878,13 @@ fn resumed_window_title(session_id: &str) -> String {
     )
 }
 
-#[cfg(unix)]
+/// Open `session_id` in a new terminal window.
+///
+/// Routes through `terminal_launch` on every platform. This used to be a
+/// hardcoded `Ok(false)` off Unix, which made `/judge`, `/fork`, `/review`,
+/// `/transfer` and crash-restore silently print "No terminal found" on Windows
+/// even though the launcher already had Windows Terminal / Alacritty / WezTerm
+/// detection plus a `cmd /C start` fallback (see #715).
 pub(super) fn spawn_in_new_terminal(
     exe: &Path,
     session_id: &str,
@@ -850,16 +894,6 @@ pub(super) fn spawn_in_new_terminal(
     let title = resumed_window_title(session_id);
     let args = resume_invocation_args(session_id, socket);
     spawn_command_in_new_terminal(exe, &args, &title, cwd)
-}
-
-#[cfg(not(unix))]
-pub(super) fn spawn_in_new_terminal(
-    _exe: &Path,
-    _session_id: &str,
-    _cwd: &Path,
-    _socket: Option<&str>,
-) -> anyhow::Result<bool> {
-    Ok(false)
 }
 
 #[cfg(test)]
@@ -1105,7 +1139,7 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
 
 /// Fetch a session's todos plus its goal-level assessments through the same
 /// stale-while-revalidate cache, so the info widget can render goal metadata
-/// (hill-climbability and objectives) without extra disk reads per frame.
+/// (closed feedback loop and objectives) without extra disk reads per frame.
 pub(super) fn gather_todos_and_goals_for_session(
     session_id: Option<&str>,
 ) -> (Vec<TodoItem>, Vec<crate::todo::TodoGoal>) {
@@ -1162,211 +1196,6 @@ pub(super) fn gather_todos_and_goals_for_session(
         });
     }
     (Vec::new(), Vec::new())
-}
-
-/// The sidecar label is a pure function of config plus which credentials exist
-/// on disk, so it changes about as often as the user logs in. Building it
-/// eagerly meant `Sidecar::new()` ran on every call to `gather_memory_info`,
-/// which the status widgets invoke several times per frame, and each
-/// construction re-read the config and probed up to three credential files.
-/// That was disk I/O on the draw path to render a string that had not changed.
-///
-/// This is deliberately cached separately from the surrounding memory-info
-/// cache: that one holds the live counts, which genuinely go stale, whereas
-/// this is effectively static for the life of a session.
-/// Counts how many times the label was actually constructed, so tests can
-/// prove the cache is doing its job instead of merely timing it (a timing
-/// bound passes even with the cache defeated, because the OS page-caches the
-/// credential files).
-static SIDECAR_LABEL_BUILDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(super) fn sidecar_label_build_count() -> usize {
-    SIDECAR_LABEL_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-fn cached_sidecar_label() -> Option<String> {
-    use std::sync::Mutex;
-    use std::time::Instant;
-
-    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
-    const TTL: Duration = Duration::from_secs(60);
-
-    if let Ok(guard) = CACHE.lock()
-        && let Some((ts, label)) = guard.as_ref()
-        && ts.elapsed() < TTL
-    {
-        return label.clone();
-    }
-
-    SIDECAR_LABEL_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let sidecar = crate::sidecar::Sidecar::new();
-    let label = Some(format!(
-        "{} \u{00b7} {}",
-        sidecar.backend_name(),
-        sidecar.model_name()
-    ));
-
-    if let Ok(mut guard) = CACHE.lock() {
-        *guard = Some((Instant::now(), label.clone()));
-    }
-    label
-}
-
-pub(super) fn gather_memory_info(
-    memory_enabled: bool,
-    working_dir: Option<String>,
-) -> Option<MemoryInfo> {
-    use std::sync::Mutex;
-    use std::time::Instant;
-
-    static CACHE: Mutex<Option<(Instant, Option<MemoryInfo>, bool)>> = Mutex::new(None);
-    const TTL: Duration = Duration::from_secs(2);
-
-    // When memory is disabled we still surface the stored counts (with a
-    // DISABLED badge) so the user can see they have memories but recall is off.
-    // Live activity and the sidecar model are suppressed in that case.
-    let activity = if memory_enabled {
-        crate::memory::get_activity()
-    } else {
-        None
-    };
-    let sidecar_model = if memory_enabled && crate::memory::memory_sidecar_enabled() {
-        cached_sidecar_label()
-    } else {
-        None
-    };
-
-    let finalize = |mut info: MemoryInfo| {
-        info.activity = activity.clone();
-        info.sidecar_model = sidecar_model.clone();
-        info.disabled = !memory_enabled;
-        info
-    };
-
-    if let Ok(mut guard) = CACHE.lock() {
-        if let Some((ts, cached, refreshing)) = guard.as_mut() {
-            if ts.elapsed() < TTL || *refreshing {
-                return match cached.clone() {
-                    Some(info) => Some(finalize(info)),
-                    None => fallback_memory_info(memory_enabled, &activity, &sidecar_model),
-                };
-            }
-            let stale = match cached.clone() {
-                Some(info) => Some(finalize(info)),
-                None => fallback_memory_info(memory_enabled, &activity, &sidecar_model),
-            };
-            *refreshing = true;
-            let working_dir = working_dir.clone();
-            spawn_cache_refresh(move || {
-                let result = gather_memory_info_inner(working_dir);
-                if let Ok(mut guard) = CACHE.lock() {
-                    *guard = Some((Instant::now(), result, false));
-                }
-            });
-            return stale;
-        }
-
-        *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
-        spawn_cache_refresh(move || {
-            let result = gather_memory_info_inner(working_dir);
-            if let Ok(mut guard) = CACHE.lock() {
-                *guard = Some((Instant::now(), result, false));
-            }
-        });
-    }
-
-    fallback_memory_info(memory_enabled, &activity, &sidecar_model)
-}
-
-fn fallback_memory_info(
-    memory_enabled: bool,
-    activity: &Option<crate::memory_types::MemoryActivity>,
-    sidecar_model: &Option<String>,
-) -> Option<MemoryInfo> {
-    // No cached counts yet. Show whatever live signal we have.
-    if activity.is_none() && sidecar_model.is_none() && memory_enabled {
-        return None;
-    }
-    Some(MemoryInfo {
-        sidecar_available: crate::memory::memory_sidecar_enabled(),
-        sidecar_model: sidecar_model.clone(),
-        activity: activity.clone(),
-        disabled: !memory_enabled,
-        ..Default::default()
-    })
-}
-
-fn gather_memory_info_inner(working_dir: Option<String>) -> Option<MemoryInfo> {
-    let activity = crate::memory::get_activity();
-    let sidecar_model = if crate::memory::memory_sidecar_enabled() {
-        let sidecar = crate::sidecar::Sidecar::new();
-        Some(format!(
-            "{} · {}",
-            sidecar.backend_name(),
-            sidecar.model_name()
-        ))
-    } else {
-        None
-    };
-
-    use crate::memory::MemoryManager;
-
-    // Scope the manager to the session working dir so the project count reads
-    // the same projects/<hash>.json store the memory tool writes (issue #491).
-    let manager = match working_dir.as_deref() {
-        Some(dir) if !dir.trim().is_empty() => MemoryManager::new().with_project_dir(dir),
-        _ => MemoryManager::new(),
-    };
-    let project_graph = manager.load_project_graph().ok();
-    let global_graph = manager.load_global_graph().ok();
-
-    let (project_count, global_count, by_category) = {
-        let mut by_category = std::collections::HashMap::new();
-        let project_count = project_graph
-            .as_ref()
-            .map(|p| {
-                for entry in p.memories.values() {
-                    *by_category.entry(entry.category.to_string()).or_insert(0) += 1;
-                }
-                p.memory_count()
-            })
-            .unwrap_or(0);
-        let global_count = global_graph
-            .as_ref()
-            .map(|g| {
-                for entry in g.memories.values() {
-                    *by_category.entry(entry.category.to_string()).or_insert(0) += 1;
-                }
-                g.memory_count()
-            })
-            .unwrap_or(0);
-        (project_count, global_count, by_category)
-    };
-
-    let total_count = project_count + global_count;
-    let (graph_nodes, graph_edges) = crate::tui::info_widget::build_graph_topology(
-        project_graph.as_ref(),
-        global_graph.as_ref(),
-    );
-
-    if total_count > 0 || activity.is_some() || sidecar_model.is_some() {
-        Some(MemoryInfo {
-            total_count,
-            project_count,
-            global_count,
-            by_category,
-            sidecar_available: crate::memory::memory_sidecar_enabled(),
-            sidecar_model,
-            activity,
-            disabled: false,
-            graph_nodes,
-            graph_edges,
-        })
-    } else {
-        None
-    }
 }
 
 pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidgetData> {

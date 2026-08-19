@@ -64,6 +64,80 @@ fn test_skill_prompt_integration() {
 }
 
 #[test]
+fn skill_description_collapses_whitespace_without_clipping_short_text() {
+    let skills = vec![SkillInfo {
+        name: "example".to_string(),
+        description: "  Build\n\tand   test the project.  ".to_string(),
+    }];
+    let section = build_skills_section(&skills, 4000);
+    assert!(
+        section.contains("- `/example ` - Build and test the project"),
+        "whitespace must collapse to single spaces; got: {section}"
+    );
+    assert!(
+        !section.contains("Build\n\tand"),
+        "raw newlines/tabs must not survive into the skill line"
+    );
+}
+
+#[test]
+fn skill_description_clips_to_the_character_limit() {
+    let skills = vec![SkillInfo {
+        name: "capped".to_string(),
+        description: "a".repeat(200),
+    }];
+    let section = build_skills_section(&skills, 4000);
+    let needle = "- `/capped ` - ";
+    let line_start = section.find(needle).expect("capped skill entry") + needle.len();
+    let desc = section[line_start..].lines().next().unwrap();
+    assert!(
+        desc.chars().count() <= 80,
+        "description must be capped at 80 chars, got {}",
+        desc.chars().count()
+    );
+}
+
+#[test]
+fn skill_description_clipping_is_utf8_safe() {
+    // Multibyte characters must not cause a panic or a broken char boundary
+    // when the cap lands mid-character.
+    let skills = vec![SkillInfo {
+        name: "cyrillic".to_string(),
+        description: "ж".repeat(200),
+    }];
+    let section = build_skills_section(&skills, 4000);
+    let needle = "- `/cyrillic ` - ";
+    let line_start = section.find(needle).expect("cyrillic skill entry") + needle.len();
+    let desc = section[line_start..].lines().next().unwrap();
+    assert!(desc.chars().all(|character| character == 'ж'));
+    assert!(desc.len() <= 80, "byte length must respect the cap");
+}
+
+#[test]
+fn full_and_split_prompt_builders_use_the_same_one_line_skill_descriptions() {
+    let skills = vec![SkillInfo {
+        name: "example".to_string(),
+        description: format!("First line\n\t{}", "д".repeat(100)),
+    }];
+    let expected = build_skills_section(&skills, 4000);
+
+    let (full, full_info) = build_system_prompt_full(None, &skills, false, None, None);
+    let (split, split_info) = build_system_prompt_split(None, &skills, false, None, None);
+
+    assert!(full.contains(&expected));
+    assert!(split.static_part.contains(&expected));
+    assert_eq!(full_info.skills_chars, expected.len());
+    assert_eq!(split_info.skills_chars, expected.len());
+    assert!(expected.contains("First line "));
+    assert!(!expected.contains("First line\n"));
+    let entry = expected
+        .lines()
+        .find(|line| line.starts_with("- `/example `"))
+        .expect("example skill entry");
+    assert!(entry.contains("First line"));
+}
+
+#[test]
 fn test_load_agents_md_files_uses_sandboxed_global_files() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
@@ -86,11 +160,148 @@ fn test_load_agents_md_files_uses_sandboxed_global_files() {
     assert!(!content.contains("~/.AGENTS.md"));
     assert!(content.contains("sandboxed global agents instructions"));
 
+    let sandboxed_home = temp.path().join("external");
+    let (content, info) = load_agents_md_files_from_dir(Some(&sandboxed_home));
+    let content = content.expect("deduplicated home instructions");
+    assert!(info.has_project_agents_md);
+    assert!(!info.has_global_agents_md);
+    assert!(content.contains("# Project Instructions (AGENTS.md)"));
+    assert!(!content.contains("# Global Instructions (~/AGENTS.md)"));
+    assert_eq!(
+        content
+            .matches("sandboxed global agents instructions")
+            .count(),
+        1
+    );
+
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
     } else {
         crate::env::remove_var("JCODE_HOME");
     }
+}
+
+#[test]
+fn agents_md_same_canonical_file_is_loaded_only_as_project_instructions() {
+    let project_dir = tempfile::TempDir::new().unwrap();
+    let agents_md = project_dir.path().join("AGENTS.md");
+    std::fs::write(&agents_md, "shared instructions").unwrap();
+
+    let (content, info) = load_agents_md_files_from_dirs(project_dir.path(), Some(&agents_md));
+    let content = content.expect("project instructions");
+
+    assert!(info.has_project_agents_md);
+    assert!(!info.has_global_agents_md);
+    assert!(content.contains("# Project Instructions (AGENTS.md)"));
+    assert!(!content.contains("# Global Instructions (~/AGENTS.md)"));
+    assert_eq!(content.matches("shared instructions").count(), 1);
+}
+
+#[test]
+fn agents_md_distinct_project_and_global_files_are_both_loaded() {
+    let project_dir = tempfile::TempDir::new().unwrap();
+    let global_dir = tempfile::TempDir::new().unwrap();
+    let global_agents_md = global_dir.path().join("AGENTS.md");
+    std::fs::write(project_dir.path().join("AGENTS.md"), "project instructions").unwrap();
+    std::fs::write(&global_agents_md, "global instructions").unwrap();
+
+    let (content, info) =
+        load_agents_md_files_from_dirs(project_dir.path(), Some(&global_agents_md));
+    let content = content.expect("project and global instructions");
+
+    assert!(info.has_project_agents_md);
+    assert!(info.has_global_agents_md);
+    assert!(content.contains("project instructions"));
+    assert!(content.contains("global instructions"));
+}
+
+#[test]
+fn captured_agents_md_keeps_split_prompt_stable_after_file_write() {
+    let project_dir = tempfile::TempDir::new().unwrap();
+    let agents_md = project_dir.path().join("AGENTS.md");
+    std::fs::write(&agents_md, "original session instructions").unwrap();
+    let snapshot = load_agents_md_files_from_dirs(project_dir.path(), None);
+
+    let (before, _) = build_system_prompt_split_with_agents_md(
+        None,
+        &[],
+        false,
+        None,
+        Some(project_dir.path()),
+        snapshot.clone(),
+    );
+    std::fs::write(&agents_md, "instructions written during the session").unwrap();
+    let (after, _) = build_system_prompt_split_with_agents_md(
+        None,
+        &[],
+        false,
+        None,
+        Some(project_dir.path()),
+        snapshot,
+    );
+
+    assert_eq!(before.static_part, after.static_part);
+    assert!(after.static_part.contains("original session instructions"));
+    assert!(
+        !after
+            .static_part
+            .contains("instructions written during the session")
+    );
+
+    // A new session/workspace boundary captures a fresh snapshot rather than
+    // pinning the old instructions forever.
+    let fresh_snapshot = load_agents_md_files_from_dirs(project_dir.path(), None);
+    let (next_session, _) = build_system_prompt_split_with_agents_md(
+        None,
+        &[],
+        false,
+        None,
+        Some(project_dir.path()),
+        fresh_snapshot,
+    );
+    assert!(
+        next_session
+            .static_part
+            .contains("instructions written during the session")
+    );
+    assert_ne!(before.static_part, next_session.static_part);
+}
+
+#[test]
+fn agents_md_missing_global_file_keeps_project_instructions() {
+    let project_dir = tempfile::TempDir::new().unwrap();
+    let global_dir = tempfile::TempDir::new().unwrap();
+    let missing_global_agents_md = global_dir.path().join("missing-AGENTS.md");
+    std::fs::write(project_dir.path().join("AGENTS.md"), "project only").unwrap();
+
+    let (content, info) =
+        load_agents_md_files_from_dirs(project_dir.path(), Some(&missing_global_agents_md));
+    let content = content.expect("project instructions");
+
+    assert!(info.has_project_agents_md);
+    assert!(!info.has_global_agents_md);
+    assert!(content.contains("project only"));
+    assert!(!content.contains("# Global Instructions (~/AGENTS.md)"));
+}
+
+#[cfg(unix)]
+#[test]
+fn agents_md_symlink_alias_is_deduplicated_by_canonical_file_path() {
+    use std::os::unix::fs::symlink;
+
+    let project_dir = tempfile::TempDir::new().unwrap();
+    let global_dir = tempfile::TempDir::new().unwrap();
+    let global_agents_md = global_dir.path().join("AGENTS.md");
+    std::fs::write(&global_agents_md, "symlinked instructions").unwrap();
+    symlink(&global_agents_md, project_dir.path().join("AGENTS.md")).unwrap();
+
+    let (content, info) =
+        load_agents_md_files_from_dirs(project_dir.path(), Some(&global_agents_md));
+    let content = content.expect("project instructions through symlink");
+
+    assert!(info.has_project_agents_md);
+    assert!(!info.has_global_agents_md);
+    assert_eq!(content.matches("symlinked instructions").count(), 1);
 }
 
 #[test]
@@ -118,7 +329,7 @@ fn test_split_prompt_does_not_inject_session_context_per_turn() {
 fn sponsored_discovery_is_not_injected_into_the_system_prompt() {
     let (split, _) = build_system_prompt_split(None, &[], false, None, None);
     assert!(!split.static_part.contains("Discoverable Tools"));
-    assert!(!split.static_part.contains("discover_tools"));
+    assert!(!split.static_part.contains("integration_tools"));
 }
 
 #[test]
@@ -387,10 +598,10 @@ fn test_selfdev_prompt_uses_full_selfdev_instructions() {
 
 #[test]
 fn test_selfdev_prompt_uses_desktop_focus_for_desktop_working_dir() {
-    let desktop_dir = std::path::Path::new("/tmp/jcode/crates/jcode-desktop/src");
+    let desktop_dir = std::path::Path::new("/tmp/jcode/crates/jcode-desktop2/src");
     let (prompt, _info) = build_system_prompt_full(None, &[], true, None, Some(desktop_dir));
-    assert!(prompt.contains("launched from the desktop app context"));
-    assert!(prompt.contains("selfdev build target=desktop"));
+    assert!(prompt.contains("launched from the jcode-desktop2"));
+    assert!(prompt.contains("selfdev build target=desktop2"));
     assert!(!prompt.contains("launched from the TUI/root jcode context"));
 }
 
@@ -649,4 +860,42 @@ fn test_swarm_prompt_project_override_needs_explicit_working_dir() {
     } else {
         crate::env::remove_var("JCODE_HOME");
     }
+}
+
+#[test]
+fn test_selfdev_prompt_uses_desktop2_focus_for_desktop2_working_dir() {
+    let desktop2_dir = std::path::Path::new("/tmp/jcode/crates/jcode-desktop2/src");
+    let (prompt, _info) = build_system_prompt_full(None, &[], true, None, Some(desktop2_dir));
+    assert!(prompt.contains("launched from the jcode-desktop2"));
+    assert!(prompt.contains("selfdev build target=desktop2"));
+    assert!(!prompt.contains("launched from the TUI/root jcode context"));
+}
+
+#[test]
+fn project_system_prompt_file_replaces_default_base_prompt() {
+    use crate::prompt::load_base_system_prompt;
+
+    let dir = std::env::temp_dir().join(format!("jcode-sysprompt-{}", std::process::id()));
+    let jcode_dir = dir.join(".jcode");
+    std::fs::create_dir_all(&jcode_dir).unwrap();
+    std::fs::write(
+        jcode_dir.join("system-prompt.md"),
+        "You are a custom agent.\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        load_base_system_prompt(Some(&dir)),
+        "You are a custom agent."
+    );
+
+    let (prompt, _info) = build_system_prompt_full(None, &[], false, None, Some(&dir));
+    assert!(prompt.contains("You are a custom agent."));
+    assert!(!prompt.contains("Jcode is open source"));
+
+    // Empty override falls back to the built-in default.
+    std::fs::write(jcode_dir.join("system-prompt.md"), "   \n").unwrap();
+    assert_eq!(load_base_system_prompt(Some(&dir)), DEFAULT_SYSTEM_PROMPT);
+
+    std::fs::remove_dir_all(&dir).ok();
 }

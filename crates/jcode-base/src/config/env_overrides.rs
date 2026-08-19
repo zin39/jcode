@@ -162,6 +162,11 @@ impl Config {
         {
             self.display.pin_images = parsed;
         }
+        if let Ok(v) = std::env::var("JCODE_PIN_TODOS")
+            && let Some(parsed) = parse_env_bool(&v)
+        {
+            self.display.pin_todos = parsed;
+        }
         if let Ok(v) = std::env::var("JCODE_DISPLAY_CENTERED") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.centered = parsed;
@@ -207,6 +212,15 @@ impl Config {
                 self.display.set_reasoning_display(mode);
             }
         }
+        // A front-end default, applied only when the user has not made an
+        // explicit choice. The desktop uses this so its transcript shows live
+        // thinking out of the box without silently overriding config.
+        if !self.display.has_explicit_reasoning_display()
+            && let Ok(v) = std::env::var("JCODE_DEFAULT_REASONING_DISPLAY")
+            && let Some(mode) = crate::config::ReasoningDisplayMode::parse(&v)
+        {
+            self.display.set_reasoning_display(mode);
+        }
         if let Ok(v) = std::env::var("JCODE_MARKDOWN_SPACING") {
             match v.trim().to_lowercase().as_str() {
                 "compact" => self.display.markdown_spacing = MarkdownSpacingMode::Compact,
@@ -232,6 +246,11 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_ACTIVE_SESSIONS_MANAGER") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.active_sessions_manager = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_EXTERNAL_SESSIONS") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.external_sessions = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_PERFORMANCE") {
@@ -261,6 +280,11 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_SHOW_AGENTGREP_OUTPUT") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.show_agentgrep_output = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_SHOW_BASH_OUTPUT") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.show_bash_output = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_TOOL_CALL_DETAILS") {
@@ -298,6 +322,16 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_ENABLE_MERMAID") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.mermaid = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_CHECK_UPDATES") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.check_updates = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_AUTO_POKE") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.auto_poke = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_MESSAGE_TIMESTAMPS") {
@@ -407,13 +441,23 @@ impl Config {
         }
 
         // Lifecycle hooks. Empty env values disable config-file hooks.
-        fn hook_env_override(slot: &mut Option<String>, key: &str) {
+        fn hook_env_override(slot: &mut Option<HookCommands>, key: &str) {
             if let Ok(v) = std::env::var(key) {
                 let trimmed = v.trim();
                 *slot = if trimmed.is_empty() {
                     None
+                } else if trimmed.starts_with('[') {
+                    #[derive(serde::Deserialize)]
+                    struct HookOverride {
+                        commands: HookCommands,
+                    }
+
+                    toml::from_str::<HookOverride>(&format!("commands = {trimmed}"))
+                        .map(|parsed| parsed.commands)
+                        .ok()
+                        .or_else(|| Some(HookCommands::one(trimmed)))
                 } else {
-                    Some(trimmed.to_string())
+                    Some(HookCommands::one(trimmed))
                 };
             }
         }
@@ -727,6 +771,18 @@ impl Config {
                     self.provider.stream_idle_timeout_secs = parsed;
                 }
             }
+        }
+        if let Ok(v) = std::env::var("JCODE_MAX_RETRIES")
+            && let Ok(parsed) = v.trim().parse::<u32>()
+            && parsed > 0
+        {
+            self.provider.max_retries = parsed;
+        }
+        if let Ok(v) = std::env::var("JCODE_RETRY_BACKOFF_CAP_SECS")
+            && let Ok(parsed) = v.trim().parse::<u64>()
+            && parsed > 0
+        {
+            self.provider.retry_backoff_cap_secs = parsed;
         }
 
         // Copilot premium mode: env var overrides config

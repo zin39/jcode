@@ -266,9 +266,11 @@ fn test_account_command_opens_account_picker() {
                 crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Switch {
                     ref provider_id,
                     ref label
-                }) if provider_id == "claude" && label == "claude-1"
+                }) if provider_id == "claude" && label == "claude-otter"
             )
         }));
+        assert!(picker.entries.iter().any(|entry| entry.name == "Claude"));
+        assert!(picker.entries.iter().any(|entry| entry.name == "OpenAI"));
         assert!(picker.entries.iter().any(|entry| {
             matches!(
                 entry.action,
@@ -334,6 +336,9 @@ fn test_account_picker_supports_arrow_and_vim_navigation() {
             .as_ref()
             .expect("inline account picker should open")
             .selected;
+        let picker = app.inline_interactive_state.as_ref().unwrap();
+        assert!(picker.entries.iter().any(|entry| entry.name == "OpenAI Otter"));
+        assert!(picker.entries.iter().any(|entry| entry.name == "OpenAI Fox"));
 
         app.handle_key(KeyCode::Down, KeyModifiers::empty())
             .unwrap();
@@ -451,7 +456,7 @@ fn test_account_command_combines_claude_and_openai_accounts() {
                 crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Switch {
                     ref provider_id,
                     ref label
-                }) if provider_id == "claude" && label == "claude-1"
+                }) if provider_id == "claude" && label == "claude-otter"
             )
         }));
         assert!(picker.entries.iter().any(|entry| {
@@ -460,7 +465,7 @@ fn test_account_command_combines_claude_and_openai_accounts() {
                 crate::tui::PickerAction::Account(crate::tui::AccountPickerAction::Switch {
                     ref provider_id,
                     ref label
-                }) if provider_id == "openai" && label == "openai-1"
+                }) if provider_id == "openai" && label == "openai-otter"
             )
         }));
         assert!(
@@ -687,7 +692,7 @@ fn test_improve_status_summarizes_current_todos() {
                     priority: "high".to_string(),
                     blocked_by: Vec::new(),
                     assigned_to: None,
-                    confidence: Some(82),
+                    confidence: Some(crate::todo::ConfidenceState::from_legacy_score(82)),
                     completion_confidence: None,
                     confidence_history: Vec::new(),
                 },
@@ -721,7 +726,7 @@ fn test_improve_status_summarizes_current_todos() {
                 .contains("1 incomplete · 1 completed · 0 cancelled")
         );
         assert!(msg.content.contains("Profile startup path"));
-        assert!(msg.content.contains("confidence 82%"));
+        assert!(msg.content.contains("confidence plausible"));
     });
 }
 

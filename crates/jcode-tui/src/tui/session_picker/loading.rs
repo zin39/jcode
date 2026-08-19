@@ -40,6 +40,17 @@ fn session_candidate_window(scan_limit: usize) -> usize {
         .clamp(scan_limit.max(1), 20_000)
 }
 
+/// Whether the picker lists transcripts discovered from other agent CLIs.
+///
+/// On by default (they can be resumed or imported), but it clutters the picker
+/// for users who only ever want jcode's own sessions, so `[display]
+/// external_sessions = false` (or `JCODE_EXTERNAL_SESSIONS=0`) opts out
+/// (issue #674). Checked before spawning the scan threads so opting out also
+/// skips the filesystem work.
+fn include_external_sessions() -> bool {
+    crate::config::config().display.external_sessions
+}
+
 fn include_old_saved_sessions_on_initial_load() -> bool {
     std::env::var("JCODE_SESSION_PICKER_INCLUDE_OLD_SAVED")
         .ok()
@@ -47,7 +58,7 @@ fn include_old_saved_sessions_on_initial_load() -> bool {
 }
 
 const SESSION_LIST_CACHE_TTL: Duration = Duration::from_secs(5);
-const SESSION_LIST_DISK_CACHE_VERSION: u32 = 1;
+const SESSION_LIST_DISK_CACHE_VERSION: u32 = 2;
 const SESSION_LIST_DISK_CACHE_MAX_AGE_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SAVED_METADATA_TAIL_SCAN_BYTES: u64 = 64 * 1024;
 const INITIAL_TRANSCRIPT_SEARCH_BUDGET_BYTES: usize = 64 * 1024;
@@ -128,6 +139,10 @@ struct SessionListCacheEntry {
     loaded_at: Instant,
     sessions_dir: PathBuf,
     scan_limit: usize,
+    /// Part of the cache key: toggling `display.external_sessions` must not
+    /// serve a stale list that still contains (or still omits) other CLIs'
+    /// transcripts.
+    external_sessions: bool,
     sessions: Vec<SessionInfo>,
 }
 
@@ -138,8 +153,17 @@ struct GroupedSessionListDiskCache {
     sessions_dir: PathBuf,
     scan_limit: usize,
     include_old_saved_sessions: bool,
+    /// Part of the cache key for the same reason as
+    /// `SessionListCacheEntry::external_sessions`. Defaulted so an older cache
+    /// file stays readable (it was written with externals on).
+    #[serde(default = "crate::tui::session_picker::loading::default_true")]
+    external_sessions: bool,
     server_groups: Vec<ServerGroup>,
     orphan_sessions: Vec<SessionInfo>,
+}
+
+pub(crate) fn default_true() -> bool {
+    true
 }
 
 fn session_list_cache() -> &'static Mutex<Option<SessionListCacheEntry>> {
@@ -154,18 +178,20 @@ pub fn invalidate_session_list_cache() {
 }
 
 fn session_list_disk_cache_path() -> Result<PathBuf> {
-    Ok(storage::jcode_dir()?.join("cache/session-picker-list-v1.json"))
+    Ok(storage::jcode_dir()?.join("cache/session-picker-list-v2.json"))
 }
 
 fn session_list_disk_cache_is_usable(
     cache: &GroupedSessionListDiskCache,
     sessions_dir: &Path,
     scan_limit: usize,
+    want_external: bool,
 ) -> bool {
     cache.version == SESSION_LIST_DISK_CACHE_VERSION
         && cache.sessions_dir == sessions_dir
         && cache.scan_limit == scan_limit
         && cache.include_old_saved_sessions == include_old_saved_sessions_on_initial_load()
+        && cache.external_sessions == want_external
         && chrono::Utc::now()
             .signed_duration_since(cache.generated_at)
             .num_seconds()
@@ -187,6 +213,7 @@ fn write_grouped_session_list_disk_cache(
         sessions_dir: sessions_dir.to_path_buf(),
         scan_limit,
         include_old_saved_sessions: include_old_saved_sessions_on_initial_load(),
+        external_sessions: include_external_sessions(),
         server_groups: server_groups.to_vec(),
         orphan_sessions: orphan_sessions.to_vec(),
     };
@@ -204,7 +231,12 @@ pub fn load_cached_sessions_grouped() -> Option<(Vec<ServerGroup>, Vec<SessionIn
     let scan_limit = session_scan_limit();
     let path = session_list_disk_cache_path().ok()?;
     let cache: GroupedSessionListDiskCache = storage::read_json(&path).ok()?;
-    if !session_list_disk_cache_is_usable(&cache, &sessions_dir, scan_limit) {
+    if !session_list_disk_cache_is_usable(
+        &cache,
+        &sessions_dir,
+        scan_limit,
+        include_external_sessions(),
+    ) {
         return None;
     }
     Some((cache.server_groups, cache.orphan_sessions))
@@ -225,6 +257,66 @@ fn push_with_byte_budget(dst: &mut String, src: &str, budget: &mut usize) {
 
     dst.push_str(&src[..end]);
     *budget = budget.saturating_sub(end);
+}
+
+fn suffix_at_most(value: &str, max_bytes: usize) -> &str {
+    let mut start = value.len().saturating_sub(max_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
+/// Keep a bounded sample from both ends of a growing transcript. Keeping only
+/// the first 64 KiB made `/resume` search silently blind to every later turn in
+/// a long session. The first half retains titles and early prompts while the
+/// second half continuously follows the newest transcript content.
+fn push_sampled_search_text(dst: &mut String, src: &str, limit: usize) {
+    if src.is_empty() || limit == 0 {
+        return;
+    }
+    if dst.len().saturating_add(1).saturating_add(src.len()) <= limit {
+        dst.push(' ');
+        dst.push_str(src);
+        return;
+    }
+
+    // An oversized first message has no existing session head to preserve. Keep
+    // both ends of that message instead of retaining only its suffix.
+    if dst.is_empty() {
+        let head_budget = limit / 2;
+        let mut head_end = src.len().min(head_budget);
+        while head_end > 0 && !src.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        dst.push_str(&src[..head_end]);
+        dst.push_str(suffix_at_most(src, limit.saturating_sub(head_end)));
+        return;
+    }
+
+    let head_budget = limit / 2;
+    let mut head_end = dst.len().min(head_budget);
+    while head_end > 0 && !dst.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let head = dst[..head_end].to_string();
+
+    let tail_budget = limit.saturating_sub(head.len());
+    let tail = if src.len().saturating_add(1) >= tail_budget {
+        suffix_at_most(src, tail_budget).to_string()
+    } else {
+        let old_budget = tail_budget.saturating_sub(src.len() + 1);
+        let old_tail = suffix_at_most(&dst[head_end..], old_budget);
+        let mut tail = String::with_capacity(old_tail.len() + 1 + src.len());
+        tail.push_str(old_tail);
+        tail.push(' ');
+        tail.push_str(src);
+        tail
+    };
+
+    dst.clear();
+    dst.push_str(&head);
+    dst.push_str(&tail);
 }
 
 pub(super) fn build_search_index(
@@ -274,22 +366,14 @@ pub(super) fn build_search_index(
     combined.to_lowercase()
 }
 
-fn push_raw_search_excerpt(dst: &mut String, raw: &str, budget: &mut usize) {
-    if *budget == 0 || raw.is_empty() {
-        return;
-    }
-    dst.push(' ');
-    push_with_byte_budget(dst, raw, budget);
-}
-
 fn raw_value_search_excerpt(raw: &RawValue, budget: usize) -> Option<String> {
     if budget == 0 {
         return None;
     }
     let raw = raw.get();
-    let mut budget = budget.min(MESSAGE_SEARCH_EXCERPT_BYTES);
+    let budget = budget.min(MESSAGE_SEARCH_EXCERPT_BYTES);
     let mut excerpt = String::new();
-    push_with_byte_budget(&mut excerpt, raw, &mut budget);
+    push_sampled_search_text(&mut excerpt, raw, budget);
     (!excerpt.is_empty()).then_some(excerpt)
 }
 
@@ -1209,10 +1293,12 @@ impl SessionMessageSummaryData {
                 .estimated_tokens
                 .saturating_add(usage.total_tokens() as usize);
         }
-        let mut remaining =
-            INITIAL_TRANSCRIPT_SEARCH_BUDGET_BYTES.saturating_sub(self.search_text.len());
         if let Some(raw_content) = message.content_raw.as_deref() {
-            push_raw_search_excerpt(&mut self.search_text, raw_content, &mut remaining);
+            push_sampled_search_text(
+                &mut self.search_text,
+                raw_content,
+                INITIAL_TRANSCRIPT_SEARCH_BUDGET_BYTES,
+            );
         }
     }
 
@@ -1230,9 +1316,11 @@ impl SessionMessageSummaryData {
         if self.first_user_prompt.is_none() {
             self.first_user_prompt = other.first_user_prompt;
         }
-        let mut remaining =
-            INITIAL_TRANSCRIPT_SEARCH_BUDGET_BYTES.saturating_sub(self.search_text.len());
-        push_raw_search_excerpt(&mut self.search_text, &other.search_text, &mut remaining);
+        push_sampled_search_text(
+            &mut self.search_text,
+            &other.search_text,
+            INITIAL_TRANSCRIPT_SEARCH_BUDGET_BYTES,
+        );
     }
 }
 
@@ -1260,11 +1348,10 @@ impl<'de> Visitor<'de> for SessionMessageSummaryDataVisitor {
     {
         let mut counts = SessionMessageSummaryData::default();
         loop {
-            let remaining = INITIAL_TRANSCRIPT_SEARCH_BUDGET_BYTES
-                .saturating_sub(counts.search_text.len())
-                .min(MESSAGE_SEARCH_EXCERPT_BYTES);
             let Some(message) = seq.next_element_seed(SessionMessageSummarySeed {
-                content_excerpt_budget: remaining,
+                // Keep sampling each turn even after the session-wide index is
+                // full. `add_message` retains a bounded head + moving tail.
+                content_excerpt_budget: MESSAGE_SEARCH_EXCERPT_BYTES,
             })?
             else {
                 break;
@@ -1727,11 +1814,13 @@ fn parse_jcode_session_info(
 pub fn load_sessions() -> Result<Vec<SessionInfo>> {
     let sessions_dir = storage::jcode_dir()?.join("sessions");
     let scan_limit = session_scan_limit();
+    let want_external = include_external_sessions();
 
     if let Ok(cache) = session_list_cache().lock()
         && let Some(entry) = cache.as_ref()
         && entry.sessions_dir == sessions_dir
         && entry.scan_limit == scan_limit
+        && entry.external_sessions == want_external
         && entry.loaded_at.elapsed() <= SESSION_LIST_CACHE_TTL
     {
         return Ok(entry.sessions.clone());
@@ -1764,11 +1853,11 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
     let catchup_ref = &catchup_seen;
 
     let (mut sessions, external_sessions) = std::thread::scope(|scope| {
-        let claude_handle = scope.spawn(|| load_external_claude_code_sessions(scan_limit));
-        let codex_handle = scope.spawn(|| load_external_codex_sessions(scan_limit));
-        let pi_handle = scope.spawn(|| load_external_pi_sessions(scan_limit));
-        let opencode_handle = scope.spawn(|| load_external_opencode_sessions(scan_limit));
-        let cursor_handle = scope.spawn(|| load_external_cursor_sessions(scan_limit));
+        // One handle for all five external scans (they fan out internally), so
+        // the opt-out is a single branch and external work still overlaps the
+        // jcode session parsing below.
+        let external_handle =
+            scope.spawn(move || load_external_sessions(want_external, scan_limit));
 
         // Phase 1: walk the recency-ordered candidates in parallel windows until
         // we have collected `scan_limit` non-empty sessions. `boundary` marks the
@@ -1840,13 +1929,7 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
             sessions.extend(saved_sessions.into_iter().flatten());
         }
 
-        let mut external = Vec::new();
-        external.extend(claude_handle.join().unwrap_or_default());
-        external.extend(codex_handle.join().unwrap_or_default());
-        external.extend(pi_handle.join().unwrap_or_default());
-        external.extend(opencode_handle.join().unwrap_or_default());
-        external.extend(cursor_handle.join().unwrap_or_default());
-        (sessions, external)
+        (sessions, external_handle.join().unwrap_or_default())
     });
     sessions.extend(external_sessions);
 
@@ -1857,11 +1940,34 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
             loaded_at: Instant::now(),
             sessions_dir,
             scan_limit,
+            external_sessions: want_external,
             sessions: sessions.clone(),
         });
     }
 
     Ok(sessions)
+}
+
+/// Scan every supported foreign agent CLI in parallel, or nothing at all when
+/// the user opted out via `display.external_sessions` (issue #674). Returning
+/// early skips the filesystem work entirely rather than filtering afterwards.
+fn load_external_sessions(enabled: bool, scan_limit: usize) -> Vec<SessionInfo> {
+    if !enabled {
+        return Vec::new();
+    }
+    std::thread::scope(|scope| {
+        let claude = scope.spawn(|| load_external_claude_code_sessions(scan_limit));
+        let codex = scope.spawn(|| load_external_codex_sessions(scan_limit));
+        let pi = scope.spawn(|| load_external_pi_sessions(scan_limit));
+        let opencode = scope.spawn(|| load_external_opencode_sessions(scan_limit));
+        let cursor = scope.spawn(|| load_external_cursor_sessions(scan_limit));
+
+        let mut external = Vec::new();
+        for handle in [claude, codex, pi, opencode, cursor] {
+            external.extend(handle.join().unwrap_or_default());
+        }
+        external
+    })
 }
 
 fn load_external_claude_code_sessions(scan_limit: usize) -> Vec<SessionInfo> {

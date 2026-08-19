@@ -94,6 +94,16 @@ async fn gmail_is_exposed_by_default_and_can_be_explicitly_disabled() {
     let tool_names = agent.tool_names().await;
     let tool_name = "gmail";
 
+    // Upstream visibility invariants for regular (non-self-dev) sessions.
+    assert!(
+        tool_names.iter().any(|name| name == "jcode_docs"),
+        "jcode_docs must be model-visible in regular sessions"
+    );
+    assert!(
+        !tool_names.iter().any(|name| name == "selfdev"),
+        "selfdev must not be model-visible in regular sessions"
+    );
+
     // gmail is in RARELY_USED_DEFERRED_TOOLS (measured: 2 calls across 789
     // sessions), so it is deferred rather than inlined. "Available by default"
     // must still hold: the model has to be able to see it and run it.
@@ -369,8 +379,10 @@ async fn rarely_used_tools_are_deferred_not_deleted() {
     let names: std::collections::HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
     // A representative withheld tool: measured at 0% of sessions, 1 call ever.
+    // (`browser` is always registered; upstream's `integration_tools` is
+    // sponsor-gated so it cannot serve as the fixture here.)
     assert!(
-        !names.contains("discover_tools"),
+        !names.contains("browser"),
         "a rarely-used tool should not ship its full schema by default"
     );
 
@@ -380,7 +392,7 @@ async fn rarely_used_tools_are_deferred_not_deleted() {
         .find(|t| t.name == "load_tools")
         .expect("load_tools must always be inline, or nothing can be expanded");
     assert!(
-        load_tools.description.contains("discover_tools"),
+        load_tools.description.contains("browser"),
         "a withheld tool must be listed in the load_tools index, or it is invisible \
          rather than deferred: {}",
         load_tools.description
@@ -395,11 +407,11 @@ async fn rarely_used_tools_are_deferred_not_deleted() {
     }
 
     // Recoverable: expanding restores the full schema.
-    crate::tool::expand_session_tools(&agent.session.id, &["discover_tools".to_string()]);
+    crate::tool::expand_session_tools(&agent.session.id, &["browser".to_string()]);
     agent.unlock_tools();
     let after = agent.tool_definitions().await;
     assert!(
-        after.iter().any(|t| t.name == "discover_tools"),
+        after.iter().any(|t| t.name == "browser"),
         "load_tools must restore a deferred tool's full schema"
     );
 }

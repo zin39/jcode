@@ -39,6 +39,33 @@ pub(crate) mod tests_tool_call_details_override {
     }
 }
 
+#[cfg(not(test))]
+pub(crate) fn show_bash_output() -> bool {
+    crate::config::config().display.show_bash_output
+}
+
+#[cfg(test)]
+pub(crate) fn show_bash_output() -> bool {
+    tests_show_bash_output_override::get()
+}
+
+#[cfg(test)]
+pub(crate) mod tests_show_bash_output_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SHOW_OUTPUT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn get() -> bool {
+        SHOW_OUTPUT.with(Cell::get)
+    }
+
+    pub(crate) fn set(value: bool) {
+        SHOW_OUTPUT.with(|cell| cell.set(value));
+    }
+}
+
 fn infer_bg_action_from_intent_for_display(intent: Option<&str>) -> Option<&'static str> {
     let intent = intent?.trim().to_ascii_lowercase();
     if intent.is_empty() {
@@ -1271,7 +1298,7 @@ pub(super) fn get_tool_summary_with_budget(
                 _ => truncate_end_display(error, bounded(40)),
             }
         }
-        "discover_tools" => {
+        "integration_tools" => {
             let action = tool
                 .input
                 .get("action")
@@ -1292,9 +1319,9 @@ pub(super) fn get_tool_summary_with_budget(
                 format!("suggest {}", truncate_end_display(detail, bounded(30)))
             } else {
                 match tool.input.get("tool").and_then(|v| v.as_str()) {
-                    Some(name) => format!("select {}", truncate_end_display(name, bounded(30))),
-                    None if !category.is_empty() => format!("browse {}", category),
-                    None => "browse".to_string(),
+                    Some(name) => format!("setup {}", truncate_end_display(name, bounded(30))),
+                    None if !category.is_empty() => format!("search {}", category),
+                    None => "search".to_string(),
                 }
             }
         }

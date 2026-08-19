@@ -293,6 +293,7 @@ fn stream_tool_call_from_state(
 pub fn parse_openai_response_event(
     data: &str,
     saw_text_delta: &mut bool,
+    saw_thinking_delta: &mut bool,
     streaming_tool_calls: &mut HashMap<String, StreamingToolCallState>,
     completed_tool_items: &mut HashSet<String>,
     pending: &mut VecDeque<StreamEvent>,
@@ -338,6 +339,7 @@ pub fn parse_openai_response_event(
         }
         "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
             if let Some(delta) = event.delta {
+                *saw_thinking_delta = true;
                 return Some(StreamEvent::ThinkingDelta(delta));
             }
         }
@@ -423,7 +425,9 @@ pub fn parse_openai_response_event(
                     completed_tool_items.remove(&item_id);
                     return None;
                 }
-                if let Some(event) = handle_openai_output_item(item, saw_text_delta, pending) {
+                if let Some(event) =
+                    handle_openai_output_item(item, saw_text_delta, saw_thinking_delta, pending)
+                {
                     return Some(event);
                 }
             }
@@ -514,6 +518,7 @@ fn extract_stop_reason_from_response(response: &Value) -> Option<String> {
 pub fn handle_openai_output_item(
     item: Value,
     saw_text_delta: &mut bool,
+    saw_thinking_delta: &mut bool,
     pending: &mut VecDeque<StreamEvent>,
 ) -> Option<StreamEvent> {
     let item_type = item.get("type")?.as_str()?;
@@ -619,7 +624,10 @@ pub fn handle_openai_output_item(
                 });
             }
 
-            if !summary.is_empty() {
+            // Only replay the full summary when it was NOT already streamed
+            // live via `response.reasoning_summary_text.delta`; otherwise the
+            // thinking text renders twice (once streamed, once from item.done).
+            if !summary.is_empty() && !*saw_thinking_delta {
                 pending.push_back(StreamEvent::ThinkingStart);
                 pending.push_back(StreamEvent::ThinkingDelta(summary.join("\n")));
                 pending.push_back(StreamEvent::ThinkingEnd);
@@ -761,8 +769,12 @@ fn handle_openai_image_generation_item(
 pub struct OpenAIResponsesStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     buffer: String,
+    /// Carries incomplete multi-byte UTF-8 sequences across chunk boundaries
+    /// so split CJK characters are not dropped (#609).
+    utf8: jcode_core::util::Utf8StreamDecoder,
     pending: VecDeque<StreamEvent>,
     saw_text_delta: bool,
+    saw_thinking_delta: bool,
     streaming_tool_calls: HashMap<String, StreamingToolCallState>,
     completed_tool_items: HashSet<String>,
 }
@@ -772,8 +784,10 @@ impl OpenAIResponsesStream {
         Self {
             inner: Box::pin(stream),
             buffer: String::new(),
+            utf8: jcode_core::util::Utf8StreamDecoder::new(),
             pending: VecDeque::new(),
             saw_text_delta: false,
+            saw_thinking_delta: false,
             streaming_tool_calls: HashMap::new(),
             completed_tool_items: HashSet::new(),
         }
@@ -803,6 +817,7 @@ impl OpenAIResponsesStream {
             if let Some(event) = parse_openai_response_event(
                 &data,
                 &mut self.saw_text_delta,
+                &mut self.saw_thinking_delta,
                 &mut self.streaming_tool_calls,
                 &mut self.completed_tool_items,
                 &mut self.pending,
@@ -851,9 +866,8 @@ impl Stream for OpenAIResponsesStream {
 
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        self.buffer.push_str(text);
-                    }
+                    let text = self.utf8.decode(&bytes);
+                    self.buffer.push_str(&text);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(anyhow::anyhow!("Stream error: {}", e))));
@@ -874,6 +888,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn structured_stream_read_error_is_extracted_and_classified_as_transient() {
+        let error = serde_json::json!({
+            "type": "upstream_error",
+            "code": "stream_read_error"
+        });
+
+        let (message, retry_after) = extract_error_with_retry(&None, &Some(error));
+
+        assert_eq!(
+            message,
+            "upstream_error (stream_read_error): OpenAI response stream error (unknown)"
+        );
+        assert_eq!(retry_after, None);
+        assert!(jcode_provider_core::is_transient_transport_error(&message));
+    }
+
+    #[test]
     fn parse_text_wrapped_tool_call_rejects_non_object_json() {
         let text = "prefix to=functions.read [1,2,3]";
         let parsed = parse_text_wrapped_tool_call(text);
@@ -883,6 +914,7 @@ mod tests {
     #[test]
     fn parse_openai_response_event_ignores_malformed_json_chunks() {
         let mut saw_text_delta = false;
+        let mut saw_thinking_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -890,6 +922,7 @@ mod tests {
         let event = parse_openai_response_event(
             "{not-json}",
             &mut saw_text_delta,
+            &mut saw_thinking_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,
@@ -909,6 +942,7 @@ mod tests {
         // `response.completed` frame containing the phrase must still produce a
         // MessageEnd, otherwise the stream "ends before the completion marker".
         let mut saw_text_delta = false;
+        let mut saw_thinking_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -932,6 +966,7 @@ mod tests {
         let event = parse_openai_response_event(
             &payload,
             &mut saw_text_delta,
+            &mut saw_thinking_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,
@@ -946,6 +981,7 @@ mod tests {
     #[test]
     fn function_call_arguments_with_fallback_phrase_still_emit_tool_call() {
         let mut saw_text_delta = false;
+        let mut saw_thinking_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -962,6 +998,7 @@ mod tests {
         let event = parse_openai_response_event(
             &payload,
             &mut saw_text_delta,
+            &mut saw_thinking_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,
@@ -976,6 +1013,7 @@ mod tests {
     #[test]
     fn plain_text_fallback_notice_is_still_dropped() {
         let mut saw_text_delta = false;
+        let mut saw_thinking_delta = false;
         let mut streaming_tool_calls = HashMap::new();
         let mut completed_tool_items = HashSet::new();
         let mut pending = VecDeque::new();
@@ -983,6 +1021,7 @@ mod tests {
         let event = parse_openai_response_event(
             "falling back from websockets to https transport",
             &mut saw_text_delta,
+            &mut saw_thinking_delta,
             &mut streaming_tool_calls,
             &mut completed_tool_items,
             &mut pending,

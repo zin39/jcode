@@ -6,14 +6,15 @@ pub(super) use jcode_provider_core::{ActiveProvider, ProviderAvailability};
 pub(crate) enum ConfigProviderSelection {
     BuiltIn(ActiveProvider),
     OpenAiCompatibleProfile(&'static str),
-    NamedProfile(String),
+    NamedProfile(String, ActiveProvider),
 }
 
 impl ConfigProviderSelection {
     pub(crate) fn active_provider(&self) -> ActiveProvider {
         match self {
             Self::BuiltIn(provider) => *provider,
-            Self::OpenAiCompatibleProfile(_) | Self::NamedProfile(_) => ActiveProvider::OpenRouter,
+            Self::OpenAiCompatibleProfile(_) => ActiveProvider::OpenRouter,
+            Self::NamedProfile(_, provider) => *provider,
         }
     }
 
@@ -31,7 +32,7 @@ impl ConfigProviderSelection {
                     None => format!("OpenAI-compatible profile {}", profile_id),
                 }
             }
-            Self::NamedProfile(profile) => format!("provider profile '{}'", profile),
+            Self::NamedProfile(profile, _) => format!("provider profile '{}'", profile),
         }
     }
 }
@@ -101,6 +102,7 @@ impl MultiProvider {
             LoginProviderTarget::AutoImport
             | LoginProviderTarget::Jcode
             | LoginProviderTarget::Azure
+            | LoginProviderTarget::GrokBuild
             | LoginProviderTarget::Google => None,
         }
     }
@@ -175,10 +177,14 @@ impl MultiProvider {
             ModelRouteApiMethod::ClaudeOAuth
                 if crate::provider::provider_for_model(bare_name) == Some("claude") =>
             {
-                Some("claude".to_string())
+                // Persist the unambiguous OAuth key. The bare `claude` key is
+                // also what `derive_session_provider_key` writes for automatic
+                // credential mode, so storing it here made a deliberate OAuth
+                // pick indistinguishable from "auto" on restore.
+                Some("claude-oauth".to_string())
             }
             ModelRouteApiMethod::OpenAIApiKey => Some("openai-api".to_string()),
-            ModelRouteApiMethod::OpenAIOAuth => Some("openai".to_string()),
+            ModelRouteApiMethod::OpenAIOAuth => Some("openai-oauth".to_string()),
             ModelRouteApiMethod::Copilot => Some("copilot".to_string()),
             ModelRouteApiMethod::Cursor => Some("cursor".to_string()),
             ModelRouteApiMethod::Bedrock => Some("bedrock".to_string()),
@@ -357,6 +363,18 @@ impl MultiProvider {
             return model.to_string();
         }
 
+        // An `@provider` suffix is an explicit OpenRouter upstream pin. It is
+        // stronger route identity than older/stale `provider_key` metadata.
+        // In particular, sessions created through the public CLI could retain
+        // an `openai-api` key from process-level runtime state while correctly
+        // persisting `z-ai/glm-5.2@Novita` as their model. Restoring through the
+        // stale key sent the pinned model to OpenAI and left the resumed run on
+        // its default model instead. Reconstruct the explicit OpenRouter route
+        // first so both the provider and pin survive resume.
+        if model.contains('@') {
+            return format!("openrouter:{model}");
+        }
+
         if let Some((prefix, rest)) = model.split_once(':') {
             let prefix = prefix.trim();
             if !prefix.is_empty()
@@ -375,17 +393,35 @@ impl MultiProvider {
         else {
             return model.to_string();
         };
-        // Fold the structured-picker vocabulary (`anthropic-api-key`,
-        // `openai-oauth`, ...) onto the canonical keys so the OAuth-vs-API-key
-        // route survives even when only `provider_key` was persisted (e.g. a
-        // forked/child session that inherited it without `route_api_method`).
-        let provider_key = Self::canonical_session_provider_key(provider_key);
-
-        // Dual-auth keys map to their canonical model prefix via the single
-        // shared parser, keeping the emitted prefix in lockstep with the parsers.
-        if let Some(route) = jcode_provider_core::AuthRoute::parse(provider_key) {
+        // Dual-auth keys map to a model prefix via the single shared parser,
+        // keeping the emitted prefix in lockstep with the parsers.
+        //
+        // Only an *explicitly credential-pinned* key may emit a pinning prefix.
+        // A bare `claude` / `anthropic` / `openai` key is what
+        // `derive_session_provider_key` writes for any Anthropic/OpenAI session,
+        // including ones running in automatic credential mode. Folding those
+        // onto `claude-oauth:` / `openai-oauth:` turned "auto" into a hard OAuth
+        // pin on restore, which disabled the runtime's API-key fallback and made
+        // every turn fail with "OAuth token is expired and refresh failed" even
+        // though a working API key was configured.
+        //
+        // Deliberate picks stay unambiguous because `session_provider_key`
+        // spells the OAuth routes out (`claude-oauth` / `openai-oauth`) rather
+        // than reusing the bare provider name.
+        if let Some(route) =
+            jcode_provider_core::AuthRoute::parse_explicit_credential_prefix(provider_key)
+        {
             return format!("{}:{model}", route.model_prefix());
         }
+        if let Some(route) = jcode_provider_core::AuthRoute::parse(provider_key) {
+            // Bare provider key: route to the provider without pinning a
+            // credential so automatic OAuth -> API-key fallback stays available.
+            return format!("{}:{model}", route.provider.bare_model_prefix());
+        }
+
+        // Fold the remaining picker vocabulary onto the canonical keys
+        // (non-dual-auth providers and OpenAI-compatible profiles).
+        let provider_key = Self::canonical_session_provider_key(provider_key);
 
         match provider_key {
             "copilot" | "antigravity" | "gemini" | "cursor" | "bedrock" | "openrouter" => {
@@ -414,6 +450,12 @@ impl MultiProvider {
         let model = model.trim();
         if model.is_empty() {
             return String::new();
+        }
+        // The model itself carries explicit OpenRouter route identity. Honor it
+        // before persisted route metadata, which may come from an older buggy
+        // session and contradict the pin.
+        if crate::provider::explicit_model_provider_prefix(model).is_none() && model.contains('@') {
+            return format!("openrouter:{model}");
         }
         if let Some(api_method) = route_api_method
             .map(str::trim)
@@ -459,8 +501,19 @@ impl MultiProvider {
             return Some(ConfigProviderSelection::OpenAiCompatibleProfile(profile.id));
         }
 
-        if cfg.providers.contains_key(trimmed) {
-            return Some(ConfigProviderSelection::NamedProfile(trimmed.to_string()));
+        if let Some(profile) = cfg.providers.get(trimmed) {
+            let provider = if matches!(
+                profile.provider_type,
+                crate::config::NamedProviderType::AnthropicCompatible
+            ) {
+                ActiveProvider::Claude
+            } else {
+                ActiveProvider::OpenRouter
+            };
+            return Some(ConfigProviderSelection::NamedProfile(
+                trimmed.to_string(),
+                provider,
+            ));
         }
 
         // Accept the dual-auth `--provider` vocabulary (`anthropic-api`,
@@ -643,7 +696,7 @@ mod tests {
                 "openai-oauth",
                 "OpenAI",
                 "openai-oauth:gpt-5.5",
-                Some("openai"),
+                Some("openai-oauth"),
             ),
             (
                 "gpt-5.5",
@@ -657,7 +710,7 @@ mod tests {
                 "claude-oauth",
                 "Anthropic",
                 "claude-oauth:claude-opus-4-6",
-                Some("claude"),
+                Some("claude-oauth"),
             ),
             (
                 "claude-opus-4-6",
@@ -696,7 +749,7 @@ mod tests {
     fn session_model_route_identity_helpers_preserve_auth_mode_and_profiles() {
         for (request, provider_name, previous_key, expected_key) in [
             ("openai-api:gpt-5.5", "OpenAI", None, Some("openai-api")),
-            ("openai-oauth:gpt-5.5", "OpenAI", None, Some("openai")),
+            ("openai-oauth:gpt-5.5", "OpenAI", None, Some("openai-oauth")),
             (
                 "claude-api:claude-opus-4-6",
                 "Anthropic",
@@ -707,7 +760,7 @@ mod tests {
                 "claude-oauth:claude-opus-4-6",
                 "Anthropic",
                 None,
-                Some("claude"),
+                Some("claude-oauth"),
             ),
             (
                 "cerebras:qwen-3-235b-a22b-instruct-2507",
@@ -743,17 +796,16 @@ mod tests {
 
         for (model, provider_key, expected_request) in [
             ("gpt-5.5", Some("openai-api"), "openai-api:gpt-5.5"),
-            ("gpt-5.5", Some("openai"), "openai-oauth:gpt-5.5"),
+            // A bare provider key means "auto credential", not "OAuth". It must
+            // route to the provider without pinning, so the runtime can still
+            // fall back to a configured API key when OAuth is unusable.
+            ("gpt-5.5", Some("openai"), "openai:gpt-5.5"),
             (
                 "claude-opus-4-6",
                 Some("claude-api"),
                 "claude-api:claude-opus-4-6",
             ),
-            (
-                "claude-opus-4-6",
-                Some("claude"),
-                "claude-oauth:claude-opus-4-6",
-            ),
+            ("claude-opus-4-6", Some("claude"), "claude:claude-opus-4-6"),
             (
                 "qwen-3-235b-a22b-instruct-2507",
                 Some("cerebras"),
@@ -783,6 +835,66 @@ mod tests {
                 Some("openai-compatible:nvidia-nim"),
             ),
             "nvidia-nim:nvidia/example"
+        );
+    }
+
+    #[test]
+    fn bare_session_provider_key_restores_auto_credential_not_oauth_pin() {
+        // `derive_session_provider_key` writes the bare provider name (`claude`
+        // / `openai`) for every Anthropic/OpenAI session, including ones running
+        // in automatic credential mode. Restoring those as `claude-oauth:` /
+        // `openai-oauth:` hard-pinned OAuth, which disabled the runtime's
+        // API-key fallback: once the stored refresh token was revoked, every
+        // turn failed with "OAuth token is expired and refresh failed" even
+        // though a working API key was configured.
+        //
+        // A bare key must therefore emit a non-pinning prefix, i.e. exactly the
+        // prefixes `AuthRoute::parse_explicit_credential_prefix` rejects.
+        for (model, provider_key, expected_request) in [
+            ("claude-opus-5", Some("claude"), "claude:claude-opus-5"),
+            ("claude-opus-5", Some("anthropic"), "claude:claude-opus-5"),
+            ("gpt-5.5", Some("openai"), "openai:gpt-5.5"),
+        ] {
+            let request =
+                MultiProvider::model_switch_request_for_session_model(model, provider_key);
+            assert_eq!(
+                request, expected_request,
+                "bare {provider_key:?} must not pin a credential"
+            );
+
+            let (prefix, _) = request.split_once(':').expect("prefixed request");
+            assert!(
+                jcode_provider_core::AuthRoute::parse_explicit_credential_prefix(prefix).is_none(),
+                "{prefix} must stay non-pinning so auto OAuth->API-key fallback survives"
+            );
+        }
+
+        // A session that only knows the bare key goes through the same path.
+        assert_eq!(
+            MultiProvider::model_switch_request_for_session_route(
+                "claude-opus-5",
+                Some("claude"),
+                None,
+            ),
+            "claude:claude-opus-5"
+        );
+        // An explicit persisted route still pins, so a deliberate API-key or
+        // OAuth choice is never downgraded to auto.
+        assert_eq!(
+            MultiProvider::model_switch_request_for_session_route(
+                "claude-opus-5",
+                Some("claude"),
+                Some("claude-api"),
+            ),
+            "claude-api:claude-opus-5"
+        );
+        assert_eq!(
+            MultiProvider::model_switch_request_for_session_route(
+                "claude-opus-5",
+                Some("claude"),
+                Some("claude-oauth"),
+            ),
+            "claude-oauth:claude-opus-5"
         );
     }
 

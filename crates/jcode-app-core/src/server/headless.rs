@@ -3,7 +3,7 @@ use crate::protocol::ServerEvent;
 use crate::provider::Provider;
 use crate::server::{
     SessionInterruptQueues, SwarmMember, VersionedPlan, broadcast_swarm_status,
-    register_background_tool_signal, register_session_interrupt_queue, swarm_id_for_dir,
+    register_background_tool_signal, register_session_interrupt_queue, swarm_id_for_session,
 };
 use crate::tool::Registry;
 use anyhow::Result;
@@ -45,6 +45,22 @@ fn resolve_spawn_model_request(
     }
 }
 
+/// Which memory store a headless session gets.
+///
+/// A bare `bool` here is one typo away from silently reintroducing #729, where
+/// every real swarm worker was forced into throwaway test storage and could
+/// never read what the session that spawned it remembered. Naming the two cases
+/// makes the wrong one hard to pick by accident and obvious in review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeadlessMemoryScope {
+    /// Real project/global memory, scoped to the session's working directory.
+    /// Correct for swarm-spawned workers, which are real user sessions.
+    RealProject,
+    /// Throwaway isolated storage. Only for debug-socket admin sessions, where
+    /// isolation is the entire point.
+    IsolatedTest,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "headless session creation wires provider, global session, swarm state, interrupts, and MCP pool together"
@@ -66,6 +82,7 @@ pub(super) async fn create_headless_session(
     effort_override: Option<String>,
     mcp_pool: Option<Arc<crate::mcp::SharedMcpPool>>,
     report_back_to_session_id: Option<String>,
+    memory_scope: HeadlessMemoryScope,
 ) -> Result<String> {
     let memory_enabled = crate::config::config().features.memory;
     let swarm_enabled = crate::config::config().features.swarm;
@@ -84,7 +101,9 @@ pub(super) async fn create_headless_session(
     let provider = provider_template.fork();
     let registry = Registry::new(provider.clone()).await;
 
-    registry.enable_memory_test_mode().await;
+    if memory_scope == HeadlessMemoryScope::IsolatedTest {
+        registry.enable_memory_test_mode().await;
+    }
 
     if selfdev_requested {
         registry.register_selfdev_tools().await;
@@ -230,7 +249,17 @@ pub(super) async fn create_headless_session(
     };
 
     let swarm_id = if swarm_enabled {
-        swarm_id_for_dir(working_dir.clone())
+        // A spawned worker belongs to its parent's swarm. A standalone
+        // headless session is an independent root and gets its own swarm.
+        let parent_swarm_id = if let Some(parent_id) = report_back_to_session_id.as_deref() {
+            let members = swarm_members.read().await;
+            members
+                .get(parent_id)
+                .and_then(|member| member.swarm_id.clone())
+        } else {
+            None
+        };
+        parent_swarm_id.or_else(|| swarm_id_for_session(&client_session_id))
     } else {
         None
     };

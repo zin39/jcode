@@ -18,6 +18,7 @@ include!("tests/remote_startup_input_03/part_01.rs");
 include!("tests/remote_startup_input_03/part_02.rs");
 include!("tests/remote_startup_input_04.rs");
 include!("tests/image_placeholder_commands.rs");
+include!("tests/interleave_images_guard.rs");
 include!("tests/remote_events_reload_01/part_01.rs");
 include!("tests/remote_events_reload_01/part_02.rs");
 include!("tests/remote_events_reload_02/part_01.rs");
@@ -44,9 +45,15 @@ include!("tests/hotkey_feedback_e2e.rs");
 include!("tests/todo_card.rs");
 include!("tests/issue_496_input_routing.rs");
 include!("tests/issue_544_paste_enter.rs");
+include!("tests/keybinding_hot_reload.rs");
+include!("tests/terminal_setup_command.rs");
 include!("tests/issue_497_copy_ctrl_c.rs");
+include!("tests/issue_699_ctrl_d_delete.rs");
+include!("tests/issue_832_remote_ctrl_k.rs");
 include!("tests/spinner_slash_commands.rs");
-
+include!("tests/command_suggestions_cache.rs");
+include!("tests/skill_invocation_multi_word.rs");
+include!("tests/prompt_history_cross_session.rs");
 #[test]
 fn kv_cache_signature_prefix_match_allows_appended_messages() {
     let baseline_messages = vec![
@@ -1719,10 +1726,12 @@ fn assert_clear_usage_reset(app: &App) {
 fn local_clear_resets_provider_reported_context_usage() {
     let mut app = create_test_app();
     seed_stale_clear_usage(&mut app);
+    seed_stale_clear_swarm_plan(&mut app);
 
     assert!(super::commands::handle_session_command(&mut app, "/clear"));
 
     assert_clear_usage_reset(&app);
+    assert_clear_swarm_plan_reset(&app);
 }
 
 #[test]
@@ -1734,6 +1743,7 @@ fn remote_clear_resets_provider_reported_context_usage() {
     remote.mark_history_loaded();
     app.is_remote = true;
     seed_stale_clear_usage(&mut app);
+    seed_stale_clear_swarm_plan(&mut app);
     app.input = "/clear".to_string();
     app.cursor_pos = app.input.len();
 
@@ -1741,6 +1751,28 @@ fn remote_clear_resets_provider_reported_context_usage() {
         .expect("remote /clear should succeed");
 
     assert_clear_usage_reset(&app);
+    assert_clear_swarm_plan_reset(&app);
+}
+
+fn seed_stale_clear_swarm_plan(app: &mut App) {
+    app.swarm_plan_items = vec![crate::plan::PlanItem {
+        content: "old session task".to_string(),
+        status: "queued".to_string(),
+        priority: "high".to_string(),
+        id: "old-task".to_string(),
+        subsystem: None,
+        file_scope: Vec::new(),
+        blocked_by: Vec::new(),
+        assigned_to: None,
+    }];
+    app.swarm_plan_version = Some(19);
+    app.swarm_plan_swarm_id = Some("old-swarm".to_string());
+}
+
+fn assert_clear_swarm_plan_reset(app: &App) {
+    assert!(app.swarm_plan_items.is_empty());
+    assert_eq!(app.swarm_plan_version, None);
+    assert_eq!(app.swarm_plan_swarm_id, None);
 }
 
 // ── WP13: Multi-pane focus unit tests ─────────────────────────────────

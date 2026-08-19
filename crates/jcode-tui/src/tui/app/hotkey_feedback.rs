@@ -116,6 +116,11 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
 
     // Configured pane/mode toggles (pre-control shortcuts).
     push(
+        inputs.toggles.auto_poke.binding().cloned(),
+        "auto_poke_toggle",
+        "toggle auto-poke",
+    );
+    push(
         inputs.toggles.copy_selection.binding().cloned(),
         "copy_selection_toggle",
         "toggle copy/selection mode",
@@ -289,6 +294,16 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
         "scroll_bookmark",
         "toggle the scroll bookmark",
     );
+    out.push(KnownHotkey::new(
+        ctrl('l'),
+        "clear_screen",
+        "clear the screen; history stays in scrollback",
+    ));
+    out.push(KnownHotkey::new(
+        key(KeyCode::Char('l'), KeyModifiers::SUPER),
+        "clear_screen",
+        "clear the screen; history stays in scrollback",
+    ));
 
     // Built-in readline-style editing chords.
     out.push(KnownHotkey::new(
@@ -333,11 +348,6 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
         "stash or restore the input draft",
     ));
     out.push(KnownHotkey::new(
-        ctrl('p'),
-        "auto_poke_toggle",
-        "toggle auto-poke",
-    ));
-    out.push(KnownHotkey::new(
         ctrl('t'),
         "queue_mode_toggle",
         "toggle queue mode",
@@ -359,8 +369,8 @@ pub(super) fn build_registry(inputs: &RegistryInputs<'_>) -> Vec<KnownHotkey> {
     ));
     out.push(KnownHotkey::new(
         ctrl('r'),
-        "recover_session",
-        "recover the session without tools",
+        "history_search",
+        "search prompt history across sessions",
     ));
     out.push(KnownHotkey::new(
         key(KeyCode::Enter, KeyModifiers::CONTROL),
@@ -684,7 +694,10 @@ impl App {
     /// Handle the `/hotkeys` command: list every known chord with a
     /// description and the user's personal usage counts.
     pub(super) fn handle_hotkeys_command(&mut self, trimmed: &str) -> bool {
-        if trimmed != "/hotkeys" && trimmed != "/keys" {
+        // `/keys` belongs to the keymap-conflict diagnostics command, which is
+        // dispatched earlier; claiming it here was dead code that only made the
+        // alias ambiguous.
+        if trimmed != "/hotkeys" {
             return false;
         }
         let registry = self.hotkey_registry(self.is_remote);
@@ -894,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_finds_builtin_ctrl_p_auto_poke() {
+    fn lookup_finds_configured_ctrl_p_auto_poke() {
         let registry = test_inputs_registry(false);
         let info = lookup(&registry, true, KeyCode::Char('p'), KeyModifiers::CONTROL)
             .expect("ctrl+p known");
@@ -1028,6 +1041,7 @@ mod tests {
             ("effort_increase", Some(&["effort_increase"])),
             ("effort_decrease", Some(&["effort_decrease"])),
             ("centered_toggle", Some(&["centered_toggle"])),
+            ("auto_poke_toggle", Some(&["auto_poke_toggle"])),
             ("scroll_prompt_up", Some(&["prompt_jump_up"])),
             ("scroll_prompt_down", Some(&["prompt_jump_down"])),
             ("scroll_bookmark", Some(&["scroll_bookmark"])),
@@ -1109,6 +1123,7 @@ mod tests {
         let registry = test_inputs_registry(false);
         let toggles = crate::tui::keybind::load_toggle_keys();
         let toggle_bindings: &[(&str, Option<&KeyBinding>)] = &[
+            ("auto_poke_toggle", toggles.auto_poke.binding()),
             ("side_panel_toggle", toggles.side_panel.binding()),
             ("copy_selection_toggle", toggles.copy_selection.binding()),
             ("diagram_pane_toggle", toggles.diagram_pane.binding()),

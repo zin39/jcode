@@ -195,7 +195,7 @@ impl App {
 
     /// The api_method string of the route currently in use, used to exclude the
     /// failed route and to recognize same-model/different-method alternatives.
-    fn current_route_api_method(&self) -> Option<String> {
+    pub(super) fn current_route_api_method(&self) -> Option<String> {
         if self.is_remote {
             return self.session.route_api_method.clone();
         }
@@ -247,17 +247,6 @@ impl App {
     fn describe_route(route: &crate::provider::ModelRoute) -> String {
         let method = crate::provider::ModelRouteApiMethod::parse(&route.api_method).display_label();
         format!("{} via {} ({})", route.model, method, route.provider)
-    }
-
-    /// Condense a (possibly multi-line JSON) provider error down to a single,
-    /// length-capped line for the fallback offer summary.
-    fn clip_error_one_line(error: &str, max_chars: usize) -> String {
-        let first = error.lines().next().unwrap_or(error).trim();
-        if first.chars().count() <= max_chars {
-            return first.to_string();
-        }
-        let clipped: String = first.chars().take(max_chars).collect();
-        format!("{clipped}…")
     }
 
     /// After a provider turn error, compute the next best available route and, if
@@ -339,13 +328,13 @@ impl App {
 
         let remote_resend = if self.is_remote { remote_resend } else { None };
 
+        // The raw error was already shown by the caller just above this offer,
+        // so only name the failed route here instead of echoing the error text
+        // a second time.
         let key_label = crate::tui::keybind::fallback_switch_key_label();
         self.push_display_message(DisplayMessage::system(format!(
-            "↪ Fallback available: press {} to switch to {} and resend.\n\nWhat failed: {}\nError: {}",
-            key_label,
-            target_label,
-            from_label,
-            Self::clip_error_one_line(error, 160),
+            "↪ {} failed. Fallback available: press {} to switch to {} and resend.",
+            from_label, key_label, target_label,
         )));
         self.set_status_notice(format!("Press {} to switch to {}", key_label, route.model));
         self.pending_fallback_offer = Some(super::PendingFallbackOffer {
@@ -1800,11 +1789,10 @@ impl App {
         match completed.result {
             Ok(summary) => {
                 self.invalidate_model_picker_cache();
-                self.upsert_background_task_progress_message(
-                    crate::message::format_model_refresh_progress_markdown(
-                        "Model list refresh complete",
-                        Some(100),
-                    ),
+                self.finish_background_task(
+                    "refresh-model-list".to_string(),
+                    "Model list refresh".to_string(),
+                    crate::tui::BackgroundTaskRowStatus::Completed,
                 );
                 self.push_display_message(DisplayMessage::system(format_model_refresh_summary(
                     &summary,
@@ -1815,11 +1803,10 @@ impl App {
                 ));
             }
             Err(error) => {
-                self.upsert_background_task_progress_message(
-                    crate::message::format_model_refresh_progress_markdown(
-                        "Model list refresh failed",
-                        None,
-                    ),
+                self.finish_background_task(
+                    "refresh-model-list".to_string(),
+                    "Model list refresh".to_string(),
+                    crate::tui::BackgroundTaskRowStatus::Failed,
                 );
                 self.push_display_message(DisplayMessage::error(format!(
                     "Failed to refresh model list: {}",

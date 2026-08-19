@@ -560,6 +560,60 @@ fn openrouter_like_status_is_provider_specific() {
 }
 
 #[test]
+fn openrouter_status_excludes_shared_compatible_transport() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("create temp dir");
+    let keys = [
+        "JCODE_HOME",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "JCODE_OPENROUTER_API_BASE",
+        "JCODE_OPENROUTER_API_KEY_NAME",
+        "JCODE_OPENROUTER_ENV_FILE",
+        "JCODE_OPENROUTER_PROVIDER_FEATURES",
+        "JCODE_OPENROUTER_DYNAMIC_BEARER_PROVIDER",
+        "JCODE_OPENROUTER_ALLOW_NO_AUTH",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_OPENROUTER_TRANSPORT_STATE",
+    ];
+    let saved = keys
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+
+    for key in keys {
+        crate::env::remove_var(key);
+    }
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    crate::env::set_var("OPENAI_API_KEY", "openai-test-key");
+    assert!(!crate::provider::openrouter::has_openrouter_credentials());
+    AuthStatus::invalidate_cache();
+    assert_eq!(
+        AuthStatus::check_fast().openrouter,
+        AuthState::NotConfigured
+    );
+
+    crate::env::set_var("JCODE_OPENROUTER_API_BASE", "https://example.test/v1");
+    crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", "OPENAI_API_KEY");
+    assert!(crate::provider::openrouter::has_credentials());
+    assert!(!crate::provider::openrouter::has_openrouter_credentials());
+
+    crate::env::remove_var("JCODE_OPENROUTER_API_BASE");
+    crate::env::remove_var("JCODE_OPENROUTER_API_KEY_NAME");
+    crate::env::remove_var("OPENAI_API_KEY");
+    crate::env::set_var("OPENROUTER_API_KEY", "openrouter-test-key");
+    assert!(crate::provider::openrouter::has_openrouter_credentials());
+    AuthStatus::invalidate_cache();
+    assert_eq!(AuthStatus::check_fast().openrouter, AuthState::Available);
+
+    for (key, value) in saved {
+        restore_env_var(key, value);
+    }
+    AuthStatus::invalidate_cache();
+}
+
+#[test]
 fn azure_readiness_distinguishes_credentials_from_deployment_validation() {
     let _lock = crate::storage::lock_test_env();
     let temp = tempfile::TempDir::new().expect("create temp dir");
@@ -964,5 +1018,89 @@ fn all_credentials_resolve_to_one_dir() {
         env_file_dir.parent(),
         Some(canonical.as_path()),
         "API-key env files and OAuth token files must share one directory"
+    );
+}
+
+/// Antigravity/Gemini access tokens live about an hour and are refreshed
+/// transparently on the next request. Reporting `Expired` just because the
+/// cached access token aged out made a fully working provider render as broken
+/// in `/login`, the header, onboarding, and `jcode auth status`, which is what
+/// the "antigravity is not working" reports actually were. Only a missing or
+/// permanently rejected refresh token means the user must log in again.
+#[test]
+fn refreshable_token_state_covers_the_full_expiry_state_space() {
+    let never_rejected = |_: &str| false;
+    let always_rejected = |_: &str| true;
+
+    // (case, expired access token, refresh token, refresh token rejected) -> state
+    let cases: [(&str, bool, &str, bool, AuthState); 6] = [
+        (
+            "hourly access token expired but refresh works",
+            true,
+            "1//live-refresh-token",
+            false,
+            AuthState::Available,
+        ),
+        (
+            "fresh access token",
+            false,
+            "1//live-refresh-token",
+            false,
+            AuthState::Available,
+        ),
+        (
+            "fresh access token, no refresh token",
+            false,
+            "",
+            false,
+            AuthState::Available,
+        ),
+        (
+            "expired with no refresh token needs re-login",
+            true,
+            "   ",
+            false,
+            AuthState::Expired,
+        ),
+        (
+            "expired with revoked refresh token needs re-login",
+            true,
+            "1//revoked",
+            true,
+            AuthState::Expired,
+        ),
+        (
+            "fresh access token is trusted even if an old refresh token was rejected",
+            false,
+            "1//revoked",
+            true,
+            AuthState::Available,
+        ),
+    ];
+
+    for (case, expired, refresh_token, rejected, expected) in cases {
+        let observed = if rejected {
+            super::refreshable_token_state_with(
+                Ok((expired, refresh_token.to_string())),
+                always_rejected,
+            )
+        } else {
+            super::refreshable_token_state_with(
+                Ok((expired, refresh_token.to_string())),
+                never_rejected,
+            )
+        };
+        assert_eq!(observed, expected, "{case}");
+    }
+}
+
+#[test]
+fn missing_refreshable_credentials_are_not_configured() {
+    assert_eq!(
+        super::refreshable_token_state_with(
+            Err(anyhow::anyhow!("No Antigravity tokens found.")),
+            |_| false
+        ),
+        AuthState::NotConfigured
     );
 }

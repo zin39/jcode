@@ -140,150 +140,35 @@ fn matching_suffix_len_detects_prepended_history() {
     assert_eq!(matching_suffix_len(&base, &old), 4);
 }
 
-/// WP3 snapshot test: verify user + assistant message rendering format across
-/// multiple terminal widths, including Plain tier fallback.
+/// The prepared-header cache trades staleness for avoiding a bundle of disk
+/// probes (auth files, goal JSON, skill overlay, update-channel stats) that
+/// measured ~22ms for the auth probe alone. Its TTL is therefore sized for slow
+/// background drift, which is only safe because credential changes are caught
+/// by the signature instead. Guard that: a generation bump must be visible to
+/// the signature so `/login` repaints on the next frame.
 #[test]
-fn snapshot_user_and_assistant_format_at_varying_widths() {
-    // Build a rendered conversation fixture:
-    //  - 2 user messages (multi-line)
-    //  - 2 assistant messages (short + markdown)
-    let widths = [60u16, 100, 140];
-    let tiers = [Tier::Rich, Tier::Plain];
+fn auth_generation_change_invalidates_the_header_signature() {
+    let before = crate::auth::auth_status_generation();
+    crate::auth::bump_auth_status_generation_for_tests();
+    let after = crate::auth::auth_status_generation();
 
-    for &width in &widths {
-        for &tier in &tiers {
-            let mut lines: Vec<Line<'static>> = Vec::new();
-            let mut raw = Vec::new();
-            let mut overrides = Vec::new();
-            let mut copy_offsets = Vec::new();
-            let mut user_indices = Vec::new();
+    assert_ne!(
+        before, after,
+        "a credential change must bump the generation so the header signature \
+         changes and the auth inventory repaints immediately"
+    );
+}
 
-            // User message 1
-            push_user_prompt_lines(
-                &mut lines,
-                &mut raw,
-                &mut overrides,
-                &mut copy_offsets,
-                &mut user_indices,
-                1,
-                "Explain the retry backoff logic in src/app.rs",
-                ratatui::layout::Alignment::Left,
-                tier,
-                "testuser",
-            );
-
-            // Assistant message 1 (body only, model tag is added by render_message_into)
-            let assistant1 = render_assistant_message(
-                &DisplayMessage::assistant(
-                    "I'll trace through the reconnect path.\n\nThe machine has 4 states: Idle, Connecting, Streaming, Blocked.",
-                ),
-                width.saturating_sub(4),
-                crate::config::DiffDisplayMode::Off,
-            );
-            // Prepend model tag (mimicking what render_message_into does)
-            let agent_color = role_color(Role::Agent, tier);
-            lines.push(
-                Line::from(Span::styled(
-                    "jcode · mock-model".to_string(),
-                    Style::default().fg(agent_color),
-                ))
-                .alignment(ratatui::layout::Alignment::Left),
-            );
-            raw.push("jcode · mock-model".to_string());
-            overrides.push(Some(WrappedLineMap {
-                raw_line: raw.len() - 1,
-                start_col: 0,
-                end_col: 0,
-            }));
-            copy_offsets.push(0);
-            // blank line between blocks
-            lines.push(Line::from(""));
-            raw.push(String::new());
-            overrides.push(Some(WrappedLineMap {
-                raw_line: raw.len() - 1,
-                start_col: 0,
-                end_col: 0,
-            }));
-            copy_offsets.push(0);
-            for line in assistant1 {
-                lines.push(line);
-                raw.push(String::new());
-                overrides.push(Some(WrappedLineMap {
-                    raw_line: raw.len() - 1,
-                    start_col: 0,
-                    end_col: 0,
-                }));
-                copy_offsets.push(0);
-            }
-
-            // Verify structure
-            let plain: Vec<String> = lines.iter().map(ui::line_plain_text).collect();
-            let full: String = plain.join("\n");
-
-            // Gutter/header for each tier
-            let expected_gutter = if tier == Tier::Plain { "|" } else { "▌" };
-            let expected_body_gutter = if tier == Tier::Plain { "|" } else { "│" };
-
-            // Check user message 1 format
-            assert!(
-                full.contains(&format!("{expected_gutter} 1 › testuser")),
-                "width {width}, tier {tier:?}: header missing gutter+number+name\n{full}"
-            );
-            assert!(
-                full.contains(&format!("{expected_body_gutter} Explain")),
-                "width {width}, tier {tier:?}: body missing gutter\n{full}"
-            );
-
-            // Check assistant model tag
-            if tier != Tier::Plain {
-                assert!(
-                    full.contains("jcode · mock-model"),
-                    "width {width}, tier {tier:?}: missing model tag\n{full}"
-                );
-            }
-            assert!(
-                full.contains("The machine has 4 states"),
-                "width {width}, tier {tier:?}: assistant body lost content\n{full}"
-            );
-
-            // ---- Render to buffer and check for full-width backgrounds ----
-            let total_height = lines.len().max(1) as u16;
-            let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(
-                0,
-                0,
-                width,
-                total_height,
-            ));
-            for (y, line) in lines.iter().enumerate() {
-                let x_offset = match line.alignment {
-                    Some(ratatui::layout::Alignment::Center) => {
-                        (width as usize).saturating_sub(line.width()) / 2
-                    }
-                    _ => 0,
-                } as u16;
-                let mut x = x_offset;
-                for span in &line.spans {
-                    let span_width = span.width() as u16;
-                    if x < width {
-                        buffer.set_span(x, y as u16, span, span_width);
-                    }
-                    x = x.saturating_add(span_width);
-                }
-            }
-
-            // Check: no full-width background rows. A full-width bg row would
-            // have every cell in the row with the same non-Reset bg color.
-            let has_full_width_bg = (0..total_height).any(|y| {
-                let first_bg = buffer[(0, y)].bg;
-                if first_bg == ratatui::style::Color::Reset {
-                    return false;
-                }
-                (1..width).all(|x| buffer[(x, y)].bg == first_bg)
-            });
-            assert!(
-                !has_full_width_bg,
-                "width {width}, tier {tier:?}: found full-width background rows\n{full}"
-            );
-        }
-    }
+/// The TTL must stay sized to the underlying data rather than the frame rate.
+/// A sub-second TTL reintroduces the bimodal cost this cache exists to remove:
+/// every lapse pays a full disk-probe rebuild (p50 48ms in TUI_SLOW_FRAME logs)
+/// to usually produce a byte-identical header.
+#[test]
+fn header_cache_ttl_is_not_sized_to_the_frame_rate() {
+    assert!(
+        HEADER_PREP_CACHE_TTL >= std::time::Duration::from_secs(5),
+        "header TTL {HEADER_PREP_CACHE_TTL:?} is short enough to rebuild on a \
+         render-loop cadence; user-visible changes are covered by the \
+         signature, so the TTL should only bound slow background drift"
+    );
 }

@@ -261,11 +261,89 @@ impl App {
     }
 
     pub(super) fn try_open_link_at(&mut self, column: u16, row: u16) -> bool {
-        self.try_open_link_at_with(column, row, |url| {
-            super::helpers::open_path_or_url_detached(url)
-        })
+        let Some(target) = super::super::ui::link_target_from_screen(column, row) else {
+            return false;
+        };
+
+        if self.try_open_repository_markdown_link(&target) {
+            return true;
+        }
+
+        match super::helpers::open_path_or_url_detached(&target) {
+            Ok(()) => self.set_status_notice(format!("Opened link: {}", target)),
+            Err(e) => self.set_status_notice(format!("Failed to open link: {}", e)),
+        }
+        true
     }
 
+    pub(super) fn try_open_repository_markdown_link(&mut self, target: &str) -> bool {
+        let path_target = target.split(['#', '?']).next().unwrap_or(target);
+        let relative = std::path::Path::new(path_target);
+        if relative.is_absolute()
+            || path_target.contains("://")
+            || !relative
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            return false;
+        }
+
+        let repository = self
+            .session
+            .working_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        let Some(repository) = repository.and_then(|path| path.canonicalize().ok()) else {
+            return false;
+        };
+        let Ok(path) = repository.join(relative).canonicalize() else {
+            self.set_status_notice(format!("Markdown file not found: {}", path_target));
+            return true;
+        };
+        if !path.starts_with(&repository) {
+            self.set_status_notice("Refused to open a Markdown file outside the repository");
+            return true;
+        }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                self.set_status_notice(format!("Failed to read Markdown file: {}", error));
+                return true;
+            }
+        };
+        let title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path_target)
+            .to_string();
+        let id = format!("linked-markdown:{}", path.display());
+        let page = crate::side_panel::SidePanelPage {
+            id: id.clone(),
+            title: title.clone(),
+            file_path: path.to_string_lossy().into_owned(),
+            format: crate::side_panel::SidePanelPageFormat::Markdown,
+            source: crate::side_panel::SidePanelPageSource::LinkedFile,
+            content,
+            updated_at_ms: 0,
+        };
+
+        let mut snapshot = self.side_panel.clone();
+        if let Some(existing) = snapshot.pages.iter_mut().find(|existing| existing.id == id) {
+            *existing = page;
+        } else {
+            snapshot.pages.push(page);
+        }
+        snapshot.focused_page_id = Some(id);
+        self.side_panel_user_hidden = false;
+        self.apply_side_panel_snapshot(snapshot);
+        self.set_diff_pane_focus(true);
+        self.set_status_notice(format!("Opened Markdown: {}", title));
+        true
+    }
+
+    #[cfg(test)]
     pub(super) fn try_open_link_at_with<F, E>(
         &mut self,
         column: u16,
@@ -1424,6 +1502,15 @@ impl App {
             self.set_diff_pane_focus(false);
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && crate::tui::ui::viewport::pinned_todo_more_area().is_some_and(|area| {
+                super::super::layout_utils::point_in_rect(mouse.column, mouse.row, area)
+            })
+        {
+            self.pinned_todos_expanded = true;
+            finish_mouse_event!(false, "pinned_todos_expand");
+        }
+
         // A left press in the composer moves the caret first (native text-field
         // behavior), then falls through so the shared copy-selection machinery
         // can arm a drag anchor: click repositions the cursor, drag selects the
@@ -1589,6 +1676,27 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && crate::tui::ui::visible_expand_edit_badge_at(mouse.column, mouse.row)
+            && super::input::handle_expand_edit_badge_shortcut(self, 'e')
+        {
+            finish_mouse_event!(false, "expand_edit_badge_click");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && let Some(target) = crate::tui::ui::visible_copy_target_at(mouse.column, mouse.row)
+        {
+            let success = super::helpers::copy_to_clipboard(&target.content);
+            self.record_copy_badge_key_press(target.key);
+            self.record_copy_badge_feedback(target.key, success);
+            if success {
+                self.set_status_notice(target.copied_notice);
+            } else {
+                self.set_status_notice(format!("Failed to copy {}", target.kind_label));
+            }
+            finish_mouse_event!(false, "copy_badge_click");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
             && self.try_open_link_at(mouse.column, mouse.row)
         {
             finish_mouse_event!(false, "open_link");
@@ -1616,6 +1724,14 @@ impl App {
     /// "phantom" scroll once the viewport is already pinned to the top.
     pub(super) fn scroll_up(&mut self, amount: usize) -> bool {
         // Scrolling up cancels any pending overscroll rebound line immediately
+        // Leaving the collapsed terminal-clear screen: drop the trailing Ctrl+L
+        // spacer so scrolling up reveals the transcript immediately instead of
+        // first having to travel back through a viewport of blank rows.
+        if self.terminal_clear_collapsed() {
+            self.display_messages.pop();
+            self.bump_display_messages_version();
+            self.request_full_repaint();
+        }
         // and ends the current downward gesture, so a subsequent scroll down
         // starts a fresh gesture evaluated from wherever the view is then.
         self.chat_overscroll_last = None;

@@ -240,6 +240,9 @@ pub struct Agent {
     last_expanded_count: usize,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
+    /// AGENTS.md is session bootstrap input. Keep the captured text stable so
+    /// tool writes do not mutate the provider's cacheable prefix mid-session.
+    agents_md_snapshot: (Option<String>, crate::prompt::ContextInfo),
     /// Whether memory features are enabled for this session
     memory_enabled: bool,
     /// One-step undo snapshot captured before the most recent rewind.
@@ -267,9 +270,21 @@ pub struct Agent {
     /// worker's rolling tail directly and surface it in the side panel.
     #[allow(clippy::type_complexity)]
     inline_tail_sink: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Prevent duplicate content uploads when shutdown/finalization is invoked
+    /// more than once for the same in-memory agent.
+    transcript_telemetry_sent: bool,
 }
 
 impl Agent {
+    fn refresh_agents_md_snapshot(&mut self) {
+        let working_dir = self
+            .session
+            .working_dir
+            .as_deref()
+            .map(std::path::Path::new);
+        self.agents_md_snapshot = crate::prompt::load_agents_md_files_from_dir(working_dir);
+    }
+
     fn should_track_client_cache(&self) -> bool {
         match std::env::var("JCODE_TRACK_CLIENT_CACHE") {
             Ok(value) => {
@@ -288,6 +303,8 @@ impl Agent {
         disabled_tools: HashSet<String>,
     ) -> Self {
         let skills = SkillRegistry::shared_snapshot();
+        let working_dir = session.working_dir.as_deref().map(std::path::Path::new);
+        let agents_md_snapshot = crate::prompt::load_agents_md_files_from_dir(working_dir);
         let initial_provider_model = provider.model();
         let agent = Self {
             provider,
@@ -315,6 +332,7 @@ impl Agent {
             mcp_late_register_resolved: false,
             last_expanded_count: 0,
             system_prompt_override: None,
+            agents_md_snapshot,
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
@@ -323,6 +341,7 @@ impl Agent {
             allow_auto_reroute: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
             inline_tail_sink: None,
+            transcript_telemetry_sent: false,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
@@ -384,9 +403,9 @@ impl Agent {
             tool_selection.disabled_tools,
         );
         agent.session.mark_active();
-        agent.session.model = Some(agent.provider.model());
-        agent.session.provider_key =
-            crate::session::derive_session_provider_key(agent.provider.name());
+        agent.session.model = Some(agent.provider_model());
+        agent.session.provider_key = agent.provider_key_for_new_session();
+        agent.reconcile_explicit_provider_pin_route();
         agent.session.ensure_initial_session_context_message();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("create");
@@ -423,8 +442,7 @@ impl Agent {
         );
         agent.session.mark_active();
         if agent.session.provider_key.is_none() {
-            agent.session.provider_key =
-                crate::session::derive_session_provider_key(agent.provider.name());
+            agent.session.provider_key = agent.provider_key_for_new_session();
         }
         if let Some(model) = agent.session.model.clone() {
             let model_request =
@@ -439,8 +457,9 @@ impl Agent {
                 &model_request,
             );
             agent.session.model = Some(restored);
+            agent.reconcile_explicit_provider_pin_route();
         } else {
-            agent.session.model = Some(agent.provider.model());
+            agent.session.model = Some(agent.provider_model());
         }
         agent.restore_reasoning_effort_from_session();
         agent.session.ensure_initial_session_context_message();
@@ -586,6 +605,17 @@ impl Agent {
         self.mcp_late_register_resolved = false;
         self.last_expanded_count = 0;
         self.rewind_undo_snapshot = None;
+    }
+
+    /// Synchronize the remote client's selected skill, accepting only names
+    /// present in the daemon's own registry snapshot.
+    pub(super) fn set_remote_active_skill(&mut self, active_skill: Option<String>) -> bool {
+        let skills = self.current_skills_snapshot();
+        let recognized = active_skill
+            .as_ref()
+            .is_none_or(|name| skills.get(name).is_some());
+        self.active_skill = active_skill.filter(|name| skills.get(name).is_some());
+        recognized
     }
 
     fn sync_session_compaction_state_from_manager(
@@ -823,9 +853,20 @@ impl Agent {
             let mut missing_for_message = Vec::new();
             for id in tool_uses {
                 self.tool_call_ids.insert(id.clone());
-                if !self.tool_result_ids.contains(&id) {
-                    missing_for_message.push(id);
+                if self.tool_result_ids.contains(&id) {
+                    continue;
                 }
+                // A tool that is still executing is not an interrupted tool:
+                // its real result is on the way, and synthesizing a
+                // placeholder now produces a duplicate tool_result that
+                // Anthropic rejects outright. See `tool::inflight`.
+                if crate::tool::inflight::is_tool_in_flight(&id) {
+                    logging::info(&format!(
+                        "Skipping missing tool-output repair for {id}: tool is still executing"
+                    ));
+                    continue;
+                }
+                missing_for_message.push(id);
             }
             if !missing_for_message.is_empty() {
                 missing_repairs.push((index, missing_for_message));
@@ -909,16 +950,17 @@ impl Agent {
 
     /// Mark this agent session as closed and persist it.
     pub fn mark_closed(&mut self) {
-        crate::telemetry::end_session_with_reason(
-            self.provider.name(),
-            &self.provider.model(),
-            crate::telemetry::SessionEndReason::NormalExit,
-        );
         self.persist_soft_interrupt_snapshot();
         self.session.mark_closed();
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session close state");
         }
+        self.upload_transcript_telemetry(crate::telemetry::SessionEndReason::NormalExit);
+        crate::telemetry::end_session_with_reason(
+            self.provider.name(),
+            &self.provider.model(),
+            crate::telemetry::SessionEndReason::NormalExit,
+        );
         self.fire_session_lifecycle_hook("session_end", "close");
     }
 
@@ -939,15 +981,39 @@ impl Agent {
     }
 
     pub fn mark_crashed(&mut self, message: Option<String>) {
+        self.persist_soft_interrupt_snapshot();
+        self.session.mark_crashed(message);
+        if !self.session.messages.is_empty() {
+            self.persist_session_best_effort("session crash state");
+        }
+        self.upload_transcript_telemetry(crate::telemetry::SessionEndReason::Unknown);
         crate::telemetry::record_crash(
             self.provider.name(),
             &self.provider.model(),
             crate::telemetry::SessionEndReason::Unknown,
         );
-        self.persist_soft_interrupt_snapshot();
-        self.session.mark_crashed(message);
-        if !self.session.messages.is_empty() {
-            self.persist_session_best_effort("session crash state");
+    }
+
+    fn upload_transcript_telemetry(&mut self, end_reason: crate::telemetry::SessionEndReason) {
+        if self.transcript_telemetry_sent || self.session.messages.is_empty() {
+            return;
+        }
+        // Keep code and ordinary transcript content intact, but reuse the
+        // session export redactor so credentials are removed recursively from
+        // text, reasoning, tool inputs, and tool results before leaving the
+        // machine.
+        let redacted_session = self.session.redacted_for_export();
+        let Ok(messages) = serde_json::to_value(&redacted_session.messages) else {
+            crate::logging::warn("failed to serialize consented transcript telemetry");
+            return;
+        };
+        if crate::telemetry::record_transcript(
+            self.provider.name(),
+            &self.provider.model(),
+            end_reason,
+            messages,
+        ) {
+            self.transcript_telemetry_sent = true;
         }
     }
 

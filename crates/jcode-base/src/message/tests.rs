@@ -313,8 +313,24 @@ fn redact_secrets_redacts_mixed_case_token_assignments() {
 
 #[test]
 fn redact_secrets_leaves_normal_output_unchanged() {
-    let input = "Found 5 files\nNo auth errors\nDone.";
+    let input = "Found 5 files\nfn token_count(input: &str) -> usize { input.len() }\nNo auth errors\nDone.";
     assert_eq!(redact_secrets(input), input);
+}
+
+#[test]
+fn redact_secrets_redacts_bearer_jwt_aws_and_private_keys() {
+    let input = concat!(
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789\n",
+        "aws=AKIAABCDEFGHIJKLMNOP\n",
+        "jwt=eyJabcdefghijk.abcdefghijkl.abcdefghijkl\n",
+        "-----BEGIN PRIVATE KEY-----\nsecret-material\n-----END PRIVATE KEY-----\n",
+    );
+    let out = redact_secrets(input);
+    assert!(!out.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"));
+    assert!(!out.contains("eyJabcdefghijk"));
+    assert!(!out.contains("secret-material"));
+    assert!(out.matches("[REDACTED_SECRET]").count() >= 4);
 }
 
 #[test]
@@ -836,4 +852,51 @@ fn reasoning_trace_serde_round_trip() {
         ContentBlock::ReasoningTrace { text } => assert_eq!(text, "persisted reasoning"),
         other => panic!("expected ReasoningTrace, got {other:?}"),
     }
+}
+
+#[test]
+fn format_background_task_stalled_markdown_renders_tail_and_guidance() {
+    let rendered =
+        format_background_task_stalled_markdown(&jcode_background_types::BackgroundTaskStalled {
+            task_id: "stall01".to_string(),
+            tool_name: "bash".to_string(),
+            display_name: Some("long training run".to_string()),
+            session_id: "session".to_string(),
+            stall_wake_seconds: 300,
+            running_secs: 1234.5,
+            output_tail: "epoch 3/10\nloss 0.42\n".to_string(),
+            output_file: std::path::PathBuf::from("/tmp/output.log"),
+            notify: true,
+            wake: true,
+        });
+
+    assert!(rendered.contains(
+        "**Background task stalled** `stall01` · `long training run` (`bash`) · no output or progress for 300s (running 1234s total)"
+    ));
+    assert!(rendered.contains("```text\nepoch 3/10\nloss 0.42\n```"));
+    assert!(rendered.contains("bg action=\"status\" task_id=\"stall01\""));
+    assert!(rendered.contains("bg action=\"cancel\" task_id=\"stall01\""));
+    assert!(rendered.contains("re-arms if output resumes"));
+}
+
+#[test]
+fn format_background_task_stalled_markdown_handles_empty_tail() {
+    let rendered =
+        format_background_task_stalled_markdown(&jcode_background_types::BackgroundTaskStalled {
+            task_id: "stall02".to_string(),
+            tool_name: "bash".to_string(),
+            display_name: None,
+            session_id: "session".to_string(),
+            stall_wake_seconds: 60,
+            running_secs: 61.0,
+            output_tail: String::new(),
+            output_file: std::path::PathBuf::from("/tmp/output.log"),
+            notify: true,
+            wake: true,
+        });
+
+    assert!(rendered.contains(
+        "**Background task stalled** `stall02` · `bash` · no output or progress for 60s"
+    ));
+    assert!(rendered.contains("_No output captured yet._"));
 }

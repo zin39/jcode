@@ -121,8 +121,14 @@ pub async fn run() -> Result<()> {
     perf::init_background();
     startup_profile::mark("perf_init");
 
-    telemetry::record_install_if_first_run();
-    telemetry::record_upgrade_if_needed();
+    // Telemetry settings commands must run before they can cause telemetry. In
+    // particular, a first-ever `jcode telemetry disable` must not emit the
+    // install event that the command is trying to opt out of. Keep the normal
+    // startup ordering unchanged for every other invocation.
+    if !is_telemetry_subcommand_invocation(std::env::args_os()) {
+        telemetry::record_install_if_first_run();
+        telemetry::record_upgrade_if_needed();
+    }
     startup_profile::mark("telemetry_check");
 
     let args = parse_and_prepare_args()?;
@@ -136,11 +142,63 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+fn is_telemetry_subcommand_invocation(
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> bool {
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
+        if arg == std::ffi::OsStr::new("telemetry") {
+            return true;
+        }
+        let text = arg.to_string_lossy();
+        if !text.starts_with('-') {
+            return false;
+        }
+        if text == "--" {
+            return args
+                .next()
+                .is_some_and(|arg| arg.as_ref() == std::ffi::OsStr::new("telemetry"));
+        }
+        let option = text.split_once('=').map_or(text.as_ref(), |(name, _)| name);
+        let takes_separate_value = !text.contains('=')
+            && matches!(
+                option,
+                "-p" | "--provider"
+                    | "-C"
+                    | "--cwd"
+                    | "--remote-working-dir"
+                    | "--spawn-hotkey"
+                    | "--socket"
+                    | "-m"
+                    | "--model"
+                    | "--provider-profile"
+                    | "--tool-profile"
+                    | "--tools"
+                    | "--disabled-tools"
+            );
+        if takes_separate_value && args.next().is_none() {
+            return false;
+        }
+    }
+    false
+}
+
 /// Register provider runtimes that live downstream of `jcode-base` with the
 /// base crate's external provider registry. Keep every downstream runtime
 /// registration in this one function so the composition-root wiring stays
 /// discoverable as more providers move out of the base crate.
 pub fn register_external_provider_runtimes() {
+    crate::provider::external::register_external_provider(
+        crate::provider::external::GROK_BUILD_RUNTIME,
+        || {
+            let mut process = jcode_provider_grok_build_runtime::GrokBuildProcess::from_env();
+            process.command = crate::auth::grok_build::cli_path();
+            std::sync::Arc::new(
+                jcode_provider_grok_build_runtime::GrokBuildProvider::with_process(process),
+            )
+        },
+    );
     crate::provider::external::register_external_provider(
         crate::provider::external::GEMINI_RUNTIME,
         || std::sync::Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new()),
@@ -284,30 +342,51 @@ fn spawn_background_update_check(args: &Args) {
     }
 
     if update::is_release_build() {
-        std::thread::spawn(move || match update::check_and_maybe_update(auto_update) {
-            update::UpdateCheckResult::UpdateAvailable {
-                current, latest, ..
-            } => {
-                logging::info(&format!("Update available: {} -> {}", current, latest));
+        std::thread::spawn(move || {
+            use crate::bus::{Bus, BusEvent, ClientMaintenanceAction, SessionUpdateStatus};
+            match update::check_and_maybe_update(auto_update) {
+                update::UpdateCheckResult::UpdateAvailable {
+                    current, latest, ..
+                } => {
+                    logging::info(&format!("Update available: {} -> {}", current, latest));
+                }
+                update::UpdateCheckResult::UpdateInstalled { version, path } => {
+                    // When an interactive TUI session is running, hand the switch
+                    // to the app's graceful reload path (saves the input line,
+                    // waits for the current turn, resumes the session) instead of
+                    // exec-ing over the live UI, which visibly resets the screen.
+                    if let Some(session_id) = terminal::get_current_session() {
+                        logging::info(&format!(
+                            "Updated to {}. Requesting graceful session reload...",
+                            version
+                        ));
+                        Bus::global().publish(BusEvent::SessionUpdateStatus(
+                            SessionUpdateStatus::ReadyToReload {
+                                session_id,
+                                action: ClientMaintenanceAction::Update,
+                                version,
+                            },
+                        ));
+                        return;
+                    }
+                    logging::info(&format!("Updated to {}. Restarting...", version));
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    let exec_path = build::client_update_candidate(false)
+                        .map(|(p, _)| p)
+                        .unwrap_or(path);
+                    let err = crate::platform::replace_process(
+                        ProcessCommand::new(&exec_path)
+                            .args(&args)
+                            .arg("--no-update"),
+                    );
+                    eprintln!("Failed to exec new binary: {}", err);
+                }
+                update::UpdateCheckResult::Error(e) => {
+                    logging::info(&format!("Update check failed: {}", e));
+                }
+                update::UpdateCheckResult::NoUpdate => {}
             }
-            update::UpdateCheckResult::UpdateInstalled { version, path } => {
-                logging::info(&format!("Updated to {}. Restarting...", version));
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                let args: Vec<String> = std::env::args().skip(1).collect();
-                let exec_path = build::client_update_candidate(false)
-                    .map(|(p, _)| p)
-                    .unwrap_or(path);
-                let err = crate::platform::replace_process(
-                    ProcessCommand::new(&exec_path)
-                        .args(&args)
-                        .arg("--no-update"),
-                );
-                eprintln!("Failed to exec new binary: {}", err);
-            }
-            update::UpdateCheckResult::Error(e) => {
-                logging::info(&format!("Update check failed: {}", e));
-            }
-            update::UpdateCheckResult::NoUpdate => {}
         });
     } else {
         std::thread::spawn(move || {
@@ -318,25 +397,41 @@ fn spawn_background_update_check(args: &Args) {
             if let Some(update_available) = hot_exec::check_for_updates()
                 && update_available
             {
-                Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Available {
-                    current: jcode_build_meta::version().to_string(),
-                    latest: "latest source".to_string(),
-                }));
-                if auto_update {
-                    logging::info("Update available - auto-updating...");
-                    Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Installing {
-                        version: "latest source".to_string(),
-                    }));
-                    if let Err(e) = hot_exec::run_auto_update() {
-                        Bus::global()
-                            .publish(BusEvent::UpdateStatus(UpdateStatus::Error(e.to_string())));
-                        logging::error(&format!(
-                            "Auto-update failed: {}. Continuing with current version.",
-                            e
-                        ));
-                    }
+                // A checkout with local commits can never fast-forward, so the
+                // pull below would always fail and surface a noisy "Update
+                // diverged. Press Ctrl+Y..." card in every new session.
+                // Developers with local work expect divergence; log it once
+                // and stay quiet in the UI (no Available/Error cards).
+                if hot_exec::local_commits_ahead_of_upstream() == Some(true) {
+                    logging::info(
+                        "Auto-update skipped: local commits are ahead of upstream (diverged). \
+                         Merge or rebase manually when ready.",
+                    );
+                    Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
                 } else {
-                    logging::info("Update available! Run `jcode update` or `/reload` to update.");
+                    Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Available {
+                        current: jcode_build_meta::version().to_string(),
+                        latest: "latest source".to_string(),
+                    }));
+                    if auto_update {
+                        logging::info("Update available - auto-updating...");
+                        Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Installing {
+                            version: "latest source".to_string(),
+                        }));
+                        if let Err(e) = hot_exec::run_auto_update() {
+                            Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Error(
+                                e.to_string(),
+                            )));
+                            logging::error(&format!(
+                                "Auto-update failed: {}. Continuing with current version.",
+                                e
+                            ));
+                        }
+                    } else {
+                        logging::info(
+                            "Update available! Run `jcode update` or `/reload` to update.",
+                        );
+                    }
                 }
             } else {
                 Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
@@ -351,7 +446,15 @@ fn spawn_background_update_check(args: &Args) {
 }
 
 fn should_spawn_background_update_check(args: &Args) -> bool {
-    !args.quiet
+    should_spawn_background_update_check_with_config(
+        args,
+        crate::config::config().features.check_updates,
+    )
+}
+
+fn should_spawn_background_update_check_with_config(args: &Args, check_updates: bool) -> bool {
+    check_updates
+        && !args.quiet
         && !args.no_update
         && !matches!(
             args.command,
@@ -384,6 +487,37 @@ mod tests {
 
     fn parse_args(argv: &[&str]) -> Args {
         Args::parse_from(argv)
+    }
+
+    #[test]
+    fn telemetry_subcommand_skips_startup_telemetry() {
+        assert!(is_telemetry_subcommand_invocation([
+            "jcode",
+            "telemetry",
+            "disable"
+        ]));
+        assert!(is_telemetry_subcommand_invocation([
+            "jcode",
+            "--no-update",
+            "telemetry",
+            "disable"
+        ]));
+        assert!(is_telemetry_subcommand_invocation([
+            "jcode",
+            "--provider",
+            "openai",
+            "telemetry",
+            "disable"
+        ]));
+    }
+
+    #[test]
+    fn telemetry_prompt_does_not_skip_normal_startup_telemetry() {
+        assert!(!is_telemetry_subcommand_invocation([
+            "jcode",
+            "run",
+            "telemetry"
+        ]));
     }
 
     #[test]
@@ -425,6 +559,17 @@ mod tests {
         assert!(matches!(args.command, Some(Command::Update)));
         assert!(!should_spawn_background_update_check(&args));
         assert!(should_auto_install_update(&args));
+    }
+
+    #[test]
+    fn config_can_permanently_disable_background_update_checks() {
+        let args = parse_args(&["jcode", "login"]);
+        assert!(should_spawn_background_update_check_with_config(
+            &args, true
+        ));
+        assert!(!should_spawn_background_update_check_with_config(
+            &args, false
+        ));
     }
 
     #[test]

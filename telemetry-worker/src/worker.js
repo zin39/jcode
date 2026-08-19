@@ -4,6 +4,7 @@ let cachedTurnDetailColumns = null;
 let cachedWebDetailColumns = null;
 let cachedInstallDetailColumns = null;
 let cachedDiscoveryDetailColumns = null;
+let cachedTodoSessionDetailColumns = null;
 
 // Website beacon events (anonymous visitor_id minted in localStorage). Their
 // web-only fields live in the web_details table (see migration 0016): the
@@ -33,6 +34,7 @@ const CLI_EVENTS = [
   "session_end",
   "session_crash",
   "discovery",
+  "todo_session",
 ];
 
 const KNOWN_EVENTS = [
@@ -41,6 +43,9 @@ const KNOWN_EVENTS = [
   ...INSTALL_FUNNEL_EVENTS,
   ...SUBSCRIPTION_EVENTS,
 ];
+
+const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Origins the website beacon posts from. The default CORS policy stays the
 // permissive ALLOWED_ORIGIN var ("*", telemetry is anonymous and unauthed);
@@ -57,10 +62,10 @@ const WEB_ALLOWED_ORIGINS = new Set([
 // ---------------------------------------------------------------------------
 // Self-defense against the D1 size cap.
 //
-// D1 hard-caps database size (500 MB class on the free plan). When the cap is
-// hit, every insert fails and telemetry silently stops being recorded (this
-// happened in June 2026; ~3 days of events were lost and the file was left at
-// its ~491.5 MB high-water mark). SQLite files never shrink on DELETE - the
+// D1 hard-caps each database at 10 GB on the Workers Paid plan (500 MB on the
+// free plan). When the old free-plan cap was hit, every insert failed and
+// telemetry silently stopped being recorded (June 2026; ~3 days of events were
+// lost). SQLite files never shrink on DELETE - the
 // nightly prune frees pages *inside* the file and the day's inserts recycle
 // them - so the steady state is "file at high-water mark, internal free-page
 // pool cycling". Two triggers defend the pool:
@@ -74,7 +79,11 @@ const WEB_ALLOWED_ORIGINS = new Set([
 // Emergency prunes use halved retention windows and are rate-limited per
 // isolate.
 // ---------------------------------------------------------------------------
-const D1_SOFT_LIMIT_BYTES = 493_000_000;
+// Keep the database below the paid plan's first 5 GB of included account-wide
+// storage, leaving 500 MB for the account's other D1 databases and growth while
+// an emergency prune catches up. This is a budget guardrail, not D1's 10 GB
+// per-database hard cap.
+const D1_SOFT_LIMIT_BYTES = 4_500_000_000;
 const EMERGENCY_PRUNE_COOLDOWN_MS = 10 * 60 * 1000;
 // Best-effort per-isolate state (resets on isolate recycle, which is fine:
 // the next request re-observes the size from its own insert result).
@@ -219,7 +228,54 @@ const FIREHOSE_INSTALL_SCHEMA = {
   doubles: [],
 };
 
+// Coarse geography (`jcode_geo_firehose` dataset). The main and web datasets
+// are both at Analytics Engine's 20-blob limit, so the country dimension gets
+// its own dataset instead of repurposing a position. Country only: no IP,
+// city, region, coordinates, or timezone is read from request.cf.
+const FIREHOSE_GEO_SCHEMA = {
+  blobs: ["event", "country", "version", "os", "arch", "build_channel"],
+  doubles: ["is_ci"],
+  // index1: telemetry_id, so adaptive sampling stays per user.
+  indexes: ["telemetry_id"],
+};
+
+// Cloudflare sets request.cf.country to "XX" for unknown clients and "T1" for
+// Tor exit nodes. Normalize to a 2-letter uppercase code or null.
+const NON_COUNTRY_CODES = new Set(["XX", "T1"]);
+
+function normalizeCountry(value) {
+  const code = String(value || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code) || NON_COUNTRY_CODES.has(code)) {
+    return null;
+  }
+  return code;
+}
+
+function writeGeoFirehose(env, body) {
+  const sink = env.FIREHOSE_GEO;
+  if (!body.country || !sink || typeof sink.writeDataPoint !== "function") {
+    return false;
+  }
+  try {
+    sink.writeDataPoint({
+      indexes: [String(body.id || "").slice(0, 96)],
+      blobs: FIREHOSE_GEO_SCHEMA.blobs.map((name) => {
+        const value = body[name];
+        return value == null ? "" : String(value).slice(0, 200);
+      }),
+      doubles: [boolToInt(body.is_ci)],
+    });
+    return true;
+  } catch (err) {
+    console.warn("geo firehose write failed", err?.message || err);
+    return false;
+  }
+}
+
 function writeFirehose(env, body) {
+  // Geo is dimensioned separately from every event family, so it is written
+  // before the per-family dispatch below (which returns early).
+  writeGeoFirehose(env, body);
   if (body.event === "discovery") {
     return writeDiscoveryFirehose(env, body);
   }
@@ -384,6 +440,10 @@ export default {
       return jsonResponse({ error: "Method not allowed" }, 405, cors);
     }
 
+    if (url.pathname === "/v1/transcript") {
+      return ingestTranscript(request, env, cors);
+    }
+
     if (url.pathname !== "/v1/event") {
       return jsonResponse({ error: "Not found" }, 404, cors);
     }
@@ -427,6 +487,12 @@ export default {
       return jsonResponse({ error: "Unknown event type" }, 400, cors);
     }
 
+    // Coarse geography, resolved at the edge rather than collected by the
+    // client. Clients cannot spoof or set this: any inbound `country` field is
+    // overwritten. Country only, so this stays consistent with TELEMETRY.md
+    // (no IP, city, region, coordinates, or timezone is read or stored).
+    body.country = normalizeCountry(request.cf?.country);
+
     if (SUBSCRIPTION_EVENTS.includes(body.event)) {
       const problem = normalizeSubscriptionEvent(body);
       if (problem) {
@@ -436,6 +502,13 @@ export default {
 
     if (body.event === "discovery") {
       const problem = normalizeDiscoveryEvent(body);
+      if (problem) {
+        return jsonResponse({ error: problem }, 400, cors);
+      }
+    }
+
+    if (body.event === "todo_session") {
+      const problem = normalizeTodoSessionEvent(body);
       if (problem) {
         return jsonResponse({ error: problem }, 400, cors);
       }
@@ -474,11 +547,9 @@ export default {
     return jsonResponse({ ok: true, durable: durableOk, firehose: firehoseOk }, 200, cors);
   },
 
-  // Nightly retention pruning. D1 hard-caps databases at 500 MB; without this
-  // the raw events table eventually fills the cap and every insert starts
-  // returning 500s (which silently drops all telemetry). High-volume raw rows
-  // are pruned on a schedule while aggregate signal is preserved in the
-  // daily_active_users rollup and in long-retention lifecycle events.
+  // Nightly retention pruning bounds durable raw-history growth and keeps the
+  // database inside its paid-plan storage budget. Aggregate signal is preserved
+  // in the daily_active_users rollup and in long-retention lifecycle events.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
@@ -499,6 +570,147 @@ export default {
     );
   },
 };
+
+async function ingestTranscript(request, env, cors) {
+  if (!env.TRANSCRIPTS || typeof env.TRANSCRIPTS.put !== "function") {
+    return jsonResponse({ error: "Transcript storage unavailable" }, 503, cors);
+  }
+  const declaredSize = Number(request.headers.get("content-length") || 0);
+  if (declaredSize > MAX_TRANSCRIPT_BYTES) {
+    return jsonResponse({ error: "Transcript payload too large" }, 413, cors);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON" }, 400, cors);
+  }
+  const problem = validateTranscript(body);
+  if (problem) {
+    return jsonResponse({ error: problem }, 400, cors);
+  }
+
+  // Defense in depth: clients redact before upload, but the public endpoint
+  // must not trust callers to have done so. Preserve ordinary code and prose
+  // while removing high-confidence credentials and sensitive object fields.
+  redactSecretsInValue(body.messages);
+
+  const encoded = JSON.stringify(body);
+  const byteLength = new TextEncoder().encode(encoded).byteLength;
+  if (byteLength > MAX_TRANSCRIPT_BYTES) {
+    return jsonResponse({ error: "Transcript payload too large" }, 413, cors);
+  }
+
+  const month = new Date().toISOString().slice(0, 7);
+  const objectKey = `transcripts/${month}/${body.upload_id}.json`;
+  try {
+    await env.TRANSCRIPTS.put(objectKey, encoded, {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        consent_version: String(body.consent_version),
+        telemetry_id: body.id,
+      },
+    });
+    await env.DB.prepare(`
+      INSERT INTO transcript_uploads (
+        upload_id, telemetry_id, object_key, consent_version, schema_version,
+        version, provider, model, end_reason, message_count, byte_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      body.upload_id,
+      body.id,
+      objectKey,
+      body.consent_version,
+      body.schema_version,
+      body.version,
+      body.provider || null,
+      body.model || null,
+      body.end_reason,
+      body.message_count,
+      byteLength,
+    ).run();
+  } catch (err) {
+    try {
+      await env.TRANSCRIPTS.delete(objectKey);
+    } catch {
+      // Best effort rollback. R2 lifecycle retention remains the safety net.
+    }
+    console.error("transcript upload failed", err?.message || err);
+    return jsonResponse({ error: "Internal error" }, 500, cors);
+  }
+  return jsonResponse({ ok: true, upload_id: body.upload_id }, 200, cors);
+}
+
+function validateTranscript(body) {
+  if (!body || body.event !== "transcript") return "Invalid transcript event";
+  if (!UUID_RE.test(body.id || "") || !UUID_RE.test(body.upload_id || "")) {
+    return "Invalid transcript identifier";
+  }
+  if (body.consent_version !== 1) return "Unsupported consent version";
+  if (!Number.isInteger(body.schema_version) || body.schema_version < 1) {
+    return "Invalid schema version";
+  }
+  if (typeof body.version !== "string" || !body.version) return "Missing version";
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return "Transcript messages must be a non-empty array";
+  }
+  if (!Number.isInteger(body.message_count) || body.message_count !== body.messages.length) {
+    return "Transcript message count mismatch";
+  }
+  if (!["normal_exit", "user_exit", "error", "unknown", "superseded"].includes(body.end_reason)) {
+    return "Invalid transcript end reason";
+  }
+  return null;
+}
+
+const SENSITIVE_KEY_RE = /^(?:authorization|cookie|setcookie|privatekey|clientsecret)$/;
+
+function isSensitiveKey(key) {
+  const normalized = String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+  return normalized.includes("apikey")
+    || normalized.endsWith("token")
+    || normalized.endsWith("secret")
+    || normalized.includes("password")
+    || SENSITIVE_KEY_RE.test(normalized);
+}
+
+function redactSecretText(text) {
+  return text
+    .replace(/sk-ant-(?:oat|ort)01-[A-Za-z0-9_-]{20,}/g, "[REDACTED_SECRET]")
+    .replace(/sk-or-v1-[A-Za-z0-9_-]{20,}/g, "[REDACTED_SECRET]")
+    .replace(/ghp_[A-Za-z0-9]{20,}/g, "[REDACTED_SECRET]")
+    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, "[REDACTED_SECRET]")
+    .replace(/ya29\.[A-Za-z0-9._-]{20,}/g, "[REDACTED_SECRET]")
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, "[REDACTED_SECRET]")
+    .replace(/xox[baprs]-[A-Za-z0-9-]{10,}/g, "[REDACTED_SECRET]")
+    .replace(/AKIA[0-9A-Z]{16}/g, "[REDACTED_SECRET]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{20,}/gi, "Bearer [REDACTED_SECRET]")
+    .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, "[REDACTED_SECRET]")
+    .replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, "[REDACTED_SECRET]")
+    .replace(/^\s*([A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|COOKIE)\s*=\s*)[^\r\n]+/gim, "$1[REDACTED_SECRET]")
+    .replace(/^\s*(AUTHORIZATION\s*[:=]\s*)[^\r\n]+/gim, "$1[REDACTED_SECRET]");
+}
+
+function redactSecretsInValue(value) {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      if (typeof value[index] === "string") value[index] = redactSecretText(value[index]);
+      else redactSecretsInValue(value[index]);
+    }
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (isSensitiveKey(key)) {
+      value[key] = "[REDACTED_SECRET]";
+    } else if (typeof entry === "string") {
+      value[key] = redactSecretText(entry);
+    } else {
+      redactSecretsInValue(entry);
+    }
+  }
+}
 
 function observeDbSize(result) {
   const size = result?.meta?.size_after;
@@ -578,6 +790,7 @@ const RETENTION_DAYS = {
   subscription_login: 180,
   subscription_router_error: 90,
   subscription_budget_exhausted: 365,
+  todo_session: 365,
 };
 
 const PRUNE_BATCH_LIMIT = 10000;
@@ -636,6 +849,18 @@ async function pruneOldEvents(env, options = {}) {
           console.warn(`install_details prune failed for ${eventType}`, err?.message || err);
         }
       }
+      if (eventType === "todo_session") {
+        try {
+          await env.DB.prepare(
+            `DELETE FROM todo_session_details WHERE event_id IN (
+               SELECT event_id FROM events
+               WHERE event = ? AND created_at < datetime('now', ?) AND event_id IS NOT NULL
+               LIMIT ?)`
+          ).bind(eventType, cutoff, PRUNE_BATCH_LIMIT).run();
+        } catch (err) {
+          console.warn("todo_session_details prune failed", err?.message || err);
+        }
+      }
       try {
         // Delete detail children first so the events FK never blocks the prune.
         await env.DB.prepare(
@@ -675,6 +900,22 @@ async function insertEvent(env, body) {
   const turnDetailColumns = await getTurnDetailColumns(env);
   const installDetailColumns = await getInstallDetailColumns(env);
   const common = commonEventEntries(body, columns);
+
+  if (body.event === "todo_session") {
+    const values = [
+      ["telemetry_id", body.id],
+      ["event", body.event],
+      ["version", body.version],
+      ["os", body.os],
+      ["arch", body.arch],
+      ...common,
+    ].filter(([name]) => columns.has(name));
+    const inserted = await insertEventRow(env, body, values);
+    if (inserted) {
+      await insertTodoSessionDetails(env, body, await getTodoSessionDetailColumns(env));
+    }
+    return;
+  }
 
   if (body.event === "discovery") {
     const values = [
@@ -1060,6 +1301,9 @@ async function insertTurnDetails(env, body, columns) {
 }
 
 async function recordDailyActivity(env, body) {
+  // Country rollup covers every event family, including the ones that never
+  // reach the DAU table (install, upgrade, web_pageview, ...).
+  await recordCountryDaily(env, body);
   if (!["session_start", "turn_end", "session_end", "session_crash"].includes(body.event)) {
     return;
   }
@@ -1089,8 +1333,9 @@ async function recordDailyActivity(env, body) {
         session_crash_count,
         ci_active,
         last_is_ci,
-        last_build_channel
-      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_build_channel,
+        last_country
+      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(activity_date, telemetry_id) DO UPDATE SET
         last_seen_at = datetime('now'),
         raw_active = 1,
@@ -1103,7 +1348,8 @@ async function recordDailyActivity(env, body) {
         session_crash_count = session_crash_count + excluded.session_crash_count,
         ci_active = MAX(ci_active, excluded.ci_active),
         last_is_ci = excluded.last_is_ci,
-        last_build_channel = COALESCE(excluded.last_build_channel, daily_active_users.last_build_channel)
+        last_build_channel = COALESCE(excluded.last_build_channel, daily_active_users.last_build_channel),
+        last_country = COALESCE(excluded.last_country, daily_active_users.last_country)
     `).bind(
       activityDate,
       body.id,
@@ -1117,11 +1363,34 @@ async function recordDailyActivity(env, body) {
       isCi,
       isCi,
       body.build_channel || null,
+      body.country || null,
     ).run();
   } catch (err) {
     // Older databases may not have the rollup migration yet. Do not reject the
     // canonical event insert, because raw events remain the source of truth.
     console.warn("daily activity rollup failed", err?.message || err);
+  }
+}
+
+// Durable per-day country x event counts. Aggregate only (no telemetry_id), so
+// it survives retention pruning and cannot be used to profile an individual.
+async function recordCountryDaily(env, body) {
+  if (!body.country) {
+    return;
+  }
+  const activityDate = new Date().toISOString().slice(0, 10);
+  try {
+    await env.DB.prepare(`
+      INSERT INTO country_daily (activity_date, country, event, is_ci, event_count)
+      VALUES (?, ?, ?, ?, 1)
+      ON CONFLICT(activity_date, country, event, is_ci) DO UPDATE SET
+        event_count = event_count + 1,
+        last_seen_at = datetime('now')
+    `).bind(activityDate, body.country, body.event, boolToInt(body.is_ci)).run();
+  } catch (err) {
+    // Databases predating migration 0022 have no country_daily table; never
+    // fail the canonical event insert over the geo rollup.
+    console.warn("country rollup failed", err?.message || err);
   }
 }
 
@@ -1334,6 +1603,19 @@ async function getDiscoveryDetailColumns(env) {
   return cachedDiscoveryDetailColumns;
 }
 
+async function getTodoSessionDetailColumns(env) {
+  if (cachedTodoSessionDetailColumns) {
+    return cachedTodoSessionDetailColumns;
+  }
+  try {
+    const result = await env.DB.prepare("PRAGMA table_info(todo_session_details)").all();
+    cachedTodoSessionDetailColumns = new Set((result.results || []).map((row) => row.name));
+  } catch {
+    cachedTodoSessionDetailColumns = new Set();
+  }
+  return cachedTodoSessionDetailColumns;
+}
+
 async function insertDiscoveryDetails(env, body, columns) {
   if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
     return;
@@ -1357,6 +1639,42 @@ async function insertDiscoveryDetails(env, body, columns) {
   ].filter(([name]) => columns.has(name));
   if (values.length > 1) {
     await insertDynamic(env, "discovery_details", values);
+  }
+}
+
+async function insertTodoSessionDetails(env, body, columns) {
+  if (!columns || columns.size === 0 || !body.event_id || !columns.has("event_id")) {
+    return;
+  }
+  const values = [
+    ["event_id", body.event_id],
+    ["correlation_id", body.correlation_id],
+    ["session_end_reason", body.session_end_reason],
+    ["todos_created", body.todos_created || 0],
+    ["todos_completed", body.todos_completed || 0],
+    ["todos_abandoned", body.todos_abandoned || 0],
+    ["todo_updates", body.todo_updates || 0],
+    ["groups_completed", body.groups_completed || 0],
+    ["groups_total", body.groups_total || 0],
+    ["max_todo_list_size", body.max_todo_list_size || 0],
+    ["confidence_min", body.confidence_min ?? null],
+    ["confidence_mean", body.confidence_mean ?? null],
+    ["confidence_count", body.confidence_count || 0],
+    ["completion_confidence_min", body.completion_confidence_min ?? null],
+    ["completion_confidence_mean", body.completion_confidence_mean ?? null],
+    ["completion_confidence_count", body.completion_confidence_count || 0],
+    ["understands_user_intent_min", body.understands_user_intent_min ?? null],
+    ["understands_user_intent_mean", body.understands_user_intent_mean ?? null],
+    ["understands_user_intent_count", body.understands_user_intent_count || 0],
+    ["closed_feedback_loop_min", body.closed_feedback_loop_min ?? null],
+    ["closed_feedback_loop_mean", body.closed_feedback_loop_mean ?? null],
+    ["closed_feedback_loop_count", body.closed_feedback_loop_count || 0],
+    ["end_to_end_ownership_min", body.end_to_end_ownership_min ?? null],
+    ["end_to_end_ownership_mean", body.end_to_end_ownership_mean ?? null],
+    ["end_to_end_ownership_count", body.end_to_end_ownership_count || 0],
+  ].filter(([name]) => columns.has(name));
+  if (values.length > 1) {
+    await insertDynamic(env, "todo_session_details", values);
   }
 }
 
@@ -1592,6 +1910,44 @@ function normalizeDiscoveryEvent(body) {
   body.response_bytes = body.response_bytes == null ? null : Math.max(0, Math.min(1_048_576, Number(body.response_bytes) || 0));
   body.result_count = body.result_count == null ? null : Math.max(0, Math.min(10_000, Number(body.result_count) || 0));
   body.benchmark_run = body.benchmark_run === true;
+  return null;
+}
+
+function normalizeTodoSessionEvent(body) {
+  const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const endReasons = new Set([
+    "normal_exit", "panic", "signal", "disconnect", "reload", "superseded", "unknown",
+  ]);
+  if (typeof body.correlation_id !== "string" || !uuidV4.test(body.correlation_id)) {
+    return "Invalid todo correlation_id";
+  }
+  // This event must never carry the persistent telemetry ID. Its required `id`
+  // envelope field is the same ephemeral UUID used for the within-session join.
+  if (body.id !== body.correlation_id) {
+    return "Todo id must equal correlation_id";
+  }
+  if (!endReasons.has(body.session_end_reason)) {
+    return "Invalid todo session_end_reason";
+  }
+
+  for (const field of [
+    "todos_created", "todos_completed", "todos_abandoned", "todo_updates",
+    "groups_completed", "groups_total", "max_todo_list_size", "confidence_count",
+    "completion_confidence_count", "understands_user_intent_count",
+    "closed_feedback_loop_count", "end_to_end_ownership_count",
+  ]) {
+    body[field] = Math.max(0, Math.min(1_000_000, Math.trunc(Number(body[field]) || 0)));
+  }
+  for (const field of [
+    "confidence_min", "confidence_mean", "completion_confidence_min",
+    "completion_confidence_mean", "understands_user_intent_min",
+    "understands_user_intent_mean", "closed_feedback_loop_min",
+    "closed_feedback_loop_mean", "end_to_end_ownership_min", "end_to_end_ownership_mean",
+  ]) {
+    body[field] = body[field] == null
+      ? null
+      : Math.max(0, Math.min(100, Number(body[field]) || 0));
+  }
   return null;
 }
 

@@ -2,169 +2,43 @@ use jcode_message_types::{
     ContentBlock, Message, Role, TOOL_OUTPUT_MISSING_TEXT, sanitize_tool_id,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Normalize a tool `parameters` JSON schema for strict OpenAI-compatible
-/// endpoints (issue #446).
+/// Normalize a tool `parameters` JSON schema for whichever upstream OpenRouter
+/// routes the model to.
 ///
-/// Some backends (LM Studio being the prominent example) validate
-/// `tools[].function.parameters` strictly and reject any object schema that
-/// lacks a `properties` field with HTTP 400. MCP servers commonly declare
-/// no-argument tools as a bare `{"type": "object"}`, and because the full tool
-/// array is sent on every request, one such tool makes the provider unusable.
+/// OpenRouter forwards to Anthropic, Vertex, Bedrock, LM Studio and others, so
+/// it must satisfy the strictest of them: object schemas need a `properties` key
+/// (LM Studio, #446) and top-level combiners are rejected by the
+/// Anthropic-family backends (#495).
 ///
-/// This recursively inserts an empty `properties: {}` into every
-/// object-typed schema node that is missing it. The rewrite is semantically a
-/// no-op per JSON Schema, so it is safe to apply for every OpenAI-compatible
-/// endpoint rather than allow-listing strict ones.
+/// The subset, the recursion, and the structural rewrites live in
+/// `jcode-schema-dialect` so every provider shares one implementation and one
+/// set of regression tests. Delegating here also strips constructs the previous
+/// hand-written version forwarded (`propertyNames`, `uniqueItems`), which the
+/// same upstreams reject when they reach them.
 pub fn sanitize_tool_parameters_schema(schema: &Value) -> Value {
-    fn walk(node: &mut Value) {
-        let Some(obj) = node.as_object_mut() else {
-            if let Some(items) = node.as_array_mut() {
-                for item in items {
-                    walk(item);
-                }
-            }
-            return;
-        };
-
-        let is_object_type = match obj.get("type") {
-            Some(Value::String(ty)) => ty == "object",
-            Some(Value::Array(types)) => types.iter().any(|ty| ty.as_str() == Some("object")),
-            _ => false,
-        };
-        if is_object_type {
-            obj.entry("properties")
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        }
-
-        for (key, value) in obj.iter_mut() {
-            match key.as_str() {
-                // Schema maps: each value is a schema.
-                "properties" | "patternProperties" | "$defs" | "definitions" => {
-                    if let Some(map) = value.as_object_mut() {
-                        for sub in map.values_mut() {
-                            walk(sub);
-                        }
-                    }
-                }
-                // Direct sub-schemas (or arrays of schemas).
-                "items"
-                | "additionalProperties"
-                | "anyOf"
-                | "oneOf"
-                | "allOf"
-                | "not"
-                | "if"
-                | "then"
-                | "else"
-                | "prefixItems"
-                | "contains" => walk(value),
-                _ => {}
-            }
-        }
-    }
-
-    // A bare `{}` / non-object parameters value is also rejected by strict
-    // validators; OpenAI's spec models "no parameters" as an empty object
-    // schema.
-    let mut sanitized = if schema.is_object() {
-        schema.clone()
-    } else {
-        serde_json::json!({ "type": "object" })
-    };
-    if let Some(obj) = sanitized.as_object_mut()
-        && obj.is_empty()
-    {
-        obj.insert("type".to_string(), Value::String("object".to_string()));
-    }
-    flatten_top_level_combinators(&mut sanitized);
-    walk(&mut sanitized);
-    sanitized
+    jcode_schema_dialect::normalize(schema, &jcode_schema_dialect::registry::OPENROUTER)
 }
 
-/// Flatten `oneOf`/`anyOf`/`allOf` at the top level of a tool parameters
-/// schema into a single object schema (issue #495).
-///
-/// OpenRouter forwards tool schemas to whichever upstream serves the model,
-/// and Anthropic-family backends (Anthropic, Google Vertex, Amazon Bedrock)
-/// reject `input_schema` combinators at the top level with HTTP 400
-/// ("input_schema does not support oneOf, allOf, or anyOf at the top level").
-/// One such tool bricks every request, so first-time OpenRouter logins fail on
-/// their first message when the registry contains a multi-action tool that
-/// models its action branches with top-level `anyOf`.
-///
-/// Mirror the direct Anthropic provider's `anthropic_input_schema`: keep the
-/// common object shape, merge branch `properties` in as optional fields, and
-/// only promote `required` from `allOf` branches (whose constraints all
-/// apply). Runtime tool deserialization remains the authority for
-/// action-specific constraints. Nested combinators inside properties are left
-/// untouched; upstreams accept those.
-fn flatten_top_level_combinators(schema: &mut Value) {
-    let Some(output) = schema.as_object_mut() else {
-        return;
-    };
-
-    let mut merged_properties = output
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut all_of_required = Vec::new();
-    let mut saw_combinator = false;
-
-    for keyword in ["oneOf", "anyOf", "allOf"] {
-        let Some(branches) = output
-            .remove(keyword)
-            .and_then(|value| value.as_array().cloned())
-        else {
-            continue;
-        };
-        saw_combinator = true;
-        for branch in branches {
-            let Some(branch) = branch.as_object() else {
-                continue;
-            };
-            if let Some(properties) = branch.get("properties").and_then(Value::as_object) {
-                for (name, property) in properties {
-                    merged_properties
-                        .entry(name.clone())
-                        .or_insert_with(|| property.clone());
-                }
-            }
-            if keyword == "allOf"
-                && let Some(required) = branch.get("required").and_then(Value::as_array)
-            {
-                for name in required.iter().filter_map(Value::as_str) {
-                    if !all_of_required.iter().any(|existing| existing == name) {
-                        all_of_required.push(name.to_string());
-                    }
-                }
-            }
-        }
+fn orphan_tool_output_to_user_message(
+    tool_use_id: &str,
+    output: &str,
+    missing_output: &str,
+) -> Option<Value> {
+    let output = output.trim();
+    if output.is_empty() || output == missing_output {
+        return None;
     }
 
-    if !saw_combinator {
-        return;
-    }
-
-    output.insert("type".to_string(), Value::String("object".to_string()));
-    output.insert("properties".to_string(), Value::Object(merged_properties));
-    if !all_of_required.is_empty() {
-        let required = output
-            .entry("required".to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Value::Array(required) = required {
-            for name in all_of_required {
-                if !required
-                    .iter()
-                    .any(|existing| existing.as_str() == Some(&name))
-                {
-                    required.push(Value::String(name));
-                }
-            }
-        }
-    }
+    Some(serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "[Recovered orphaned tool output: {}]\n{}",
+            sanitize_tool_id(tool_use_id),
+            output
+        )
+    }))
 }
 
 /// Build OpenAI-compatible chat `messages` for OpenRouter/direct compatible providers.
@@ -446,33 +320,34 @@ pub fn build_chat_messages(
         ));
     }
 
+    let mut rewritten_pending_orphans = 0usize;
     if !pending_tool_results.is_empty() {
-        // These outputs never found their assistant tool call (it was likely
-        // lost to compaction/truncation). Silently discarding them loses real
-        // conversation context, so rewrite them as user messages the same way
-        // the openai path does. Sort by id for deterministic ordering.
-        let mut recovered: Vec<(String, String)> = pending_tool_results.drain().collect();
-        recovered.sort_by(|a, b| a.0.cmp(&b.0));
-        let recovered_count = recovered.len();
-        for (tool_call_id, output) in recovered {
-            api_messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "[Recovered orphaned tool output: {}]\n{}",
-                    tool_call_id, output
-                )
-            }));
+        let mut pending_entries: Vec<(String, String)> = std::mem::take(&mut pending_tool_results)
+            .into_iter()
+            .collect();
+        pending_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (tool_use_id, output) in pending_entries {
+            if let Some(message) =
+                orphan_tool_output_to_user_message(&tool_use_id, &output, &missing_output)
+            {
+                api_messages.push(message);
+                rewritten_pending_orphans += 1;
+            } else {
+                skipped_results += 1;
+            }
         }
-        jcode_logging::info(&format!(
-            "[openrouter] Recovered {} orphaned tool output(s) as user messages",
-            recovered_count
-        ));
     }
 
     if injected_missing > 0 {
         jcode_logging::info(&format!(
             "[openrouter] Injected {} synthetic tool output(s) to prevent API error",
             injected_missing
+        ));
+    }
+    if rewritten_pending_orphans > 0 {
+        jcode_logging::info(&format!(
+            "[openrouter] Rewrote {} pending orphaned tool output(s) as user messages",
+            rewritten_pending_orphans
         ));
     }
     if skipped_results > 0 {
@@ -604,7 +479,8 @@ pub fn build_chat_messages(
     }
 
     // Final pass: ensure tool outputs immediately follow assistant tool calls.
-    let mut tool_output_map: HashMap<String, Value> = HashMap::new();
+    let mut tool_output_map: HashMap<String, VecDeque<Value>> = HashMap::new();
+    let mut missing_tool_outputs: HashMap<String, Value> = HashMap::new();
     for msg in &api_messages {
         if msg.get("role").and_then(|v| v.as_str()) == Some("tool")
             && let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str())
@@ -614,29 +490,26 @@ pub fn build_chat_messages(
                 .and_then(|v| v.as_str())
                 .map(|v| v == missing_output)
                 .unwrap_or(false);
-            match tool_output_map.get(id) {
-                Some(existing) => {
-                    let existing_missing = existing
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .map(|v| v == missing_output)
-                        .unwrap_or(false);
-                    if existing_missing && !is_missing {
-                        tool_output_map.insert(id.to_string(), msg.clone());
-                    }
-                }
-                None => {
-                    tool_output_map.insert(id.to_string(), msg.clone());
-                }
+            if is_missing {
+                missing_tool_outputs
+                    .entry(id.to_string())
+                    .or_insert_with(|| msg.clone());
+            } else {
+                tool_output_map
+                    .entry(id.to_string())
+                    .or_default()
+                    .push_back(msg.clone());
             }
         }
     }
 
     let mut reordered: Vec<Value> = Vec::with_capacity(api_messages.len());
-    let mut used_outputs: HashSet<String> = HashSet::new();
     let mut injected_ordered = 0usize;
     let mut dropped_orphans = 0usize;
     let mut recovered_orphans = 0usize;
+    // IDs whose output has been re-inserted adjacent to its assistant call.
+    // Later tool messages with these ids are duplicates, not orphans.
+    let mut used_outputs: HashSet<String> = HashSet::new();
 
     for msg in api_messages.into_iter() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -650,9 +523,13 @@ pub fn build_chat_messages(
                 reordered.push(msg);
                 for call in tool_calls {
                     if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
-                        if let Some(tool_msg) = tool_output_map.get(id) {
-                            reordered.push(tool_msg.clone());
-                            used_outputs.insert(id.to_string());
+                        used_outputs.insert(id.to_string());
+                        if let Some(tool_msg) = tool_output_map
+                            .get_mut(id)
+                            .and_then(VecDeque::pop_front)
+                            .or_else(|| missing_tool_outputs.get(id).cloned())
+                        {
+                            reordered.push(tool_msg);
                         } else {
                             injected_ordered += 1;
                             reordered.push(serde_json::json!({
@@ -660,7 +537,6 @@ pub fn build_chat_messages(
                                 "tool_call_id": id,
                                 "content": missing_output.clone()
                             }));
-                            used_outputs.insert(id.to_string());
                         }
                     }
                 }
@@ -720,6 +596,62 @@ pub fn build_chat_messages(
     }
 
     api_messages
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::build_chat_messages;
+    use jcode_message_types::{ContentBlock, Message, Role};
+    use serde_json::json;
+
+    fn tool_call(id: &str, output: &str) -> [Message; 2] {
+        [
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: id.to_string(),
+                    name: "read".to_string(),
+                    input: json!({"path": output}),
+                    thought_signature: None,
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+            Message::tool_result(id, output, false),
+        ]
+    }
+
+    #[test]
+    fn repeated_tool_call_ids_get_their_own_outputs_in_order() {
+        let messages = tool_call("read:0", "first output")
+            .into_iter()
+            .chain(tool_call("read_0", "second output"))
+            .collect::<Vec<_>>();
+
+        let api_messages = build_chat_messages(&messages, "", false, false, false);
+        let outputs = api_messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["content"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(outputs, ["first output", "second output"]);
+    }
+
+    #[test]
+    fn orphaned_tool_output_is_recovered_as_a_user_message() {
+        let messages = vec![Message::tool_result("call_orphan", "orphan result", false)];
+
+        let api_messages = build_chat_messages(&messages, "", false, false, false);
+
+        assert_eq!(
+            api_messages,
+            vec![json!({
+                "role": "user",
+                "content": "[Recovered orphaned tool output: call_orphan]\norphan result"
+            })]
+        );
+    }
 }
 
 #[cfg(test)]

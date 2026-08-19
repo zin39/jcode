@@ -46,7 +46,9 @@ fn test_provider_choice_arg_values() {
     assert_eq!(ProviderChoice::Fireworks.as_arg_value(), "fireworks");
     assert_eq!(ProviderChoice::Minimax.as_arg_value(), "minimax");
     assert_eq!(ProviderChoice::Xai.as_arg_value(), "xai");
+    assert_eq!(ProviderChoice::GrokBuild.as_arg_value(), "grok-build");
     assert_eq!(ProviderChoice::XiaomiMimo.as_arg_value(), "xiaomi-mimo");
+    assert_eq!(ProviderChoice::MetaMuse.as_arg_value(), "meta-muse");
     assert_eq!(ProviderChoice::Celeris.as_arg_value(), "celeris");
     assert_eq!(ProviderChoice::Lmstudio.as_arg_value(), "lmstudio");
     assert_eq!(ProviderChoice::Ollama.as_arg_value(), "ollama");
@@ -139,6 +141,76 @@ async fn explicit_anthropic_api_choice_pins_api_key_over_available_oauth() {
     crate::auth::AuthStatus::invalidate_cache();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "test env locks intentionally stay held across provider init to isolate process-global auth env"
+)]
+async fn explicit_openai_api_choice_overrides_configured_compatible_default() {
+    let _guard = lock_env();
+    let _env_guard = crate::storage::lock_test_env();
+    let dir = TempDir::new().expect("temp dir");
+    let keys = [
+        "JCODE_HOME",
+        "OPENAI_API_KEY",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_RUNTIME_PROVIDER",
+        "JCODE_ACTIVE_PROVIDER",
+        "JCODE_INITIAL_PROVIDER_EXPLICIT",
+    ];
+    let saved: Vec<(&str, Option<String>)> = keys
+        .iter()
+        .map(|key| (*key, std::env::var(key).ok()))
+        .collect();
+
+    crate::env::set_var("JCODE_HOME", dir.path());
+    crate::env::set_var("OPENAI_API_KEY", "sk-openai-api-test");
+    for key in keys.iter().skip(2) {
+        crate::env::remove_var(key);
+    }
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+[provider]
+default_provider = "local-gateway"
+default_model = "gateway-default"
+
+[providers.local-gateway]
+type = "openai-compatible"
+base_url = "http://localhost:1234/v1"
+auth = "none"
+default_model = "gateway-default"
+requires_api_key = false
+"#,
+    )
+    .expect("write competing configured provider default");
+    crate::config::invalidate_config_cache();
+    crate::auth::AuthStatus::invalidate_cache();
+
+    let provider = init_provider_for_validation(&ProviderChoice::OpenaiApi, Some("gpt-5.6-luna"))
+        .await
+        .expect("explicit OpenAI API provider should override configured defaults");
+
+    assert_eq!(provider.active_auth_method_label(), Some("API key"));
+    assert_eq!(provider.model(), "gpt-5.6-luna");
+    assert_eq!(
+        std::env::var("JCODE_RUNTIME_PROVIDER").ok().as_deref(),
+        Some("openai-api")
+    );
+
+    for (key, value) in saved {
+        if let Some(value) = value {
+            crate::env::set_var(key, value);
+        } else {
+            crate::env::remove_var(key);
+        }
+    }
+    crate::config::invalidate_config_cache();
+    crate::auth::AuthStatus::invalidate_cache();
+}
+
 #[test]
 fn test_server_bootstrap_login_selection_preserves_order() {
     let providers = provider_catalog::server_bootstrap_login_providers();
@@ -214,7 +286,7 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
         .block_on(init_provider(&ProviderChoice::Jcode, None))
         .expect("init jcode provider");
 
-    assert_eq!(provider.name(), "Jcode Subscription");
+    assert_eq!(provider.name(), "Jcode Hosted Models");
     assert!(crate::subscription_catalog::is_runtime_mode_enabled());
     assert_eq!(
         std::env::var("JCODE_OPENROUTER_MODEL").ok().as_deref(),
@@ -543,6 +615,55 @@ fn resolved_profile_default_model_uses_openai_compatible_override() {
             crate::env::set_var(&key, value);
         } else {
             crate::env::remove_var(&key);
+        }
+    }
+}
+
+#[test]
+fn apply_login_provider_profile_env_keeps_an_explicit_named_profile() {
+    // Regression for #712: `auth-test --provider-profile <name>` cleared
+    // JCODE_NAMED_PROVIDER_PROFILE before probing, so the probe evaluated the
+    // built-in generic openai-compatible slot and false-negatived every custom
+    // named profile.
+    let _guard = lock_env();
+    let _env_guard = crate::storage::lock_test_env();
+    let saved: Vec<(String, Option<String>)> = [
+        "JCODE_OPENROUTER_API_BASE",
+        "JCODE_OPENROUTER_API_KEY_NAME",
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), std::env::var(k).ok()))
+    .collect();
+    for (key, _) in &saved {
+        crate::env::remove_var(key);
+    }
+
+    crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", "company-gateway");
+    crate::env::set_var("JCODE_OPENROUTER_API_BASE", "https://gw.example.com/v1");
+    crate::env::set_var("JCODE_OPENROUTER_API_KEY_NAME", "COMPANY_GATEWAY_KEY");
+
+    apply_login_provider_profile_env(provider_catalog::OPENCODE_GO_LOGIN_PROVIDER);
+
+    assert_eq!(
+        std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+            .ok()
+            .as_deref(),
+        Some("company-gateway"),
+        "explicit named profile must survive the auth-test probe setup"
+    );
+    assert_eq!(
+        std::env::var("JCODE_OPENROUTER_API_BASE").ok().as_deref(),
+        Some("https://gw.example.com/v1"),
+        "named profile runtime env must not be replaced by a builtin profile"
+    );
+
+    for (key, value) in saved {
+        match value {
+            Some(value) => crate::env::set_var(&key, value),
+            None => crate::env::remove_var(&key),
         }
     }
 }

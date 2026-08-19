@@ -43,6 +43,7 @@ anyhow = "1"
 libc = "0.2"             # Unix system calls (flock)
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 urlencoding = "2"        # URL encoding for web search
 uuid = { version = "1", features = ["v4", "v5"] }
 proctitle = "0.1"
@@ -56,6 +57,7 @@ jcode-logging = { path = "../jcode-logging" }
 # OAuth
 base64 = "0.22"
 sha2 = "0.10"
+jcode-transport = { path = "../jcode-transport" }
 rand = "0.9.3"
 hex = "0.4"
 url = "2"
@@ -150,3 +152,5 @@ global-hotkey = "0.7"
 # MultiProvider routing tests exercise the real OpenRouter/OpenAI-compatible
 # runtime through the composition-root registry, exactly like the binary.
 jcode-provider-openrouter-runtime = { path = "../jcode-provider-openrouter-runtime" }
+# Paused-time (auto-advancing virtual clock) tests for the background stall watchdog.
+tokio = { version = "1", features = ["test-util"] }

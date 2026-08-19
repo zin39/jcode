@@ -5,7 +5,7 @@ use crate::bus::{
 };
 use crate::message::{
     ContentBlock, Message, Role, background_task_status_notice,
-    format_background_task_notification_markdown, format_background_task_progress_markdown,
+    format_background_task_notification_markdown,
 };
 use crate::session::StoredDisplayRole;
 use anyhow::Result;
@@ -61,10 +61,15 @@ pub(super) async fn process_turn_with_input(
 }
 
 pub(super) fn handle_tick(app: &mut App) -> bool {
-    // The decorative idle animation is deliberately excluded here: the run
-    // loops repaint it with an animation-only partial update, so reporting it as
-    // "needs a redraw" would force a full frame at animation FPS.
-    let mut needs_redraw = crate::tui::periodic_redraw_required_excluding_idle_animation(app);
+    // Liveness breadcrumb: if the UI loop wedges, the watchdog reports this as
+    // the last phase that made progress.
+    crate::logging::watchdog::beat("tui.idle_tick");
+    // The decorative animation must still request redraws here: the run loops
+    // decide *how* to paint (cheap animation-only repaint vs full frame) at the
+    // draw site. Excluding it here instead would mean animation ticks request
+    // no paint at all, which drops the animation to whatever unrelated events
+    // happen to trigger (~4fps in practice).
+    let mut needs_redraw = crate::tui::periodic_redraw_required(app);
     needs_redraw |= app.flush_pending_resize_redraw();
     app.maybe_capture_runtime_memory_heartbeat();
     app.maybe_release_idle_heap();
@@ -91,6 +96,7 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
     }
     needs_redraw |= app.refresh_todos_view_if_needed();
     needs_redraw |= app.refresh_todo_card_if_needed();
+    needs_redraw |= app.refresh_pinned_todos_if_needed();
     needs_redraw |= app.refresh_side_panel_linked_content_if_due();
     needs_redraw |= app.poll_model_picker_load();
     needs_redraw |= app.poll_session_picker_load();
@@ -103,6 +109,7 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
     needs_redraw |= app.maybe_progress_provider_failover_countdown();
     app.check_debug_command();
     needs_redraw |= app.check_stable_version();
+    needs_redraw |= app.refresh_keybindings_if_config_reloaded();
     needs_redraw |= app.maybe_finish_background_client_reload();
     if app.pending_migration.is_some() && !app.is_processing {
         app.execute_migration();
@@ -131,6 +138,7 @@ pub(super) fn handle_terminal_event(
     terminal: &mut DefaultTerminal,
     event: Option<std::result::Result<Event, std::io::Error>>,
 ) -> Result<bool> {
+    crate::logging::watchdog::beat("tui.terminal_event");
     let mut needs_redraw = apply_terminal_event(app, terminal, event)?;
     const MAX_DRAINED_EVENTS_PER_WAKE: usize = 32;
     for _ in 0..MAX_DRAINED_EVENTS_PER_WAKE {
@@ -155,6 +163,10 @@ pub(super) fn handle_bus_event(
         }
         Ok(BusEvent::BackgroundTaskProgress(progress)) => {
             handle_background_task_progress(app, progress);
+            true
+        }
+        Ok(BusEvent::BackgroundTaskStalled(task)) => {
+            handle_background_task_stalled(app, task);
             true
         }
         Ok(BusEvent::InputShellCompleted(shell)) => {
@@ -195,6 +207,7 @@ pub(super) fn handle_bus_event(
         }
         Ok(BusEvent::ModelsUpdated) => {
             app.invalidate_model_picker_cache();
+            app.maybe_apply_event_driven_onboarding_model();
             true
         }
         Ok(BusEvent::AuthCatalogRefreshReady) => {
@@ -300,7 +313,9 @@ pub(super) fn handle_ui_activity(app: &mut App, activity: UiActivity) -> bool {
 
     match activity.kind {
         UiActivityKind::Background => {
-            app.push_display_message(DisplayMessage::background_task(activity.message.clone()))
+            if !app.upsert_running_background_task_started(&activity.message) {
+                app.push_display_message(DisplayMessage::background_task(activity.message.clone()))
+            }
         }
         UiActivityKind::Auth | UiActivityKind::Catalog => {
             if activity.message.trim().is_empty() {
@@ -312,7 +327,7 @@ pub(super) fn handle_ui_activity(app: &mut App, activity: UiActivity) -> bool {
                 )
                 .is_some()
             {
-                app.upsert_background_task_progress_message(activity.message.clone());
+                app.upsert_running_background_task_progress(&activity.message);
             } else {
                 app.push_display_message(DisplayMessage::system(activity.message.clone()))
             }
@@ -387,6 +402,7 @@ fn apply_terminal_event(
             Ok(false)
         }
         Some(Ok(Event::Key(key))) => {
+            crate::tui::ui::note_key_event_read();
             app.note_client_interaction();
             app.update_copy_badge_key_event(key);
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -413,12 +429,23 @@ fn apply_terminal_event(
 }
 
 fn handle_background_task_completed(app: &mut App, task: BackgroundTaskCompleted) {
+    if task.session_id == app.session.id {
+        let label = crate::message::background_task_display_label(
+            &task.tool_name,
+            task.display_name.as_deref(),
+        );
+        let status = if task.status == crate::bus::BackgroundTaskStatus::Completed {
+            crate::tui::BackgroundTaskRowStatus::Completed
+        } else {
+            crate::tui::BackgroundTaskRowStatus::Failed
+        };
+        app.finish_background_task(task.task_id.clone(), label, status);
+    }
     if !task.notify || task.session_id != app.session.id {
         return;
     }
 
     let notification = format_background_task_notification_markdown(&task);
-    app.push_display_message(DisplayMessage::background_task(notification.clone()));
     app.set_status_notice(background_task_status_notice(&task));
 
     if !app.is_processing {
@@ -453,12 +480,76 @@ fn handle_background_task_completed(app: &mut App, task: BackgroundTaskCompleted
     }
 }
 
+fn handle_background_task_stalled(app: &mut App, task: crate::bus::BackgroundTaskStalled) {
+    if task.session_id != app.session.id {
+        return;
+    }
+
+    let notification = crate::message::format_background_task_stalled_markdown(&task);
+    let percent = app
+        .background_task_rows_ref()
+        .iter()
+        .find(|row| row.task_id == task.task_id)
+        .and_then(|row| row.percent);
+    app.upsert_running_background_task(
+        task.task_id.clone(),
+        crate::message::background_task_display_label(
+            &task.tool_name,
+            task.display_name.as_deref(),
+        ),
+        percent,
+    );
+    app.set_status_notice(format!(
+        "Background task stalled · {} · no output for {}s",
+        crate::message::background_task_display_label(
+            &task.tool_name,
+            task.display_name.as_deref()
+        ),
+        task.stall_wake_seconds
+    ));
+
+    if !app.is_processing {
+        app.add_provider_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: notification.clone(),
+                cache_control: None,
+            }],
+            timestamp: Some(chrono::Utc::now()),
+            tool_duration_ms: None,
+        });
+        app.session.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: notification,
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::BackgroundTask),
+        );
+        let _ = app.session.save();
+
+        if task.wake {
+            app.pending_turn = true;
+            app.is_processing = true;
+            app.status = ProcessingStatus::Sending;
+            if app.processing_started.is_none() {
+                app.processing_started = Some(std::time::Instant::now());
+            }
+            app.visible_turn_started = Some(std::time::Instant::now());
+        }
+    }
+}
+
 fn handle_background_task_progress(app: &mut App, event: BackgroundTaskProgressEvent) {
     if event.session_id != app.session.id {
         return;
     }
 
-    app.upsert_background_task_progress_message(format_background_task_progress_markdown(&event));
+    let label = crate::message::background_task_display_label(
+        &event.tool_name,
+        event.display_name.as_deref(),
+    );
+    app.upsert_running_background_task(event.task_id.clone(), label, event.progress.percent);
 
     let notice = format!(
         "Background task · {} · {}",

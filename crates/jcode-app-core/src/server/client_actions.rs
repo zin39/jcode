@@ -5,7 +5,7 @@ use super::{
     ClientConnectionInfo, SessionInterruptQueues, SwarmEvent, SwarmMember, SwarmState,
     VersionedPlan, broadcast_swarm_status, fanout_session_event, persist_swarm_state_for,
     queue_soft_interrupt_for_session, remove_session_channel_subscriptions,
-    remove_session_from_swarm, swarm_id_for_dir, truncate_detail, update_member_status,
+    remove_session_from_swarm, swarm_id_for_session, truncate_detail, update_member_status,
 };
 use crate::agent::Agent;
 use crate::protocol::{FeatureToggle, NotificationType, ServerEvent};
@@ -105,10 +105,9 @@ pub(super) async fn handle_notify_session(
     };
 
     let ran_immediately = if target_has_client {
-        super::live_turn::run_live_turn_if_idle(
+        super::live_turn::run_live_system_turn_if_idle(
             &session_id,
             &message,
-            None,
             ctx.sessions,
             super::live_turn::LiveTurnSwarmContext::new(
                 ctx.swarm_members,
@@ -500,7 +499,8 @@ pub(super) async fn handle_set_feature(
             }
 
             if enabled {
-                let new_swarm_id = swarm_id_for_dir(working_dir);
+                let _ = working_dir;
+                let new_swarm_id = swarm_id_for_session(client_session_id);
                 if let Some(ref id) = new_swarm_id {
                     {
                         let mut swarms = swarms_by_id.write().await;
@@ -992,6 +992,7 @@ pub(super) async fn handle_resume_all_sessions(
             Arc::clone(&agent),
             String::new(),
             Some(reminder),
+            None,
             Some("resuming interrupted session".to_string()),
             super::live_turn::LiveTurnSwarmContext::new(
                 swarm_members,

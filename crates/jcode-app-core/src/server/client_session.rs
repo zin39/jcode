@@ -8,7 +8,7 @@ use super::{
     register_session_interrupt_queue, remove_background_tool_signal, remove_plan_participant,
     remove_session_channel_subscriptions, remove_session_from_swarm,
     remove_session_interrupt_queue, rename_background_tool_signal, rename_plan_participant,
-    rename_session_interrupt_queue, send_swarm_plan_to_session, swarm_id_for_dir,
+    rename_session_interrupt_queue, send_swarm_plan_to_session, swarm_id_for_session,
     unregister_session_event_sender, update_member_status,
 };
 use crate::agent::Agent;
@@ -120,6 +120,12 @@ async fn rename_shutdown_signal(
     }
     drop(signals);
     rename_background_tool_signal(old_session_id, new_session_id);
+    // In-flight turns are registered in the process-global cancel registry by
+    // session id. Attaching to / resuming a session renames it underneath a
+    // still-streaming turn, so the registration must follow, or a later Esc
+    // finds no active-turn signal for the new id and the model keeps
+    // generating (issue #732, regression of issue #428).
+    crate::turn_cancel_registry::rename_active_turns(old_session_id, new_session_id);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -220,24 +226,23 @@ pub(super) async fn handle_clear_session(
     }
     remove_session_interrupt_queue(soft_interrupt_queues, client_session_id).await;
 
-    let swarm_id_for_update = {
+    // `/clear` creates a genuinely fresh session. Do not migrate the old
+    // session's swarm membership or plan participation to the replacement:
+    // doing so lets a subsequent plan snapshot repopulate the cleared UI.
+    let (swarm_id_for_update, swarm_enabled, friendly_name) = {
         let mut members = swarm_members.write().await;
-        if let Some(mut member) = members.remove(client_session_id) {
-            let swarm_id = member.swarm_id.clone();
-            member.session_id = new_id.clone();
-            member.status = "ready".to_string();
-            member.detail = None;
-            members.insert(new_id.clone(), member);
-            swarm_id
-        } else {
-            None
+        match members.remove(client_session_id) {
+            Some(member) => (member.swarm_id, member.swarm_enabled, member.friendly_name),
+            None => (None, false, None),
         }
     };
     if let Some(ref swarm_id) = swarm_id_for_update {
         let mut swarms = swarms_by_id.write().await;
         if let Some(swarm) = swarms.get_mut(swarm_id) {
             swarm.remove(client_session_id);
-            swarm.insert(new_id.clone());
+            if swarm.is_empty() {
+                swarms.remove(swarm_id);
+            }
         }
     }
     file_touch.clear_session(client_session_id).await;
@@ -245,6 +250,23 @@ pub(super) async fn handle_clear_session(
         client_session_id,
         channel_subscriptions,
         channel_subscriptions_by_session,
+    )
+    .await;
+    // The connection remains subscribed across `/clear`, so there is no later
+    // subscribe request to register the replacement session. Register it as a
+    // fresh root while deliberately leaving the old swarm and plan behind.
+    ensure_client_swarm_member(
+        &new_id,
+        client_connection_id,
+        &friendly_name,
+        client_event_tx,
+        agent,
+        swarm_enabled,
+        swarm_members,
+        swarms_by_id,
+        event_history,
+        event_counter,
+        swarm_event_tx,
     )
     .await;
     update_member_status(
@@ -259,7 +281,7 @@ pub(super) async fn handle_clear_session(
     )
     .await;
     if let Some(ref swarm_id) = swarm_id_for_update {
-        rename_plan_participant(swarm_id, client_session_id, &new_id, swarm_plans).await;
+        remove_plan_participant(swarm_id, client_session_id, swarm_plans).await;
     }
 
     *client_session_id = new_id.clone();
@@ -329,7 +351,7 @@ async fn ensure_client_swarm_member(
             }
         };
         let derived_swarm_id = if swarm_enabled {
-            swarm_id_for_dir(working_dir.clone())
+            swarm_id_for_session(client_session_id)
         } else {
             None
         };
@@ -607,7 +629,7 @@ pub(super) async fn handle_subscribe(
             ("swarm_enabled", swarm_enabled.to_string()),
         ],
     );
-    ensure_client_swarm_member(
+    let inserted_swarm_member = ensure_client_swarm_member(
         client_session_id,
         client_connection_id,
         friendly_name,
@@ -636,13 +658,24 @@ pub(super) async fn handle_subscribe(
             effective_subscribe_working_dir(current.as_deref(), dir, dirs::home_dir().as_deref())
         };
         let new_path = PathBuf::from(&bound_dir);
-        let new_swarm_id = swarm_id_for_dir(Some(new_path.clone()));
         let mut old_swarm_id: Option<String> = None;
         let mut updated_swarm_id: Option<String> = None;
         {
             let mut members = swarm_members.write().await;
             if let Some(member) = members.get_mut(client_session_id) {
                 old_swarm_id = member.swarm_id.clone();
+                // Existing members include reconnects and daemon-restored
+                // sessions. Keep their persisted swarm id so an intentional
+                // resume retains its workers and plan. Only a newly inserted
+                // root receives the new session-scoped identity.
+                let new_swarm_id = if inserted_swarm_member {
+                    swarm_id_for_session(client_session_id)
+                } else {
+                    member
+                        .swarm_id
+                        .clone()
+                        .or_else(|| swarm_id_for_session(client_session_id))
+                };
                 member.working_dir = Some(new_path);
                 member.swarm_id = if member.swarm_enabled {
                     new_swarm_id.clone()
@@ -856,6 +889,14 @@ pub(super) async fn handle_subscribe(
     // plan graph immediately instead of waiting for the next plan mutation.
     send_swarm_plan_to_session(client_session_id, swarm_members, swarm_plans).await;
 
+    // Tell the client which session it is bound to. Local clients learn this
+    // from their own launch state, but a remote client (gateway/WebSocket) has
+    // no other source, and without it a dropped connection cannot reattach:
+    // the next Subscribe carries no `target_session_id`, so the server hands
+    // it a brand-new session and the in-flight turn becomes unreachable.
+    let _ = client_event_tx.send(ServerEvent::SessionId {
+        session_id: client_session_id.to_string(),
+    });
     let _ = client_event_tx.send(ServerEvent::Done { id });
 }
 

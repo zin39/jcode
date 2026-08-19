@@ -109,6 +109,9 @@ impl App {
     }
 
     pub(super) fn note_client_interaction(&mut self) {
+        // Every key/mouse/paste event routes through here, which makes this the
+        // one place that reliably knows the user is actively driving the UI.
+        self.last_user_interaction = Some(std::time::Instant::now());
         // A terminal only delivers key/mouse/paste events to the focused window,
         // so receiving one is proof this window is focused *right now*. Adopt that
         // focus state directly instead of relying solely on FocusGained reports:
@@ -132,17 +135,19 @@ impl App {
     }
 
     /// Record a terminal focus-state change (from crossterm FocusGained/FocusLost).
-    /// Returns true when a redraw is warranted (focus regained, so we repaint at
-    /// full fidelity immediately).
+    /// Returns true when a redraw is warranted. The normal ratatui diff is enough
+    /// to catch up state that changed while the tab was backgrounded: the terminal
+    /// still contains the last frame ratatui emitted. Do not invalidate the whole
+    /// backend here. Doing so sends an ED2 clear followed by every terminal cell on
+    /// each tab switch, which makes focus changes visibly lag on large terminals.
     pub(super) fn set_client_focused(&mut self, focused: bool) -> bool {
         if self.client_focused == focused {
             return false;
         }
         self.client_focused = focused;
         if focused {
-            // Repaint immediately so a newly-focused window is not stuck on the
-            // last paused frame, and resume animation timing from "now".
-            self.request_full_redraw();
+            // Schedule an immediate differential frame so a newly-focused window
+            // catches up and resumes animation timing from "now".
             self.note_client_focus(true);
             true
         } else {
@@ -2076,7 +2081,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
                     ("confidence", todo.confidence)
                 };
                 let confidence = confidence
-                    .map(|score| format!("{}%", score))
+                    .map(|state| state.as_str().to_string())
                     .unwrap_or_else(|| "?".to_string());
                 todo_lines.push_str(&format!(
                     "- [{}|{}|{} {}] {}\n",

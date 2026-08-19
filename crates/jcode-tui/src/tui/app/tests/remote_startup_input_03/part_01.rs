@@ -324,6 +324,85 @@ fn test_handle_paste_large() {
 }
 
 #[test]
+fn test_paste_again_expands_placeholder_in_place() {
+    let mut app = create_test_app();
+    let big = "α\nβ\nγ\nδ\nε".to_string();
+
+    app.handle_paste(big.clone());
+    app.handle_key(KeyCode::Char('!'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_paste(big.clone());
+
+    assert_eq!(app.input(), format!("{big}!"));
+    assert_eq!(app.cursor_pos, big.len());
+    assert!(app.pasted_contents.is_empty());
+}
+
+#[test]
+fn test_paste_again_with_different_text_still_collapses() {
+    let mut app = create_test_app();
+
+    app.handle_paste("a\nb\nc\nd\ne".to_string());
+    app.handle_paste("f\ng\nh\ni\nj".to_string());
+
+    assert_eq!(app.input(), "[pasted 5 lines][pasted 5 lines]");
+    assert_eq!(app.pasted_contents.len(), 2);
+}
+
+#[test]
+fn test_paste_again_expands_matching_placeholder_not_newer_same_sized_paste() {
+    let mut app = create_test_app();
+    let first = "a\nb\nc\nd\ne".to_string();
+    let second = "f\ng\nh\ni\nj".to_string();
+
+    app.handle_paste(first.clone());
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::empty())
+        .unwrap();
+    app.handle_paste(second.clone());
+    app.handle_paste(first.clone());
+
+    assert_eq!(app.input(), format!("{first} [pasted 5 lines]"));
+    assert_eq!(app.cursor_pos, first.len());
+    let visible_input = app.input().to_string();
+    assert_eq!(
+        crate::tui::app::input::expand_paste_placeholders(&mut app, &visible_input),
+        format!("{first} {second}")
+    );
+    assert_eq!(app.pasted_contents, vec![second]);
+}
+
+#[test]
+fn test_paste_again_expands_only_most_recent_identical_placeholder() {
+    let mut app = create_test_app();
+    let big = "a\nb\nc\nd\ne".to_string();
+
+    app.set_input_for_test("[pasted 5 lines] [pasted 5 lines]");
+    app.pasted_contents = vec![big.clone(), big.clone()];
+    app.handle_paste(big.clone());
+
+    assert_eq!(app.input(), format!("[pasted 5 lines] {big}"));
+    assert_eq!(app.pasted_contents, vec![big]);
+}
+
+#[test]
+fn test_paste_again_does_not_expand_an_edited_placeholder() {
+    let mut app = create_test_app();
+    let big = "a\nb\nc\nd\ne".to_string();
+
+    app.handle_paste(big.clone());
+    app.handle_key(KeyCode::Backspace, KeyModifiers::empty())
+        .unwrap();
+    app.handle_paste(big);
+
+    assert_eq!(
+        app.input(),
+        "[pasted 5 lines[pasted 5 lines]",
+        "an edited placeholder must not be mistaken for the original"
+    );
+    assert_eq!(app.pasted_contents.len(), 2);
+}
+
+#[test]
 fn test_paste_expansion_on_submit() {
     let mut app = create_test_app();
 
@@ -347,9 +426,9 @@ fn test_paste_expansion_on_submit() {
     // Submit expands placeholder
     app.submit_input();
 
-    // Display shows placeholder (user sees condensed view)
+    // Sent transcript renders the actual pasted content, while the composer above stayed compact.
     assert_eq!(app.display_messages().len(), 1);
-    assert_eq!(app.display_messages()[0].content, "A: [pasted 5 lines] B");
+    assert_eq!(app.display_messages()[0].content, "A: 1\n2\n3\n4\n5 B");
 
     // Model receives expanded content (actual pasted text). Local sessions keep the
     // provider message cache lazy, so inspect the materialized provider view.
@@ -625,6 +704,31 @@ fn test_background_update_ready_waits_for_turn_to_finish() {
 }
 
 #[test]
+fn test_background_update_ready_waits_for_typing_to_go_idle() {
+    let mut app = create_test_app();
+    let session_id = app.session.id.clone();
+    app.note_client_interaction();
+
+    app.handle_session_update_status(SessionUpdateStatus::ReadyToReload {
+        session_id: session_id.clone(),
+        action: ClientMaintenanceAction::Update,
+        version: "v1.2.3".to_string(),
+    });
+
+    assert!(app.reload_requested.is_none());
+    assert!(!app.should_quit);
+    assert_eq!(
+        app.status_notice(),
+        Some("↑ v1.2.3 ready · reloads when idle".to_string())
+    );
+
+    app.last_user_interaction = Some(Instant::now() - Duration::from_secs(2));
+    crate::tui::app::local::handle_tick(&mut app);
+    assert_eq!(app.reload_requested.as_deref(), Some(session_id.as_str()));
+    assert!(app.should_quit);
+}
+
+#[test]
 fn test_background_rebuild_status_uses_compact_rebuild_card() {
     let mut app = create_test_app();
     let session_id = app.session.id.clone();
@@ -664,6 +768,8 @@ fn test_startup_update_checking_stays_quiet_until_update_work_starts() {
 
     app.handle_update_status(UpdateStatus::Downloading {
         version: "v1.2.3".to_string(),
+        downloaded: 512 * 1024,
+        total: Some(1024 * 1024),
     });
 
     let update_cards = app
@@ -671,16 +777,15 @@ fn test_startup_update_checking_stays_quiet_until_update_work_starts() {
         .iter()
         .filter(|message| message.title.as_deref() == Some("Update"))
         .count();
-    assert_eq!(update_cards, 1, "update statuses should update one card");
-    let message = app
-        .display_messages()
-        .last()
-        .expect("expected update display message");
-    assert!(message.content.contains("Status: downloading v1.2.3"));
-    assert!(message.content.contains("restart automatically"));
     assert_eq!(
-        app.status_notice(),
-        Some("Updating to v1.2.3...".to_string())
+        update_cards, 0,
+        "background progress should stay out of the transcript"
+    );
+    let notice = app.status_notice().expect("expected download notice");
+    assert!(notice.starts_with("↑ v1.2.3 · Downloading update..."));
+    assert!(
+        notice.contains("50%"),
+        "notice should show progress: {notice}"
     );
 
     app.handle_update_status(UpdateStatus::Installed {
@@ -696,6 +801,41 @@ fn test_startup_update_checking_stays_quiet_until_update_work_starts() {
     assert_eq!(
         app.status_notice(),
         Some("Updated to v1.2.3; restarting...".to_string())
+    );
+}
+
+/// The user-facing complaint behind the progress work: update output used to
+/// churn the transcript and clobber the input line. A streaming download must
+/// stay in the compact status area, never grow the message list, and never
+/// touch the input buffer.
+#[test]
+fn test_startup_update_progress_stream_does_not_churn_transcript_or_input() {
+    let mut app = create_test_app();
+    app.set_input_for_test("draft the user was typing".to_string());
+    let baseline_messages = app.display_messages().len();
+
+    for downloaded in [0u64, 256, 512, 768, 1024].map(|kib| kib * 1024) {
+        app.handle_update_status(UpdateStatus::Downloading {
+            version: "v1.2.3".to_string(),
+            downloaded,
+            total: Some(1024 * 1024),
+        });
+    }
+
+    assert_eq!(
+        app.display_messages().len(),
+        baseline_messages,
+        "streamed progress must not append transcript cards"
+    );
+    assert!(
+        app.status_notice()
+            .is_some_and(|notice| notice.contains("100%")),
+        "compact status shows latest progress"
+    );
+    assert_eq!(
+        app.input(),
+        "draft the user was typing",
+        "update progress must never clobber the input line"
     );
 }
 
@@ -812,7 +952,10 @@ fn test_startup_update_error_replaces_checking_card() {
     );
     let notice = app.status_notice().expect("expected failure notice");
     assert_eq!(notice, "Update failed: offline");
-    assert!(!notice.contains('\n'), "notice should be one line: {notice}");
+    assert!(
+        !notice.contains('\n'),
+        "notice should be one line: {notice}"
+    );
     assert!(app.background_client_action.is_none());
     assert!(app.pending_background_client_reload.is_none());
 }

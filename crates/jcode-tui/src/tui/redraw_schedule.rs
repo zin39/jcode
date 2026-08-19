@@ -19,6 +19,36 @@ pub(crate) const REDRAW_REMOTE_STARTUP: Duration = Duration::from_millis(1000);
 pub(crate) const REDRAW_PASSIVE_LIVENESS: Duration = Duration::from_millis(1000);
 pub(crate) const REDRAW_DEEP_IDLE_AFTER: Duration = Duration::from_secs(30);
 
+/// Whether this session has been left alone long enough to be treated as
+/// dormant (deep idle): no stream activity *and* no user interaction for
+/// [`REDRAW_DEEP_IDLE_AFTER`].
+///
+/// `time_since_activity()` alone is not a dormancy signal. It reports
+/// "already past the deep-idle threshold" for any non-empty transcript that
+/// has never streamed in this process (see `TuiState::time_since_activity`),
+/// which is correct for a restored historical session but also matches a
+/// brand-new session the moment onboarding leaves its "here are a few things
+/// to try" notice. The user is sitting right there, actively pressing keys,
+/// while every deep-idle consumer (donut gate, tick cadence, periodic-redraw
+/// short-circuit) treats the session as abandoned. That is how the decorative
+/// animation ended up never running on the screen it was built for.
+///
+/// A recent keystroke/mouse/paste is direct evidence the session is not
+/// dormant, so it must hold deep idle off for the same window.
+fn deep_idle_dormant(state: &dyn TuiState) -> bool {
+    let stream_dormant = state
+        .time_since_activity()
+        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
+        .unwrap_or(false);
+    let user_dormant = state
+        .time_since_user_interaction()
+        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
+        // No interaction recorded yet: a fresh client that has never been
+        // touched. Fall back to the stream/app clock alone, as before.
+        .unwrap_or(true);
+    stream_dormant && user_dormant
+}
+
 fn idle_donut_active_with_policy(
     state: &dyn TuiState,
     policy: &crate::perf::TuiPerfPolicy,
@@ -34,25 +64,16 @@ fn idle_donut_active_with_policy(
         return false;
     }
 
-    // The onboarding welcome screen draws the same live donut, but it also
-    // shows a welcome/login card so `display_messages()` is not empty.  Keep the
-    // animation loop running smoothly while that screen is up (even past the
-    // deep-idle threshold) so the donut spins as an attention grab instead of
-    // only repainting on input events.
+    // The onboarding welcome screen is static (no decorative animation), so it
+    // does not need to keep the animation loop running.
     if state.onboarding_welcome_active() {
-        return policy.enable_decorative_animations
-            && crate::config::config().display.idle_animation
-            && policy.tier.idle_animation_enabled();
+        return false;
     }
 
     // The idle donut is decorative.  Leaving many dormant tabs/sessions open
     // should not keep every TUI repainting forever, especially when those tabs
     // are hidden behind a terminal multiplexer or kitty single-instance window.
-    if state
-        .time_since_activity()
-        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
-        .unwrap_or(false)
-    {
+    if deep_idle_dormant(state) {
         return false;
     }
 
@@ -75,6 +96,113 @@ fn has_started_conversation(state: &dyn TuiState) -> bool {
         .display_messages()
         .iter()
         .any(|m| matches!(m.role.as_str(), "user" | "assistant" | "tool" | "reasoning"))
+}
+
+/// Whether the decorative animation is actually *on screen*, which is what the
+/// redraw cadence must be paced by.
+///
+/// [`idle_donut_active`] answers a different question: "does this screen want a
+/// donut?". The renderer uses that to lay out donut rows, and the two answers
+/// can differ, because layout can drop the animation after the fact:
+///
+/// * `ui::draw_inner` returns early for full-screen overlays (`/resume` picker,
+///   help, changelog, model status, login/account pickers) long before the donut
+///   chunk is laid out.
+/// * The donut reservation shrinks as the composer grows, and on a short
+///   terminal it reaches zero rows.
+///
+/// In both cases nothing animates, yet the loop still ticked at `animation_fps`.
+/// Because no animated rectangle was published, the cheap animation-only repaint
+/// stood down (`no_animation_area`) and *every* tick became a full frame.
+/// Measured on a live client freshly spawned onto the `/resume` picker: 63 full
+/// `terminal.draw` calls per second, each changing 0 of 7680 cells, on a screen
+/// a terminal emulator confirmed was completely static. Keystrokes competed with
+/// 60 useless full frames a second, which is the reported lag.
+///
+/// `animation_on_screen` is passed in rather than read from the renderer's
+/// global slot so this stays a pure function of stated inputs: the callers that
+/// pace the live loop supply [`ui::last_idle_animation_area`], while tests can
+/// state the premise directly. Deriving it from what the renderer actually
+/// published (rather than re-deriving layout rules here) means a new overlay or
+/// layout tweak cannot reintroduce the wasted loop.
+///
+/// The renderer must never consult this when deciding whether to draw the donut:
+/// that would be self-referential, and "nothing published last frame" would
+/// prevent a donut forever.
+fn idle_donut_paces_redraws(
+    state: &dyn TuiState,
+    policy: &crate::perf::TuiPerfPolicy,
+    animation_on_screen: bool,
+) -> bool {
+    animation_on_screen && idle_donut_active_with_policy(state, policy)
+}
+
+/// Whether the renderer published animated rows on its last frame.
+///
+/// The live default for `animation_on_screen`. A brand-new client has published
+/// nothing yet, and its first frame is drawn on demand rather than on the
+/// animation cadence, so starting from `false` costs at most one tick of
+/// smoothness and never blocks the animation from starting.
+fn animation_on_screen_now() -> bool {
+    ui::last_idle_animation_area().is_some()
+}
+
+/// Last reason a periodic tick demanded a full frame instead of the cheap
+/// animation-only repaint, surfaced through `draw-stats`.
+///
+/// Stored as an index into [`FULL_FRAME_REDRAW_REASONS`] in an atomic, so the
+/// redraw hot path records it without locking (and without an error to ignore).
+static LAST_FULL_FRAME_REDRAW_REASON: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+const FULL_FRAME_REDRAW_REASONS: &[&str] = &[
+    "processing",
+    "streaming",
+    "tail_catchup",
+    "status_notice",
+    "learn_hint",
+    "mouse_scroll_animation",
+    "copy_autoscroll",
+    "chat_overscroll",
+    "notification",
+    "rate_limit_countdown",
+    "remote_startup",
+    "status_animation",
+    "swarm_spinner",
+    "session_picker_spinner",
+];
+
+fn record_full_frame_redraw_reason(reason: &'static str) {
+    if let Some(idx) = FULL_FRAME_REDRAW_REASONS.iter().position(|r| *r == reason) {
+        LAST_FULL_FRAME_REDRAW_REASON.store(idx, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn last_full_frame_redraw_reason() -> Option<&'static str> {
+    FULL_FRAME_REDRAW_REASONS
+        .get(LAST_FULL_FRAME_REDRAW_REASON.load(std::sync::atomic::Ordering::Relaxed))
+        .copied()
+}
+
+/// The reason a full frame is required *right now*, or `None` when nothing is
+/// live.
+///
+/// [`last_full_frame_redraw_reason`] is sticky: it keeps reporting a notice that
+/// has long since expired, which makes "why is this client repainting at 60fps"
+/// impossible to diagnose from `draw-stats`. This evaluates the predicates
+/// against current state instead.
+pub(crate) fn current_full_frame_redraw_reason(state: &dyn TuiState) -> Option<&'static str> {
+    let policy = crate::perf::tui_policy();
+    if full_frame_status_animation_active_with_policy(state, &policy) {
+        return Some("status_animation");
+    }
+    if swarm_spinner_redraw_active(state) {
+        return Some("swarm_spinner");
+    }
+    if session_picker_spinner_redraw_active(state) {
+        return Some("session_picker_spinner");
+    }
+    live_activity_redraw_reason(state)
 }
 
 pub(crate) fn idle_donut_active(state: &dyn TuiState) -> bool {
@@ -193,9 +321,80 @@ fn fps_to_duration(fps: u32) -> Duration {
     Duration::from_millis((1000 / fps.max(1)) as u64)
 }
 
-pub(crate) fn redraw_interval_with_policy(
+/// Frame rate cap for the purely decorative idle animation.
+///
+/// Measured on a real session (`scripts/sweep_animation_fps.py`), the cost is
+/// linear in frame rate while the perceived motion is not:
+///
+/// | fps | CPU over idle baseline |
+/// |-----|------------------------|
+/// | 60  | 0.224 cores            |
+/// | 30  | 0.104 cores            |
+/// | 20  | 0.080 cores            |
+///
+/// Each animation frame is a coarse glyph change in a 3x3 subpixel grid, so 30fps
+/// already saturates what a terminal can express, and halving the frame rate
+/// halves the cost of a decoration that exists to look pleasant while idle.
+/// Burning a fifth of a core on it is not a good trade on a laptop.
+///
+/// This caps only the decorative animation. Functional motion (status spinners,
+/// scroll/tail-follow catch-up, streaming output) keeps the configured
+/// `animation_fps`, because there smoothness is the feature. Users who
+/// explicitly configure a *lower* `animation_fps` still get their value.
+const DECORATIVE_ANIMATION_FPS_CAP: u32 = 30;
+
+/// Cadence for the decorative idle animation: the configured animation rate,
+/// capped by [`DECORATIVE_ANIMATION_FPS_CAP`].
+fn decorative_animation_interval(policy: &crate::perf::TuiPerfPolicy) -> Duration {
+    fps_to_duration(policy.animation_fps.min(DECORATIVE_ANIMATION_FPS_CAP))
+}
+
+/// Chrome that is text-only and changes on a human timescale: the status notice,
+/// the learn hint, and the notification line.
+///
+/// None of these animate. They appear on an event (which already forces an
+/// immediate repaint) and disappear on a multi-second timer, so the loop only
+/// needs a tick fast enough to retire them promptly. Treating them as "live"
+/// used to pull the whole client to the animation cadence: a single 3s notice
+/// meant ~180 full frames of ~10ms each, all to redraw the same glyphs, and
+/// every keystroke in that window queued behind one of those frames. A notice
+/// that keeps re-arming (a syncing swarm plan, for instance) held a client there
+/// indefinitely, which is what made a freshly spawned session feel laggy.
+fn static_text_chrome_active(state: &dyn TuiState) -> bool {
+    state.status_notice().is_some() || state.learn_hint().is_some() || state.has_notification()
+}
+
+/// How long after a keystroke the decorative animation stays out of the way.
+///
+/// Long enough to cover a continuous typing burst, short enough that the
+/// animation resumes smoothly as soon as the user pauses, so a draft left in the
+/// composer does not permanently downgrade the animation.
+const COMPOSING_ANIMATION_BACKOFF: Duration = Duration::from_millis(600);
+
+/// Whether the user is actively typing right now.
+///
+/// A non-empty composer alone is not enough: a draft can sit there for minutes,
+/// and downgrading the animation for all of it would be a visible regression for
+/// no latency benefit.
+fn actively_composing(state: &dyn TuiState) -> bool {
+    !state.input().is_empty()
+        && state
+            .time_since_user_interaction()
+            .is_some_and(|since| since < COMPOSING_ANIMATION_BACKOFF)
+}
+
+/// Tick cadence for the current state, with both the performance policy and
+/// "is the decorative animation actually on screen" stated explicitly.
+///
+/// `animation_on_screen` exists because the renderer can drop the animation
+/// after the scheduler has decided the screen wants one (full-screen overlay, or
+/// a terminal too short to reserve donut rows). Pacing the loop at animation FPS
+/// in that case costs a full frame per tick and paints nothing; see
+/// [`idle_donut_paces_redraws`].
+pub(crate) fn redraw_interval_with_policy_and_animation(
     state: &dyn TuiState,
     policy: &crate::perf::TuiPerfPolicy,
+    animation_on_screen: bool,
 ) -> Duration {
     let animation_interval = fps_to_duration(policy.animation_fps);
     let fast_interval = fps_to_duration(policy.redraw_fps);
@@ -241,10 +440,7 @@ pub(crate) fn redraw_interval_with_policy(
         return REDRAW_DEEP_IDLE;
     }
 
-    let deep_idle = state
-        .time_since_activity()
-        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
-        .unwrap_or(false);
+    let deep_idle = deep_idle_dormant(state);
 
     if deep_idle
         && !state.is_processing()
@@ -255,17 +451,28 @@ pub(crate) fn redraw_interval_with_policy(
         && !rate_limit_countdown_redraw_active(state)
         && !cache_cold_countdown_redraw_active(state)
         && crate::build::read_build_progress().is_none()
-        && !state.onboarding_welcome_active()
         && !swarm_spinner_redraw_active(state)
         && !session_picker_spinner_redraw_active(state)
     {
         return REDRAW_DEEP_IDLE;
     }
 
-    if idle_donut_active_with_policy(state, policy) {
+    if idle_donut_paces_redraws(state, policy, animation_on_screen) {
+        // While the user is actively typing, the input line matters and the
+        // decoration does not. A 60fps donut means a keystroke can land behind an
+        // in-flight animation frame, so typing into a fresh session felt sluggish
+        // exactly when responsiveness is most visible. Keep animating (the donut
+        // still moves, just slower) at a cadence that leaves the loop free for
+        // keystrokes, and return to full smoothness as soon as typing pauses.
+        if actively_composing(state) {
+            return REDRAW_IDLE;
+        }
         return match policy.tier {
             crate::perf::PerformanceTier::Minimal => fast_interval,
-            _ => animation_interval,
+            // Decorative only: capped, because the cost is linear in frame rate
+            // and the perceived smoothness is not. See
+            // `DECORATIVE_ANIMATION_FPS_CAP`.
+            _ => decorative_animation_interval(policy),
         };
     }
 
@@ -309,17 +516,21 @@ pub(crate) fn redraw_interval_with_policy(
 
     if state.is_processing()
         || !state.streaming_text().is_empty()
-        || state.status_notice().is_some()
-        || state.learn_hint().is_some()
         || state.has_pending_mouse_scroll_animation()
         || state.copy_selection_edge_autoscroll_active()
-        || state.has_notification()
         || rate_limit_countdown_redraw_active(state)
     {
         return match policy.tier {
             crate::perf::PerformanceTier::Minimal => REDRAW_IDLE,
             _ => fast_interval,
         };
+    }
+
+    // Static text chrome only needs a tick fast enough to retire it, never the
+    // animation cadence. Keep this below the animated branches above so live
+    // output still wins.
+    if static_text_chrome_active(state) {
+        return REDRAW_IDLE;
     }
 
     if state.remote_startup_phase_active() {
@@ -333,9 +544,27 @@ pub(crate) fn redraw_interval_with_policy(
     }
 }
 
+/// Policy-only cadence: what the schedule would be if the decorative animation
+/// were on screen.
+///
+/// This is the right entry point for reasoning about (and testing) the cadence
+/// *policy* without depending on renderer state. The live loop must use
+/// [`redraw_interval`], which additionally accounts for the animation having
+/// been dropped by layout.
+///
+/// Only tests call this today (the run loop needs the live variant), hence the
+/// allow: it documents the policy/liveness split rather than being dead weight.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn redraw_interval_with_policy(
+    state: &dyn TuiState,
+    policy: &crate::perf::TuiPerfPolicy,
+) -> Duration {
+    redraw_interval_with_policy_and_animation(state, policy, true)
+}
+
 pub(crate) fn redraw_interval(state: &dyn TuiState) -> Duration {
     let policy = crate::perf::tui_policy();
-    let requested = redraw_interval_with_policy(state, &policy);
+    let requested = redraw_interval_with_policy_and_animation(state, &policy, animation_on_screen_now());
     govern_redraw_interval_by_draw_cost(requested)
 }
 
@@ -414,10 +643,7 @@ pub(crate) fn periodic_redraw_required_excluding_idle_animation(state: &dyn TuiS
 fn periodic_redraw_required_inner(state: &dyn TuiState, include_idle_animation: bool) -> bool {
     let policy = crate::perf::tui_policy();
 
-    let deep_idle = state
-        .time_since_activity()
-        .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
-        .unwrap_or(false);
+    let deep_idle = deep_idle_dormant(state);
 
     if deep_idle
         && !state.is_processing()
@@ -430,43 +656,155 @@ fn periodic_redraw_required_inner(state: &dyn TuiState, include_idle_animation: 
         && !rate_limit_countdown_redraw_active(state)
         && !cache_cold_countdown_redraw_active(state)
         && crate::build::read_build_progress().is_none()
-        && !state.onboarding_welcome_active()
         && !swarm_spinner_redraw_active(state)
         && !session_picker_spinner_redraw_active(state)
     {
         return false;
     }
 
-    if include_idle_animation && idle_donut_active_with_policy(state, &policy) {
+    let animation_paces_redraws =
+        idle_donut_paces_redraws(state, &policy, animation_on_screen_now());
+    if include_idle_animation && animation_paces_redraws {
         return true;
     }
 
     if full_frame_status_animation_active_with_policy(state, &policy) {
+        record_full_frame_redraw_reason("status_animation");
         return true;
     }
 
     if swarm_spinner_redraw_active(state) {
+        record_full_frame_redraw_reason("swarm_spinner");
         return true;
     }
 
     if session_picker_spinner_redraw_active(state) {
+        record_full_frame_redraw_reason("session_picker_spinner");
         return true;
     }
 
-    if state.is_processing()
-        || !state.streaming_text().is_empty()
-        || ui::tail_catchup_active()
-        || state.status_notice().is_some()
-        || state.learn_hint().is_some()
-        || state.has_pending_mouse_scroll_animation()
-        || state.copy_selection_edge_autoscroll_active()
-        || state.chat_overscroll_remaining().is_some()
-        || state.has_notification()
-        || rate_limit_countdown_redraw_active(state)
-        || state.remote_startup_phase_active()
-    {
+    if let Some(reason) = live_activity_redraw_reason(state) {
+        record_full_frame_redraw_reason(reason);
         return true;
     }
 
     false
+}
+
+/// Why a tick needs a full frame beyond the decorative animation, or `None`
+/// when nothing else is live.
+///
+/// Named rather than a bare boolean chain so `draw-stats` can report the exact
+/// predicate keeping the animation on the expensive full-frame path. Without
+/// this, diagnosing "the animation ticks are still doing full renders" means
+/// bisecting a ten-term `||`.
+fn live_activity_redraw_reason(state: &dyn TuiState) -> Option<&'static str> {
+    if state.is_processing() {
+        return Some("processing");
+    }
+    if !state.streaming_text().is_empty() {
+        return Some("streaming");
+    }
+    if ui::tail_catchup_active() {
+        return Some("tail_catchup");
+    }
+    if state.status_notice().is_some() {
+        return Some("status_notice");
+    }
+    if state.learn_hint().is_some() {
+        return Some("learn_hint");
+    }
+    if state.has_pending_mouse_scroll_animation() {
+        return Some("mouse_scroll_animation");
+    }
+    if state.copy_selection_edge_autoscroll_active() {
+        return Some("copy_autoscroll");
+    }
+    if state.chat_overscroll_remaining().is_some() {
+        return Some("chat_overscroll");
+    }
+    if state.has_notification() {
+        return Some("notification");
+    }
+    if rate_limit_countdown_redraw_active(state) {
+        return Some("rate_limit_countdown");
+    }
+    if state.remote_startup_phase_active() {
+        return Some("remote_startup");
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both tests mutate the single process-wide reason slot, so they must not
+    /// interleave.
+    fn reason_slot_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reasons are recorded by index into a fixed table, so a name that is not
+    /// in the table would silently record nothing. Pin every reason the code
+    /// actually passes so a rename cannot quietly blind the diagnostics.
+    #[test]
+    fn every_recorded_reason_is_in_the_reason_table() {
+        let _lock = reason_slot_lock();
+        for reason in [
+            "processing",
+            "streaming",
+            "tail_catchup",
+            "status_notice",
+            "learn_hint",
+            "mouse_scroll_animation",
+            "copy_autoscroll",
+            "chat_overscroll",
+            "notification",
+            "rate_limit_countdown",
+            "remote_startup",
+            "status_animation",
+            "swarm_spinner",
+            "session_picker_spinner",
+        ] {
+            assert!(
+                FULL_FRAME_REDRAW_REASONS.contains(&reason),
+                "{reason} is recorded but missing from FULL_FRAME_REDRAW_REASONS"
+            );
+            record_full_frame_redraw_reason(reason);
+            assert_eq!(
+                last_full_frame_redraw_reason(),
+                Some(reason),
+                "{reason} did not round-trip through the reason slot"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_reasons_do_not_corrupt_the_reason_slot() {
+        let _lock = reason_slot_lock();
+        record_full_frame_redraw_reason("notification");
+        record_full_frame_redraw_reason("not-a-real-reason");
+        assert_eq!(last_full_frame_redraw_reason(), Some("notification"));
+    }
+
+    /// The static-chrome cadence has to be fast enough to retire a notice
+    /// promptly (notices expire after 3s) while being far slower than the
+    /// animation cadence that caused the lag.
+    ///
+    /// The behavioral gate (a notice must not pull a real state to animation
+    /// cadence) lives in `ui_tests::basic::redraw_cadence`, which can build a
+    /// full `TuiState`.
+    #[test]
+    fn static_chrome_cadence_retires_notices_without_animation_cost() {
+        assert!(
+            REDRAW_IDLE <= Duration::from_millis(250),
+            "a notice must retire within a frame or two of its 3s expiry"
+        );
+        assert!(
+            REDRAW_IDLE >= fps_to_duration(60) * 4,
+            "static chrome must cost far fewer frames than animation cadence"
+        );
+    }
 }

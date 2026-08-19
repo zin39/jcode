@@ -37,28 +37,139 @@ pub const CARET_HEIGHT: f64 = 18.0;
 /// Caption row under the composer for notices and the scrollback indicator.
 pub const FOOTNOTE_HEIGHT: f64 = 16.0;
 pub const FOOTNOTE_GAP: f64 = 6.0;
-/// Largest the hero donut gets, in logical units. Matches the website's
-/// 360px hero canvas, so the halftone screen has the same density there.
-pub const DONUT_MAX_SIDE: f64 = 360.0;
+/// Session strip: one row of bars at the very top, modelled on the waybar
+/// `niri-workspaces` module. Fixed height, because it is chrome rather than
+/// content and must not grow with the number of sessions.
+pub const STRIP_HEIGHT: f64 = 14.0;
+/// Gap between the strip and the transcript below it.
+pub const STRIP_GAP: f64 = 10.0;
+/// Width of one session block, and the gap between blocks in a group. Tuned to
+/// read as the `|` ticks of the waybar module rather than as buttons.
+pub const STRIP_BAR_WIDTH: f64 = 2.0;
+/// The focused block is drawn wider, standing in for the module's `█` glyph.
+pub const STRIP_BAR_FOCUS_WIDTH: f64 = 6.0;
+pub const STRIP_BAR_GAP: f64 = 3.0;
+/// Height of a block within the strip row.
+pub const STRIP_BAR_HEIGHT: f64 = 8.0;
+/// Padding between a group's outline and the blocks inside it. The outline is
+/// what names the group now that no text does, so it needs enough air to read
+/// as an enclosure rather than as a border on the first block. Blocks plus this
+/// padding on both sides must stay inside `STRIP_HEIGHT`, or the enclosure
+/// bleeds into the transcript's gap; `strip_owns_its_band` pins that.
+pub const STRIP_FRAME_PAD: f64 = 2.0;
+/// Corner radius of a group outline.
+pub const STRIP_FRAME_RADIUS: f64 = 2.0;
+/// Gap between one group and the next.
+pub const STRIP_GROUP_GAP: f64 = 16.0;
+/// The hero donut's side, in logical units. Matches the website's 360px hero
+/// canvas, so the halftone screen has the same density there. It is one fixed
+/// number rather than a cap: the donut is a mark, and a mark that breathes
+/// with the window (or twitches when the top chrome row appears) reads as a
+/// bug. A window that cannot hold it drops the hero instead of shrinking it.
+pub const DONUT_SIDE: f64 = 360.0;
 /// Hero wordmark over the donut, as on the website's landing section.
 pub const HERO_WORDMARK_SIZE: f32 = 34.0;
-/// Gap under the wordmark, and under the donut before the tagline.
-pub const HERO_GAP: f64 = 14.0;
+/// Clear space under the wordmark, and under the donut before the tagline.
+/// Measured from painted ink to painted ink, not from box to box, so it is the
+/// gap the eye actually sees. Roughly half the wordmark's size, which is the
+/// smallest gap that still reads as "separate thing" rather than "touching".
+pub const HERO_GAP: f64 = 18.0;
 /// Line height for hero text. Tight, because the hero stacks single lines
 /// against a graphic: body leading would put invisible slack above each line
 /// and make the measured gaps disagree with the optical ones.
 pub const HERO_LINE_HEIGHT: f32 = 1.15;
 /// Tagline under the donut: the one line that says what this is.
 pub const HERO_TAGLINE_SIZE: f32 = 12.5;
-/// Fraction of the donut's square its silhouette actually inks. The torus at
-/// this tilt does not reach the corners or the top and bottom edges, so laying
-/// the stack out on the raw square leaves a gap that looks like a mistake; the
-/// wordmark and tagline are spaced against the *visible* disc instead.
-pub const DONUT_INK_FRACTION: f64 = 0.82;
-/// Below this the halftone screen has too few dots across (at [`DOT_PITCH`]) to
-/// read as a donut, so the hero is dropped entirely rather than degrading into
-/// speckle on a cramped window.
+/// Fraction of the donut's square its silhouette actually inks vertically, at
+/// the *widest* point of the tilt wobble. The torus at this tilt does not reach
+/// the square's top and bottom edges, so laying the stack out on the raw square
+/// leaves a gap that looks like a mistake; the wordmark and tagline are spaced
+/// against the *visible* disc instead. This is the worst case over the whole
+/// animation, not the average: spacing against the average lets the disc grow
+/// into the gap on the frames where it is tallest, which is exactly when the
+/// text looks touched. Measured by `donut::tests::ink_extent_is_stable_across_
+/// the_wobble`.
+pub const DONUT_INK_FRACTION: f64 = 0.88;
+/// The halftone screen paints a *disc* centred on each sampled cell, so the
+/// painted silhouette reaches about one dot radius further than the cell grid
+/// [`DONUT_INK_FRACTION`] measures. Counted as part of the donut so the gap the
+/// eye sees is the gap the layout asked for. See `scene`'s `DOT_PITCH` and
+/// `DOT_FILL`: 360/76 * 0.62 rounded up.
+pub const DONUT_DOT_BLEED: f64 = 3.0;
+/// Smallest square that still reads as a donut at [`DOT_PITCH`]. Nothing is
+/// drawn between this and [`DONUT_SIDE`] now that the hero is fixed size, but
+/// the renderer and the hit test keep it as their floor so a degenerate box
+/// can never paint speckle.
 pub const DONUT_MIN_SIDE: f64 = 100.0;
+/// The settings gear's hit target, in logical units. A square in the top
+/// margin's trailing corner: the one place on the page that is empty at every
+/// window size, and the corner every desktop app already puts its chrome in.
+pub const GEAR_SIZE: f64 = 18.0;
+/// Sessions button size.
+pub const SESSIONS_SIZE: f64 = GEAR_SIZE;
+/// Radius of the gear's body, as a fraction of its box. The teeth and the hub
+/// are drawn around this, so the whole mark scales from one number.
+pub const GEAR_RADIUS: f64 = 0.30;
+/// Number of teeth. Six reads as a gear at 18 logical pixels; more turns into
+/// a blurred ring at this size.
+pub const GEAR_TEETH: usize = 6;
+/// The settings panel the gear opens: one row per setting, hanging under the
+/// gear and aligned to its trailing edge like any menu.
+pub const PANEL_WIDTH: f64 = 230.0;
+pub const PANEL_ROW_HEIGHT: f64 = 26.0;
+pub const PANEL_PAD: f64 = 6.0;
+pub const PANEL_RADIUS: f64 = 6.0;
+/// Gap between the gear and the panel below it.
+pub const PANEL_GAP: f64 = 6.0;
+/// Inset from the panel's edge to a row's text.
+pub const PANEL_TEXT_PAD: f64 = 10.0;
+
+/// Model picker anchored to the active-model caption below the composer. It
+/// opens upward so the ordinary bottom margin never clips the catalog.
+pub const MODEL_MENU_WIDTH: f64 = 320.0;
+pub const MODEL_MENU_ROW_HEIGHT: f64 = 26.0;
+pub const MODEL_MENU_PAD: f64 = 6.0;
+pub const MODEL_MENU_RADIUS: f64 = 6.0;
+pub const MODEL_MENU_GAP: f64 = 6.0;
+pub const MODEL_MENU_TEXT_PAD: f64 = 10.0;
+
+/// The resume overlay: a left panel of stored sessions, a preview to its
+/// right, both floating over the conversation rather than replacing it.
+///
+/// Fractions of the window rather than fixed pixels, because the panel has to
+/// hold paths ("/home/j/some/deep/checkout") on a small window and must not
+/// eat a wide one. Clamped so it is neither unreadable nor a wall.
+pub const RESUME_PANEL_FRACTION: f64 = 0.34;
+pub const RESUME_PANEL_MIN: f64 = 220.0;
+pub const RESUME_PANEL_MAX: f64 = 380.0;
+/// Height of one row in the picker, and the search field above the list.
+pub const RESUME_ROW_HEIGHT: f64 = 22.0;
+pub const RESUME_SEARCH_HEIGHT: f64 = 30.0;
+/// Inset of the overlay card from the window edges, as a fraction of the
+/// window's short side, and its bounds in logical units.
+///
+/// Generous on purpose: the point of an overlay is that the conversation is
+/// still there around it. A card pinned near the window edges hides the very
+/// thing that makes the choice a comparison, and reads as a separate screen.
+pub const RESUME_INSET_FRACTION: f64 = 0.07;
+pub const RESUME_INSET_MIN: f64 = 20.0;
+pub const RESUME_INSET_MAX: f64 = 72.0;
+/// Fraction of the window height the card may take, and its floor.
+///
+/// Capped rather than full-height because the list scrolls: past this the extra
+/// rows buy less than the page they hide, and the whole reason this is an
+/// overlay is that the conversation stays readable around it.
+pub const RESUME_CARD_HEIGHT_FRACTION: f64 = 0.66;
+pub const RESUME_CARD_HEIGHT_MIN: f64 = 200.0;
+/// Padding inside the overlay's card, and its corner radius.
+pub const RESUME_PAD: f64 = 12.0;
+pub const RESUME_RADIUS: f64 = 8.0;
+/// Type sizes: a session row, a project heading, and the meta caption
+/// (directory, size) that trails a row.
+pub const RESUME_ROW_SIZE: f32 = 12.0;
+pub const RESUME_GROUP_SIZE: f32 = 11.0;
+pub const RESUME_META_SIZE: f32 = 9.5;
+
 /// Vertical breathing room between regions.
 pub const SPACE_BEFORE_COMPOSER: f64 = 20.0;
 /// Fraction of the page height the input box is centred on. 0.5 puts the
@@ -77,6 +188,41 @@ pub struct Hero {
     /// Top of the tagline line under the donut.
     pub tagline_top: f64,
 }
+
+/// The empty band between one edge of the donut's square and the nearest
+/// painted dot, at the tallest point of the wobble. The stack's gaps are laid
+/// against this, so `HERO_GAP` is optical clearance rather than box padding.
+pub fn donut_bleed(side: f64) -> f64 {
+    (side * (1.0 - DONUT_INK_FRACTION) / 2.0 - DONUT_DOT_BLEED).max(0.0)
+}
+
+/// Height of the hero stack as laid on the page: the wordmark, the donut's
+/// *inked* disc (the square's empty bleed bands are not demanded), and the
+/// tagline, with their gaps. One definition shared by [`Frame::hero`]'s fit
+/// check and [`Frame::resolve`]'s reservation, so the two can never disagree
+/// about whether the stack fits.
+fn hero_stack_height() -> f64 {
+    let wordmark = f64::from(HERO_WORDMARK_SIZE * HERO_LINE_HEIGHT);
+    let tagline = f64::from(HERO_TAGLINE_SIZE * HERO_LINE_HEIGHT);
+    let bleed = donut_bleed(DONUT_SIDE);
+    DONUT_SIDE - bleed * 2.0 + wordmark + tagline + HERO_GAP * 2.0
+}
+
+/// The transcript height [`Frame::resolve`] reserves for the hero on an empty
+/// session. A hair over the stack itself, so floating-point placement cannot
+/// round the available space to just under the stack and silently drop it.
+fn hero_reservation() -> f64 {
+    hero_stack_height() + 0.5
+}
+
+/// Slack allowed when judging whether the hero stack fits, in logical pixels.
+///
+/// The stack's top and bottom edges are whitespace (a gap and the disc's soft
+/// silhouette), so a region a couple of pixels short of the stack loses
+/// nothing visible. Without this, a page whose composer ceiling lands a
+/// fraction of a pixel under the reservation drops the whole hero over slack
+/// nobody can see.
+const HERO_FIT_SLACK: f64 = 2.0;
 
 /// Resolved geometry for one frame. All fields are logical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,6 +244,9 @@ pub struct Frame {
     /// appearing never shifts the composer or spills off-paper.
     pub footnote_top: f64,
     pub footnote_bottom: f64,
+    /// Top of the session strip row, when the strip is shown. `None` means
+    /// there is no strip and nothing above was reserved for it.
+    strip_top: Option<f64>,
 }
 
 impl Frame {
@@ -107,11 +256,89 @@ impl Frame {
         Self::with_composer_lines(size, scale, 1)
     }
 
+    /// Resolve geometry with a session strip reserved at the top.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_strip(size: (u32, u32), scale: f64, lines: usize, strip: bool) -> Self {
+        Self::resolve(size, scale, lines, strip, 0.0)
+    }
+
+    /// Resolve geometry with a strip and a measured transcript height, so the
+    /// composer can ride down the page as the conversation grows instead of
+    /// staying pinned to the middle with a gap under the first reply.
+    pub fn with_content(
+        size: (u32, u32),
+        scale: f64,
+        lines: usize,
+        strip: bool,
+        content_height: f64,
+    ) -> Self {
+        Self::resolve(size, scale, lines, strip, content_height)
+    }
+
+    fn resolve(
+        size: (u32, u32),
+        scale: f64,
+        lines: usize,
+        strip: bool,
+        content_height: f64,
+    ) -> Self {
+        // The strip's row comes out of the transcript's top margin, so the
+        // content's own floor has to know about it before the composer is
+        // placed. Resolve it on a probe frame first, then rebuild with the
+        // real top so a growing transcript pushes the well down correctly.
+        let strip_offset = if strip { STRIP_HEIGHT + STRIP_GAP } else { 0.0 };
+        let build = |content: f64| {
+            let mut frame = Self::with_composer_lines_and_content(size, scale, lines, content);
+            // The strip takes its row out of the transcript's top margin, which
+            // is dead space anyway, and only when there is something to show.
+            // Nothing is reserved otherwise, so a single-session window is
+            // byte-identical to one built before the strip existed.
+            if strip {
+                frame.strip_top = Some(frame.body_top);
+                frame.body_top = (frame.body_top + STRIP_HEIGHT + STRIP_GAP).min(frame.body_bottom);
+            }
+            frame
+        };
+        if content_height > 0.0 {
+            return build(content_height + strip_offset);
+        }
+        // An empty session is the hero's page, so reserve its stack the same
+        // way a transcript reserves its height: the composer sits just under
+        // the wordmark/donut/tagline column, exactly like the input under the
+        // website's landing hero. Centring the composer instead starved the
+        // hero of room on ordinary laptop windows (a 720-tall page has ~280
+        // logical pixels above a centred well; the stack needs ~377), which
+        // silently dropped the donut at the default window size.
+        //
+        // Checked against the built frame's own `hero()` rather than by
+        // repeating its fit arithmetic here: the two can then never disagree.
+        // A window too short or too narrow for the stack falls back to the
+        // centred composer with no hero, as before.
+        let reserved = build(hero_reservation() + strip_offset);
+        if reserved.hero().is_some() {
+            return reserved;
+        }
+        build(strip_offset)
+    }
+
     /// Resolve geometry with a composer sized for `lines` of input. The
     /// composer grows upward so the transcript shrinks instead of the input
     /// being clipped, and stops growing at [`COMPOSER_MAX_LINES`] so a long
     /// paste can never push the transcript off the page.
     pub fn with_composer_lines(size: (u32, u32), scale: f64, lines: usize) -> Self {
+        Self::resolve(size, scale, lines, false, 0.0)
+    }
+
+    /// As [`Self::with_composer_lines`], with the measured height of the
+    /// transcript. A conversation taller than the space above the centre line
+    /// pushes the composer down, so the input always sits just under the last
+    /// reply rather than leaving a hole between them.
+    pub fn with_composer_lines_and_content(
+        size: (u32, u32),
+        scale: f64,
+        lines: usize,
+        content_height: f64,
+    ) -> Self {
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
@@ -146,8 +373,17 @@ impl Frame {
         // about that line as the text wraps, clamped so it never crosses the
         // top margin or its own caption row.
         let centred = height * COMPOSER_CENTER - composer_height * 0.5;
+        // ...until the conversation is taller than that. Then the well rides
+        // down with the last reply, the way a chat log fills a page top-down,
+        // and stops at the floor once the transcript fills the window.
+        let content = content_height.max(0.0);
+        let followed = if content > 0.0 {
+            centred.max(body_top + content + SPACE_BEFORE_COMPOSER)
+        } else {
+            centred
+        };
         let ceiling = (slot_bottom - composer_height).max(body_top);
-        let composer_top = centred.clamp(min_top.min(ceiling), ceiling);
+        let composer_top = followed.clamp(min_top.min(ceiling), ceiling);
         let composer_bottom = composer_top + composer_height;
         let footnote_top = composer_bottom + FOOTNOTE_GAP;
         let footnote_bottom = footnote_top + FOOTNOTE_HEIGHT;
@@ -166,6 +402,7 @@ impl Frame {
             composer_bottom,
             footnote_top,
             footnote_bottom,
+            strip_top: None,
         }
     }
 
@@ -174,14 +411,16 @@ impl Frame {
         self.right - self.left
     }
 
+    /// The session strip's row, in logical units, or `None` when no strip is
+    /// shown. Returned as a band rather than a top so callers cannot invent
+    /// their own height and drift from the reserved space.
+    pub fn strip(&self) -> Option<(f64, f64)> {
+        self.strip_top.map(|top| (top, top + STRIP_HEIGHT))
+    }
+
     /// Height of one body line.
     pub fn body_line_height(&self) -> f64 {
         f64::from(BODY_SIZE) * BODY_LEADING
-    }
-
-    /// Body lines that fit in the transcript region.
-    pub fn visible_body_lines(&self) -> usize {
-        (((self.body_bottom - self.body_top) / self.body_line_height()) as usize).max(1)
     }
 
     /// Width available to composer text, inside the well's padding. This is
@@ -208,6 +447,43 @@ impl Frame {
         1 + (extra / COMPOSER_LINE_HEIGHT).round() as usize
     }
 
+    /// The model catalog occupies a centered band inside the transcript. The
+    /// renderer parts messages around this rect, making the chooser feel like a
+    /// temporary transcript object rather than chrome hanging from the composer.
+    pub fn model_menu(&self, rows: usize) -> vello::kurbo::Rect {
+        let rows = rows.max(1);
+        let height = rows as f64 * MODEL_MENU_ROW_HEIGHT + MODEL_MENU_PAD * 2.0;
+        let width = MODEL_MENU_WIDTH.min(self.column());
+        let x0 = self.left + (self.column() - width) / 2.0;
+        let centre = (self.body_top + self.body_bottom) / 2.0;
+        vello::kurbo::Rect::new(x0, centre - height / 2.0, x0 + width, centre + height / 2.0)
+    }
+
+    pub fn model_menu_row(&self, rows: usize, index: usize) -> vello::kurbo::Rect {
+        let menu = self.model_menu(rows);
+        let y0 = menu.y0 + MODEL_MENU_PAD + index as f64 * MODEL_MENU_ROW_HEIGHT;
+        vello::kurbo::Rect::new(
+            menu.x0 + MODEL_MENU_PAD,
+            y0,
+            menu.x1 - MODEL_MENU_PAD,
+            y0 + MODEL_MENU_ROW_HEIGHT,
+        )
+    }
+
+    pub fn model_menu_row_at(&self, rows: usize, x: f64, y: f64) -> Option<usize> {
+        let rows = rows.max(1);
+        let menu = self.model_menu(rows);
+        if !menu.contains(vello::kurbo::Point::new(x, y)) {
+            return None;
+        }
+        let offset = y - menu.y0 - MODEL_MENU_PAD;
+        if offset < 0.0 {
+            return None;
+        }
+        let index = (offset / MODEL_MENU_ROW_HEIGHT) as usize;
+        (index < rows).then_some(index)
+    }
+
     /// The caret must stay inside the composer well at any size.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn caret_fits_in_composer(&self) -> bool {
@@ -232,16 +508,21 @@ impl Frame {
     pub fn hero(&self) -> Option<Hero> {
         let available = self.body_bottom - self.body_top;
         let wordmark_height = f64::from(HERO_WORDMARK_SIZE * HERO_LINE_HEIGHT);
-        let tagline_height = f64::from(HERO_TAGLINE_SIZE * HERO_LINE_HEIGHT);
-        let chrome = wordmark_height + tagline_height + HERO_GAP * 2.0;
-        let side = (available - chrome).min(self.column()).min(DONUT_MAX_SIDE);
-        if side < DONUT_MIN_SIDE {
-            return None;
-        }
+        // Fixed side: the hero either fits at its one true size or is not
+        // drawn. Fitting it by scaling made the donut jump whenever the frame
+        // changed height, e.g. when the top chrome row appeared.
+        let side = DONUT_SIDE;
         // Space the text against the inked disc, not the square, then centre
         // the whole stack in the region like the website's flexbox.
-        let bleed = side * (1.0 - DONUT_INK_FRACTION) / 2.0;
-        let total = side - bleed * 2.0 + chrome;
+        let bleed = donut_bleed(side);
+        // Fit is judged on the inked stack, not the raw square: the square's
+        // top and bottom `bleed` bands are empty, so demanding room for them
+        // would drop the hero on ordinary laptop windows for the sake of
+        // whitespace.
+        let total = hero_stack_height();
+        if total > available + HERO_FIT_SLACK || self.column() < side {
+            return None;
+        }
         let top = self.body_top + (available - total) / 2.0;
         let centre_x = (self.left + self.right) / 2.0;
         let donut_top = top + wordmark_height + HERO_GAP - bleed;
@@ -255,6 +536,229 @@ impl Frame {
             ),
             tagline_top: donut_top + side - bleed + HERO_GAP,
         })
+    }
+
+    /// The settings gear's box: the trailing end of the page's top margin.
+    ///
+    /// The margin is the one band that is empty at every window size and in
+    /// every state (hero, transcript, strip), so the gear costs no reading
+    /// space and never moves as the conversation grows. It is centred in the
+    /// margin rather than pinned to the window edge, so it keeps the same
+    /// optical relationship to the text column as everything else on the page.
+    pub fn gear(&self) -> vello::kurbo::Rect {
+        let centre_y = self.body_top / 2.0;
+        let x1 = self.right;
+        let y0 = (centre_y - GEAR_SIZE / 2.0).max(0.0);
+        vello::kurbo::Rect::new(x1 - GEAR_SIZE, y0, x1, y0 + GEAR_SIZE)
+    }
+
+    /// The sessions button at the leading edge of the page's top margin.
+    ///
+    /// Sessions are navigation, so they occupy the familiar top-left position;
+    /// settings stays at the opposite edge as a secondary control.
+    pub fn sessions(&self) -> vello::kurbo::Rect {
+        let gear = self.gear();
+        vello::kurbo::Rect::new(
+            self.left,
+            gear.y0,
+            self.left + SESSIONS_SIZE,
+            gear.y0 + SESSIONS_SIZE,
+        )
+    }
+
+    pub fn hits_sessions(&self, x: f64, y: f64) -> bool {
+        self.sessions().contains(vello::kurbo::Point::new(x, y))
+    }
+
+    /// Whether a logical point is on the gear. The whole box, not the drawn
+    /// silhouette: an 18-pixel mark with tooth-accurate hit testing is a mark
+    /// you have to aim at.
+    pub fn hits_gear(&self, x: f64, y: f64) -> bool {
+        self.gear().contains(vello::kurbo::Point::new(x, y))
+    }
+
+    /// The settings panel's box, for `rows` rows. Hangs under the gear,
+    /// aligned to the column's trailing edge so it opens along the same line
+    /// the gear sits on, and is clamped into the window so a short page shows
+    /// the whole panel rather than half of it.
+    pub fn panel(&self, rows: usize) -> vello::kurbo::Rect {
+        let height = rows as f64 * PANEL_ROW_HEIGHT + PANEL_PAD * 2.0;
+        let gear = self.gear();
+        let x1 = gear.x1;
+        let x0 = (x1 - PANEL_WIDTH).max(0.0);
+        let top = (gear.y1 + PANEL_GAP).min((self.height - height).max(0.0));
+        vello::kurbo::Rect::new(x0, top, x1, top + height)
+    }
+
+    /// Which panel row a logical point is on, or `None` when it is off the
+    /// panel entirely. One definition shared by the renderer's highlight and
+    /// the click handler, so the row that lights up is the row that fires.
+    pub fn panel_row_at(&self, rows: usize, x: f64, y: f64) -> Option<usize> {
+        let panel = self.panel(rows);
+        if !panel.contains(vello::kurbo::Point::new(x, y)) {
+            return None;
+        }
+        let offset = y - panel.y0 - PANEL_PAD;
+        if offset < 0.0 {
+            return None;
+        }
+        let index = (offset / PANEL_ROW_HEIGHT) as usize;
+        (index < rows).then_some(index)
+    }
+
+    /// The box of one panel row, for drawing its highlight.
+    pub fn panel_row(&self, rows: usize, index: usize) -> vello::kurbo::Rect {
+        let panel = self.panel(rows);
+        let top = panel.y0 + PANEL_PAD + index as f64 * PANEL_ROW_HEIGHT;
+        vello::kurbo::Rect::new(panel.x0, top, panel.x1, top + PANEL_ROW_HEIGHT)
+    }
+
+    /// The resume overlay's card: the whole floating surface, inset from the
+    /// window on all four sides so the conversation stays visible around it.
+    ///
+    /// An overlay rather than a page: the point of the picker is to choose the
+    /// next session *while still seeing the one you are in*, which is what a
+    /// full-screen list takes away.
+    pub fn resume_card(&self) -> vello::kurbo::Rect {
+        self.resume_card_for(usize::MAX)
+    }
+
+    /// The card sized for a list of `rows`.
+    ///
+    /// A card taller than its content is furniture: it hides page for nothing
+    /// and makes a five-session store look like a failed load of a big one. So
+    /// the height is the shorter of the cap and what the rows actually need,
+    /// and the preview's own minimum keeps a long conversation readable even
+    /// beside a list of two.
+    pub fn resume_card_for(&self, rows: usize) -> vello::kurbo::Rect {
+        let inset = (self.width.min(self.height) * RESUME_INSET_FRACTION)
+            .clamp(RESUME_INSET_MIN, RESUME_INSET_MAX);
+        let available = (self.height - inset * 2.0).max(1.0);
+        let capped = (self.height * RESUME_CARD_HEIGHT_FRACTION)
+            .clamp(RESUME_CARD_HEIGHT_MIN.min(available), available);
+        // What the rows need: the search field, its gap, the rows themselves,
+        // and the padding around the lot.
+        let wanted =
+            RESUME_PAD * 2.5 + RESUME_SEARCH_HEIGHT + (rows as f64).min(200.0) * RESUME_ROW_HEIGHT;
+        let height = wanted
+            .max(RESUME_CARD_HEIGHT_MIN.min(available))
+            .min(capped);
+        // Centred in what is left, so the page shows above and below rather
+        // than only under the card: an overlay hanging from the top edge reads
+        // as a drawer, and a drawer is a different promise than a sheet.
+        let top = inset + (available - height) / 2.0;
+        vello::kurbo::Rect::new(
+            inset,
+            top,
+            (self.width - inset).max(inset + 1.0),
+            top + height,
+        )
+    }
+
+    /// The left panel: the search field and the list of projects and sessions.
+    pub fn resume_panel(&self) -> vello::kurbo::Rect {
+        self.resume_panel_for(usize::MAX)
+    }
+
+    /// The left panel of a card sized for `rows`.
+    pub fn resume_panel_for(&self, rows: usize) -> vello::kurbo::Rect {
+        let card = self.resume_card_for(rows);
+        let width = (card.width() * RESUME_PANEL_FRACTION)
+            .clamp(RESUME_PANEL_MIN, RESUME_PANEL_MAX)
+            // A narrow window has no room for two columns, so the panel takes
+            // the card and the preview is dropped rather than squeezed into a
+            // strip too thin to read.
+            .min(card.width());
+        vello::kurbo::Rect::new(card.x0, card.y0, card.x0 + width, card.y1)
+    }
+
+    /// The search field at the top of the panel.
+    pub fn resume_search(&self) -> vello::kurbo::Rect {
+        self.resume_search_for(usize::MAX)
+    }
+
+    /// The search field of a card sized for `rows`.
+    pub fn resume_search_for(&self, rows: usize) -> vello::kurbo::Rect {
+        let panel = self.resume_panel_for(rows);
+        vello::kurbo::Rect::new(
+            panel.x0 + RESUME_PAD,
+            panel.y0 + RESUME_PAD,
+            panel.x1 - RESUME_PAD,
+            panel.y0 + RESUME_PAD + RESUME_SEARCH_HEIGHT,
+        )
+    }
+
+    /// The list region under the search field.
+    pub fn resume_list(&self) -> vello::kurbo::Rect {
+        self.resume_list_for(usize::MAX)
+    }
+
+    /// The list region of a card sized for `rows`.
+    pub fn resume_list_for(&self, rows: usize) -> vello::kurbo::Rect {
+        let panel = self.resume_panel_for(rows);
+        let search = self.resume_search_for(rows);
+        vello::kurbo::Rect::new(
+            panel.x0 + RESUME_PAD,
+            search.y1 + RESUME_PAD / 2.0,
+            panel.x1 - RESUME_PAD,
+            (panel.y1 - RESUME_PAD).max(search.y1 + RESUME_ROW_HEIGHT),
+        )
+    }
+
+    /// How many rows the list can show at once. At least one, so a tiny window
+    /// still shows the row the highlight is on.
+    pub fn resume_visible_rows(&self) -> usize {
+        self.resume_visible_rows_for(usize::MAX)
+    }
+
+    /// How many rows a card sized for `rows` can show.
+    pub fn resume_visible_rows_for(&self, rows: usize) -> usize {
+        let list = self.resume_list_for(rows);
+        ((list.height() / RESUME_ROW_HEIGHT) as usize).max(1)
+    }
+
+    /// The band of the `index`th *visible* row, for its highlight and text.
+    pub fn resume_row(&self, index: usize) -> vello::kurbo::Rect {
+        self.resume_row_for(usize::MAX, index)
+    }
+
+    /// The band of one visible row of a card sized for `rows`.
+    pub fn resume_row_for(&self, rows: usize, index: usize) -> vello::kurbo::Rect {
+        let list = self.resume_list_for(rows);
+        let top = list.y0 + index as f64 * RESUME_ROW_HEIGHT;
+        vello::kurbo::Rect::new(list.x0, top, list.x1, top + RESUME_ROW_HEIGHT)
+    }
+
+    /// Which visible row a logical point is on, or `None` off the list.
+    ///
+    /// One definition shared by the highlight and by click handling, for the
+    /// same reason [`Self::panel_row_at`] is: a row that lights up under the
+    /// cursor and a different row firing on click is the worst kind of bug.
+    pub fn resume_row_at(&self, rows: usize, x: f64, y: f64) -> Option<usize> {
+        let list = self.resume_list_for(rows);
+        if !list.contains(vello::kurbo::Point::new(x, y)) {
+            return None;
+        }
+        let index = ((y - list.y0) / RESUME_ROW_HEIGHT) as usize;
+        (index < self.resume_visible_rows_for(rows)).then_some(index)
+    }
+
+    /// The preview column, to the right of the panel, or `None` when the
+    /// window is too narrow to hold both.
+    pub fn resume_preview(&self) -> Option<vello::kurbo::Rect> {
+        self.resume_preview_for(usize::MAX)
+    }
+
+    /// The preview column of a card sized for `rows`.
+    pub fn resume_preview_for(&self, rows: usize) -> Option<vello::kurbo::Rect> {
+        let card = self.resume_card_for(rows);
+        let panel = self.resume_panel_for(rows);
+        let x0 = panel.x1 + RESUME_PAD;
+        let x1 = card.x1 - RESUME_PAD;
+        // Below the measure floor the preview is a column of one word per
+        // line, which tells the user nothing; the panel gets the whole card.
+        (x1 - x0 >= RESUME_PANEL_MIN * 0.6)
+            .then(|| vello::kurbo::Rect::new(x0, card.y0 + RESUME_PAD, x1, card.y1 - RESUME_PAD))
     }
 
     /// Whether a logical point is inside the donut, used for drag hit-testing.
@@ -300,6 +804,57 @@ mod tests {
                 for lines in [1usize, 2, 4, COMPOSER_MAX_LINES, COMPOSER_MAX_LINES + 20] {
                     check(Frame::with_composer_lines(size, scale, lines));
                 }
+            }
+        }
+    }
+
+    /// The same sweep, with the session strip shown.
+    fn sweep_with_strip(mut check: impl FnMut(Frame)) {
+        for &size in SIZES {
+            for &scale in SCALES {
+                for lines in [1usize, 2, 4, COMPOSER_MAX_LINES] {
+                    check(Frame::with_strip(size, scale, lines, true));
+                }
+            }
+        }
+    }
+
+    /// R1: the strip owns a band of its own at the top and can never collide
+    /// with the transcript or the composer, at any window size or DPI.
+    #[test]
+    fn strip_band_never_overlaps_body_or_composer() {
+        sweep_with_strip(|frame| {
+            let (top, bottom) = frame.strip().expect("strip was requested but absent");
+            assert!(top >= 0.0, "strip started off-paper at {top}");
+            assert!(bottom > top, "strip band inverted");
+            assert!(
+                bottom <= frame.body_top + 1e-9,
+                "strip ({bottom}) ran into the transcript ({})",
+                frame.body_top
+            );
+            assert!(
+                bottom < frame.composer_top,
+                "strip ran into the composer at {}x{}",
+                frame.width,
+                frame.height
+            );
+        });
+    }
+
+    /// R2: with nothing worth showing, the strip must not merely be invisible
+    /// but absent, leaving the rest of the frame bit-for-bit as it was.
+    #[test]
+    fn strip_is_absent_when_not_requested() {
+        for &size in SIZES {
+            for &scale in SCALES {
+                let without = Frame::with_strip(size, scale, 1, false);
+                let before = Frame::new(size, scale);
+                assert_eq!(without.strip(), None);
+                assert_eq!(
+                    without.body_top, before.body_top,
+                    "a hidden strip still stole space"
+                );
+                assert_eq!(without.body_bottom, before.body_bottom);
             }
         }
     }
@@ -382,8 +937,12 @@ mod tests {
 
     #[test]
     fn the_composer_grows_with_its_line_count() {
-        let one = Frame::with_composer_lines((1100, 720), 1.0, 1);
-        let three = Frame::with_composer_lines((1100, 720), 1.0, 3);
+        // A window too short for the hero keeps the original centred layout:
+        // the well grows symmetrically about the page's middle line.
+        let size = (1100, 480);
+        let one = Frame::with_composer_lines(size, 1.0, 1);
+        assert!(one.hero().is_none(), "this size must not hold a hero");
+        let three = Frame::with_composer_lines(size, 1.0, 3);
         assert!(
             three.composer_top < one.composer_top,
             "the composer did not grow for more lines"
@@ -401,6 +960,20 @@ mod tests {
         assert!(
             three.body_bottom < one.body_bottom,
             "the transcript did not yield space to the composer"
+        );
+
+        // On a hero page the well's top is seated under the stack, so growth
+        // goes downward: the hero must not be squeezed by a longer input.
+        let one = Frame::with_composer_lines((1100, 720), 1.0, 1);
+        assert!(one.hero().is_some(), "the default window must hold a hero");
+        let three = Frame::with_composer_lines((1100, 720), 1.0, 3);
+        assert_eq!(
+            one.composer_top, three.composer_top,
+            "a longer input moved the hero page's composer top"
+        );
+        assert!(
+            three.composer_bottom > one.composer_bottom,
+            "the composer did not grow for more lines on the hero page"
         );
     }
 
@@ -421,12 +994,78 @@ mod tests {
                     let clamped_low =
                         frame.body_bottom - frame.body_top <= frame.body_line_height() + 0.001;
                     let clamped_high = frame.footnote_bottom >= frame.height - 40.0 - 0.001;
+                    // An empty session seats the well under the hero stack when
+                    // the stack does not fit above the centre line; that only
+                    // ever moves the well *down*, like a transcript would.
+                    let hero_seated = frame.hero().is_some() && center > page;
                     assert!(
-                        (center - page).abs() < 0.001 || clamped_low || clamped_high,
+                        (center - page).abs() < 0.001 || clamped_low || clamped_high || hero_seated,
                         "composer centre {center} left the page middle {page} unclamped at {}x{}",
                         frame.width,
                         frame.height
                     );
+                }
+            }
+        }
+    }
+
+    /// The composer follows the conversation down the page: with an empty
+    /// transcript it is centred, and as content accumulates it sits just under
+    /// the last message rather than leaving a hole above itself.
+    #[test]
+    fn the_composer_follows_a_growing_transcript_down_the_page() {
+        let size = (1400u32, 1000u32);
+        let empty = Frame::with_content(size, 1.0, 1, false, 0.0);
+        let mut last = empty.composer_top;
+        for content in [0.0f64, 100.0, 300.0, 500.0, 900.0] {
+            let frame = Frame::with_content(size, 1.0, 1, false, content);
+            assert!(
+                frame.composer_top >= last - 0.001,
+                "composer moved back up as the transcript grew: \
+                 {content} gave {} after {last}",
+                frame.composer_top
+            );
+            last = frame.composer_top;
+        }
+        assert!(
+            last > empty.composer_top,
+            "a tall transcript never pushed the composer below centre"
+        );
+    }
+
+    /// A short transcript must not move the well at all: the centred hero
+    /// layout is the resting state, and only content that would collide with
+    /// the well is allowed to displace it.
+    #[test]
+    fn a_short_transcript_leaves_the_composer_centred() {
+        let size = (1400u32, 1000u32);
+        let empty = Frame::with_content(size, 1.0, 1, false, 0.0);
+        let short = Frame::with_content(size, 1.0, 1, false, 40.0);
+        assert_eq!(empty.composer_top, short.composer_top);
+    }
+
+    /// However tall the conversation, the composer stops at its floor and the
+    /// frame keeps every ordering invariant.
+    #[test]
+    fn a_huge_transcript_never_pushes_the_composer_off_the_page() {
+        for &size in SIZES {
+            for &scale in SCALES {
+                for strip in [false, true] {
+                    for lines in [1usize, 4, COMPOSER_MAX_LINES] {
+                        let frame = Frame::with_content(size, scale, lines, strip, 100_000.0);
+                        assert!(frame.body_top <= frame.body_bottom);
+                        assert!(frame.body_bottom <= frame.composer_top + 0.001);
+                        assert!(frame.composer_bottom <= frame.footnote_top + 0.001);
+                        assert!(
+                            frame.footnote_bottom <= frame.height + 0.001,
+                            "a tall transcript pushed the caption row off-paper at {}x{}",
+                            frame.width,
+                            frame.height
+                        );
+                        if let Some((_, bottom)) = frame.strip() {
+                            assert!(bottom <= frame.body_top + 1e-9);
+                        }
+                    }
                 }
             }
         }
@@ -437,9 +1076,17 @@ mod tests {
         for &size in &[(1100u32, 720u32), (1440, 900), (1920, 1080), (2560, 1440)] {
             let frame = Frame::with_composer_lines(size, 1.0, 1);
             let center = (frame.composer_top + frame.composer_bottom) / 2.0;
+            let centred = (center - frame.height / 2.0).abs() < 0.001;
+            // A roomy page is also a hero page: when the stack does not fit
+            // above the centre line, the well is seated exactly under the
+            // reserved stack instead. Anything else is drift.
+            let seated = (frame.composer_top
+                - (frame.body_top + hero_reservation() + SPACE_BEFORE_COMPOSER))
+                .abs()
+                < 0.001;
             assert!(
-                (center - frame.height / 2.0).abs() < 0.001,
-                "composer was not centred at {}x{}: {center}",
+                centred || seated,
+                "composer neither centred nor seated under the hero at {}x{}: {center}",
                 frame.width,
                 frame.height
             );
@@ -542,10 +1189,12 @@ mod tests {
         }
     }
 
+    /// The transcript region must always have room for at least one line of
+    /// body copy, or a reply has nowhere to go at any window size.
     #[test]
     fn transcript_always_shows_at_least_one_line() {
         sweep(|frame| {
-            assert!(frame.visible_body_lines() >= 1);
+            assert!(frame.body_bottom - frame.body_top >= frame.body_line_height());
         });
     }
 
@@ -594,7 +1243,10 @@ mod tests {
                 (box_.width() - box_.height()).abs() < 1e-9,
                 "donut must be square"
             );
-            assert!(box_.width() <= DONUT_MAX_SIDE + 1e-9);
+            assert!(
+                (box_.width() - DONUT_SIDE).abs() < 1e-9,
+                "the donut must always be DONUT_SIDE"
+            );
             assert!(box_.width() >= 0.0);
         });
     }
@@ -671,5 +1323,131 @@ mod tests {
                 frame.height
             );
         });
+    }
+    /// The resume overlay must fit the window at every size and scale, and its
+    /// three regions must not overlap. A picker drawn off-page is history the
+    /// user cannot reach, and a list overlapping its own preview is unreadable
+    /// exactly when it is being read.
+    #[test]
+    fn the_resume_overlay_fits_and_does_not_overlap() {
+        sweep(|frame| {
+            for rows in [0usize, 1, 3, 12, 400] {
+                let card = frame.resume_card_for(rows);
+                assert!(card.x0 >= 0.0 && card.y0 >= 0.0, "{card:?} off the page");
+                assert!(
+                    card.x1 <= frame.width + 0.5 && card.y1 <= frame.height + 0.5,
+                    "{card:?} ran past the window {}x{}",
+                    frame.width,
+                    frame.height
+                );
+                assert!(
+                    card.width() > 0.0 && card.height() > 0.0,
+                    "{card:?} degenerate"
+                );
+
+                let panel = frame.resume_panel_for(rows);
+                let list = frame.resume_list_for(rows);
+                let search = frame.resume_search_for(rows);
+                for region in [panel, list, search] {
+                    assert!(
+                        region.x0 >= card.x0 - 0.5
+                            && region.x1 <= card.x1 + 0.5
+                            && region.y0 >= card.y0 - 0.5
+                            && region.y1 <= card.y1 + 0.5,
+                        "{region:?} escaped the card {card:?}"
+                    );
+                }
+                assert!(list.y0 >= search.y1 - 0.5, "the list overlapped the search");
+                if let Some(preview) = frame.resume_preview_for(rows) {
+                    assert!(
+                        preview.x0 >= panel.x1 - 0.5,
+                        "the preview overlapped the list panel"
+                    );
+                    assert!(preview.x1 <= card.x1 + 0.5, "the preview left the card");
+                    assert!(preview.width() > 0.0 && preview.height() > 0.0);
+                }
+            }
+        });
+    }
+
+    /// The overlay must never fill the window: the conversation showing around
+    /// it is the whole reason it is an overlay and not a page.
+    #[test]
+    fn the_resume_overlay_always_leaves_page_around_it() {
+        sweep(|frame| {
+            let card = frame.resume_card_for(400);
+            assert!(card.x0 >= RESUME_INSET_MIN - 0.5, "no left margin");
+            assert!(
+                frame.width - card.x1 >= RESUME_INSET_MIN - 0.5,
+                "no right margin"
+            );
+            assert!(
+                card.y0 > 0.0 && card.y1 < frame.height,
+                "no vertical margin"
+            );
+        });
+    }
+
+    /// A short list gets a short card: a card of empty paper below three
+    /// sessions hides page for nothing.
+    #[test]
+    fn the_resume_card_shrinks_to_its_rows() {
+        sweep(|frame| {
+            let small = frame.resume_card_for(2).height();
+            let large = frame.resume_card_for(400).height();
+            assert!(
+                small <= large + 0.5,
+                "a two-row card ({small:.1}) was taller than a full one ({large:.1})"
+            );
+        });
+    }
+
+    /// A row that lights up must be the row that fires: hit testing has to
+    /// round-trip against the bands the renderer draws.
+    #[test]
+    fn resume_row_hit_testing_round_trips() {
+        sweep(|frame| {
+            let rows = 400;
+            for slot in 0..frame.resume_visible_rows_for(rows) {
+                let band = frame.resume_row_for(rows, slot);
+                let x = (band.x0 + band.x1) / 2.0;
+                let y = (band.y0 + band.y1) / 2.0;
+                assert_eq!(
+                    frame.resume_row_at(rows, x, y),
+                    Some(slot),
+                    "row {slot} did not hit itself"
+                );
+            }
+            // Above the list and below it belong to nobody.
+            let list = frame.resume_list_for(rows);
+            assert_eq!(
+                frame.resume_row_at(rows, list.x0 + 1.0, list.y0 - 2.0),
+                None
+            );
+            assert_eq!(
+                frame.resume_row_at(rows, list.x0 - 2.0, list.y0 + 1.0),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn model_menu_rows_round_trip_and_are_centered_in_the_transcript() {
+        let frame = Frame::new((1100, 720), 1.0);
+        let rows = 4;
+        let menu = frame.model_menu(rows);
+        assert!((menu.center().x - (frame.left + frame.right) / 2.0).abs() < 0.01);
+        assert!((menu.center().y - (frame.body_top + frame.body_bottom) / 2.0).abs() < 0.01);
+        for index in 0..rows {
+            let row = frame.model_menu_row(rows, index);
+            assert_eq!(
+                frame.model_menu_row_at(
+                    rows,
+                    row.x0 + row.width() / 2.0,
+                    row.y0 + row.height() / 2.0,
+                ),
+                Some(index)
+            );
+        }
     }
 }

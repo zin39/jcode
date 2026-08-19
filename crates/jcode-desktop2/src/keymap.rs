@@ -1,10 +1,21 @@
 //! Keymap: winit key events to editor actions.
 //!
-//! The chords mirror the jcode TUI (see `jcode-tui/src/tui/app/input.rs`) so
-//! muscle memory transfers. Resolution is a pure function of key + modifiers,
-//! which lets [`PORTED`] act as a machine-checkable parity table: every chord
-//! documented as ported is asserted to actually resolve to its action, so the
-//! table cannot drift from the behavior.
+//! desktop2 is a GUI app, so the primary contract is the **web/browser text
+//! field**: Ctrl+A selects all, Ctrl+C copies, Ctrl+Z / Ctrl+Shift+Z undo and
+//! redo, Shift+arrows extend the selection, Ctrl+Tab and Ctrl+PageUp/PageDown
+//! walk the "tabs" (the session strip). Those are the chords a desktop user
+//! already has in their hands, and violating them is a data-loss trap
+//! (Ctrl+A jumping the caret, Ctrl+C killing a turn while text is selected).
+//!
+//! TUI/emacs chords are kept wherever they do not collide, so terminal muscle
+//! memory still mostly works: Ctrl+E, Ctrl+U, Ctrl+W, Alt+B/F. Ctrl+J/K walk
+//! prompts, matching the TUI's prompt navigation. Where
+//! the two disagree the web binding wins and start-of-line stays reachable via
+//! Home.
+//!
+//! Resolution is a pure function of key + modifiers, which lets [`PORTED`] act
+//! as a machine-checkable table: every documented chord is asserted to really
+//! resolve to its action, so the table cannot drift from the behavior.
 //!
 //! Like the TUI, Ctrl / Cmd (Super) / Alt are accepted interchangeably where
 //! the meaning is unambiguous, because which one reaches the app depends on
@@ -18,6 +29,9 @@ pub enum Action {
     /// Insert the event's text at the cursor.
     Insert,
     Submit,
+    /// Open or close the Desktop2 help overlay. F1 is intentionally unmodified
+    /// so the feature is discoverable without knowing a command first.
+    ToggleHelp,
     /// Newline within the input (Shift+Enter), not a submit.
     InsertNewline,
 
@@ -35,6 +49,15 @@ pub enum Action {
     ExtendWordRight,
     ExtendHome,
     ExtendEnd,
+    /// Shift+Up / Shift+Down: grow the selection a line at a time, clamping to
+    /// the buffer edges like a browser textarea.
+    ExtendLineUp,
+    ExtendLineDown,
+    /// Ctrl+Home / Ctrl+End inside a text field: caret to the very start/end.
+    MoveDocStart,
+    MoveDocEnd,
+    ExtendDocStart,
+    ExtendDocEnd,
     SelectAll,
 
     DeleteBack,
@@ -46,7 +69,12 @@ pub enum Action {
     CutLine,
 
     Undo,
+    Redo,
     Copy,
+    /// Ctrl+C: copy when something is selected, otherwise interrupt or quit.
+    /// The web meaning wins whenever it can apply, so Ctrl+C never silently
+    /// kills a turn while the user was trying to copy.
+    CopyOrInterrupt,
     Paste,
 
     HistoryPrev,
@@ -58,12 +86,127 @@ pub enum Action {
     PageDown,
     ScrollTop,
     ScrollBottom,
+    /// Jump to the adjacent user prompt. "Previous" travels toward older
+    /// transcript content and "next" travels back toward the live tail.
+    PromptPrev,
+    PromptNext,
 
     /// Escape: cancel a running turn, else clear the input, else follow the
     /// tail. Never quits: quitting on Escape loses work.
     Cancel,
     /// Ctrl+C / Ctrl+D: interrupt while busy, quit only when idle and empty.
     InterruptOrQuit,
+
+    /// Session strip navigation, mirroring niri's spatial motion: left/right
+    /// walk the sessions in the current working directory, up/down walk the
+    /// directories. Bound to Ctrl+Shift+arrows because plain and Alt arrows
+    /// are already text motion, and typing must always win over chrome.
+    SessionLeft,
+    SessionRight,
+    SessionUp,
+    SessionDown,
+    /// Ctrl+Alt+Shift+Left/Right: resize only the focused session page while
+    /// leaving the application window and UI scale unchanged.
+    PanelShrink,
+    PanelGrow,
+
+    /// Cmd/Ctrl+T or Ctrl+Shift+N: create a fresh session panel and focus it.
+    /// This is spatially a new tab/panel, never a clear of the current page.
+    SessionNew,
+    /// Ctrl+Alt+Space: open the spatial session overview without relying on a
+    /// bare Super event, which Wayland compositors may reserve and never send
+    /// to the focused client.
+    ToggleOverview,
+    /// Overview field navigation, while the overview is held open. Spatial
+    /// rather than list motion: the field is 2D, so these move to whichever
+    /// blob actually lies that way.
+    OverviewLeft,
+    OverviewRight,
+    OverviewUp,
+    OverviewDown,
+    /// Cycle the field in reading order, for Alt+Tab muscle memory.
+    OverviewNext,
+    OverviewPrev,
+    /// Attach to the highlighted session and close the field.
+    OverviewCommit,
+    /// Close the field without switching.
+    OverviewCancel,
+
+    /// Ctrl+R: open or shut the resume-from-disk picker. The TUI spends the
+    /// same chord on session recovery, and this is the desktop's answer to it:
+    /// every stored session, grouped by the project it ran in.
+    ToggleResume,
+    /// Picker navigation, while the resume overlay is up. A list rather than a
+    /// field, so these are line and group motion instead of spatial moves.
+    ResumeUp,
+    ResumeDown,
+    /// Collapse the project the highlight is in, or expand it (and step in).
+    ResumeCollapse,
+    ResumeExpand,
+    /// Jump to the previous or next project heading, for a long list.
+    ResumeGroupUp,
+    ResumeGroupDown,
+    /// Attach to the highlighted stored session and close the overlay.
+    ResumeCommit,
+    /// Close the overlay without switching.
+    ResumeCancel,
+    /// Narrow the list by the typed character, and undo that.
+    ResumeType,
+    ResumeBackspace,
+
+    /// Ctrl+Shift+D: flip the window between light and dark without opening
+    /// anything. The panel is where a setting is *found*; a palette is the one
+    /// setting people change often enough to want it on a key.
+    ToggleTheme,
+
+    /// Ctrl+comma: open or shut the settings panel. The chord every desktop
+    /// app puts preferences on, so it needs no discovering.
+    ToggleSettings,
+
+    /// Ctrl+M: open or shut the model catalog. The caption beside the composer
+    /// advertises this chord so switching models becomes a learned keyboard
+    /// action rather than a pointer-only control.
+    ToggleModelPicker,
+
+    /// Cycle how much of the model's thinking the transcript keeps (`current`
+    /// -> `full` -> `off`). This remains available from the settings panel.
+    CycleReasoningDisplay,
+
+    /// Ctrl+Shift+R: activate changed application code inside the stable native host.
+    /// Deliberately global, so it works even while an overlay owns the keyboard.
+    ManualReload,
+
+    /// Ctrl+plus / Ctrl+minus / Ctrl+0: grow, shrink, or reset the UI zoom.
+    /// The browser's chords, because "the text is too small" is a browser-
+    /// shaped problem and everyone already has the muscle memory.
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+}
+
+impl Action {
+    /// Whether this action can leave a different selection behind.
+    ///
+    /// Auto-copy keys off this rather than off a diff of the editor state,
+    /// because the point is to publish what the user *selected*: republishing
+    /// on unrelated actions would mean an arrow key quietly overwrites the
+    /// primary selection with the same text over and over.
+    pub fn changes_the_selection(self) -> bool {
+        matches!(
+            self,
+            Self::ExtendLeft
+                | Self::ExtendRight
+                | Self::ExtendWordLeft
+                | Self::ExtendWordRight
+                | Self::ExtendHome
+                | Self::ExtendEnd
+                | Self::ExtendLineUp
+                | Self::ExtendLineDown
+                | Self::ExtendDocStart
+                | Self::ExtendDocEnd
+                | Self::SelectAll
+        )
+    }
 }
 
 /// One row of the parity table: the chord, its action, and the TUI binding it
@@ -78,6 +221,11 @@ pub struct Ported {
 /// Chords ported from the TUI. Adding a row without wiring the chord fails
 /// `tests::every_ported_chord_resolves`.
 pub const PORTED: &[Ported] = &[
+    Ported {
+        chord: "f1",
+        action: Action::ToggleHelp,
+        tui: "/help (Desktop2 overlay)",
+    },
     Ported {
         chord: "enter",
         action: Action::Submit,
@@ -121,8 +269,13 @@ pub const PORTED: &[Ported] = &[
     // Emacs motion, from handle_control_key.
     Ported {
         chord: "ctrl+a",
-        action: Action::MoveHome,
-        tui: "Ctrl+A start of line",
+        action: Action::SelectAll,
+        tui: "web: select all (Home keeps start-of-line)",
+    },
+    Ported {
+        chord: "super+a",
+        action: Action::SelectAll,
+        tui: "web: Cmd+A select all",
     },
     Ported {
         chord: "ctrl+e",
@@ -189,8 +342,13 @@ pub const PORTED: &[Ported] = &[
     },
     Ported {
         chord: "ctrl+k",
-        action: Action::KillToEnd,
-        tui: "Ctrl+K kill to end",
+        action: Action::PromptPrev,
+        tui: "previous prompt",
+    },
+    Ported {
+        chord: "ctrl+j",
+        action: Action::PromptNext,
+        tui: "next prompt",
     },
     Ported {
         chord: "ctrl+w",
@@ -254,9 +412,114 @@ pub const PORTED: &[Ported] = &[
         tui: "Alt+V paste",
     },
     Ported {
+        chord: "ctrl+c",
+        action: Action::CopyOrInterrupt,
+        tui: "web: copy when selected, else interrupt",
+    },
+    Ported {
+        chord: "super+c",
+        action: Action::CopyOrInterrupt,
+        tui: "web: Cmd+C copy",
+    },
+    Ported {
         chord: "ctrl+shift+c",
         action: Action::Copy,
         tui: "copy selection",
+    },
+    Ported {
+        chord: "ctrl+shift+a",
+        action: Action::SelectAll,
+        tui: "web: select all (alias)",
+    },
+    Ported {
+        chord: "ctrl+shift+d",
+        action: Action::ToggleTheme,
+        tui: "light/dark theme",
+    },
+    Ported {
+        chord: "ctrl+shift+r",
+        action: Action::ManualReload,
+        tui: "desktop: manually reload the activated build",
+    },
+    Ported {
+        chord: "ctrl+shift+n",
+        action: Action::SessionNew,
+        tui: "new session",
+    },
+    Ported {
+        chord: "ctrl+t",
+        action: Action::SessionNew,
+        tui: "new session panel (browser convention)",
+    },
+    Ported {
+        chord: "super+t",
+        action: Action::SessionNew,
+        tui: "new session panel (macOS convention)",
+    },
+    Ported {
+        chord: "ctrl+r",
+        action: Action::ToggleResume,
+        tui: "Ctrl+R resume a stored session",
+    },
+    Ported {
+        chord: "ctrl+,",
+        action: Action::ToggleSettings,
+        tui: "settings panel",
+    },
+    Ported {
+        chord: "ctrl+shift+z",
+        action: Action::Redo,
+        tui: "web: redo",
+    },
+    Ported {
+        chord: "ctrl+y",
+        action: Action::Redo,
+        tui: "web/Windows: redo",
+    },
+    Ported {
+        chord: "ctrl+delete",
+        action: Action::DeleteWordForward,
+        tui: "web: delete word forward",
+    },
+    Ported {
+        chord: "shift+up",
+        action: Action::ExtendLineUp,
+        tui: "web: extend selection a line up",
+    },
+    Ported {
+        chord: "shift+down",
+        action: Action::ExtendLineDown,
+        tui: "web: extend selection a line down",
+    },
+    Ported {
+        chord: "ctrl+shift+home",
+        action: Action::ExtendDocStart,
+        tui: "web: extend to start of field",
+    },
+    Ported {
+        chord: "ctrl+shift+end",
+        action: Action::ExtendDocEnd,
+        tui: "web: extend to end of field",
+    },
+    Ported {
+        chord: "ctrl+tab",
+        action: Action::SessionRight,
+        tui: "web: next tab",
+    },
+    Ported {
+        chord: "ctrl+shift+tab",
+        action: Action::SessionLeft,
+        tui: "web: previous tab",
+    },
+    Ported {
+        chord: "ctrl+pagedown",
+        action: Action::SessionRight,
+        tui: "web: next tab",
+    },
+    Ported {
+        chord: "ctrl+pageup",
+        action: Action::SessionLeft,
+        tui: "web: previous tab",
     },
     // History.
     Ported {
@@ -292,13 +555,23 @@ pub const PORTED: &[Ported] = &[
     },
     Ported {
         chord: "ctrl+home",
-        action: Action::ScrollTop,
-        tui: "scroll to top",
+        action: Action::MoveDocStart,
+        tui: "web: caret to start of field",
     },
     Ported {
         chord: "ctrl+end",
+        action: Action::MoveDocEnd,
+        tui: "web: caret to end of field",
+    },
+    Ported {
+        chord: "alt+home",
+        action: Action::ScrollTop,
+        tui: "scroll transcript to top",
+    },
+    Ported {
+        chord: "alt+end",
         action: Action::ScrollBottom,
-        tui: "scroll to bottom",
+        tui: "scroll transcript to bottom",
     },
     // Interrupt / cancel.
     Ported {
@@ -307,29 +580,183 @@ pub const PORTED: &[Ported] = &[
         tui: "Esc cancel or clear input",
     },
     Ported {
-        chord: "ctrl+c",
-        action: Action::InterruptOrQuit,
-        tui: "Ctrl+C interrupt or quit",
-    },
-    Ported {
         chord: "ctrl+d",
         action: Action::InterruptOrQuit,
         tui: "Ctrl+D interrupt or quit",
+    },
+    // Session strip, in the spirit of niri's window/workspace motion.
+    Ported {
+        chord: "super+h",
+        action: Action::SessionLeft,
+        tui: "no TUI equivalent: niri focus-column-left",
+    },
+    Ported {
+        chord: "super+l",
+        action: Action::SessionRight,
+        tui: "no TUI equivalent: niri focus-column-right",
+    },
+    Ported {
+        chord: "super+k",
+        action: Action::SessionUp,
+        tui: "no TUI equivalent: niri focus-window-up",
+    },
+    Ported {
+        chord: "super+j",
+        action: Action::SessionDown,
+        tui: "no TUI equivalent: niri focus-window-down",
+    },
+    Ported {
+        chord: "ctrl+alt+left",
+        action: Action::SessionLeft,
+        tui: "no TUI equivalent: desktop-only session strip",
+    },
+    Ported {
+        chord: "ctrl+alt+right",
+        action: Action::SessionRight,
+        tui: "no TUI equivalent: desktop-only session strip",
+    },
+    Ported {
+        chord: "ctrl+alt+up",
+        action: Action::SessionUp,
+        tui: "no TUI equivalent: desktop-only session strip",
+    },
+    Ported {
+        chord: "ctrl+alt+down",
+        action: Action::SessionDown,
+        tui: "no TUI equivalent: desktop-only session strip",
+    },
+    Ported {
+        chord: "ctrl+=",
+        action: Action::ZoomIn,
+        tui: "no TUI equivalent: the terminal owns font size there",
+    },
+    Ported {
+        chord: "ctrl+-",
+        action: Action::ZoomOut,
+        tui: "no TUI equivalent: the terminal owns font size there",
+    },
+    Ported {
+        chord: "ctrl+0",
+        action: Action::ZoomReset,
+        tui: "no TUI equivalent: the terminal owns font size there",
     },
 ];
 
 /// TUI chords deliberately **not** ported, with the reason. Keeps the scope
 /// honest: these depend on surfaces desktop2 does not have yet.
 pub const NOT_PORTED: &[(&str, &str)] = &[
-    ("tab", "no slash-command autocomplete yet"),
+    (
+        "tab",
+        "no slash-command autocomplete yet (Ctrl+Tab switches sessions)",
+    ),
     ("ctrl+t", "no queue mode yet"),
+    ("ctrl+a as start-of-line", "web select-all wins; use Home"),
     ("ctrl+s", "no input stash yet"),
     ("ctrl+p", "no auto-poke yet"),
-    ("ctrl+r", "no session recovery yet"),
     ("ctrl+g", "no diagram overlay yet"),
-    ("ctrl+j / ctrl+[ / ctrl+]", "no prompt-jump anchors yet"),
+    (
+        "ctrl+[ / ctrl+]",
+        "prompt-jump aliases are not bound on desktop",
+    ),
     ("super+5", "onboarding simulator is a TUI dev aid"),
 ];
+
+/// Resolve a key press while the overview is held open.
+///
+/// A separate table rather than more arms in [`resolve`]: the overview owns
+/// the whole keyboard while it is up, so the same arrow that moves the text
+/// cursor in the composer moves across the field here. Keeping the two
+/// resolvers apart is what makes that impossible to get wrong, and lets the
+/// overview's bindings be tested without a window.
+///
+/// `None` means the key does nothing while the field is up. Unbound keys are
+/// swallowed rather than typed: text arriving in a composer you cannot see
+/// would be worse than a dead key.
+pub fn resolve_overview(key: &Key) -> Option<Action> {
+    match key {
+        Key::Named(named) => match named {
+            NamedKey::ArrowLeft => Some(Action::OverviewLeft),
+            NamedKey::ArrowRight => Some(Action::OverviewRight),
+            NamedKey::ArrowUp => Some(Action::OverviewUp),
+            NamedKey::ArrowDown => Some(Action::OverviewDown),
+            NamedKey::Tab => Some(Action::OverviewNext),
+            NamedKey::Enter | NamedKey::Space => Some(Action::OverviewCommit),
+            NamedKey::Escape => Some(Action::OverviewCancel),
+            _ => None,
+        },
+        Key::Character(text) => match text.chars().next()?.to_ascii_lowercase() {
+            // vim motion, because the field is a spatial surface and the
+            // author's hands are already on the home row.
+            'h' => Some(Action::OverviewLeft),
+            'l' => Some(Action::OverviewRight),
+            'k' => Some(Action::OverviewUp),
+            'j' => Some(Action::OverviewDown),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolve a key press while the resume picker is up.
+///
+/// Its own resolver for the same reason the overview has one: the overlay owns
+/// the keyboard while it is open, so the letters that would go into the
+/// composer narrow the list instead. Keeping the two tables apart is what
+/// makes it impossible for a search keystroke to leak into a message.
+///
+/// `None` means the key does nothing here and is swallowed rather than typed.
+pub fn resolve_resume(key: &Key, mods: ModifiersState) -> Option<Action> {
+    let ctrl = mods.control_key();
+    let sup = mods.super_key();
+    let alt = mods.alt_key();
+    let cmd = ctrl || sup;
+    match key {
+        Key::Named(named) => match named {
+            NamedKey::ArrowUp => Some(Action::ResumeUp),
+            NamedKey::ArrowDown => Some(Action::ResumeDown),
+            NamedKey::ArrowLeft => Some(Action::ResumeCollapse),
+            NamedKey::ArrowRight => Some(Action::ResumeExpand),
+            NamedKey::PageUp => Some(Action::ResumeGroupUp),
+            NamedKey::PageDown => Some(Action::ResumeGroupDown),
+            // Tab walks the list rather than the field: the overlay is a
+            // vertical list, so "next" means the row below.
+            NamedKey::Tab if mods.shift_key() => Some(Action::ResumeUp),
+            NamedKey::Tab => Some(Action::ResumeDown),
+            NamedKey::Enter => Some(Action::ResumeCommit),
+            NamedKey::Escape => Some(Action::ResumeCancel),
+            NamedKey::Backspace => Some(Action::ResumeBackspace),
+            NamedKey::Space if !cmd && !alt => Some(Action::ResumeType),
+            _ => None,
+        },
+        Key::Character(text) => {
+            let ch = text.chars().next()?.to_ascii_lowercase();
+            // The chord that opened the overlay also shuts it, and Ctrl+C /
+            // Ctrl+D keep meaning "get me out of here" rather than typing a
+            // letter into the search.
+            if cmd && !alt {
+                return match ch {
+                    'r' => Some(Action::ToggleResume),
+                    'c' | 'd' | 'g' => Some(Action::ResumeCancel),
+                    'j' | 'n' => Some(Action::ResumeDown),
+                    'k' | 'p' => Some(Action::ResumeUp),
+                    _ => None,
+                };
+            }
+            // Everything else is search text: a picker you cannot type into is
+            // a list you have to scroll through a thousand rows of.
+            (!alt).then_some(Action::ResumeType)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a key while the help card owns the keyboard.
+///
+/// Only its two close chords are live. Returning `None` deliberately swallows
+/// everything else so typing cannot edit a composer obscured by a modal card.
+pub fn resolve_help(key: &Key) -> Option<Action> {
+    matches!(key, Key::Named(NamedKey::Escape | NamedKey::F1)).then_some(Action::ToggleHelp)
+}
 
 /// Resolve a key press to an action. `None` means the key is not bound and
 /// should fall through to text insertion.
@@ -339,11 +766,30 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
     let sup = mods.super_key();
     let shift = mods.shift_key();
     // Ctrl and Cmd are interchangeable for editing chords: which one arrives
-    // depends on the platform.
+    // depends on the platform, and a Linux user pressing Ctrl+C expects the
+    // same thing a macOS user pressing Cmd+C does.
     let cmd = ctrl || sup;
 
     match key {
         Key::Named(named) => match named {
+            NamedKey::F1 => Some(Action::ToggleHelp),
+            NamedKey::Space if ctrl && alt => Some(Action::ToggleOverview),
+            // Session-strip motion is checked first: the arrow arms below
+            // would otherwise swallow it, and chrome navigation has to be
+            // reachable from any editor state.
+            NamedKey::ArrowLeft if ctrl && alt && shift => Some(Action::PanelShrink),
+            NamedKey::ArrowRight if ctrl && alt && shift => Some(Action::PanelGrow),
+            NamedKey::ArrowLeft if ctrl && alt => Some(Action::SessionLeft),
+            NamedKey::ArrowRight if ctrl && alt => Some(Action::SessionRight),
+            NamedKey::ArrowUp if ctrl && alt => Some(Action::SessionUp),
+            NamedKey::ArrowDown if ctrl && alt => Some(Action::SessionDown),
+            // Ctrl+Tab / Ctrl+PageUp / Ctrl+PageDown are the browser's tab
+            // chords, and sessions are this app's tabs.
+            NamedKey::Tab if cmd => Some(if shift {
+                Action::SessionLeft
+            } else {
+                Action::SessionRight
+            }),
             NamedKey::Enter => Some(if shift {
                 Action::InsertNewline
             } else {
@@ -358,9 +804,11 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
                 }
             }
             NamedKey::Delete => {
-                // Option+Delete is word-delete-back on macOS keyboards, which
-                // the TUI also honors.
-                if alt || sup {
+                if ctrl {
+                    // Web/Windows: Ctrl+Delete deletes the word *ahead*.
+                    Some(Action::DeleteWordForward)
+                } else if alt || sup {
+                    // Option+Delete is word-delete-back on macOS keyboards.
                     Some(Action::DeleteWordBack)
                 } else {
                     Some(Action::DeleteForward)
@@ -380,38 +828,91 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
                 (false, true, _) => Action::MoveWordRight,
                 (false, false, false) => Action::MoveRight,
             }),
-            NamedKey::ArrowUp => Some(Action::HistoryPrev),
-            NamedKey::ArrowDown => Some(Action::HistoryNext),
-            NamedKey::Home => Some(if shift {
-                Action::ExtendHome
-            } else if cmd {
-                Action::ScrollTop
+            // Shift+Up/Down extends by line, exactly like a textarea. Without
+            // shift the caret walks lines and falls through to history recall
+            // at the edges (handled by the app).
+            NamedKey::ArrowUp => Some(if shift {
+                Action::ExtendLineUp
             } else {
-                Action::MoveHome
+                Action::HistoryPrev
             }),
-            NamedKey::End => Some(if shift {
-                Action::ExtendEnd
-            } else if cmd {
-                Action::ScrollBottom
+            NamedKey::ArrowDown => Some(if shift {
+                Action::ExtendLineDown
             } else {
-                Action::MoveEnd
+                Action::HistoryNext
             }),
-            NamedKey::PageUp => Some(Action::PageUp),
-            NamedKey::PageDown => Some(Action::PageDown),
+            // Home/End behave as they do in a focused text field: line edges,
+            // and with Ctrl the whole field. Transcript scroll-to-edge lives on
+            // the Alt chords, since the field owns the Ctrl ones.
+            NamedKey::Home => Some(match (shift, cmd, alt) {
+                (_, _, true) => Action::ScrollTop,
+                (true, true, _) => Action::ExtendDocStart,
+                (true, false, _) => Action::ExtendHome,
+                (false, true, _) => Action::MoveDocStart,
+                (false, false, _) => Action::MoveHome,
+            }),
+            NamedKey::End => Some(match (shift, cmd, alt) {
+                (_, _, true) => Action::ScrollBottom,
+                (true, true, _) => Action::ExtendDocEnd,
+                (true, false, _) => Action::ExtendEnd,
+                (false, true, _) => Action::MoveDocEnd,
+                (false, false, _) => Action::MoveEnd,
+            }),
+            NamedKey::PageUp => Some(if cmd {
+                Action::SessionLeft
+            } else {
+                Action::PageUp
+            }),
+            NamedKey::PageDown => Some(if cmd {
+                Action::SessionRight
+            } else {
+                Action::PageDown
+            }),
             _ => None,
         },
         Key::Character(text) => {
             let ch = text.chars().next().map(|c| c.to_ascii_lowercase())?;
-            // Shifted J/K with a nav modifier scroll by line, matching the
-            // TUI's ScrollKeys fallback.
+            // Zoom first: the chord is Ctrl plus a punctuation key whose glyph
+            // depends on the layout and on whether Shift is held (`+` vs `=`,
+            // `_` vs `-`), so every spelling is accepted rather than only the
+            // unshifted one. Checked before the shifted and Alt blocks so
+            // Ctrl+Shift+= cannot be swallowed on the way past.
+            if cmd && !alt {
+                match ch {
+                    // Preferences, on the chord the whole desktop uses. Both
+                    // spellings, because a shifted comma is `<` on most
+                    // layouts and the user's finger does not know that.
+                    ',' | '<' => return Some(Action::ToggleSettings),
+                    '+' | '=' => return Some(Action::ZoomIn),
+                    '-' | '_' => return Some(Action::ZoomOut),
+                    '0' => return Some(Action::ZoomReset),
+                    // New-tab muscle memory maps directly to a new spatial
+                    // session panel. Shift remains free for reopen-closed-tab.
+                    't' if !shift => return Some(Action::SessionNew),
+                    _ => {}
+                }
+            }
             if (ctrl || sup || alt) && shift {
                 match ch {
+                    // Ctrl+Shift+Z is redo everywhere on the web.
+                    'z' => return Some(Action::Redo),
+                    // Shifted J/K with a nav modifier scroll by line, matching
+                    // the TUI's ScrollKeys fallback.
                     'k' => return Some(Action::ScrollUp),
                     'j' => return Some(Action::ScrollDown),
                     'c' => return Some(Action::Copy),
-                    // Ctrl+A stays "start of line" (emacs, matching the TUI),
-                    // so select-all takes the shifted chord.
                     'a' => return Some(Action::SelectAll),
+                    // Ctrl+Shift+D: light/dark. Shifted so it cannot collide
+                    // with a plain Ctrl+D, which is interrupt-or-quit.
+                    'd' => return Some(Action::ToggleTheme),
+                    // Ctrl+Shift+R: gracefully adopt the activated desktop
+                    // build. Plain Ctrl+R remains session recovery.
+                    'r' => return Some(Action::ManualReload),
+                    // Ctrl+Shift+N: a new session. Shifted so it cannot be hit
+                    // by a plain Ctrl+N reflex while typing, and matching the
+                    // "new window" chord rather than "new tab": a session is a
+                    // whole place, not a view of this one.
+                    'n' => return Some(Action::SessionNew),
                     _ => {}
                 }
             }
@@ -424,19 +925,52 @@ pub fn resolve(key: &Key, mods: ModifiersState) -> Option<Action> {
                     _ => None,
                 };
             }
+            // Super+HJKL walks the session strip: niri's focus motion,
+            // verbatim, because that is the muscle memory this app lives
+            // inside. Checked before the cmd block so Super+K means "session
+            // up" here while Ctrl+K keeps its emacs kill-to-end.
+            if sup && !ctrl && !alt && !shift {
+                match ch {
+                    'h' => return Some(Action::SessionLeft),
+                    'l' => return Some(Action::SessionRight),
+                    'k' => return Some(Action::SessionUp),
+                    'j' => return Some(Action::SessionDown),
+                    _ => {}
+                }
+            }
+            // Prompt navigation is deliberately Control-only. Cmd+K keeps its
+            // text-field meaning on macOS, while the TUI's Ctrl+J/K muscle
+            // memory walks whole turns instead of shaving a few text rows.
+            if ctrl && !sup && !alt && !shift {
+                match ch {
+                    'k' => return Some(Action::PromptPrev),
+                    'j' => return Some(Action::PromptNext),
+                    _ => {}
+                }
+            }
             if cmd {
                 return match ch {
-                    'a' => Some(Action::MoveHome),
+                    // Web first: select all, copy, cut, paste, undo, redo.
+                    'a' => Some(Action::SelectAll),
+                    'c' => Some(Action::CopyOrInterrupt),
+                    'x' => Some(Action::CutLine),
+                    'v' => Some(Action::Paste),
+                    'z' => Some(Action::Undo),
+                    'y' => Some(Action::Redo),
+                    // Emacs chords that do not collide with the web set.
                     'e' => Some(Action::MoveEnd),
                     'b' => Some(Action::MoveWordLeft),
                     'f' => Some(Action::MoveWordRight),
                     'u' => Some(Action::KillToStart),
                     'k' => Some(Action::KillToEnd),
                     'w' => Some(Action::DeleteWordBack),
-                    'x' => Some(Action::CutLine),
-                    'z' => Some(Action::Undo),
-                    'v' => Some(Action::Paste),
-                    'c' | 'd' => Some(Action::InterruptOrQuit),
+                    // Ctrl+R: the stored-session picker. The TUI's recovery
+                    // chord, on the desktop's overlay: it opens over the
+                    // conversation rather than replacing it, so the session
+                    // you are in stays legible while you pick another.
+                    'r' => Some(Action::ToggleResume),
+                    'm' => Some(Action::ToggleModelPicker),
+                    'd' => Some(Action::InterruptOrQuit),
                     _ => None,
                 };
             }
@@ -472,6 +1006,8 @@ pub fn parse_chord(chord: &str) -> Option<(Key, ModifiersState)> {
                     "end" => Key::Named(NamedKey::End),
                     "pageup" => Key::Named(NamedKey::PageUp),
                     "pagedown" => Key::Named(NamedKey::PageDown),
+                    "tab" => Key::Named(NamedKey::Tab),
+                    "f1" => Key::Named(NamedKey::F1),
                     other if other.chars().count() == 1 => {
                         Key::Character(winit::keyboard::SmolStr::new(other))
                     }
@@ -496,6 +1032,55 @@ mod tests {
     fn unknown_chords_are_rejected_rather_than_guessed() {
         assert!(parse_chord("ctrl+nope").is_none());
         assert!(parse_chord("ctrl").is_none(), "a chord needs a key");
+    }
+
+    #[test]
+    fn resume_picker_supports_ctrl_j_and_k_navigation() {
+        for (chord, action) in [("ctrl+j", Action::ResumeDown), ("ctrl+k", Action::ResumeUp)] {
+            let (key, mods) = parse(chord);
+            assert_eq!(resolve_resume(&key, mods), Some(action), "'{chord}'");
+        }
+    }
+
+    /// R7: chrome navigation must never cost the user their text motion.
+    /// Bare and Alt arrows stay in the editor; only Ctrl+Shift leaves it.
+    #[test]
+    fn bare_arrows_still_edit_text() {
+        for (chord, action) in [
+            ("left", Action::MoveLeft),
+            ("right", Action::MoveRight),
+            ("up", Action::HistoryPrev),
+            ("down", Action::HistoryNext),
+            ("alt+left", Action::MoveWordLeft),
+            ("alt+right", Action::MoveWordRight),
+            ("shift+left", Action::ExtendLeft),
+            ("shift+right", Action::ExtendRight),
+            ("ctrl+left", Action::MoveWordLeft),
+            ("ctrl+right", Action::MoveWordRight),
+            ("ctrl+shift+left", Action::ExtendWordLeft),
+            ("ctrl+shift+right", Action::ExtendWordRight),
+        ] {
+            let (key, mods) = parse(chord);
+            assert_eq!(
+                resolve(&key, mods),
+                Some(action),
+                "'{chord}' was stolen by the session strip"
+            );
+        }
+    }
+
+    /// R7: and the strip chords really do reach the strip.
+    #[test]
+    fn ctrl_alt_arrows_resolve_to_session_actions() {
+        for (chord, action) in [
+            ("ctrl+alt+left", Action::SessionLeft),
+            ("ctrl+alt+right", Action::SessionRight),
+            ("ctrl+alt+up", Action::SessionUp),
+            ("ctrl+alt+down", Action::SessionDown),
+        ] {
+            let (key, mods) = parse(chord);
+            assert_eq!(resolve(&key, mods), Some(action), "'{chord}' did not bind");
+        }
     }
 
     /// The parity table is the contract: every documented chord must really
@@ -542,7 +1127,9 @@ mod tests {
     /// arrives depends on the platform and window manager.
     #[test]
     fn cmd_and_ctrl_are_interchangeable_for_editing() {
-        for ch in ['a', 'e', 'u', 'k', 'w', 'x', 'z', 'v'] {
+        // 'k' is deliberately absent: Super+K is session-up (niri motion)
+        // while Ctrl+K keeps its emacs kill-to-end.
+        for ch in ['a', 'e', 'u', 'w', 'x', 'z', 'v', 'c'] {
             let key = Key::Character(SmolStr::new(ch.to_string()));
             let with_ctrl = resolve(&key, ModifiersState::CONTROL);
             let with_cmd = resolve(&key, ModifiersState::SUPER);
@@ -678,20 +1265,103 @@ mod tests {
         );
     }
 
-    /// Ctrl+A must remain start-of-line (emacs, as in the TUI); select-all is
-    /// the shifted chord. Getting this backwards would break muscle memory.
+    /// Ctrl+A is select-all, as in every browser and GUI text field, and
+    /// start-of-line stays reachable on Home. Reverting this would make the
+    /// most reflexive shortcut on the platform silently do something else.
     #[test]
-    fn ctrl_a_stays_start_of_line_and_select_all_is_shifted() {
+    fn ctrl_a_selects_all_like_the_web() {
         let a = Key::Character(SmolStr::new("a"));
+        for mods in [
+            ModifiersState::CONTROL,
+            ModifiersState::SUPER,
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+        ] {
+            assert_eq!(
+                resolve(&a, mods),
+                Some(Action::SelectAll),
+                "{mods:?}+A is not select-all"
+            );
+        }
         assert_eq!(
-            resolve(&a, ModifiersState::CONTROL),
+            resolve(&Key::Named(NamedKey::Home), ModifiersState::empty()),
             Some(Action::MoveHome),
-            "Ctrl+A stopped being start-of-line"
+            "start-of-line must stay reachable on Home"
+        );
+    }
+
+    /// The web clipboard/undo set must be exactly what a browser does.
+    #[test]
+    fn the_web_clipboard_and_undo_set_matches_a_browser() {
+        for (ch, action) in [
+            ('a', Action::SelectAll),
+            ('c', Action::CopyOrInterrupt),
+            ('x', Action::CutLine),
+            ('v', Action::Paste),
+            ('z', Action::Undo),
+        ] {
+            let key = Key::Character(SmolStr::new(ch.to_string()));
+            for mods in [ModifiersState::CONTROL, ModifiersState::SUPER] {
+                assert_eq!(
+                    resolve(&key, mods),
+                    Some(action),
+                    "{mods:?}+{ch} diverged from the web binding"
+                );
+            }
+        }
+        let z = Key::Character(SmolStr::new("z"));
+        assert_eq!(
+            resolve(&z, ModifiersState::CONTROL | ModifiersState::SHIFT),
+            Some(Action::Redo),
+            "Ctrl+Shift+Z is redo on the web"
         );
         assert_eq!(
-            resolve(&a, ModifiersState::CONTROL | ModifiersState::SHIFT),
-            Some(Action::SelectAll)
+            resolve(&Key::Character(SmolStr::new("y")), ModifiersState::CONTROL),
+            Some(Action::Redo),
+            "Ctrl+Y is redo on Windows/web"
         );
+    }
+
+    /// Ctrl+Tab and Ctrl+PageUp/PageDown are the browser's tab chords, and
+    /// sessions are this app's tabs.
+    #[test]
+    fn browser_tab_chords_walk_the_session_strip() {
+        for (chord, action) in [
+            ("ctrl+tab", Action::SessionRight),
+            ("ctrl+shift+tab", Action::SessionLeft),
+            ("ctrl+pagedown", Action::SessionRight),
+            ("ctrl+pageup", Action::SessionLeft),
+        ] {
+            let (key, mods) = parse(chord);
+            assert_eq!(resolve(&key, mods), Some(action), "'{chord}' did not bind");
+        }
+        // Bare PageUp/PageDown must still scroll the transcript.
+        assert_eq!(
+            resolve(&Key::Named(NamedKey::PageUp), ModifiersState::empty()),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            resolve(&Key::Named(NamedKey::PageDown), ModifiersState::empty()),
+            Some(Action::PageDown)
+        );
+    }
+
+    /// Shift+arrows extend, Ctrl+Home/End move within the field, and only the
+    /// Alt chords reach the transcript, matching a focused browser textarea.
+    #[test]
+    fn field_navigation_matches_a_browser_textarea() {
+        for (chord, action) in [
+            ("shift+up", Action::ExtendLineUp),
+            ("shift+down", Action::ExtendLineDown),
+            ("ctrl+home", Action::MoveDocStart),
+            ("ctrl+end", Action::MoveDocEnd),
+            ("ctrl+shift+home", Action::ExtendDocStart),
+            ("ctrl+shift+end", Action::ExtendDocEnd),
+            ("alt+home", Action::ScrollTop),
+            ("alt+end", Action::ScrollBottom),
+        ] {
+            let (key, mods) = parse(chord);
+            assert_eq!(resolve(&key, mods), Some(action), "'{chord}' did not bind");
+        }
     }
 
     #[test]

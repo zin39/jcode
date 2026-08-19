@@ -375,6 +375,44 @@ fn test_expand_badge_rendered_shortcut_expands_with_alt_lowercase_event() {
 }
 
 #[test]
+fn test_clicking_expand_edit_badge_expands_to_full_diff() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = make_edit_badge_test_app(20);
+    render_and_snap(&app, &mut terminal);
+
+    let buf = terminal.backend().buffer();
+    let area = *buf.area();
+    let mut badge = None;
+    'rows: for row in 0..area.height {
+        let line = (0..area.width)
+            .map(|col| buf[(col, row)].symbol())
+            .collect::<String>();
+        if let Some(byte) = line.find("[E] expand") {
+            badge = Some((line[..byte].chars().count() as u16, row));
+            break 'rows;
+        }
+    }
+    let (column, row) = badge.expect("expand edit badge must be visible");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.handle_mouse_event(MouseEvent {
+            kind,
+            column: column + 1,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+    assert_eq!(
+        app.status_notice(),
+        Some("Expanded edit diffs · Diffs: Inline Full".to_string())
+    );
+}
+
+#[test]
 fn test_expand_badge_shortcut_works_while_diff_pane_focused() {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -563,6 +601,71 @@ fn test_try_open_link_at_opens_clicked_url_and_sets_notice() {
     assert_eq!(
         app.status_notice(),
         Some("Opened link: https://example.com/docs".to_string())
+    );
+}
+
+#[test]
+fn test_repository_markdown_link_opens_in_focused_side_panel() {
+    let _render_lock = scroll_render_test_lock();
+    let repository = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repository.path().join("docs")).unwrap();
+    std::fs::write(
+        repository.path().join("docs/guide.md"),
+        "# Repository guide\n",
+    )
+    .unwrap();
+    let mut app = create_test_app();
+    app.session.working_dir = Some(repository.path().to_string_lossy().into_owned());
+    crate::tui::ui::clear_copy_viewport_snapshot();
+    crate::tui::ui::record_copy_viewport_snapshot(
+        std::sync::Arc::new(vec!["Read the guide".to_string()]),
+        std::sync::Arc::new(vec![0]),
+        std::sync::Arc::new(vec!["Read the [guide](docs/guide.md#setup)".to_string()]),
+        std::sync::Arc::new(vec![crate::tui::ui::WrappedLineMap {
+            raw_line: 0,
+            start_col: 0,
+            end_col: 40,
+        }]),
+        0,
+        1,
+        Rect::new(0, 0, 80, 5),
+        &[0],
+    );
+
+    assert!(app.try_open_link_at(10, 0));
+
+    let page = app
+        .side_panel
+        .focused_page()
+        .expect("focused Markdown page");
+    assert_eq!(page.title, "guide.md");
+    assert_eq!(page.content, "# Repository guide\n");
+    assert_eq!(
+        page.source,
+        crate::side_panel::SidePanelPageSource::LinkedFile
+    );
+    assert!(app.diff_pane_focus);
+    assert!(!app.side_panel_user_hidden);
+    assert_eq!(
+        app.status_notice(),
+        Some("Opened Markdown: guide.md".to_string())
+    );
+}
+
+#[test]
+fn test_repository_markdown_link_cannot_escape_working_directory() {
+    let parent = tempfile::tempdir().unwrap();
+    let repository = parent.path().join("repo");
+    std::fs::create_dir(&repository).unwrap();
+    std::fs::write(parent.path().join("outside.md"), "secret").unwrap();
+    let mut app = create_test_app();
+    app.session.working_dir = Some(repository.to_string_lossy().into_owned());
+
+    assert!(app.try_open_repository_markdown_link("../outside.md"));
+    assert!(app.side_panel.focused_page().is_none());
+    assert_eq!(
+        app.status_notice(),
+        Some("Refused to open a Markdown file outside the repository".to_string())
     );
 }
 

@@ -23,6 +23,57 @@ fn server_start_and_internal_keepalive_parse() {
 }
 
 #[test]
+fn server_promote_parses_default_and_explicit_version() {
+    let current = Args::try_parse_from(["jcode", "server", "promote", "--json"])
+        .expect("server promote should default to current");
+    assert!(matches!(
+        current.command,
+        Some(Command::Server {
+            action: ServerCommand::Promote {
+                version: None,
+                json: true,
+            }
+        })
+    ));
+
+    let explicit = Args::try_parse_from(["jcode", "server", "promote", "abc1234-dirty-deadbeef"])
+        .expect("server promote should accept an installed version label");
+    assert!(matches!(
+        explicit.command,
+        Some(Command::Server {
+            action: ServerCommand::Promote {
+                version: Some(ref version),
+                json: false,
+            }
+        }) if version == "abc1234-dirty-deadbeef"
+    ));
+}
+
+#[test]
+fn telemetry_subcommands_parse() {
+    let status = Args::try_parse_from(["jcode", "telemetry", "status", "--json"])
+        .expect("telemetry status should parse");
+    assert!(matches!(
+        status.command,
+        Some(Command::Telemetry(TelemetryCommand::Status { json: true }))
+    ));
+
+    let enable = Args::try_parse_from(["jcode", "telemetry", "enable"])
+        .expect("telemetry enable should parse");
+    assert!(matches!(
+        enable.command,
+        Some(Command::Telemetry(TelemetryCommand::Enable))
+    ));
+
+    let disable = Args::try_parse_from(["jcode", "telemetry", "disable"])
+        .expect("telemetry disable should parse");
+    assert!(matches!(
+        disable.command,
+        Some(Command::Telemetry(TelemetryCommand::Disable))
+    ));
+}
+
+#[test]
 fn test_provider_choice_aliases_parse() {
     let args = Args::try_parse_from(["jcode", "--provider", "z.ai", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Zai);
@@ -46,6 +97,9 @@ fn test_provider_choice_aliases_parse() {
 
     let args = Args::try_parse_from(["jcode", "--provider", "grok", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Xai);
+
+    let args = Args::try_parse_from(["jcode", "--provider", "grok-build"]).unwrap();
+    assert_eq!(args.provider, ProviderChoice::GrokBuild);
 
     let args = Args::try_parse_from(["jcode", "--provider", "cgc", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Comtegra);
@@ -758,4 +812,45 @@ fn onboarding_repair_brief_commands_are_valid_cli() {
         "--api-key-stdin",
     ])
     .expect("provider add --base-url --model --api-key-stdin must parse");
+}
+
+/// The bridge has two sockets and the global `--socket` already owns one of
+/// them. When the subcommand flag was also `--socket`, clap bound the global
+/// and the bridge listened on, and dialled, the same path: it came up looking
+/// healthy and every SDK client got ECONNREFUSED. Keep the names distinct.
+#[cfg(unix)]
+#[test]
+fn api_bridge_socket_flags_do_not_collide() {
+    let args = Args::try_parse_from([
+        "jcode",
+        "--socket",
+        "/tmp/daemon.sock",
+        "api-bridge",
+        "--api-socket",
+        "/tmp/api.sock",
+    ])
+    .expect("api-bridge should accept both socket flags");
+    assert_eq!(args.socket.as_deref(), Some("/tmp/daemon.sock"));
+    assert!(matches!(
+        args.command,
+        Some(Command::ApiBridge { api_socket: Some(ref path) }) if path == "/tmp/api.sock"
+    ));
+
+    // The bare form must resolve both paths from the environment.
+    let bare = Args::try_parse_from(["jcode", "api-bridge"]).expect("bare api-bridge should parse");
+    assert!(matches!(
+        bare.command,
+        Some(Command::ApiBridge { api_socket: None })
+    ));
+
+    // `--socket` after the subcommand must not be silently accepted as the
+    // API socket, which is the exact confusion this test exists to prevent.
+    let ambiguous = Args::try_parse_from(["jcode", "api-bridge", "--socket", "/tmp/x.sock"]).ok();
+    assert!(
+        matches!(
+            ambiguous.map(|args| (args.socket, args.command)),
+            None | Some((Some(_), Some(Command::ApiBridge { api_socket: None })))
+        ),
+        "`--socket` after api-bridge must bind the daemon socket, never the API socket"
+    );
 }

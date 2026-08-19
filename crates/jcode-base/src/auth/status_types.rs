@@ -3,14 +3,14 @@ pub use jcode_auth_types::{
     AuthValidationMethod,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Cached low-level authentication snapshot for all supported providers.
 ///
 /// This is the probe/cache substrate. New CLI and UI surfaces should prefer
 /// `AuthStatus::assessment_for_provider`, which normalizes these raw fields into
 /// the canonical provider auth contract (`ProviderAuthAssessment`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthStatus {
     /// Jcode subscription router credentials
     pub jcode: AuthState,
@@ -46,6 +46,8 @@ pub struct AuthStatus {
     pub gemini: AuthState,
     /// Cursor provider configured via Cursor Agent plus API key or CLI session
     pub cursor: AuthState,
+    /// Grok Build CLI is installed. Runtime auth is delegated to its cached login.
+    pub grok_build: AuthState,
     /// Google/Gmail OAuth configured
     pub google: AuthState,
     /// Google Gmail has send capability (Full tier)
@@ -53,7 +55,7 @@ pub struct AuthStatus {
 }
 
 /// Auth state for Anthropic which has multiple auth methods
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ProviderAuth {
     /// Overall state (best of available methods)
     pub state: AuthState,
