@@ -165,3 +165,4 @@ include!("comm_control_tests/dag_e2e.rs");
 include!("comm_control_tests/auto_worker_filter.rs");
 include!("comm_control_tests/client_attached_dispatch.rs");
 include!("comm_control_tests/report_audit_wiring.rs");
+include!("comm_control_tests/member_report_delivery.rs");

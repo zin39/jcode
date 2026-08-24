@@ -294,6 +294,30 @@ pub struct SwarmAwaitCompleted {
     pub wake: bool,
 }
 
+/// A swarm member reached a terminal status that its owner/coordinator should
+/// act on (completed, ready-after-running with an owner, failed, stopped, or
+/// crashed mid-work).
+///
+/// Carries the already-rendered notification body (including the member's
+/// completion report when present) so the server's bus monitor can inject it
+/// into the recipient agent's context via the same wake/soft-interrupt path as
+/// background tasks and swarm awaits. Without this, completion reports only
+/// reached attached UI clients as a transient notification card and never
+/// entered the coordinating agent's conversation.
+#[derive(Clone, Debug)]
+pub struct SwarmMemberReportReady {
+    /// Session that should receive the report (owner, else coordinator).
+    pub recipient_session_id: String,
+    /// Session of the member that finished.
+    pub member_session_id: String,
+    /// Friendly name of the member, when known.
+    pub member_name: Option<String>,
+    /// Terminal status the member reached (completed, ready, failed, ...).
+    pub status: String,
+    /// Already-formatted notification body (status intro + report + follow-up).
+    pub notification: String,
+}
+
 /// Result of a `/productivity` report generation run.
 ///
 /// Carries already-rendered outputs (markdown + PNG bytes) so the TUI layer can
@@ -410,6 +434,8 @@ pub enum BusEvent {
     BackgroundTaskStalled(BackgroundTaskStalled),
     /// A backgrounded `swarm await_members` watcher reached a terminal result.
     SwarmAwaitCompleted(SwarmAwaitCompleted),
+    /// A swarm member finished with a report its owner/coordinator should see.
+    SwarmMemberReportReady(SwarmMemberReportReady),
     /// Usage report fetched from providers
     UsageReport(Vec<jcode_usage_types::ProviderUsage>),
     /// Progressive usage report update while providers are still loading

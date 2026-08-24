@@ -1516,10 +1516,26 @@ pub(super) async fn update_member_status_with_report_tldr(
                             channel: None,
                             tldr: report_tldr.clone(),
                         },
-                        message: msg,
+                        message: msg.clone(),
                     },
                 )
                 .await;
+                // The fanout above only reaches attached UI clients as a
+                // transient notification card: the TUI intentionally does not
+                // persist swarm-scoped notification bodies into the session
+                // transcript, so the report text never entered the recipient
+                // agent's context. Publish a bus event so the server's monitor
+                // injects the report via wake/soft-interrupt, the same durable
+                // path used for background-task and await completions.
+                crate::bus::Bus::global().publish(crate::bus::BusEvent::SwarmMemberReportReady(
+                    crate::bus::SwarmMemberReportReady {
+                        recipient_session_id,
+                        member_session_id: session_id.to_string(),
+                        member_name: agent_name.clone(),
+                        status: status.to_string(),
+                        notification: msg,
+                    },
+                ));
             }
         }
     }

@@ -249,6 +249,79 @@ pub(super) async fn dispatch_swarm_await_completion(
     }
 }
 
+/// Deliver a finished swarm member's completion notification (including its
+/// report body) into the owning/coordinating agent's context. The notification
+/// card fanout to attached clients already happened at the publish site; this
+/// handles the agent-context half via wake (idle) or soft interrupt (busy),
+/// with the durable soft-interrupt store as fallback for detached sessions.
+///
+/// Skipped when the recipient has a pending `await_members` watching this
+/// member for the status it just reached: the await's own completion delivery
+/// carries the same report, and injecting both would duplicate it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "swarm member report delivery needs session, interrupt, and swarm status state"
+)]
+pub(super) async fn dispatch_swarm_member_report(
+    event: &crate::bus::SwarmMemberReportReady,
+    sessions: &SessionAgents,
+    soft_interrupt_queues: &SessionInterruptQueues,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    event_history: &Arc<RwLock<VecDeque<SwarmEvent>>>,
+    event_counter: &Arc<AtomicU64>,
+    swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+) {
+    let covered_by_pending_await =
+        super::await_members_state::pending_await_members_for_session(&event.recipient_session_id)
+            .iter()
+            .any(|state| {
+                let watches_member = state.requested_ids.is_empty()
+                    || state.requested_ids.contains(&event.member_session_id);
+                watches_member && state.target_status.contains(&event.status)
+            });
+    if covered_by_pending_await {
+        return;
+    }
+
+    let member_label = event
+        .member_name
+        .clone()
+        .unwrap_or_else(|| event.member_session_id.clone());
+    if !run_live_turn_if_idle(
+        &event.recipient_session_id,
+        &event.notification,
+        Some(format!(
+            "Swarm agent {} just reported {}. Review the report and continue if useful.",
+            member_label, event.status
+        )),
+        sessions,
+        LiveTurnSwarmContext::new(
+            swarm_members,
+            swarms_by_id,
+            event_history,
+            event_counter,
+            swarm_event_tx,
+        ),
+    )
+    .await
+        && !queue_soft_interrupt_for_session(
+            &event.recipient_session_id,
+            event.notification.clone(),
+            false,
+            SoftInterruptSource::System,
+            soft_interrupt_queues,
+            sessions,
+        )
+        .await
+    {
+        crate::logging::warn(&format!(
+            "Failed to deliver swarm member report from {} to session {}",
+            event.member_session_id, event.recipient_session_id
+        ));
+    }
+}
+
 pub(super) async fn dispatch_background_task_progress(
     task: &crate::bus::BackgroundTaskProgressEvent,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
