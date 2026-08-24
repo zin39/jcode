@@ -1822,7 +1822,10 @@ struct CommunicateInput {
     value: Option<String>,
     #[serde(default)]
     message: Option<String>,
-    #[serde(default)]
+    /// `to` is accepted as an alias: models (and humans) reach for the natural
+    /// field name, and without the alias serde silently dropped it, turning an
+    /// intended DM into a subtree broadcast with a success confirmation.
+    #[serde(default, alias = "to")]
     to_session: Option<String>,
     #[serde(default)]
     channel: Option<String>,

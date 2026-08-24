@@ -458,3 +458,27 @@ fn an_output_schema_appends_a_contract_to_the_spawned_workers_prompt() {
         Some("map the seams")
     );
 }
+
+/// `to` must work as an alias for `to_session`. Without it, serde silently
+/// dropped the field and an intended DM became a subtree broadcast while the
+/// sender got a success confirmation (observed live: an 11k-char "DM" logged
+/// as scope=broadcast to_session=none).
+#[test]
+fn communicate_input_accepts_to_as_alias_for_to_session() {
+    let dm: CommunicateInput = serde_json::from_value(serde_json::json!({
+        "action": "message",
+        "message": "hello",
+        "to": "hedgehog",
+    }))
+    .expect("'to' alias should deserialize");
+    assert_eq!(dm.to_session.as_deref(), Some("hedgehog"));
+
+    // Explicit to_session still wins over nothing; both spellings agree.
+    let explicit: CommunicateInput = serde_json::from_value(serde_json::json!({
+        "action": "message",
+        "message": "hello",
+        "to_session": "hedgehog",
+    }))
+    .expect("to_session should deserialize");
+    assert_eq!(explicit.to_session.as_deref(), Some("hedgehog"));
+}
