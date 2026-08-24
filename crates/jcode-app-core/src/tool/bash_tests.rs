@@ -1038,3 +1038,119 @@ async fn indirect_dispatch_paths_cannot_bypass_the_gate() {
     );
     assert!(canary.exists(), "the file must survive a backgrounded call");
 }
+
+/// End-to-end acceptance for the opt-in OS sandbox: with
+/// `tools.sandbox.mode = "workspace-write"`, a command run through the REAL
+/// BashTool can write inside its working directory but not outside it. This
+/// exercises config loading (scoped JCODE_HOME), the build_shell_command_in
+/// wiring, and actual Seatbelt enforcement, not just the profile string.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_workspace_write_confines_real_bash_tool() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp jcode home");
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[tools.sandbox]\nmode = \"workspace-write\"\n",
+    )
+    .expect("write config");
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    // A fixed path outside temp, the workspace, and HOME: several gate tests
+    // in this file mutate HOME concurrently, so deriving this from
+    // dirs::home_dir() is racy. /Users/Shared is present and writable on all
+    // macOS systems.
+    let outside = std::path::PathBuf::from(format!(
+        "/Users/Shared/jcode-sandbox-e2e-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&outside);
+
+    let ctx = ToolContext {
+        session_id: "sandbox-e2e".to_string(),
+        message_id: "m".to_string(),
+        tool_call_id: "c".to_string(),
+        working_dir: Some(workspace.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::Direct,
+    };
+
+    let inside = workspace.path().join("inside.txt");
+    let result = BashTool::new()
+        .execute(
+            serde_json::json!({
+                "command": format!(
+                    "echo in > {} ; echo out > {} ; true",
+                    inside.display(),
+                    outside.display()
+                ),
+            }),
+            ctx,
+        )
+        .await;
+
+    crate::env::remove_var("JCODE_HOME");
+
+    assert!(result.is_ok(), "sandboxed command should run: {result:?}");
+    assert!(
+        inside.exists(),
+        "write inside the working dir must succeed under workspace-write"
+    );
+    let outside_exists = outside.exists();
+    let _ = std::fs::remove_file(&outside);
+    assert!(
+        !outside_exists,
+        "write outside the workspace must be blocked by the OS sandbox"
+    );
+}
+
+/// Without the sandbox configured, the same command writes both files: pins
+/// that confinement comes from configuration, not from some ambient change to
+/// the bash tool.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sandbox_off_leaves_bash_tool_unconfined() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().expect("temp jcode home");
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    // See sandbox_workspace_write_confines_real_bash_tool for why this must
+    // not derive from HOME.
+    let outside = std::path::PathBuf::from(format!(
+        "/Users/Shared/jcode-sandbox-off-e2e-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&outside);
+
+    let ctx = ToolContext {
+        session_id: "sandbox-off-e2e".to_string(),
+        message_id: "m".to_string(),
+        tool_call_id: "c".to_string(),
+        working_dir: Some(workspace.path().to_path_buf()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::Direct,
+    };
+
+    let result = BashTool::new()
+        .execute(
+            serde_json::json!({
+                "command": format!("echo out > {}", outside.display()),
+            }),
+            ctx,
+        )
+        .await;
+
+    crate::env::remove_var("JCODE_HOME");
+
+    assert!(result.is_ok(), "unsandboxed command should run: {result:?}");
+    let outside_exists = outside.exists();
+    let _ = std::fs::remove_file(&outside);
+    assert!(
+        outside_exists,
+        "with sandbox off the same write must succeed (default behavior unchanged)"
+    );
+}

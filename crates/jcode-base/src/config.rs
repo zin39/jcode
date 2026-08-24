@@ -669,6 +669,36 @@ pub struct ToolConfig {
     /// schemas load on demand via the load_tools meta-tool.
     #[serde(default)]
     pub deferred: bool,
+    /// OS-level sandbox for the bash tool (opt-in).
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+/// OS-level confinement for shell commands run by the bash tool.
+///
+/// This is enforcement, not advice: unlike the `jcode-command-risk` gate
+/// (which classifies and asks), the sandbox makes writes outside the allowed
+/// roots fail at the OS level. Currently implemented on macOS via
+/// `sandbox-exec` deny-by-default file-write profiles. On other platforms the
+/// setting is accepted but commands run unconfined, and the enforcement level
+/// is reported so callers never mistake "configured" for "enforced".
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Sandbox mode: "off" (default) or "workspace-write".
+    ///
+    /// "workspace-write": file writes are restricted to the session working
+    /// directory, the system temp/scratch dirs, and `extra_writable_roots`.
+    /// Reads and network are unrestricted (build tools need both).
+    pub mode: String,
+    /// Additional directories the sandboxed command may write to.
+    pub extra_writable_roots: Vec<String>,
+}
+
+impl SandboxConfig {
+    pub fn workspace_write_enabled(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("workspace-write")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

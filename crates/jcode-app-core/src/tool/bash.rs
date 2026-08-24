@@ -528,9 +528,18 @@ impl Drop for ProcessGroupKillGuard {
     }
 }
 
+#[cfg(test)]
 fn build_shell_command(cmd_str: &str) -> TokioCommand {
+    build_shell_command_in(cmd_str, None)
+}
+
+/// Build the shell command, confining it with the configured OS sandbox when
+/// one is enforced on this host. `working_dir` feeds the sandbox's writable
+/// roots; callers still set `current_dir` themselves.
+fn build_shell_command_in(cmd_str: &str, working_dir: Option<&std::path::Path>) -> TokioCommand {
     #[cfg(windows)]
     {
+        let _ = working_dir;
         let mut cmd = TokioCommand::new("cmd.exe");
         // cmd.exe does not use the standard C runtime argument-decoding rules.
         // Passing the command through `arg` makes Rust escape nested quotes for
@@ -548,6 +557,24 @@ fn build_shell_command(cmd_str: &str) -> TokioCommand {
     }
     #[cfg(not(windows))]
     {
+        let sandbox_cfg = &crate::config::config().tools.sandbox;
+        if let Some((program, args)) =
+            crate::sandbox::wrap_command(sandbox_cfg, working_dir, cmd_str)
+        {
+            let mut cmd = TokioCommand::new(program);
+            cmd.args(args);
+            configure_tool_scratch(&mut cmd);
+            return cmd;
+        }
+        if crate::sandbox::enforcement_level(sandbox_cfg)
+            == crate::sandbox::SandboxEnforcement::Unenforced
+        {
+            // Configured but unenforceable here: say so once per call in the
+            // logs instead of silently running unconfined.
+            crate::logging::warn(
+                "tools.sandbox.mode is set but no OS sandbox is available on this platform; command runs UNCONFINED",
+            );
+        }
         let mut cmd = TokioCommand::new("bash");
         cmd.arg("-c").arg(cmd_str);
         configure_tool_scratch(&mut cmd);
@@ -563,13 +590,29 @@ fn configure_background_command_stdio(command: &mut TokioCommand) {
 }
 
 #[cfg(unix)]
-fn build_detached_shell_wrapper(command: &str) -> StdCommand {
-    let mut cmd = StdCommand::new("bash");
-    cmd.arg("-lc")
-        .arg(
-            r#"eval "$JCODE_RELOAD_DETACH_COMMAND"; status=$?; printf '\n--- Command finished with exit code: %s ---\n' "$status"; exit "$status""#,
-        )
-        .env("JCODE_RELOAD_DETACH_COMMAND", command);
+fn build_detached_shell_wrapper(
+    command: &str,
+    working_dir: Option<&std::path::Path>,
+) -> StdCommand {
+    const WRAPPER: &str = r#"eval "$JCODE_RELOAD_DETACH_COMMAND"; status=$?; printf '\n--- Command finished with exit code: %s ---\n' "$status"; exit "$status""#;
+    // Same confinement as the foreground path: when the OS sandbox is
+    // enforced, the whole wrapper (and thus the eval'd command) runs inside it.
+    let sandbox_cfg = &crate::config::config().tools.sandbox;
+    let mut cmd = if crate::sandbox::enforcement_level(sandbox_cfg)
+        == crate::sandbox::SandboxEnforcement::EnforcedSeatbelt
+    {
+        let roots =
+            crate::sandbox::writable_roots(working_dir, &sandbox_cfg.extra_writable_roots);
+        let profile = crate::sandbox::seatbelt_profile(&roots);
+        let mut cmd = StdCommand::new("/usr/bin/sandbox-exec");
+        cmd.args(["-p", &profile, "bash", "-lc", WRAPPER]);
+        cmd
+    } else {
+        let mut cmd = StdCommand::new("bash");
+        cmd.arg("-lc").arg(WRAPPER);
+        cmd
+    };
+    cmd.env("JCODE_RELOAD_DETACH_COMMAND", command);
     if let Some(dir) = tool_scratch_dir() {
         cmd.env("TMPDIR", &dir).env("JCODE_SCRATCH_DIR", dir);
     }
@@ -794,7 +837,7 @@ impl BashTool {
 
         let has_stdin_channel = ctx.stdin_request_tx.is_some();
 
-        let mut command = build_shell_command(&params.command);
+        let mut command = build_shell_command_in(&params.command, ctx.working_dir.as_deref());
         command
             .kill_on_drop(true)
             .stdout(Stdio::piped())
@@ -1011,7 +1054,7 @@ impl BashTool {
         let info = manager.reserve_task_info();
         let display_name = summarize_background_command(params.intent.as_deref(), &params.command);
 
-        let mut cmd = build_detached_shell_wrapper(&params.command);
+        let mut cmd = build_detached_shell_wrapper(&params.command, ctx.working_dir.as_deref());
         let stdout = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1161,7 +1204,7 @@ impl BashTool {
                 notify,
                 wake,
 				move |output_path| async move {
-					let mut cmd = build_shell_command(&command);
+					let mut cmd = build_shell_command_in(&command, working_dir.as_deref());
 					#[cfg(unix)]
 					unsafe {
 						cmd.pre_exec(|| {
