@@ -12,7 +12,7 @@ mod provider;
 mod response_recovery;
 mod status;
 mod streaming;
-mod tools;
+pub(crate) mod tools;
 mod turn_execution;
 mod turn_loops;
 mod turn_streaming_mpsc;

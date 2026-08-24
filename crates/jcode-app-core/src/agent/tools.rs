@@ -137,13 +137,21 @@ fn tail_str(s: &str, max_chars: usize) -> &str {
 /// Write the full tool output to a file under the session's truncated-outputs
 /// directory and return a human-readable path for the truncation marker.
 fn save_truncated_output(session_id: &str, tool_name: &str, full_output: &str) -> String {
+    save_spilled_text(session_id, tool_name, full_output)
+}
+
+/// Write oversized text to the session's truncated-outputs directory and
+/// return the path (or an error placeholder). Shared by the tool-output cap
+/// above and the swarm comm-message cap, so every "too big for context"
+/// payload lands in the same place with the same retrieval story.
+pub(crate) fn save_spilled_text(session_id: &str, label: &str, full_output: &str) -> String {
     let write_result: anyhow::Result<String> = (|| -> anyhow::Result<String> {
         let jcode_dir = crate::storage::jcode_dir()?;
         let dir = jcode_dir.join("sessions").join("truncated_outputs");
         std::fs::create_dir_all(&dir)?;
 
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-        let safe_name = tool_name.replace(['/', '\\', ' '], "_");
+        let safe_name = label.replace(['/', '\\', ' '], "_");
         let filename = format!("{session_id}_{safe_name}_{timestamp}.txt");
         let path = dir.join(&filename);
 

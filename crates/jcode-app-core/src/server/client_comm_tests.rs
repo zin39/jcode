@@ -901,3 +901,224 @@ async fn comm_broadcast_reaches_only_senders_spawned_subtree() {
         Ok(ServerEvent::Notification { .. })
     ));
 }
+
+/// Boundary cap for swarm messages: an oversized DM body must arrive truncated
+/// with a spill pointer instead of entering the recipient's context whole.
+/// Guards the coordinator-context cost leak where multi-10k-char worker DMs
+/// were re-paid on every subsequent turn of a premium coordinator model.
+#[tokio::test]
+async fn comm_message_oversized_dm_is_spilled_to_disk_with_pointer() {
+    let _env_lock = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().expect("temp jcode home");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    let sender = test_agent().await;
+    let target = test_agent().await;
+    let sender_id = sender.lock().await.session_id().to_string();
+    let target_id = target.lock().await.session_id().to_string();
+
+    let sessions = Arc::new(RwLock::new(HashMap::from([
+        (sender_id.clone(), sender.clone()),
+        (target_id.clone(), target.clone()),
+    ])));
+    let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let (sender_event_tx, _sender_event_rx) = mpsc::unbounded_channel();
+    let (target_event_tx, mut target_event_rx) = mpsc::unbounded_channel();
+    let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+    let swarm_id = "swarm-spill".to_string();
+    let member = |session_id: &str, name: &str, event_tx| SwarmMember {
+        session_id: session_id.to_string(),
+        event_tx,
+        event_txs: HashMap::new(),
+        working_dir: None,
+        swarm_id: Some(swarm_id.clone()),
+        swarm_enabled: true,
+        status: "ready".to_string(),
+        detail: None,
+        friendly_name: Some(name.to_string()),
+        report_back_to_session_id: None,
+        latest_completion_report: None,
+        role: "agent".to_string(),
+        joined_at: Instant::now(),
+        last_status_change: Instant::now(),
+        is_headless: false,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime::default(),
+        task_label: None,
+    };
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        (sender_id.clone(), member(&sender_id, "falcon", sender_event_tx)),
+        (target_id.clone(), member(&target_id, "bear", target_event_tx)),
+    ])));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
+        swarm_id.clone(),
+        HashSet::from([sender_id.clone(), target_id.clone()]),
+    )])));
+    let channel_subscriptions = Arc::new(RwLock::new(HashMap::new()));
+    let event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>> =
+        Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let event_counter = Arc::new(AtomicU64::new(0));
+    let (swarm_event_tx, _) = broadcast::channel(16);
+    let client_connections = Arc::new(RwLock::new(HashMap::new()));
+
+    // 30k-char body: three-plus times the inline cap.
+    let big_body = "R".repeat(30_000);
+    handle_comm_message(
+        7,
+        sender_id.clone(),
+        big_body.clone(),
+        Some(target_id.clone()),
+        None,
+        None,
+        None,
+        None,
+        &client_event_tx,
+        &sessions,
+        &soft_interrupt_queues,
+        &swarm_members,
+        &swarms_by_id,
+        &channel_subscriptions,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &client_connections,
+    )
+    .await;
+
+    let delivered = match target_event_rx.recv().await.expect("target notification") {
+        ServerEvent::Notification { message, .. } => message,
+        other => panic!("unexpected event: {:?}", other),
+    };
+
+    let restore_home = || match prev_home.clone() {
+        Some(value) => crate::env::set_var("JCODE_HOME", value),
+        None => crate::env::remove_var("JCODE_HOME"),
+    };
+
+    assert!(
+        delivered.chars().count() < 12_000,
+        "oversized DM must be truncated before delivery, got {} chars",
+        delivered.chars().count()
+    );
+    assert!(
+        delivered.contains("[Swarm message truncated by jcode"),
+        "delivery must explain the truncation: {}",
+        &delivered[delivered.len().saturating_sub(400)..]
+    );
+    let path_start = delivered
+        .find("FULL message saved to ")
+        .expect("delivery must carry a spill pointer")
+        + "FULL message saved to ".len();
+    let path_end = delivered[path_start..]
+        .find(' ')
+        .map(|i| path_start + i)
+        .unwrap_or(delivered.len());
+    let spill_path = &delivered[path_start..path_end];
+    let spilled = std::fs::read_to_string(spill_path).unwrap_or_else(|e| {
+        restore_home();
+        panic!("spilled file must be readable at {spill_path}: {e}")
+    });
+    assert_eq!(
+        spilled, big_body,
+        "spilled file must contain the complete original message"
+    );
+
+    match client_event_rx.recv().await.expect("done event") {
+        ServerEvent::Done { id } => assert_eq!(id, 7),
+        other => {
+            restore_home();
+            panic!("unexpected client event: {:?}", other)
+        }
+    }
+    restore_home();
+}
+
+/// A normal-sized message must pass through byte-identical: the cap only
+/// engages above the inline limit.
+#[tokio::test]
+async fn comm_message_normal_size_is_not_modified() {
+    let sender = test_agent().await;
+    let target = test_agent().await;
+    let sender_id = sender.lock().await.session_id().to_string();
+    let target_id = target.lock().await.session_id().to_string();
+
+    let sessions = Arc::new(RwLock::new(HashMap::from([
+        (sender_id.clone(), sender.clone()),
+        (target_id.clone(), target.clone()),
+    ])));
+    let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let (sender_event_tx, _sender_event_rx) = mpsc::unbounded_channel();
+    let (target_event_tx, mut target_event_rx) = mpsc::unbounded_channel();
+    let (client_event_tx, _client_event_rx) = mpsc::unbounded_channel();
+
+    let swarm_id = "swarm-nospill".to_string();
+    let member = |session_id: &str, name: &str, event_tx| SwarmMember {
+        session_id: session_id.to_string(),
+        event_tx,
+        event_txs: HashMap::new(),
+        working_dir: None,
+        swarm_id: Some(swarm_id.clone()),
+        swarm_enabled: true,
+        status: "ready".to_string(),
+        detail: None,
+        friendly_name: Some(name.to_string()),
+        report_back_to_session_id: None,
+        latest_completion_report: None,
+        role: "agent".to_string(),
+        joined_at: Instant::now(),
+        last_status_change: Instant::now(),
+        is_headless: false,
+        output_tail: None,
+        todo_progress: None,
+        todo_items: Vec::new(),
+        runtime: crate::protocol::SwarmMemberRuntime::default(),
+        task_label: None,
+    };
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        (sender_id.clone(), member(&sender_id, "falcon", sender_event_tx)),
+        (target_id.clone(), member(&target_id, "bear", target_event_tx)),
+    ])));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
+        swarm_id.clone(),
+        HashSet::from([sender_id.clone(), target_id.clone()]),
+    )])));
+    let channel_subscriptions = Arc::new(RwLock::new(HashMap::new()));
+    let event_history: Arc<RwLock<std::collections::VecDeque<SwarmEvent>>> =
+        Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let event_counter = Arc::new(AtomicU64::new(0));
+    let (swarm_event_tx, _) = broadcast::channel(16);
+    let client_connections = Arc::new(RwLock::new(HashMap::new()));
+
+    handle_comm_message(
+        8,
+        sender_id.clone(),
+        "short and intact".to_string(),
+        Some(target_id.clone()),
+        None,
+        None,
+        None,
+        None,
+        &client_event_tx,
+        &sessions,
+        &soft_interrupt_queues,
+        &swarm_members,
+        &swarms_by_id,
+        &channel_subscriptions,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &client_connections,
+    )
+    .await;
+
+    match target_event_rx.recv().await.expect("target notification") {
+        ServerEvent::Notification { message, .. } => {
+            assert_eq!(message, "DM from falcon: short and intact");
+        }
+        other => panic!("unexpected event: {:?}", other),
+    }
+}

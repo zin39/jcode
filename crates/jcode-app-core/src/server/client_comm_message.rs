@@ -222,6 +222,31 @@ pub(super) async fn handle_comm_message(
             "broadcast"
         };
 
+        // Boundary cap: an oversized message body enters every recipient's
+        // model context (often a premium coordinator model) and is then re-sent
+        // on all of that session's future turns. Keep a bounded head inline and
+        // spill the full body to disk with a read pointer, mirroring the
+        // tool-output cap in `agent::tools::cap_tool_output_for_history`.
+        const MAX_INLINE_COMM_MESSAGE_CHARS: usize = 8_000;
+        let message = {
+            let char_count = message.chars().count();
+            if char_count > MAX_INLINE_COMM_MESSAGE_CHARS {
+                let head: String = message.chars().take(MAX_INLINE_COMM_MESSAGE_CHARS).collect();
+                let path = crate::agent::tools::save_spilled_text(
+                    &from_session,
+                    &format!("comm_{scope}"),
+                    &message,
+                );
+                format!(
+                    "{head}\n\n[Swarm message truncated by jcode: {char_count} chars; kept first \
+                     {MAX_INLINE_COMM_MESSAGE_CHARS} inline. FULL message saved to {path} — use \
+                     the read tool for the rest.]"
+                )
+            } else {
+                message
+            }
+        };
+
         let known_member_ids: std::collections::HashSet<String> = {
             let members = swarm_members.read().await;
             members.keys().cloned().collect()
