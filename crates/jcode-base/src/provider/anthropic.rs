@@ -36,7 +36,15 @@ pub fn is_cache_ttl_1h() -> bool {
 }
 
 /// User-Agent for OAuth requests, matching the official Claude Code CLI.
-pub const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.123 (external, sdk-cli)";
+///
+/// Derived from the single `ANTHROPIC_CLAUDE_CODE_VERSION` source of truth so
+/// it cannot drift from the billing header and eval `app_version`. Anthropic
+/// rejects new models outright when this version is too old.
+pub const CLAUDE_CLI_USER_AGENT: &str = concat!(
+    "claude-cli/",
+    jcode_provider_core::anthropic_claude_code_version!(),
+    " (external, sdk-cli)"
+);
 
 pub const OAUTH_BETA_HEADERS: &str = ANTHROPIC_OAUTH_BETA_HEADERS;
 
@@ -72,6 +80,7 @@ pub fn apply_oauth_attribution_headers(
 /// Available models
 pub const AVAILABLE_MODELS: &[&str] = &[
     "claude-opus-5",
+    "claude-fable-5-1",
     "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-6",

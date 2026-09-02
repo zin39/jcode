@@ -1,3 +1,27 @@
+/// Claude Code CLI version jcode advertises on OAuth requests.
+///
+/// Anthropic gates newer models on the client version: requests that advertise
+/// a version older than a model's minimum are rejected with a 400
+/// `claude_code_version_too_old` ("Claude Code X does not support this model;
+/// version Y or newer is required"), which reads like the model does not exist.
+/// `claude-fable-5-1` requires >= 2.1.251, so a stale constant here silently
+/// makes brand new models unusable.
+///
+/// This is the single source of truth. The User-Agent, the OAuth billing
+/// header, and the eval preflight `app_version` all derive from it, so they can
+/// never drift apart. Bump it when Anthropic ships models that outrank it.
+///
+/// Exposed as a macro as well as a const so downstream crates can build their
+/// own `&'static str` headers with `concat!` (needed for `HeaderValue::from_static`).
+#[macro_export]
+macro_rules! anthropic_claude_code_version {
+    () => {
+        "2.1.258"
+    };
+}
+
+pub const ANTHROPIC_CLAUDE_CODE_VERSION: &str = crate::anthropic_claude_code_version!();
+
 /// Claude Code OAuth beta headers used by the Anthropic transport.
 pub const ANTHROPIC_OAUTH_BETA_HEADERS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
 
@@ -417,6 +441,54 @@ pub fn anthropic_stainless_os() -> &'static str {
 mod tests {
     use super::*;
     use crate::ALL_CLAUDE_MODELS;
+
+    /// Anthropic rejects models newer than the advertised Claude Code version
+    /// with a 400 `claude_code_version_too_old`, which surfaces to users as
+    /// "does not support this model". jcode advertised 2.1.123 while
+    /// `claude-fable-5-1` required >= 2.1.251, so the model was unusable.
+    #[test]
+    fn advertised_claude_code_version_is_new_enough_for_current_models() {
+        let parts: Vec<u32> = ANTHROPIC_CLAUDE_CODE_VERSION
+            .split('.')
+            .map(|part| part.parse().expect("numeric version component"))
+            .collect();
+        assert_eq!(parts.len(), 3, "expected semver-shaped version");
+
+        // `claude-fable-5-1` is gated behind 2.1.251.
+        assert!(
+            (parts[0], parts[1], parts[2]) >= (2, 1, 251),
+            "advertised Claude Code version {ANTHROPIC_CLAUDE_CODE_VERSION} is older than the \
+             2.1.251 minimum required by claude-fable-5-1"
+        );
+    }
+
+    /// The macro and the const must stay in lockstep: downstream crates build
+    /// `&'static str` headers from the macro while runtime code reads the const.
+    #[test]
+    fn claude_code_version_macro_matches_const() {
+        assert_eq!(
+            crate::anthropic_claude_code_version!(),
+            ANTHROPIC_CLAUDE_CODE_VERSION
+        );
+    }
+
+    /// `claude-fable-5-1` must be a first-class catalog model: dotted user
+    /// input has to normalize to it, and its capabilities must be classified
+    /// rather than silently falling back to conservative defaults.
+    #[test]
+    fn fable_5_1_is_a_fully_classified_catalog_model() {
+        assert!(ALL_CLAUDE_MODELS.contains(&"claude-fable-5-1"));
+        assert_eq!(
+            anthropic_context_mode("claude-fable-5-1"),
+            AnthropicContextMode::Native1M
+        );
+        assert_eq!(anthropic_max_output_tokens("claude-fable-5-1"), 128_000);
+        // The dotted spelling users naturally type must resolve to it.
+        assert_eq!(
+            crate::models::normalize_copilot_model_name("claude-fable-5.1"),
+            Some("claude-fable-5-1")
+        );
+    }
 
     #[test]
     fn model_suffix_helpers_require_explicit_1m_suffix() {
