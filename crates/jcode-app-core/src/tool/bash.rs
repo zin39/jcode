@@ -788,7 +788,28 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
-        let mut params: BashInput = serde_json::from_value(input)?;
+        // Surface a self-correcting message rather than the raw serde error.
+        // Smaller models sometimes emit `{}` or omit `command`, and
+        // "missing field `command`" does not tell them what to send next, so
+        // they repeat the same empty call. Observed twice in one day from a
+        // local 3B model. Naming the required field and echoing what arrived
+        // turns a dead end into a retry the model can act on.
+        let mut params: BashInput = serde_json::from_value(input.clone()).map_err(|err| {
+            let received = match &input {
+                Value::Object(map) if map.is_empty() => "an empty object `{}`".to_string(),
+                Value::Object(map) => {
+                    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                    keys.sort_unstable();
+                    format!("keys [{}]", keys.join(", "))
+                }
+                other => format!("a non-object value ({})", other),
+            };
+            anyhow::anyhow!(
+                "{err}. The bash tool requires a `command` string, for example \
+                 {{\"command\": \"ls -la\"}}. Received {received}. Re-issue the call with the \
+                 shell command you want to run."
+            )
+        })?;
         let run_in_background = params.run_in_background.unwrap_or(false);
 
         // Destructive-command gate (#604), before background dispatch.
@@ -1404,3 +1425,55 @@ impl BashTool {
 #[cfg(all(test, not(windows)))]
 #[path = "bash_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod malformed_input_tests {
+    use super::*;
+
+    /// A malformed bash call must tell the model how to fix it.
+    ///
+    /// Smaller models sometimes emit `{}` for a tool call. The raw serde error
+    /// "missing field `command`" names the field but not the remedy, so the
+    /// model tends to repeat the same empty call. Observed twice in one day
+    /// from a local 3B model. Assert the message names the field, shows a
+    /// concrete example, and echoes what actually arrived.
+    #[tokio::test]
+    async fn empty_bash_input_returns_a_self_correcting_error() {
+        let tool = BashTool;
+        let ctx = ToolContext {
+            session_id: "test-session".to_string(),
+            message_id: "test-message".to_string(),
+            tool_call_id: "test-call".to_string(),
+            working_dir: None,
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: crate::tool::ToolExecutionMode::Direct,
+        };
+
+        let err = tool
+            .execute(serde_json::json!({}), ctx.clone())
+            .await
+            .expect_err("empty input must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("command"), "must name the field; got: {msg}");
+        assert!(
+            msg.contains("\"command\": \"ls -la\""),
+            "must show a concrete example; got: {msg}"
+        );
+        assert!(
+            msg.contains("empty object"),
+            "must echo what arrived so the model sees its own mistake; got: {msg}"
+        );
+
+        // A populated-but-wrong call should report the keys it did receive.
+        let err = tool
+            .execute(serde_json::json!({"cmd": "ls"}), ctx)
+            .await
+            .expect_err("wrong key must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cmd"),
+            "must echo the keys that were sent; got: {msg}"
+        );
+    }
+}
