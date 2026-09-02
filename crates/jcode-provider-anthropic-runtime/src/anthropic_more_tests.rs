@@ -4,6 +4,87 @@
 
 use super::*;
 
+/// The exact 400 body Anthropic returned when jcode advertised a stale Claude
+/// Code version and the user selected `claude-fable-5-1`. Kept verbatim so the
+/// classifier is tested against the real wire format, not a paraphrase.
+const VERSION_TOO_OLD_BODY: &str = "Anthropic API error (400 Bad Request): {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Claude Code 2.1.123 does not support this model; version 2.1.251 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.\",\"details\":{\"error_code\":\"claude_code_version_too_old\"}},\"request_id\":\"req_011CedzPjGXB4szyvmFjHQnm\"}";
+
+/// A stale advertised client version surfaced to users as "does not support
+/// this model", which reads like the model does not exist. It must be
+/// recognized so jcode can replace Anthropic's misleading `claude update`
+/// advice with the real fix.
+#[test]
+fn version_too_old_400_is_recognized_from_the_real_error_body() {
+    assert!(is_claude_code_version_too_old_error(
+        &VERSION_TOO_OLD_BODY.to_lowercase()
+    ));
+
+    // The machine-readable code alone is enough, so a message reword by
+    // Anthropic cannot silently break detection.
+    assert!(is_claude_code_version_too_old_error(
+        "400 bad request: {\"details\":{\"error_code\":\"claude_code_version_too_old\"}}"
+    ));
+
+    // And the prose alone is enough, for responses that omit the code.
+    assert!(is_claude_code_version_too_old_error(
+        "claude code 2.1.123 does not support this model; version 2.1.251 or newer is required"
+    ));
+}
+
+/// The classifier must not swallow unrelated failures: those take the OAuth
+/// refresh/org-policy paths, and mislabeling them would hide the real cause.
+#[test]
+fn version_too_old_classifier_ignores_unrelated_errors() {
+    for unrelated in [
+        "anthropic api error (401 unauthorized): oauth token has expired",
+        "anthropic api error (403 forbidden): oauth authentication is currently not allowed",
+        "anthropic api error (400 bad request): messages: at least one message is required",
+        "anthropic api error (404 not found): model: claude-nonexistent-9",
+        "failed to send request to anthropic api: connection reset",
+    ] {
+        assert!(
+            !is_claude_code_version_too_old_error(unrelated),
+            "must not classify as version-too-old: {unrelated}"
+        );
+    }
+}
+
+/// A version-too-old rejection is about jcode's own hardcoded version, so the
+/// guidance must not repeat Anthropic's `claude update` advice (which cannot
+/// help) and must name the constant a source build has to bump.
+#[test]
+fn version_too_old_guidance_points_at_the_actual_fix() {
+    assert!(
+        !CLAUDE_CODE_VERSION_TOO_OLD_GUIDANCE.contains("claude update`\n"),
+        "must not present `claude update` as the fix"
+    );
+    assert!(CLAUDE_CODE_VERSION_TOO_OLD_GUIDANCE.contains("will not help"));
+    assert!(CLAUDE_CODE_VERSION_TOO_OLD_GUIDANCE.contains("ANTHROPIC_CLAUDE_CODE_VERSION"));
+    assert!(CLAUDE_CODE_VERSION_TOO_OLD_GUIDANCE.contains("jcode update"));
+}
+
+/// Regression guard for the bug that produced this error in the first place:
+/// the version jcode advertises on the wire must satisfy the floor of every
+/// model in the curated catalog that is known to be gated.
+#[test]
+fn advertised_user_agent_version_satisfies_the_fable_5_1_floor() {
+    // `CLAUDE_CLI_USER_AGENT` is what actually goes on the wire, so assert on
+    // it rather than on the constant it is built from.
+    assert!(
+        CLAUDE_CLI_USER_AGENT.contains(jcode_provider_core::ANTHROPIC_CLAUDE_CODE_VERSION),
+        "User-Agent must be derived from the single version source of truth"
+    );
+    let version = jcode_provider_core::ANTHROPIC_CLAUDE_CODE_VERSION;
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|part| part.parse().expect("numeric version component"))
+        .collect();
+    assert!(
+        (parts[0], parts[1], parts[2]) >= (2, 1, 251),
+        "advertised version {version} is below the 2.1.251 floor claude-fable-5-1 requires"
+    );
+}
+
 #[test]
 fn test_cache_breakpoint_too_few_messages() {
     let mut messages = vec![

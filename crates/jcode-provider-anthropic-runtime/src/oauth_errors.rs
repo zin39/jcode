@@ -30,6 +30,31 @@ pub(super) fn is_oauth_org_policy_error(error_str: &str) -> bool {
             || error_str.contains("oauth_not_allowed_for_organization"))
 }
 
+/// Detect Anthropic's "your Claude Code client is too old for this model" 400.
+///
+/// Anthropic gates newer models on the client version advertised in the
+/// User-Agent. When jcode's advertised version falls behind, the API returns a
+/// 400 `claude_code_version_too_old` whose message reads "Claude Code X does
+/// not support this model", plus advice to run `claude update`. Both are
+/// actively misleading here: the model exists and is selectable, nothing about
+/// the user's Claude Code install is at fault, and running `claude update`
+/// changes nothing because jcode advertises its own hardcoded version.
+///
+/// Matching on the machine-readable `error_code` first keeps this robust
+/// against message rewording; the prose fallback covers older responses that
+/// omit the code.
+pub(super) fn is_claude_code_version_too_old_error(error_str: &str) -> bool {
+    error_str.contains("claude_code_version_too_old")
+        || (error_str.contains("does not support this model")
+            && error_str.contains("or newer is required"))
+}
+
+/// Guidance shown when Anthropic rejects the advertised Claude Code version.
+///
+/// Points at the real fix (jcode's own constant) instead of the API's
+/// `claude update` advice, which cannot help.
+pub(super) const CLAUDE_CODE_VERSION_TOO_OLD_GUIDANCE: &str = "\n\nThis is not a problem with the model or your Claude Code install. Anthropic gates newer models on the client version jcode advertises, and jcode's advertised version is older than this model requires. Running `claude update` will not help.\n\nTo fix this:\n• Update jcode (`jcode update`), which ships a newer advertised version, or\n• If you are building jcode from source, bump `ANTHROPIC_CLAUDE_CODE_VERSION` in `crates/jcode-provider-core/src/anthropic.rs` to at least the version named above.";
+
 pub(super) fn is_oauth_catalog_auth_error(error_str: &str) -> bool {
     let lower = error_str.to_ascii_lowercase();
     // An org-policy rejection is not refreshable: the token is valid, the

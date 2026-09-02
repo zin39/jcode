@@ -20,7 +20,8 @@ use jcode_base::auth;
 use jcode_base::auth::oauth;
 use jcode_provider_core::{EventStream, NativeToolResultSender, Provider};
 use oauth_errors::{
-    OAUTH_ORG_POLICY_GUIDANCE, claude_refresh_token_available, is_oauth_auth_error,
+    CLAUDE_CODE_VERSION_TOO_OLD_GUIDANCE, OAUTH_ORG_POLICY_GUIDANCE,
+    claude_refresh_token_available, is_claude_code_version_too_old_error, is_oauth_auth_error,
     is_oauth_catalog_auth_error, is_oauth_org_policy_error,
 };
 fn oauth_beta_headers(model: &str) -> &'static str {
@@ -1747,6 +1748,25 @@ async fn run_stream_with_retries(
                 // a connection reset) lives deeper than "Failed to send request to
                 // Anthropic API", and the retry classifier needs to see it.
                 let error_str = format!("{e:#}").to_lowercase();
+
+                // Anthropic rejected the Claude Code version jcode advertises,
+                // not the model. Its own message ("Claude Code X does not
+                // support this model", "run `claude update`") sends users
+                // hunting for a nonexistent model or updating an unrelated
+                // install, so replace the advice before it reaches them. Not
+                // retryable: every attempt advertises the same version. Applies
+                // to both auth routes because the version is jcode's, not the
+                // credential's.
+                if is_claude_code_version_too_old_error(&error_str) {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "{}{}",
+                            e,
+                            CLAUDE_CODE_VERSION_TOO_OLD_GUIDANCE
+                        )))
+                        .await;
+                    return;
+                }
 
                 // OAuth org-policy rejection: the org forbids OAuth entirely.
                 // This is not a refreshable token error; force-refreshing the token
