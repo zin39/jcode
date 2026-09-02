@@ -1102,3 +1102,35 @@ fn test_catalog_classifier_excludes_org_policy_error() {
         "Anthropic API error (401 Unauthorized): oauth token has expired"
     ));
 }
+
+/// A version-too-old 400 must be classified as such for OAuth sessions too, and
+/// must not be mistaken for any OAuth failure mode.
+///
+/// This matters more than it looks: the OAuth endpoint URL is hardcoded and
+/// cannot be pointed at a mock, so the API-key end-to-end check cannot cover
+/// OAuth users. The classifier carries no `is_oauth` gate and runs above every
+/// OAuth branch, because the advertised version is jcode's own rather than the
+/// credential's. These assertions pin that, so adding an auth-mode gate or
+/// reordering the branches fails here instead of silently restoring the
+/// misleading "does not support this model" text for OAuth users.
+#[test]
+fn version_too_old_is_auth_mode_independent_and_not_an_oauth_failure() {
+    let lowered = VERSION_TOO_OLD_BODY.to_lowercase();
+
+    assert!(
+        is_claude_code_version_too_old_error(&lowered),
+        "a version-too-old 400 must be classified as such regardless of auth mode"
+    );
+
+    // It is an invalid_request_error, not a credential problem. Routing it into
+    // the OAuth paths would force a token refresh that cannot possibly help and
+    // would replace the real cause with a misleading auth error.
+    assert!(
+        !is_oauth_auth_error(&lowered),
+        "a version rejection is not an auth error; refreshing the token cannot fix it"
+    );
+    assert!(
+        !is_oauth_org_policy_error(&lowered),
+        "a version rejection is not an org-policy 403"
+    );
+}
