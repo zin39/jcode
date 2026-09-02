@@ -27,7 +27,34 @@ struct SkillFrontmatter {
     name: String,
     description: String,
     #[serde(rename = "allowed-tools")]
-    allowed_tools: Option<String>,
+    allowed_tools: Option<AllowedTools>,
+}
+
+/// `allowed-tools` in SKILL.md frontmatter appears in two shapes in the wild:
+/// a comma-separated string (`allowed-tools: Bash, Read`) and a YAML sequence
+/// (`allowed-tools:\n  - Bash\n  - Read`). Claude Code accepts both, so a
+/// string-only type silently dropped every skill using the list form: the
+/// whole file failed to deserialize, and the skill vanished from the registry
+/// with only a WARN in the log.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AllowedTools {
+    List(Vec<String>),
+    Csv(String),
+}
+
+impl AllowedTools {
+    fn into_vec(self) -> Vec<String> {
+        let tools = match self {
+            Self::List(tools) => tools,
+            Self::Csv(csv) => csv.split(',').map(|tool| tool.to_string()).collect(),
+        };
+        tools
+            .into_iter()
+            .map(|tool| tool.trim().to_string())
+            .filter(|tool| !tool.is_empty())
+            .collect()
+    }
 }
 
 /// Registry of available skills
@@ -499,8 +526,7 @@ impl SkillRegistry {
             allowed_tools,
         } = frontmatter;
 
-        let allowed_tools =
-            allowed_tools.map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
+        let allowed_tools = allowed_tools.map(AllowedTools::into_vec);
         let search_text = build_skill_search_text(&name, &description, &body);
 
         Ok(Skill {
@@ -951,6 +977,54 @@ fn normalize_skill_search_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real plugin skills in the wild write `allowed-tools` as a YAML
+    /// sequence. jcode typed it as a plain string, so the whole frontmatter
+    /// failed to deserialize and the skill was silently dropped from the
+    /// registry (only a WARN in the log). Both spellings must parse.
+    #[test]
+    fn allowed_tools_accepts_both_yaml_sequence_and_csv_string() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let list_path = dir.path().join("LIST.md");
+        std::fs::write(
+            &list_path,
+            "---\nname: standup\ndescription: List form\nallowed-tools:\n  - Bash\n  - Read\n  - Edit\n---\n\nBody.\n",
+        )
+        .expect("write list skill");
+        let list = SkillRegistry::parse_skill(&list_path).expect("list form must parse");
+        assert_eq!(
+            list.allowed_tools.as_deref(),
+            Some(["Bash".to_string(), "Read".to_string(), "Edit".to_string()].as_slice())
+        );
+
+        let csv_path = dir.path().join("CSV.md");
+        std::fs::write(
+            &csv_path,
+            "---\nname: csv\ndescription: Csv form\nallowed-tools: Bash, Read , Edit\n---\n\nBody.\n",
+        )
+        .expect("write csv skill");
+        let csv = SkillRegistry::parse_skill(&csv_path).expect("csv form must parse");
+        assert_eq!(
+            csv.allowed_tools.as_deref(),
+            Some(["Bash".to_string(), "Read".to_string(), "Edit".to_string()].as_slice()),
+            "csv entries must stay trimmed"
+        );
+
+        // Absent stays absent (meaning "no restriction"), not an empty allowlist.
+        let none_path = dir.path().join("NONE.md");
+        std::fs::write(
+            &none_path,
+            "---\nname: none\ndescription: No tools key\n---\n\nBody.\n",
+        )
+        .expect("write skill");
+        assert_eq!(
+            SkillRegistry::parse_skill(&none_path)
+                .expect("parses")
+                .allowed_tools,
+            None
+        );
+    }
 
     fn test_skill(name: &str, description: &str, content: &str) -> Skill {
         Skill {
