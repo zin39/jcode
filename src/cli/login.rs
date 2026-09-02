@@ -880,13 +880,61 @@ fn login_openai_compatible_flow(
         eprintln!("\nSuccessfully saved {} API key!", resolved.display_name);
         "api_key"
     } else {
-        eprintln!("Endpoint: {}", resolved.api_base);
-        if setup_url_depends_on_key {
-            eprintln!("See setup details: {}", resolved.setup_url);
+        // A "local" runtime is not necessarily on this machine. llama.cpp,
+        // Ollama and LM Studio are routinely served from a LAN box, a
+        // workstation reached over an SSH tunnel, or a non-default port. jcode
+        // used to hardcode the profile default here and never ask, so those
+        // users could complete login and then have every request go to
+        // localhost and fail with `Connection refused`, with no prompt or flag
+        // in the flow that could have corrected it.
+        //
+        // Ask for the endpoint (defaulting to the profile's usual address, so
+        // the common local case is still a single Enter), and honor --api-base
+        // for non-interactive use.
+        let endpoint_input = match options.openai_compatible_api_base.as_deref() {
+            Some(value) => value.trim().to_string(),
+            None if io::stdin().is_terminal() => {
+                eprintln!("Endpoint: {}", resolved.api_base);
+                if setup_url_depends_on_key {
+                    eprintln!("See setup details: {}", resolved.setup_url);
+                }
+                eprintln!(
+                    "This runtime speaks the OpenAI-compatible API. It usually runs on this \
+                     machine, but it can be on another host or port."
+                );
+                read_line_trimmed(&format!(
+                    "Endpoint URL [{}] (Enter to keep): ",
+                    resolved.api_base
+                ))?
+            }
+            None => {
+                eprintln!("Endpoint: {}", resolved.api_base);
+                if setup_url_depends_on_key {
+                    eprintln!("See setup details: {}", resolved.setup_url);
+                }
+                String::new()
+            }
+        };
+        if !endpoint_input.is_empty() {
+            let normalized = crate::provider_catalog::normalize_api_base(&endpoint_input)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Invalid endpoint '{}'. Use http://host:port/v1 (plain HTTP is allowed \
+                         for localhost and private/LAN addresses) or https://... for a public host.",
+                        endpoint_input
+                    )
+                })?;
+            resolved.api_base = normalized;
+            crate::provider_catalog::save_env_value_to_env_file(
+                &crate::provider_catalog::local_endpoint_api_base_env(&resolved.id),
+                &resolved.env_file,
+                Some(&resolved.api_base),
+            )?;
+            eprintln!("Endpoint set to {}", resolved.api_base);
         }
-        eprintln!("This provider uses a local OpenAI-compatible endpoint.");
+
         eprintln!(
-            "An API key is optional here. Press Enter to skip if your local server does not require one.\n"
+            "An API key is optional here. Press Enter to skip if your server does not require one.\n"
         );
         let key = match options.openai_compatible_api_key.as_deref() {
             Some(value) => value.trim().to_string(),

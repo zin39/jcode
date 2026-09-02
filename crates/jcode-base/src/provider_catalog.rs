@@ -24,6 +24,21 @@ pub fn api_base_uses_localhost(raw: &str) -> bool {
     )
 }
 
+/// The jcode-native endpoint override variable for a local provider.
+///
+/// This is what `jcode login <local-provider>` persists when the user points
+/// the runtime at a non-default host or port, and it is the highest-precedence
+/// entry in [`local_endpoint_override_env_vars`].
+pub fn local_endpoint_api_base_env(profile_id: &str) -> String {
+    format!(
+        "JCODE_{}_API_BASE",
+        profile_id
+            .trim()
+            .to_ascii_uppercase()
+            .replace(['-', '.'], "_")
+    )
+}
+
 /// Environment variables that relocate a local provider's endpoint, in
 /// precedence order.
 ///
@@ -98,7 +113,16 @@ fn apply_local_endpoint_override(
     resolved: &mut ResolvedOpenAiCompatibleProfile,
 ) {
     for var in local_endpoint_override_env_vars(profile.id) {
-        let Some(raw) = env_override(var) else {
+        // Read the process environment first, then the *provider's own* env
+        // file. `env_override` only consults the generic openai-compatible
+        // file, so an endpoint saved by `jcode login llamacpp` into
+        // `llamacpp.env` would be written and then never read back.
+        let raw = std::env::var(var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| load_env_value_from_env_or_config(var, profile.env_file));
+        let Some(raw) = raw else {
             continue;
         };
         match normalize_local_endpoint_override(&raw, profile.api_base) {

@@ -1408,3 +1408,66 @@ fn llamacpp_login_provider_is_registered_with_aliases() {
         "llamacpp must appear in the TUI /login menu"
     );
 }
+
+/// `jcode login <local-provider>` persists a custom endpoint into the
+/// provider's OWN env file. Reading it back used to go through `env_override`,
+/// which only consults the generic openai-compatible file, so the value was
+/// written and then silently ignored and every request still went to the
+/// hardcoded default.
+#[test]
+fn local_endpoint_saved_by_login_is_read_back_from_the_provider_env_file() {
+    let vars = [
+        "JCODE_LLAMACPP_API_BASE",
+        "LLAMACPP_HOST",
+        "LLAMA_CPP_HOST",
+        "LLAMA_SERVER_HOST",
+        "JCODE_HOME",
+    ];
+    let _guard = EnvGuard::save(&vars);
+    for key in vars {
+        crate::env::remove_var(key);
+    }
+
+    let home = tempfile::tempdir().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
+
+    // The name login writes to must match what resolution reads.
+    assert_eq!(
+        local_endpoint_api_base_env("llamacpp"),
+        "JCODE_LLAMACPP_API_BASE"
+    );
+
+    save_env_value_to_env_file(
+        &local_endpoint_api_base_env("llamacpp"),
+        LLAMACPP_PROFILE.env_file,
+        Some("http://192.168.1.42:9187/v1"),
+    )
+    .expect("persist endpoint");
+
+    assert_eq!(
+        resolve_openai_compatible_profile(LLAMACPP_PROFILE).api_base,
+        "http://192.168.1.42:9187/v1",
+        "an endpoint saved by login must survive into a fresh process"
+    );
+}
+
+/// The env-var name derivation must be stable for every local provider, since
+/// login writes it and resolution reads it.
+#[test]
+fn local_endpoint_env_var_names_are_consistent() {
+    assert_eq!(
+        local_endpoint_api_base_env("ollama"),
+        "JCODE_OLLAMA_API_BASE"
+    );
+    assert_eq!(
+        local_endpoint_api_base_env("lmstudio"),
+        "JCODE_LMSTUDIO_API_BASE"
+    );
+    for id in ["ollama", "lmstudio", "llamacpp"] {
+        assert!(
+            local_endpoint_override_env_vars(id)
+                .contains(&local_endpoint_api_base_env(id).as_str()),
+            "{id}: the name login writes must be one resolution reads"
+        );
+    }
+}
