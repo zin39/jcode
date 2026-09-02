@@ -24,6 +24,89 @@ pub fn api_base_uses_localhost(raw: &str) -> bool {
     )
 }
 
+/// Environment variables that relocate a local provider's endpoint, in
+/// precedence order.
+///
+/// Local runtimes are routinely served somewhere other than their default
+/// port: a second Ollama instance, a remote box on the LAN, an SSH tunnel, or
+/// LM Studio's configurable port. jcode hardcoded `localhost:11434` /
+/// `localhost:1234`, so those users simply could not reach their own model and
+/// got `Connection refused` with no hint that a knob existed.
+///
+/// `OLLAMA_HOST` / `LMSTUDIO_HOST` are the variables those tools already
+/// define, so honoring them means an existing working setup keeps working.
+/// The `JCODE_*_API_BASE` forms are the jcode-native override and win when both
+/// are set.
+fn local_endpoint_override_env_vars(profile_id: &str) -> &'static [&'static str] {
+    match profile_id {
+        "ollama" => &["JCODE_OLLAMA_API_BASE", "OLLAMA_HOST"],
+        "lmstudio" => &["JCODE_LMSTUDIO_API_BASE", "LMSTUDIO_HOST"],
+        _ => &[],
+    }
+}
+
+/// Turn a host-style override into a usable OpenAI-compatible API base.
+///
+/// `OLLAMA_HOST` is conventionally written as a bare host (`10.0.0.5:11434`)
+/// or an origin (`http://10.0.0.5:11434`), not a full `/v1` API base, so add
+/// the scheme and the `/v1` suffix the OpenAI-compatible transport needs.
+/// Returns `None` for anything that does not normalize to a valid endpoint, so
+/// a malformed value falls back to the default instead of breaking the client.
+fn normalize_local_endpoint_override(raw: &str, default_api_base: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+
+    // Preserve an explicitly provided path (`/v1`, or a gateway prefix);
+    // otherwise inherit the path from the profile's default API base.
+    let parsed = url::Url::parse(&with_scheme).ok()?;
+    let has_path = parsed.path().trim_matches('/').is_empty();
+    let candidate = if has_path {
+        let suffix = url::Url::parse(default_api_base)
+            .ok()
+            .map(|url| url.path().trim_end_matches('/').to_string())
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| "/v1".to_string());
+        format!("{}{}", with_scheme.trim_end_matches('/'), suffix)
+    } else {
+        with_scheme
+    };
+
+    normalize_api_base(&candidate)
+}
+
+/// Apply a local endpoint relocation (`OLLAMA_HOST`, `LMSTUDIO_HOST`, or the
+/// `JCODE_*_API_BASE` equivalents) to an already-resolved profile.
+fn apply_local_endpoint_override(
+    profile: OpenAiCompatibleProfile,
+    resolved: &mut ResolvedOpenAiCompatibleProfile,
+) {
+    for var in local_endpoint_override_env_vars(profile.id) {
+        let Some(raw) = env_override(var) else {
+            continue;
+        };
+        match normalize_local_endpoint_override(&raw, profile.api_base) {
+            Some(api_base) => {
+                resolved.api_base = api_base;
+                return;
+            }
+            None => {
+                eprintln!(
+                    "Warning: ignoring invalid {} '{}'. Use host:port or http://host:port.",
+                    var, raw
+                );
+            }
+        }
+    }
+}
+
 pub fn resolve_openai_compatible_profile(
     profile: OpenAiCompatibleProfile,
 ) -> ResolvedOpenAiCompatibleProfile {
@@ -56,6 +139,7 @@ pub fn resolve_openai_compatible_profile_with_api_key_hint(
     }
 
     apply_profile_key_based_endpoint_overrides(profile, &mut resolved, api_key_hint);
+    apply_local_endpoint_override(profile, &mut resolved);
 
     if profile.id != OPENAI_COMPAT_PROFILE.id {
         if let Some(newest_model) =

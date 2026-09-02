@@ -1253,3 +1253,81 @@ fn test_cerebras_profile_reports_endpoint_cap_not_model_spec() {
         Some(200_000)
     );
 }
+
+/// Local runtimes are commonly served off their default port (second
+/// instance, LAN box, SSH tunnel, LM Studio's configurable port). jcode
+/// hardcoded `localhost:11434`/`localhost:1234`, so those users hit
+/// `Connection refused` and had no way to point jcode at their own model.
+#[test]
+fn local_provider_endpoints_follow_host_env_overrides() {
+    let _guard = EnvGuard::save(&[
+        "OLLAMA_HOST",
+        "JCODE_OLLAMA_API_BASE",
+        "LMSTUDIO_HOST",
+        "JCODE_LMSTUDIO_API_BASE",
+    ]);
+    for key in [
+        "OLLAMA_HOST",
+        "JCODE_OLLAMA_API_BASE",
+        "LMSTUDIO_HOST",
+        "JCODE_LMSTUDIO_API_BASE",
+    ] {
+        crate::env::remove_var(key);
+    }
+
+    // Default with nothing set.
+    assert_eq!(
+        resolve_openai_compatible_profile(OLLAMA_PROFILE).api_base,
+        "http://localhost:11434/v1"
+    );
+
+    // Bare host:port, the way OLLAMA_HOST is conventionally written.
+    crate::env::set_var("OLLAMA_HOST", "127.0.0.1:11435");
+    assert_eq!(
+        resolve_openai_compatible_profile(OLLAMA_PROFILE).api_base,
+        "http://127.0.0.1:11435/v1"
+    );
+
+    // Full origin, and a LAN address.
+    crate::env::set_var("OLLAMA_HOST", "http://10.0.0.8:11434");
+    assert_eq!(
+        resolve_openai_compatible_profile(OLLAMA_PROFILE).api_base,
+        "http://10.0.0.8:11434/v1"
+    );
+
+    // An explicit path is preserved rather than getting a second /v1.
+    crate::env::set_var("OLLAMA_HOST", "http://10.0.0.8:11434/v1");
+    assert_eq!(
+        resolve_openai_compatible_profile(OLLAMA_PROFILE).api_base,
+        "http://10.0.0.8:11434/v1"
+    );
+
+    // The jcode-native override wins over the tool's own variable.
+    crate::env::set_var("JCODE_OLLAMA_API_BASE", "http://127.0.0.1:9999/v1");
+    assert_eq!(
+        resolve_openai_compatible_profile(OLLAMA_PROFILE).api_base,
+        "http://127.0.0.1:9999/v1"
+    );
+
+    // Garbage falls back to the default instead of breaking the client.
+    crate::env::remove_var("JCODE_OLLAMA_API_BASE");
+    crate::env::set_var("OLLAMA_HOST", "not a url at all");
+    assert_eq!(
+        resolve_openai_compatible_profile(OLLAMA_PROFILE).api_base,
+        "http://localhost:11434/v1"
+    );
+
+    // LM Studio gets the same treatment.
+    crate::env::set_var("LMSTUDIO_HOST", "localhost:4321");
+    assert_eq!(
+        resolve_openai_compatible_profile(LMSTUDIO_PROFILE).api_base,
+        "http://localhost:4321/v1"
+    );
+
+    // Non-local providers are untouched by these variables.
+    let deepseek = openai_compatible_profile_by_id("deepseek").expect("deepseek profile");
+    assert_eq!(
+        resolve_openai_compatible_profile(deepseek).api_base,
+        deepseek.api_base
+    );
+}
