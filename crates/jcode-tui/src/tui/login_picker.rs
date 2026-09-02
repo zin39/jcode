@@ -979,6 +979,14 @@ mod tests {
 
     #[test]
     fn login_picker_catalog_state_space_renders_and_executes_every_provider_state() {
+        // The Claude/OpenAI detail panes read saved accounts from disk. Without
+        // a scoped home this renders the developer's real accounts, and enough
+        // of them push the footer out of the 46-row viewport, failing on a
+        // machine state that has nothing to do with the picker.
+        let _env_guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _scoped_home = crate::storage::scoped_test_home(temp.path());
+
         let providers = crate::provider_catalog::login_providers();
         assert!(
             !providers.is_empty(),
