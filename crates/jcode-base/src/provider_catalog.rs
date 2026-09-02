@@ -41,6 +41,15 @@ fn local_endpoint_override_env_vars(profile_id: &str) -> &'static [&'static str]
     match profile_id {
         "ollama" => &["JCODE_OLLAMA_API_BASE", "OLLAMA_HOST"],
         "lmstudio" => &["JCODE_LMSTUDIO_API_BASE", "LMSTUDIO_HOST"],
+        // llama-server has no single conventional host variable, so accept the
+        // spellings people actually use alongside the jcode-native one. Port
+        // 8080 collides with common dev servers, so relocation is the norm here.
+        "llamacpp" => &[
+            "JCODE_LLAMACPP_API_BASE",
+            "LLAMACPP_HOST",
+            "LLAMA_CPP_HOST",
+            "LLAMA_SERVER_HOST",
+        ],
         _ => &[],
     }
 }

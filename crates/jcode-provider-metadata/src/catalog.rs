@@ -367,6 +367,20 @@ pub const LMSTUDIO_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     requires_api_key: false,
 };
 
+pub const LLAMACPP_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "llamacpp",
+    display_name: "llama.cpp",
+    // `llama-server`'s default port. Relocatable via LLAMA_CPP_HOST /
+    // JCODE_LLAMACPP_API_BASE, since 8080 collides with common dev servers and
+    // people routinely move it.
+    api_base: "http://localhost:8080/v1",
+    api_key_env: "LLAMACPP_API_KEY",
+    env_file: "llamacpp.env",
+    setup_url: "https://github.com/ggml-org/llama.cpp/tree/master/tools/server",
+    default_model: None,
+    requires_api_key: false,
+};
+
 pub const OLLAMA_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     id: "ollama",
     display_name: "Ollama",
@@ -472,7 +486,7 @@ pub const OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfi
     requires_api_key: true,
 };
 
-pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 40] = [
+pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 41] = [
     OPENCODE_PROFILE,
     OPENCODE_GO_PROFILE,
     ZAI_PROFILE,
@@ -512,6 +526,7 @@ pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 40] = [
     CELERIS_PROFILE,
     LMSTUDIO_PROFILE,
     OLLAMA_PROFILE,
+    LLAMACPP_PROFILE,
     OPENAI_COMPAT_PROFILE,
 ];
 
@@ -1077,6 +1092,19 @@ pub const OLLAMA_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(35), Some(35), Some(35), Some(35), Some(35)),
 };
 
+pub const LLAMACPP_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "llamacpp",
+    display_name: "llama.cpp",
+    auth_kind: LoginProviderAuthKind::Local,
+    auth_state_key: LoginProviderAuthStateKey::OpenRouterLike,
+    auth_status_method: "local endpoint",
+    aliases: &["llama-cpp", "llama.cpp", "llama-server", "llama"],
+    menu_detail: "local OpenAI-compatible endpoint",
+    recommended: false,
+    target: LoginProviderTarget::OpenAiCompatible(LLAMACPP_PROFILE),
+    order: LoginProviderSurfaceOrder::new(Some(36), Some(36), Some(36), Some(36), Some(36)),
+};
+
 pub const OPENAI_COMPAT_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
     id: "openai-compatible",
     display_name: "OpenAI-compatible",
@@ -1212,7 +1240,7 @@ pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(13), None, None, None, None),
 };
 
-pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 52] = [
+pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 53] = [
     AUTO_IMPORT_LOGIN_PROVIDER,
     CLAUDE_LOGIN_PROVIDER,
     ANTHROPIC_API_LOGIN_PROVIDER,
@@ -1258,6 +1286,7 @@ pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 52] = [
     CELERIS_LOGIN_PROVIDER,
     LMSTUDIO_LOGIN_PROVIDER,
     OLLAMA_LOGIN_PROVIDER,
+    LLAMACPP_LOGIN_PROVIDER,
     OPENAI_COMPAT_LOGIN_PROVIDER,
     CURSOR_LOGIN_PROVIDER,
     COPILOT_LOGIN_PROVIDER,

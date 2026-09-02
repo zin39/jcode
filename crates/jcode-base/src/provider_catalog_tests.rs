@@ -1331,3 +1331,80 @@ fn local_provider_endpoints_follow_host_env_overrides() {
         deepseek.api_base
     );
 }
+
+/// llama.cpp is a first-class local provider, not a hand-rolled
+/// `openai-compatible` profile. `llama-server`'s default port (8080) collides
+/// with common dev servers, so relocation must work through the spellings
+/// people actually use.
+#[test]
+fn llamacpp_is_a_local_profile_with_endpoint_overrides() {
+    let vars = [
+        "JCODE_LLAMACPP_API_BASE",
+        "LLAMACPP_HOST",
+        "LLAMA_CPP_HOST",
+        "LLAMA_SERVER_HOST",
+    ];
+    let _guard = EnvGuard::save(&vars);
+    for key in vars {
+        crate::env::remove_var(key);
+    }
+
+    // No API key required, like the other local runtimes.
+    assert!(!LLAMACPP_PROFILE.requires_api_key);
+    assert_eq!(
+        resolve_openai_compatible_profile(LLAMACPP_PROFILE).api_base,
+        "http://localhost:8080/v1"
+    );
+
+    for key in ["LLAMA_CPP_HOST", "LLAMACPP_HOST", "LLAMA_SERVER_HOST"] {
+        crate::env::set_var(key, "127.0.0.1:9911");
+        assert_eq!(
+            resolve_openai_compatible_profile(LLAMACPP_PROFILE).api_base,
+            "http://127.0.0.1:9911/v1",
+            "{key} should relocate the endpoint"
+        );
+        crate::env::remove_var(key);
+    }
+
+    // A LAN address is legitimate for a machine running the model elsewhere.
+    crate::env::set_var("LLAMACPP_HOST", "192.168.1.50:8080");
+    assert_eq!(
+        resolve_openai_compatible_profile(LLAMACPP_PROFILE).api_base,
+        "http://192.168.1.50:8080/v1"
+    );
+
+    // Plain HTTP to a public IP stays refused, falling back to the default.
+    crate::env::set_var("LLAMACPP_HOST", "1.2.3.4:7000");
+    assert_eq!(
+        resolve_openai_compatible_profile(LLAMACPP_PROFILE).api_base,
+        "http://localhost:8080/v1",
+        "public plain-HTTP hosts must not be accepted"
+    );
+
+    // jcode-native override wins.
+    crate::env::set_var("LLAMACPP_HOST", "127.0.0.1:1111");
+    crate::env::set_var("JCODE_LLAMACPP_API_BASE", "http://127.0.0.1:5555/v1");
+    assert_eq!(
+        resolve_openai_compatible_profile(LLAMACPP_PROFILE).api_base,
+        "http://127.0.0.1:5555/v1"
+    );
+}
+
+/// The `/login` surfaces must offer llama.cpp under the names people type.
+#[test]
+fn llamacpp_login_provider_is_registered_with_aliases() {
+    let provider = resolve_login_provider("llamacpp").expect("llamacpp login provider");
+    assert_eq!(provider.id, "llamacpp");
+    assert_eq!(provider.auth_kind, LoginProviderAuthKind::Local);
+    for alias in ["llama-cpp", "llama.cpp", "llama-server", "llama"] {
+        assert_eq!(
+            resolve_login_provider(alias).map(|p| p.id),
+            Some("llamacpp"),
+            "alias {alias} must resolve to llamacpp"
+        );
+    }
+    assert!(
+        tui_login_providers().iter().any(|p| p.id == "llamacpp"),
+        "llamacpp must appear in the TUI /login menu"
+    );
+}
