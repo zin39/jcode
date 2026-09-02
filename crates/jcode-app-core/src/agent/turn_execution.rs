@@ -568,9 +568,26 @@ impl Agent {
         // per request for tools used in under 3% of sessions. Anything the
         // session has explicitly expanded via `load_tools` stays.
         let expanded = crate::tool::session_expanded_tools(&self.session.id);
+
+        // Once history has been compacted, `conversation_search` stops being a
+        // rarely-used tool and becomes the only way to recover detail the
+        // summary dropped. Keeping it deferred there costs a discovery
+        // round-trip at exactly the moment the model has just been told to use
+        // it, and a model that does not see the schema tends to re-derive the
+        // fact or ask the user to repeat themselves instead. Promote it inline
+        // only after a summary exists, so uncompacted sessions keep the tokens.
+        let history_was_compacted = {
+            let compaction = self.registry.compaction();
+            let manager = compaction.read().await;
+            manager.stats().has_summary
+        };
+
         tools.retain(|tool| {
-            !crate::tool::RARELY_USED_DEFERRED_TOOLS.contains(&tool.name.as_str())
-                || expanded.contains(&tool.name)
+            let name = tool.name.as_str();
+            if history_was_compacted && name == "conversation_search" {
+                return true;
+            }
+            !crate::tool::RARELY_USED_DEFERRED_TOOLS.contains(&name) || expanded.contains(name)
         });
 
         // Apply deferred tool filtering: when deferred mode is on, drop definitions

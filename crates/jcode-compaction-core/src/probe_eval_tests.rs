@@ -492,4 +492,18 @@ fn summary_block_reinjection() {
         block.ends_with("\n\n"),
         "compacted_summary_text_block should end with a trailing newline separator, got: {block:?}"
     );
+
+    // The block must tell the model the dropped turns are RECOVERABLE. Without
+    // this, a summary reads as the complete record of everything before it and
+    // the agent re-derives facts or asks the user to repeat themselves instead
+    // of looking them up (the "mini-amnesia" failure mode of repeated
+    // compaction).
+    assert!(
+        block.contains("conversation_search"),
+        "post-compaction block must point at the recovery tool, got: {block:?}"
+    );
+    assert!(
+        block.contains("compacted, not deleted"),
+        "post-compaction block must say history still exists, got: {block:?}"
+    );
 }

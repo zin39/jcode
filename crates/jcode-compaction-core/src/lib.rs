@@ -420,8 +420,29 @@ pub struct CompactionStats {
     pub context_usage: f32,
 }
 
+/// Render the summary that replaces compacted history, plus an explicit
+/// recovery pointer.
+///
+/// Without the pointer the model treats the summary as the *entire* record of
+/// everything before it. Anything the summarizer dropped looks permanently
+/// gone, so the agent re-derives facts it already established, re-reads files
+/// it already read, or asks the user to repeat themselves. That is the
+/// "mini-amnesia" failure mode of repeated compaction.
+///
+/// The raw turns are not actually gone: `conversation_search` still indexes
+/// them. Saying so converts an apparent memory loss into a lookup, which is
+/// the single highest-leverage line in the whole compaction path because it
+/// applies to every post-compaction turn.
 pub fn compacted_summary_text_block(summary: &str) -> String {
-    format!("## Previous Conversation Summary\n\n{}\n\n---\n\n", summary)
+    format!(
+        "## Previous Conversation Summary\n\n{}\n\n\
+         > Older turns were compacted, not deleted. If you need a detail that is \
+         not in this summary (an exact error string, a file's prior contents, a \
+         command you already ran, or something the user said), call \
+         `conversation_search` to retrieve it from the full transcript instead \
+         of re-deriving it or asking the user to repeat themselves.\n\n---\n\n",
+        summary
+    )
 }
 
 pub fn build_compaction_prompt(

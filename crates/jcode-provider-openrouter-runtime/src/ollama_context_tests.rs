@@ -85,3 +85,64 @@ fn ollama_cloud_model_is_not_clamped_to_the_local_runner_default() {
 
     assert_eq!(provider.context_window(), 1_000_000);
 }
+
+#[test]
+fn llamacpp_context_window_does_not_inherit_the_trained_family_window() {
+    // `llama-server -c N` fixes the served window, and a served id like
+    // `qwen3-coder` collides with the open-weight family table, which reports
+    // the model's *trained* window (256K+). Inheriting that overstates the
+    // gauge and builds prompts the server truncates, which reads to the user
+    // as the model forgetting the conversation.
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let mut config = jcode_base::config::NamedProviderConfig {
+        base_url: "http://localhost:8080/v1".to_string(),
+        auth: jcode_base::config::NamedProviderAuth::None,
+        default_model: Some("qwen3-coder".to_string()),
+        ..Default::default()
+    };
+    config.model_catalog = false;
+    config.requires_api_key = Some(false);
+
+    let provider =
+        OpenRouterProvider::new_named_openai_compatible("llamacpp", &config).expect("provider");
+
+    assert_eq!(
+        provider.context_window(),
+        8_192,
+        "a cold llama.cpp cache must fall back to a conservative served window \
+         instead of the model's advertised trained window"
+    );
+}
+
+#[test]
+fn explicit_context_window_still_wins_for_llamacpp() {
+    // The fallback is a guess for missing evidence, not a ceiling: a user who
+    // ran `llama-server -c 131072` and declared it must be believed.
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let mut config = jcode_base::config::NamedProviderConfig {
+        base_url: "http://localhost:8080/v1".to_string(),
+        auth: jcode_base::config::NamedProviderAuth::None,
+        default_model: Some("qwen3-coder".to_string()),
+        models: vec![jcode_base::config::NamedProviderModelConfig {
+            id: "qwen3-coder".to_string(),
+            context_window: Some(131_072),
+            input: Vec::new(),
+            price_input_per_mtok: None,
+            price_output_per_mtok: None,
+        }],
+        ..Default::default()
+    };
+    config.model_catalog = false;
+    config.requires_api_key = Some(false);
+
+    let provider =
+        OpenRouterProvider::new_named_openai_compatible("llamacpp", &config).expect("provider");
+
+    assert_eq!(
+        provider.context_window(),
+        131_072,
+        "an explicitly configured context_window must outrank the fallback"
+    );
+}

@@ -3258,3 +3258,50 @@ fn named_openai_compatible_provider_keeps_stable_name_and_profile_display_name()
     assert_eq!(provider.runtime_display_name(), "example-compat");
     assert_eq!(Provider::display_name(&provider), "example-compat");
 }
+
+/// A local server that reports no context at all must not inherit a cloud
+/// model's window just because the served id resembles one. `llama-server -m
+/// qwen3-coder.gguf` commonly reports ids like `qwen3-coder`, whose hosted
+/// namesake advertises a far larger window than the local `-c` flag allows.
+/// Overstating it makes the gauge read low and lets jcode build a request the
+/// endpoint rejects.
+#[test]
+fn openai_compatible_models_endpoint_reports_absent_context_as_none() {
+    let parsed = parse_openai_compatible_models_response(
+        r#"{
+            "object": "list",
+            "data": [{"id": "qwen3-coder", "object": "model", "owned_by": "llamacpp"}]
+        }"#,
+    )
+    .expect("response should parse");
+
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(
+        parsed[0].context_length, None,
+        "absent context must stay unknown rather than being invented"
+    );
+}
+
+/// llama.cpp reports both the *served* window (`n_ctx`, set by `-c`) and the
+/// model's trained maximum (`n_ctx_train`). The served value is the real
+/// constraint and must win; using the trained maximum overstates the window
+/// and produces requests the endpoint rejects outright.
+#[test]
+fn llamacpp_served_n_ctx_beats_trained_maximum() {
+    let parsed = parse_openai_compatible_models_response(
+        r#"{
+            "object": "list",
+            "data": [{
+                "id": "qwen3-coder", "object": "model", "owned_by": "llamacpp",
+                "meta": {"n_ctx": 8192, "n_ctx_train": 262144}
+            }]
+        }"#,
+    )
+    .expect("response should parse");
+
+    assert_eq!(
+        parsed[0].context_length,
+        Some(8192),
+        "the -c served window must win over the trained maximum"
+    );
+}

@@ -2,6 +2,18 @@ use super::openrouter_sse_stream::run_stream_with_retries;
 use super::*;
 use jcode_base::provider::{ModelCatalogRefreshSummary, summarize_model_catalog_refresh};
 
+/// Conservative served-window assumption for llama.cpp when the live catalog
+/// gave us nothing.
+///
+/// `llama-server`'s own default `-c` is 4096, but builds and launch scripts
+/// commonly raise it, and 8192 is the most common practical floor for a coding
+/// session. Guessing low only costs earlier compaction (recoverable); guessing
+/// high produces a request the server truncates or rejects (not recoverable,
+/// and it looks like memory loss). Users who serve a larger window get the real
+/// number from `meta.n_ctx` automatically, or can pin it explicitly with
+/// `context_window` in their provider profile.
+const LLAMACPP_FALLBACK_SERVING_CONTEXT: usize = 8_192;
+
 #[async_trait]
 impl Provider for OpenRouterProvider {
     fn runtime_display_name(&self) -> String {
@@ -755,6 +767,22 @@ impl Provider for OpenRouterProvider {
             && !super::ollama_context::is_cloud_model(&model_id)
         {
             return super::ollama_context::OLLAMA_DEFAULT_SERVING_CONTEXT as usize;
+        }
+
+        // Same hazard for llama.cpp: `llama-server -c N` fixes the served
+        // window, and a served id like `qwen3-coder` or a bare `.gguf` filename
+        // collides with the open-weight family table below, which reports the
+        // model's *trained* window (often 256K+). Inheriting that number
+        // overstates the gauge and makes jcode build prompts the endpoint
+        // rejects or silently truncates, which reads as the model forgetting
+        // the conversation.
+        //
+        // llama.cpp does publish the truth as `meta.n_ctx`, so this only
+        // applies when the catalog above produced nothing (server unreachable
+        // or an old build without `meta`). It stays below the live catalog and
+        // the user's explicit `context_window`, which are real evidence.
+        if self.profile_id.as_deref() == Some("llamacpp") {
+            return LLAMACPP_FALLBACK_SERVING_CONTEXT;
         }
         if let Some(profile_id) = self.profile_id.as_deref()
             && let Some(limit) =
