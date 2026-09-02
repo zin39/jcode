@@ -318,3 +318,57 @@ fn all_local_providers_offer_the_endpoint_step() {
         }
     });
 }
+
+/// Multi-line provider guidance must render as multiple rows in the transcript.
+///
+/// Ratatui does not split a `Line` on `\n`; it silently drops the newline and
+/// concatenates. `ui_prepare` used to push an entire error message as one
+/// `Line`, so the Anthropic `claude_code_version_too_old` guidance rendered as
+/// "...install.To fix this:..." on a single row and was clipped at the terminal
+/// width. It read fine over the CLI, which is why the earlier end-to-end check
+/// missed it, but it was effectively invisible in the TUI where the reporting
+/// user actually hit it.
+#[test]
+fn multiline_error_guidance_renders_as_separate_rows() {
+    let msg = crate::tui::app::DisplayMessage::error(
+        "Anthropic API error (400): does not support this model.\n\nThis is not a problem \
+         with the model.\n\nTo fix this:\n• Update jcode (`jcode update`)"
+            .to_string(),
+    );
+
+    let lines = crate::tui::ui::prepare::prepare_error_lines_for_test(&msg, 120);
+
+    // One rendered row per logical line, rather than everything collapsed.
+    assert_eq!(
+        lines.len(),
+        6,
+        "expected one row per logical line; got {}:\n{lines:#?}",
+        lines.len()
+    );
+
+    // The actionable text must occupy its own rows, not be glued onto earlier
+    // content where the terminal would clip it.
+    assert!(
+        lines.iter().any(|l| l.contains("To fix this:")),
+        "guidance heading must be on its own row; got:\n{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("jcode update")),
+        "the actionable fix must be visible on its own row; got:\n{lines:#?}"
+    );
+
+    // Only the first row carries the error marker; continuations align under it.
+    assert!(lines[0].contains("\u{2717}"), "first row keeps the marker");
+    assert!(
+        !lines[2].contains("\u{2717}"),
+        "continuation rows must not repeat the marker; got: {:?}",
+        lines[2]
+    );
+
+    // Regression guard for the exact symptom: adjacent logical lines must not
+    // be concatenated into one row.
+    assert!(
+        !lines.iter().any(|l| l.contains("model.This")),
+        "logical lines must not be glued together; got:\n{lines:#?}"
+    );
+}

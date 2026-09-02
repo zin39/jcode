@@ -1616,6 +1616,88 @@ fn message_is_compact(ctx: &BodyRenderCtx<'_>, msg_global_idx: usize) -> bool {
 /// per-message renderer; the full and incremental body builders both call it so
 /// their output cannot drift (which previously caused subtle text-selection and
 /// spacing differences on the incremental path).
+/// Lay out an error message, one rendered row per logical line.
+///
+/// Errors arrive as a single message whose content may span several logical
+/// lines: providers append actionable guidance after the raw API text (e.g. the
+/// Anthropic `claude_code_version_too_old` 400, which explains that the *client
+/// version* is stale, not the model). Ratatui does not split a `Line` on `\n`,
+/// it silently drops the newline and concatenates, so pushing the whole content
+/// as one `Line` rendered "...install.To fix this:..." on a single row and
+/// clipped the rest at the terminal width. That read fine over the CLI while
+/// being effectively invisible in the TUI.
+///
+/// The marker stays on the first row so continuation lines align under it, and
+/// copy targets and raw-line maps are emitted per line so select/copy still
+/// yields the original text.
+fn push_error_message_lines(
+    acc: &mut BodyAcc,
+    content: &str,
+    centered: bool,
+    align: ratatui::layout::Alignment,
+) {
+    let error_start_line = acc.lines.len();
+    let marker = if centered { "\u{2717} " } else { "  \u{2717} " };
+    let prefix_width = unicode_width::UnicodeWidthStr::width(marker);
+    let indent = " ".repeat(prefix_width);
+
+    let content_lines: Vec<&str> = content.split('\n').collect();
+    if let Some(target) = error_copy_target(content, content_lines.len()) {
+        acc.copy_targets
+            .push(offset_copy_target(target, error_start_line));
+    }
+
+    for (idx, content_line) in content_lines.iter().enumerate() {
+        let raw_line = acc.raw_plain_lines.len();
+        acc.raw_plain_lines.push((*content_line).to_string());
+        let raw_width = unicode_width::UnicodeWidthStr::width(*content_line);
+        acc.lines.push(
+            Line::from(vec![
+                Span::styled(
+                    if idx == 0 {
+                        marker.to_string()
+                    } else {
+                        indent.clone()
+                    },
+                    Style::default().fg(Color::Red),
+                ),
+                Span::styled((*content_line).to_string(), Style::default().fg(Color::Red)),
+            ])
+            .alignment(align),
+        );
+        acc.line_raw_overrides.push(Some(WrappedLineMap {
+            raw_line,
+            start_col: 0,
+            end_col: raw_width,
+        }));
+        acc.line_copy_offsets.push(prefix_width);
+    }
+}
+
+/// Render an error message's rows as plain strings, for tests.
+///
+/// Goes through the same `push_error_message_lines` production uses, so a
+/// regression in layout shows up here rather than passing against a copy.
+#[cfg(test)]
+pub(crate) fn prepare_error_lines_for_test(msg: &DisplayMessage, _width: usize) -> Vec<String> {
+    let mut acc = BodyAcc::default();
+    push_error_message_lines(
+        &mut acc,
+        &msg.content,
+        false,
+        ratatui::layout::Alignment::Left,
+    );
+    acc.lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
+}
+
 fn render_message_into(
     ctx: &BodyRenderCtx<'_>,
     acc: &mut BodyAcc,
@@ -2061,32 +2143,7 @@ fn render_message_into(
             }
         }
         "error" => {
-            let error_start_line = acc.lines.len();
-            if let Some(target) = error_copy_target(&msg.content, 1) {
-                acc.copy_targets
-                    .push(offset_copy_target(target, error_start_line));
-            }
-            let raw_line = acc.raw_plain_lines.len();
-            acc.raw_plain_lines.push(msg.content.clone());
-            let raw_width = unicode_width::UnicodeWidthStr::width(msg.content.as_str());
-            let prefix_width =
-                unicode_width::UnicodeWidthStr::width(if centered { "✗ " } else { "  ✗ " });
-            acc.lines.push(
-                Line::from(vec![
-                    Span::styled(
-                        if centered { "✗ " } else { "  ✗ " },
-                        Style::default().fg(Color::Red),
-                    ),
-                    Span::styled(msg.content.clone(), Style::default().fg(Color::Red)),
-                ])
-                .alignment(align),
-            );
-            acc.line_raw_overrides.push(Some(WrappedLineMap {
-                raw_line,
-                start_col: 0,
-                end_col: raw_width,
-            }));
-            acc.line_copy_offsets.push(prefix_width);
+            push_error_message_lines(acc, &msg.content, centered, align);
         }
         _ => {}
     }
