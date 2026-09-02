@@ -308,3 +308,44 @@ mod coercion_coverage_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod leak_probe_tests {
+    /// serde error text quotes the offending value, so any tool that returns a
+    /// raw `serde_json::from_value` error hands that value back to the provider
+    /// and writes it into the transcript.
+    ///
+    /// This documents the shape of the problem with a concrete payload. `bash`
+    /// is already fixed via `redact_serde_error`; this pins the behavior of the
+    /// redactor itself so the remaining tools have a vetted helper to adopt.
+    #[test]
+    fn redactor_strips_values_serde_would_otherwise_quote() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Input {
+            path: String,
+        }
+
+        const SECRET: &str = "sk-ant-canary-4417";
+        let err = serde_json::from_value::<Input>(serde_json::json!(SECRET))
+            .expect_err("a bare string is not this struct");
+
+        // Precondition: without redaction the secret is in the message, which
+        // is exactly why this helper exists.
+        assert!(
+            err.to_string().contains(SECRET),
+            "serde is expected to quote the value; if it stopped, this guard is moot"
+        );
+
+        let redacted = super::super::redact_serde_error(&err);
+        assert!(
+            !redacted.contains(SECRET),
+            "redaction must remove the quoted value; got: {redacted}"
+        );
+        // Still useful: the diagnostic prefix survives.
+        assert!(
+            redacted.contains("invalid type"),
+            "redaction must keep the diagnostic; got: {redacted}"
+        );
+    }
+}
