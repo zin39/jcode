@@ -34,7 +34,10 @@ struct WebFetchInput {
     url: String,
     #[serde(default)]
     format: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     timeout: Option<u64>,
 }
 

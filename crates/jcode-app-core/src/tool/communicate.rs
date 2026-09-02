@@ -1845,7 +1845,10 @@ struct CommunicateInput {
     prompt: Option<String>,
     #[serde(default)]
     output_schema: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     limit: Option<usize>,
     #[serde(default)]
     task_id: Option<String>,
@@ -1871,7 +1874,10 @@ struct CommunicateInput {
     session_ids: Option<Vec<String>>,
     #[serde(default)]
     mode: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     timeout_minutes: Option<u64>,
     #[serde(default)]
     wake: Option<bool>,
@@ -1881,7 +1887,10 @@ struct CommunicateInput {
     notify: Option<bool>,
     #[serde(default)]
     delivery: Option<CommDeliveryMode>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     concurrency_limit: Option<usize>,
     #[serde(default)]
     force: Option<bool>,

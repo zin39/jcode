@@ -357,6 +357,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    /// The load-bearing promise of the post-compaction block: it tells the model
+    /// "older turns were compacted, not deleted... call `conversation_search`".
+    /// If that were false, the guidance would be worse than saying nothing,
+    /// because the model would burn a tool call to discover the detail is gone.
+    ///
+    /// Compaction sets `compacted_count`, a SKIP pointer used when building API
+    /// payloads. It does not truncate the session. `conversation_search` loads
+    /// the session from disk and never consults `compacted_count`, so a fact
+    /// from a compacted turn stays retrievable. Pin that end to end.
+    #[tokio::test]
+    async fn compacted_turns_remain_searchable() {
+        let _guard = env_lock();
+
+        // A distinctive fact in the OLDEST turn, plus filler so compaction has
+        // something to cut.
+        let mut messages = vec![Message::user("The deploy key is ZEBRA_ANCHOR_7741")];
+        for i in 0..40 {
+            messages.push(Message::assistant_text(&format!(
+                "filler turn {i} with enough text to occupy budget"
+            )));
+            messages.push(Message::user(&format!("follow-up {i}")));
+        }
+
+        let (ctx, base, previous_home) = setup_session(messages.clone());
+
+        // Compact for real through the production path.
+        let manager = Arc::new(RwLock::new(CompactionManager::new()));
+        let compacted = {
+            let mut m = manager.write().await;
+            m.hard_compact_with(&messages)
+        };
+        let tool = ConversationSearchTool::new(Arc::clone(&manager));
+
+        // Precondition: compaction must actually have skipped the anchor turn,
+        // otherwise this test proves nothing about compacted history.
+        let stats = manager.read().await.stats();
+        assert!(
+            stats.has_summary,
+            "compaction should have produced a summary; got {compacted:?}"
+        );
+        // The anchor is turn 0, so it must be behind the skip pointer. Without
+        // this the test could pass on an uncompacted prefix and prove nothing.
+        let compacted_count = compacted.expect("hard_compact_with should succeed");
+        assert!(
+            compacted_count > 0,
+            "the anchor turn must actually be compacted away, else this proves nothing"
+        );
+
+        // The anchor lives in turn 0, which is now behind the skip pointer.
+        let result = tool
+            .execute(json!({"query": "ZEBRA_ANCHOR_7741"}), ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            result.output.contains("ZEBRA_ANCHOR_7741"),
+            "a fact from a compacted turn must still be retrievable, otherwise the \
+             post-compaction guidance is a lie; got:\n{}",
+            result.output
+        );
+
+        restore_env(base, previous_home);
+    }
+
     #[test]
     fn test_tool_name() {
         let tool = create_test_tool();

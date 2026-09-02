@@ -21,7 +21,10 @@ impl WebSearchTool {
 #[derive(Deserialize)]
 struct WebSearchInput {
     query: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     num_results: Option<usize>,
     #[serde(default)]
     engine: Option<WebSearchEngine>,

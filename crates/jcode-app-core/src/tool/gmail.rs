@@ -37,7 +37,10 @@ struct GmailInput {
     body: Option<String>,
     #[serde(default)]
     in_reply_to: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u32_from_string_or_number"
+    )]
     max_results: Option<u32>,
     #[serde(default)]
     label_ids: Option<Vec<String>>,

@@ -130,13 +130,22 @@ struct ProgressMarker {
     percent: Option<f32>,
     #[serde(default)]
     message: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     current: Option<u64>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     total: Option<u64>,
     #[serde(default)]
     unit: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     eta_seconds: Option<u64>,
     #[serde(default)]
     kind: Option<String>,
@@ -601,8 +610,7 @@ fn build_detached_shell_wrapper(
     let mut cmd = if crate::sandbox::enforcement_level(sandbox_cfg)
         == crate::sandbox::SandboxEnforcement::EnforcedSeatbelt
     {
-        let roots =
-            crate::sandbox::writable_roots(working_dir, &sandbox_cfg.extra_writable_roots);
+        let roots = crate::sandbox::writable_roots(working_dir, &sandbox_cfg.extra_writable_roots);
         let profile = crate::sandbox::seatbelt_profile(&roots);
         let mut cmd = StdCommand::new("/usr/bin/sandbox-exec");
         cmd.args(["-p", &profile, "bash", "-lc", WRAPPER]);
@@ -731,7 +739,10 @@ struct BashInput {
     command: String,
     #[serde(default)]
     intent: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     timeout: Option<u64>,
     #[serde(default)]
     run_in_background: Option<bool>,
@@ -741,7 +752,10 @@ struct BashInput {
     wake: bool,
     /// For background runs: wake the agent after this many seconds with no
     /// new output and no progress events. Resets on activity.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     stall_wake_seconds: Option<u64>,
     /// Set only when re-issuing a call the gate refused (#604).
     #[serde(default)]

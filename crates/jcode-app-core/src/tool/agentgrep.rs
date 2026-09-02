@@ -62,9 +62,15 @@ struct AgentGrepInput {
     hidden: Option<bool>,
     #[serde(default)]
     no_ignore: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     max_files: Option<usize>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     max_regions: Option<usize>,
     #[serde(default)]
     full_region: Option<String>,

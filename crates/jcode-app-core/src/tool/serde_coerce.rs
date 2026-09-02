@@ -93,6 +93,60 @@ where
     }
 }
 
+/// Deserialize an `Option<u64>` from a JSON number, a numeric string, or
+/// null/missing. Empty strings deserialize to `None`.
+///
+/// Same provider quirk as the `u32` helpers: models emit `"600"` for a field
+/// whose schema says `integer`, and strict serde rejects the entire tool call
+/// with `invalid type: string "600", expected u64`. The model gets no partial
+/// credit, so a whole turn is wasted on a formatting detail.
+pub fn opt_u64_from_string_or_number<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| de::Error::custom(format!("string {:?} is not a valid u64", s.trim()))),
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(u) = n.as_u64() {
+                Ok(Some(u))
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f >= 0.0 && f <= u64::MAX as f64 {
+                    Ok(Some(f as u64))
+                } else {
+                    Err(de::Error::custom(format!("number {f} is not a valid u64")))
+                }
+            } else {
+                Err(de::Error::custom("number is not a valid u64"))
+            }
+        }
+        Some(other) => Err(de::Error::custom(format!(
+            "expected u64 or numeric string, got {other}"
+        ))),
+    }
+}
+
+/// Deserialize an `Option<usize>` from a JSON number, a numeric string, or
+/// null/missing. Empty strings deserialize to `None`.
+pub fn opt_usize_from_string_or_number<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let parsed = opt_u64_from_string_or_number(deserializer)?;
+    parsed
+        .map(|v| {
+            usize::try_from(v)
+                .map_err(|_| de::Error::custom(format!("number {v} out of range for usize")))
+        })
+        .transpose()
+}
+
 struct BoolOrString;
 
 impl<'de> de::Visitor<'de> for BoolOrString {
@@ -189,5 +243,68 @@ mod tests {
         assert!(d.flag);
         let d: Demo = serde_json::from_value(serde_json::json!({"n": 1, "flag": "false"})).unwrap();
         assert!(!d.flag);
+    }
+}
+
+#[cfg(test)]
+mod coercion_coverage_tests {
+    /// Every optional numeric field on a tool input must tolerate a stringified
+    /// number.
+    ///
+    /// Providers emit `"600"` for a field whose schema says `integer`, and
+    /// strict serde rejects the *entire* tool call rather than that one field.
+    /// The model gets no partial credit, so a whole turn is lost to a
+    /// formatting detail. `serde_coerce` was introduced for this exact quirk
+    /// (issue #106) but adoption was per-field, so most tools silently kept the
+    /// strict behavior; `bg` failed twice in one session on
+    /// `max_wait_seconds: "600"`.
+    ///
+    /// This scans the tool sources rather than testing types one by one,
+    /// because the failure mode is precisely a field that *forgot* to opt in.
+    #[test]
+    fn optional_numeric_tool_fields_use_lenient_deserializers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool");
+        let mut offenders = Vec::new();
+
+        let entries = std::fs::read_dir(&dir).expect("tool dir");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name == "serde_coerce.rs" {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if line.trim() != "#[serde(default)]" {
+                    continue;
+                }
+                let Some(next) = lines.get(idx + 1) else {
+                    continue;
+                };
+                let next = next.trim();
+                // Only optional integer fields; floats and non-numerics are out
+                // of scope for the string-number quirk.
+                if next.contains(": Option<u64>")
+                    || next.contains(": Option<usize>")
+                    || next.contains(": Option<u32>")
+                {
+                    offenders.push(format!("{name}:{}: {next}", idx + 2));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these optional numeric tool fields use strict serde, so a provider \
+             sending \"600\" instead of 600 fails the whole tool call. Add \
+             #[serde(deserialize_with = \"super::serde_coerce::opt_*_from_string_or_number\")]:\n{}",
+            offenders.join("\n")
+        );
     }
 }

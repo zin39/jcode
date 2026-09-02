@@ -63,7 +63,10 @@ struct BgInput {
     #[serde(default)]
     status_filter: Option<Value>,
     /// Max age in hours for cleanup (default: 24)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     max_age_hours: Option<u64>,
     /// Dry-run cleanup without deleting files
     #[serde(default)]
@@ -76,10 +79,16 @@ struct BgInput {
     wake: Option<bool>,
     /// For watch/delivery: also arm a stall watchdog that wakes the agent after
     /// this many seconds with no new output or progress (resets on activity)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     stall_wake_seconds: Option<u64>,
     /// Max seconds to block when using wait (default: 60, capped at 3600)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     max_wait_seconds: Option<u64>,
     /// Whether wait should return on progress/checkpoint events (default: true)
     #[serde(default)]
@@ -88,16 +97,25 @@ struct BgInput {
     #[serde(default)]
     wait_mode: Option<String>,
     /// Tail only the last N lines for output/tail and wait previews
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     tail_lines: Option<usize>,
     /// Alias for tail_lines
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     lines: Option<usize>,
     /// Include an output preview when wait returns; failed tasks preview by default
     #[serde(default)]
     include_output_preview: Option<bool>,
     /// Optional grace period for detached cancellation before SIGKILL
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     graceful_timeout_ms: Option<u64>,
 }
 
@@ -898,5 +916,54 @@ mod tests {
             "err={err:?}"
         );
         Ok(())
+    }
+
+    /// Models routinely emit numbers as JSON strings even when the schema says
+    /// `integer`. Strict serde rejects the whole tool call with
+    /// `invalid type: string "600", expected u64`, so the model gets no partial
+    /// credit and burns a turn on a formatting detail.
+    ///
+    /// This is not theoretical: it happened twice in one session on
+    /// `max_wait_seconds: "600"`, and `serde_coerce` already existed for the
+    /// identical u32 quirk (issue #106) but `bg` never adopted it. Pin every
+    /// numeric field, using the exact payload that failed.
+    #[test]
+    fn numeric_fields_accept_stringified_numbers() {
+        let input = serde_json::json!({
+            "action": "wait",
+            "task_id": "abc123",
+            "max_wait_seconds": "600",
+            "stall_wake_seconds": "30",
+            "graceful_timeout_ms": "1500",
+            "max_age_hours": "24",
+            "tail_lines": "40",
+            "lines": "10",
+        });
+        let parsed: BgInput =
+            serde_json::from_value(input).expect("stringified numbers must be accepted");
+        assert_eq!(parsed.max_wait_seconds, Some(600));
+        assert_eq!(parsed.stall_wake_seconds, Some(30));
+        assert_eq!(parsed.graceful_timeout_ms, Some(1500));
+        assert_eq!(parsed.max_age_hours, Some(24));
+        assert_eq!(parsed.tail_lines, Some(40));
+        assert_eq!(parsed.lines, Some(10));
+
+        // Native numbers must keep working.
+        let native = serde_json::json!({
+            "action": "wait",
+            "max_wait_seconds": 600,
+            "tail_lines": 40,
+        });
+        let parsed: BgInput = serde_json::from_value(native).expect("native numbers still work");
+        assert_eq!(parsed.max_wait_seconds, Some(600));
+        assert_eq!(parsed.tail_lines, Some(40));
+
+        // Genuinely bad values must still be rejected rather than silently
+        // coerced to a default, which would hide a real mistake.
+        let bad = serde_json::json!({"action": "wait", "max_wait_seconds": "not-a-number"});
+        assert!(
+            serde_json::from_value::<BgInput>(bad).is_err(),
+            "a non-numeric string must still be an error"
+        );
     }
 }

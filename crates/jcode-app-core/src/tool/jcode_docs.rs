@@ -28,7 +28,10 @@ struct JcodeDocsInput {
     query: Option<String>,
     #[serde(default)]
     path: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     limit: Option<usize>,
 }
 

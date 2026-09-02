@@ -72,7 +72,10 @@ struct BrowserInput {
     position: Option<String>,
     #[serde(default)]
     behavior: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     timeout_ms: Option<u64>,
     #[serde(default)]
     path: Option<String>,

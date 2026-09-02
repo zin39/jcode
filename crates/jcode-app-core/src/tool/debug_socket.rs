@@ -27,7 +27,10 @@ struct DebugSocketInput {
     command: String,
     #[serde(default)]
     session_id: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
+    )]
     timeout_secs: Option<u64>,
 }
 

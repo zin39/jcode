@@ -78,10 +78,16 @@ struct MemoryInput {
     #[serde(default)]
     weight: Option<f32>,
     /// For related action: traversal depth (default: 2)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     depth: Option<usize>,
     /// For recall action: max results (default: 10)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
+    )]
     limit: Option<usize>,
     /// For recall action: retrieval mode
     #[serde(default)]
