@@ -372,3 +372,64 @@ fn multiline_error_guidance_renders_as_separate_rows() {
         "logical lines must not be glued together; got:\n{lines:#?}"
     );
 }
+
+/// Drive the endpoint prompt through the real production key dispatch.
+///
+/// The other tests in this file call `submit_input()` directly, which proves
+/// the handler is correct but says nothing about whether keystrokes reach it.
+/// That distinction is not hypothetical: the sibling OpenRouter regression
+/// (`openrouter_key_typed_through_full_key_path_does_not_reopen_picker`) was a
+/// case where the handler was fine and the onboarding welcome handler
+/// intercepted the keys, swallowing input and looping the picker.
+///
+/// A local login is reached from the same onboarding state, so type the
+/// endpoint character by character and press Enter exactly as a user does.
+#[test]
+fn endpoint_typed_through_the_full_key_path_is_saved() {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    with_temp_local_endpoint_home(|| {
+        let mut app = create_test_app();
+        app.start_openai_compatible_profile_login_for_test(llamacpp_profile());
+        assert!(
+            matches!(
+                app.pending_login,
+                Some(crate::tui::app::PendingLogin::LocalEndpointApiBase { .. })
+            ),
+            "precondition: the endpoint prompt must be pending"
+        );
+
+        let endpoint = "10.1.2.3:8642";
+        for ch in endpoint.chars() {
+            app.handle_key(KeyCode::Char(ch), KeyModifiers::NONE)
+                .expect("keystroke should be handled");
+        }
+        assert_eq!(
+            app.input, endpoint,
+            "every typed character must reach the input buffer, not be eaten by \
+             an onboarding/welcome handler"
+        );
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+            .expect("Enter should be handled");
+
+        // Enter must advance the flow rather than re-opening a picker.
+        assert!(
+            matches!(
+                app.pending_login,
+                Some(crate::tui::app::PendingLogin::ApiKeyProfile { .. })
+            ),
+            "Enter must consume the endpoint and move to the key prompt, got {:?}",
+            app.pending_login
+        );
+        assert!(app.input.is_empty(), "input buffer should clear after submit");
+
+        // And the typed endpoint must actually be persisted.
+        let resolved =
+            crate::provider_catalog::resolve_openai_compatible_profile(llamacpp_profile());
+        assert_eq!(
+            resolved.api_base, "http://10.1.2.3:8642/v1",
+            "the endpoint typed through real keystrokes must be what resolution returns"
+        );
+    });
+}
