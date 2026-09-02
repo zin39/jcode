@@ -1547,7 +1547,45 @@ impl App {
             return;
         }
 
+        // Local runtimes are only "local" by convention. llama.cpp, Ollama and
+        // LM Studio are routinely served from a LAN box, an SSH tunnel, or a
+        // non-default port, and llama-server's default 8080 collides with
+        // common dev servers so relocation is the norm. The TUI used to show
+        // the endpoint as static text and jump straight to the key prompt, so
+        // there was no way to point it anywhere: users completed login and then
+        // had every request fail against localhost. The CLI flow already asks,
+        // so this also removes a gap between the two surfaces.
+        let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
+        if !resolved.requires_api_key {
+            self.push_display_message(DisplayMessage::system(format!(
+                "{} Endpoint\n\n\
+                 Setup docs: {}\n\
+                 Current endpoint: {}\n\n\
+                 This runtime speaks the OpenAI-compatible API. It usually runs on this machine, \
+                 but it can be on another host or port.\n\n\
+                 Enter the endpoint URL below (host:port is fine). Press Enter to keep the current \
+                 value, or type /cancel to abort.",
+                resolved.display_name, resolved.setup_url, resolved.api_base
+            )));
+            self.set_status_notice("Login: endpoint...");
+            self.pending_login = Some(PendingLogin::LocalEndpointApiBase { profile });
+            return;
+        }
+
         self.start_openai_compatible_key_login(profile);
+    }
+
+    /// Drive the OpenAI-compatible login entry point from tests.
+    ///
+    /// Exposed so the local-endpoint tests exercise the same routing real users
+    /// hit, instead of hand-constructing a `PendingLogin` (which would keep
+    /// passing if the routing itself regressed).
+    #[cfg(test)]
+    pub(crate) fn start_openai_compatible_profile_login_for_test(
+        &mut self,
+        profile: crate::provider_catalog::OpenAiCompatibleProfile,
+    ) {
+        self.start_openai_compatible_profile_login(profile);
     }
 
     fn start_openai_compatible_key_login(
@@ -2029,7 +2067,7 @@ impl App {
             return;
         }
 
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && !pending.accepts_empty_input() {
             let help = match &pending {
                 PendingLogin::AutoImportSelection { .. } => {
                     "Auto import is waiting for your selection. Reply with a to approve all, 1,3 to approve specific sources, or /cancel to abort.".to_string()
@@ -2535,6 +2573,53 @@ impl App {
                             Some(PendingLogin::OpenAiCompatibleApiBase { profile });
                         return;
                     }
+                }
+                self.start_openai_compatible_key_login(profile);
+            }
+            PendingLogin::LocalEndpointApiBase { profile } => {
+                let endpoint = input.trim();
+                if !endpoint.is_empty() {
+                    let resolved =
+                        crate::provider_catalog::resolve_openai_compatible_profile(profile);
+                    // Accept the same spellings the env vars do (`host:port`,
+                    // an origin, or a full `/v1` base), so what works in
+                    // `LLAMACPP_HOST` also works when typed here.
+                    let normalized =
+                        match crate::provider_catalog::normalize_local_endpoint_override(
+                            endpoint,
+                            &resolved.api_base,
+                        ) {
+                            Some(value) => value,
+                            None => {
+                                self.push_display_message(DisplayMessage::error(format!(
+                                    "Invalid endpoint '{}'. Use host:port, http://host:port, or a \
+                                     full http://host:port/v1 URL. Plain HTTP is allowed for \
+                                     localhost and private/LAN addresses; a public host needs https.",
+                                    endpoint
+                                )));
+                                self.pending_login =
+                                    Some(PendingLogin::LocalEndpointApiBase { profile });
+                                return;
+                            }
+                        };
+                    // Write the provider's own `JCODE_<ID>_API_BASE` so each
+                    // local runtime can point somewhere different.
+                    if let Err(err) = crate::provider_catalog::save_env_value_to_env_file(
+                        &crate::provider_catalog::local_endpoint_api_base_env(&resolved.id),
+                        &resolved.env_file,
+                        Some(&normalized),
+                    ) {
+                        self.push_display_message(DisplayMessage::error(format!(
+                            "Failed to save {} endpoint: {}",
+                            resolved.display_name, err
+                        )));
+                        self.pending_login = Some(PendingLogin::LocalEndpointApiBase { profile });
+                        return;
+                    }
+                    self.push_display_message(DisplayMessage::system(format!(
+                        "Endpoint set to {}",
+                        normalized
+                    )));
                 }
                 self.start_openai_compatible_key_login(profile);
             }

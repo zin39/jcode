@@ -42,6 +42,17 @@ pub(crate) enum PendingLogin {
     OpenAiCompatibleApiBase {
         profile: crate::provider_catalog::OpenAiCompatibleProfile,
     },
+    /// Waiting for the user to relocate a local runtime's endpoint.
+    ///
+    /// Separate from [`Self::OpenAiCompatibleApiBase`] because the two save to
+    /// different places: the custom profile writes the shared
+    /// `JCODE_OPENAI_COMPAT_API_BASE`, while a local provider must write its
+    /// own `JCODE_<ID>_API_BASE` so llama.cpp, Ollama and LM Studio can be
+    /// pointed at different hosts independently. Blank input keeps the
+    /// existing endpoint, so the common localhost case stays one keypress.
+    LocalEndpointApiBase {
+        profile: crate::provider_catalog::OpenAiCompatibleProfile,
+    },
     /// Waiting for user to paste a Cursor API key.
     CursorApiKey,
     /// GitHub Copilot device flow in progress (polling in background)
@@ -63,6 +74,26 @@ pub(crate) enum PendingLogin {
 }
 
 impl PendingLogin {
+    /// Whether an empty submission (a bare Enter) is a meaningful answer.
+    ///
+    /// Most login prompts want a pasted secret or callback URL, so blank input
+    /// is a no-op and the prompt should be repeated. But several prompts
+    /// explicitly advertise Enter as the way to accept a default: the endpoint
+    /// prompts say "Press Enter to keep the current value", the optional local
+    /// API key says "Press Enter to skip", and the Azure auth choice documents
+    /// `[1]` as its default. For those, swallowing the Enter strands the user
+    /// on a prompt whose own instructions do not work.
+    pub(crate) fn accepts_empty_input(&self) -> bool {
+        match self {
+            Self::OpenAiCompatibleApiBase { .. } | Self::LocalEndpointApiBase { .. } => true,
+            Self::ApiKeyProfile {
+                api_key_optional, ..
+            } => *api_key_optional,
+            Self::AzureAuthChoice { .. } => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn telemetry_context(&self) -> Option<(String, String)> {
         match self {
             Self::ClaudeAccount { .. } => Some(("claude".to_string(), "oauth".to_string())),
@@ -84,6 +115,10 @@ impl PendingLogin {
                         "local_endpoint".to_string()
                     },
                 ))
+            }
+            Self::LocalEndpointApiBase { profile } => {
+                let resolved = crate::provider_catalog::resolve_openai_compatible_profile(*profile);
+                Some((resolved.id, "local_endpoint".to_string()))
             }
             Self::CursorApiKey => Some(("cursor".to_string(), "api_key".to_string())),
             Self::Copilot => Some(("copilot".to_string(), "device_code".to_string())),

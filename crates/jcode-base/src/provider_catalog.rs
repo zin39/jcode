@@ -76,7 +76,12 @@ fn local_endpoint_override_env_vars(profile_id: &str) -> &'static [&'static str]
 /// the scheme and the `/v1` suffix the OpenAI-compatible transport needs.
 /// Returns `None` for anything that does not normalize to a valid endpoint, so
 /// a malformed value falls back to the default instead of breaking the client.
-fn normalize_local_endpoint_override(raw: &str, default_api_base: &str) -> Option<String> {
+///
+/// Public so the login surfaces accept exactly the spellings the environment
+/// variables do. They previously used the stricter [`normalize_api_base`],
+/// which rejects `10.0.0.5:8080` outright, so a host that worked fine via
+/// `LLAMACPP_HOST` was refused when typed into the login prompt.
+pub fn normalize_local_endpoint_override(raw: &str, default_api_base: &str) -> Option<String> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return None;

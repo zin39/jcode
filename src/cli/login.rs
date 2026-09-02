@@ -916,14 +916,21 @@ fn login_openai_compatible_flow(
             }
         };
         if !endpoint_input.is_empty() {
-            let normalized = crate::provider_catalog::normalize_api_base(&endpoint_input)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Invalid endpoint '{}'. Use http://host:port/v1 (plain HTTP is allowed \
-                         for localhost and private/LAN addresses) or https://... for a public host.",
-                        endpoint_input
-                    )
-                })?;
+            // Accept the same spellings the env vars do (`host:port`, an
+            // origin, or a full `/v1` base). `normalize_api_base` alone rejects
+            // `10.0.0.5:8080`, so a host that works via `LLAMACPP_HOST` used to
+            // be refused here.
+            let normalized = crate::provider_catalog::normalize_local_endpoint_override(
+                &endpoint_input,
+                &resolved.api_base,
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid endpoint '{}'. Use host:port or http://host:port/v1 (plain HTTP is \
+                     allowed for localhost and private/LAN addresses) or https://... for a public host.",
+                    endpoint_input
+                )
+            })?;
             resolved.api_base = normalized;
             crate::provider_catalog::save_env_value_to_env_file(
                 &crate::provider_catalog::local_endpoint_api_base_env(&resolved.id),

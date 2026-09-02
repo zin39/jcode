@@ -1343,11 +1343,17 @@ fn llamacpp_is_a_local_profile_with_endpoint_overrides() {
         "LLAMACPP_HOST",
         "LLAMA_CPP_HOST",
         "LLAMA_SERVER_HOST",
+        // Resolution also reads the provider's saved env file, so without a
+        // scoped home this test reads the developer's own `llamacpp.env` and
+        // fails against whatever endpoint they last logged in with.
+        "JCODE_HOME",
     ];
     let _guard = EnvGuard::save(&vars);
     for key in vars {
         crate::env::remove_var(key);
     }
+    let home = tempfile::tempdir().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", home.path());
 
     // No API key required, like the other local runtimes.
     assert!(!LLAMACPP_PROFILE.requires_api_key);
