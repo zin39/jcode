@@ -57,6 +57,12 @@ const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_API_KEY_NAME: &str = "OPENROUTER_API_KEY";
 const DEFAULT_ENV_FILE: &str = "openrouter.env";
 const OPENROUTER_TRANSPORT_STATE_ENV: &str = "JCODE_OPENROUTER_TRANSPORT_STATE";
+/// User-Agent Kimi's coding-plan endpoint expects.
+///
+/// Intentionally NOT derived from `ANTHROPIC_CLAUDE_CODE_VERSION`: this is
+/// Moonshot's own gate on a claude-cli-shaped client, not Anthropic's model
+/// version gate, and bumping it to track Anthropic releases would change a
+/// value Kimi matches on for reasons unrelated to model availability.
 const KIMI_CODING_USER_AGENT: &str = "claude-cli/1.0.0";
 const KIMI_CODING_X_APP: &str = "cli";
 

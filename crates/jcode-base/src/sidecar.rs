@@ -37,8 +37,14 @@ const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 /// Claude Messages API endpoint for direct API-key access (no OAuth beta flag).
 const CLAUDE_API_KEY_URL: &str = "https://api.anthropic.com/v1/messages";
 
-/// User-Agent for OAuth requests (must match Claude CLI format)
-const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/1.0.0";
+/// User-Agent for OAuth requests (must match Claude CLI format).
+///
+/// Reuses the derived constant rather than a literal: this path posts real
+/// inference requests with a user-configurable model
+/// (`[agents] memory_model`), so a hardcoded old version would make new models
+/// fail here with the same misleading "does not support this model" 400 that
+/// broke `claude-fable-5-1`.
+use crate::provider::anthropic::CLAUDE_CLI_USER_AGENT;
 
 /// Beta headers required for OAuth
 const OAUTH_BETA_HEADERS: &str = "oauth-2025-04-20,claude-code-20250219";

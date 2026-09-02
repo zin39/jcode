@@ -147,3 +147,86 @@ pub fn load_anthropic_api_key() -> Result<String> {
 pub fn has_anthropic_api_key() -> bool {
     load_anthropic_api_key().is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    /// No Anthropic-bound request may hardcode a `claude-cli` version.
+    ///
+    /// Anthropic gates model availability on the advertised client version and
+    /// rejects anything too old with a 400 whose message reads "does not
+    /// support this model". A stale literal on any Anthropic call site
+    /// therefore makes new models look nonexistent, which is exactly how
+    /// `claude-fable-5-1` broke. Every such site must derive from
+    /// `ANTHROPIC_CLAUDE_CODE_VERSION`.
+    ///
+    /// Scanned by source text because the failure mode is a *literal* that
+    /// bypasses the constant, which no type-level check can catch. Providers
+    /// that merely impersonate claude-cli for their own gating (Kimi, Zai,
+    /// Alibaba) are excluded: their endpoints are not Anthropic and do not
+    /// version-gate models.
+    #[test]
+    fn anthropic_call_sites_never_hardcode_a_claude_cli_version() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+
+        // Paths whose `claude-cli/...` literal is a non-Anthropic provider's
+        // own expectation, documented at each site.
+        let allowed: &[&str] = &[
+            "crates/jcode-provider-openrouter-runtime/src/lib.rs",
+            "src/cli/auth_test/choice.rs",
+        ];
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![repo_root.join("crates"), repo_root.join("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&repo_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if allowed.contains(&rel.as_str()) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (idx, line) in text.lines().enumerate() {
+                    // A literal version right after `claude-cli/`. The derived
+                    // form uses `concat!` and never spells digits inline.
+                    let Some(rest) = line.split("claude-cli/").nth(1) else {
+                        continue;
+                    };
+                    if rest.starts_with(|c: char| c.is_ascii_digit()) {
+                        offenders.push(format!("{rel}:{}: {}", idx + 1, line.trim()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these Anthropic call sites hardcode a claude-cli version instead of deriving it \
+             from ANTHROPIC_CLAUDE_CODE_VERSION, which makes new models fail as \
+             \"does not support this model\":\n{}",
+            offenders.join("\n")
+        );
+    }
+}

@@ -149,6 +149,9 @@ async fn discover_openai_compatible_validation_model(
     let url = format!("{}/models", profile.api_base.trim_end_matches('/'));
     let mut request = crate::provider::shared_http_client().get(&url);
     if matches!(profile.id.as_str(), "kimi" | "alibaba-coding-plan" | "zai") {
+        // These providers gate on a claude-cli-shaped client of their own, not
+        // on Anthropic's model version, so this literal must not be derived
+        // from ANTHROPIC_CLAUDE_CODE_VERSION.
         request = request
             .header("User-Agent", "claude-cli/1.0.0")
             .header("x-app", "cli");
