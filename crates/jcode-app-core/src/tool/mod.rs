@@ -49,6 +49,54 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Strip quoted values out of a serde error before it is shown to a model.
+///
+/// serde reports type mismatches as `invalid type: string "the-actual-value",
+/// expected struct Foo`. That is fine for a local panic but not for a message
+/// echoed to the provider and persisted in the transcript, because the value
+/// may be a secret the model passed in. Keep the diagnostic part
+/// (`invalid type: string`) and drop the quoted payload.
+pub(crate) fn redact_serde_error(err: &impl std::fmt::Display) -> String {
+    let text = err.to_string();
+    let Some(open) = text.find('"') else {
+        return text;
+    };
+    // Find the closing quote of the first quoted run; everything between is a
+    // value we must not echo.
+    let Some(close_offset) = text[open + 1..].find('"') else {
+        return text[..open].trim_end().to_string();
+    };
+    let close = open + 1 + close_offset;
+    let mut out = String::with_capacity(text.len());
+    out.push_str(text[..open].trim_end());
+    out.push_str(" <redacted>");
+    out.push_str(&text[close + 1..]);
+    out
+}
+
+/// Describe the *shape* of a tool input for an error message, never its values.
+///
+/// Malformed-input errors are echoed back to the provider and land in the
+/// transcript, so a value quoted here travels further than a log line would.
+/// Tool-call logging in this module already records only `input_keys` for that
+/// reason; this keeps the error path to the same standard while still telling
+/// the model enough to correct itself.
+pub(crate) fn describe_tool_input_shape(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::Object(map) if map.is_empty() => "an empty object `{}`".to_string(),
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            format!("an object with keys [{}]", keys.join(", "))
+        }
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(_) => "a boolean".to_string(),
+        serde_json::Value::Number(_) => "a number".to_string(),
+        serde_json::Value::String(_) => "a string".to_string(),
+        serde_json::Value::Array(items) => format!("an array of {} item(s)", items.len()),
+    }
+}
+
 pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> bool {
     allowed.contains(name) || (allowed.contains("mcp") && name.starts_with("mcp__"))
 }

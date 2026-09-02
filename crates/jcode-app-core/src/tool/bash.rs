@@ -792,24 +792,44 @@ impl Tool for BashTool {
         // Smaller models sometimes emit `{}` or omit `command`, and
         // "missing field `command`" does not tell them what to send next, so
         // they repeat the same empty call. Observed twice in one day from a
-        // local 3B model. Naming the required field and echoing what arrived
+        // local 3B model. Naming the required field and describing what arrived
         // turns a dead end into a retry the model can act on.
-        let mut params: BashInput = serde_json::from_value(input.clone()).map_err(|err| {
-            let received = match &input {
-                Value::Object(map) if map.is_empty() => "an empty object `{}`".to_string(),
-                Value::Object(map) => {
-                    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-                    keys.sort_unstable();
-                    format!("keys [{}]", keys.join(", "))
-                }
-                other => format!("a non-object value ({})", other),
-            };
-            anyhow::anyhow!(
-                "{err}. The bash tool requires a `command` string, for example \
-                 {{\"command\": \"ls -la\"}}. Received {received}. Re-issue the call with the \
-                 shell command you want to run."
-            )
-        })?;
+        //
+        // Describe the *shape* of the input, never its values. Tool-call
+        // logging in `tool/mod.rs` deliberately records `input_keys` and never
+        // the values, because arguments can carry secrets. This message is
+        // echoed back to the provider and into the transcript, so leaking a
+        // value here would be strictly worse than a log line.
+        // Reject non-objects before deserializing. serde's derive builds a
+        // struct positionally from a JSON *sequence*, so `["rm -rf /"]`
+        // deserializes into `BashInput { command: "rm -rf /" }` and runs, even
+        // though the declared schema is `{"type": "object", "required":
+        // ["command"]}`. A caller that never intended to name `command` should
+        // not get a shell execution by argument position.
+        if !input.is_object() {
+            let received = super::describe_tool_input_shape(&input);
+            return Err(anyhow::anyhow!(
+                "The bash tool expects an object, for example {{\"command\": \"ls -la\"}}. \
+                 Received {received}. Re-issue the call with a `command` field."
+            ));
+        }
+        let mut params: BashInput = match serde_json::from_value(input.clone()) {
+            Ok(params) => params,
+            Err(err) => {
+                let received = super::describe_tool_input_shape(&input);
+                // serde's own message quotes the offending value (e.g.
+                // `invalid type: string "sk-ant-..."`), so it cannot be
+                // interpolated verbatim into a message that goes back to the
+                // provider and into the transcript. Keep only its
+                // value-independent prefix.
+                let reason = super::redact_serde_error(&err);
+                return Err(anyhow::anyhow!(
+                    "{reason}. The bash tool requires a `command` string, for example \
+                     {{\"command\": \"ls -la\"}}. Received {received}. Re-issue the call with the \
+                     shell command you want to run."
+                ));
+            }
+        };
         let run_in_background = params.run_in_background.unwrap_or(false);
 
         // Destructive-command gate (#604), before background dispatch.
@@ -1467,13 +1487,48 @@ mod malformed_input_tests {
 
         // A populated-but-wrong call should report the keys it did receive.
         let err = tool
-            .execute(serde_json::json!({"cmd": "ls"}), ctx)
+            .execute(serde_json::json!({"cmd": "ls"}), ctx.clone())
             .await
             .expect_err("wrong key must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("cmd"),
             "must echo the keys that were sent; got: {msg}"
+        );
+
+        // The message is echoed back to the provider and stored in the
+        // transcript, so it must describe the input's SHAPE and never quote a
+        // value. Tool-call logging in tool/mod.rs holds the same line by
+        // recording only `input_keys`.
+        const SECRET: &str = "sk-ant-super-secret-value";
+        for payload in [
+            serde_json::json!(SECRET),
+            serde_json::json!([SECRET]),
+            serde_json::json!({"api_key": SECRET}),
+        ] {
+            let err = match tool.execute(payload.clone(), ctx.clone()).await {
+                Ok(output) => panic!(
+                    "payload {payload} must be rejected, but it was accepted and produced \
+                     {output:?}. serde builds structs positionally from sequences, so an \
+                     array would run its first element as a shell command."
+                ),
+                Err(err) => err,
+            };
+            let msg = err.to_string();
+            assert!(
+                !msg.contains(SECRET),
+                "the error must not quote argument values; payload {payload} produced: {msg}"
+            );
+        }
+
+        // Shape descriptions must still be specific enough to be actionable.
+        let err = tool
+            .execute(serde_json::json!([1, 2, 3]), ctx)
+            .await
+            .expect_err("array input must be rejected");
+        assert!(
+            err.to_string().contains("an array of 3 item(s)"),
+            "must describe the shape; got: {err}"
         );
     }
 }
