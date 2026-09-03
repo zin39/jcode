@@ -1,10 +1,10 @@
 mod agentgrep;
 pub mod ambient;
 mod apply_patch;
-mod bash;
+pub(crate) mod bash;
 mod batch;
-mod bg;
-mod browser;
+pub(crate) mod bg;
+pub(crate) mod browser;
 mod cheap_route_tool;
 pub(crate) mod communicate;
 #[cfg(target_os = "macos")]

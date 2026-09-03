@@ -22,7 +22,7 @@ fn browser_tool_description_text() -> &'static str {
 }
 
 #[derive(Debug, Deserialize)]
-struct BrowserInput {
+pub(crate) struct BrowserInput {
     action: String,
     #[serde(default)]
     browser: Option<String>,

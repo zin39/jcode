@@ -350,6 +350,83 @@ mod coercion_coverage_tests {
             offenders.join("\n")
         );
     }
+
+    /// End-to-end acceptance: deserialise the actual tool Input structs with
+    /// stringified bools, exactly as Fable 5.1 sends them.  We test that
+    /// parsing succeeds (or fails for garbage) against the real struct rather
+    /// than a Demo, which catches wiring bugs like a missing `deserialize_with`.
+    #[test]
+    fn cross_tool_bool_coercion_acceptance() {
+        // BgInput -- the original Fable 5.1 failure site.
+        serde_json::from_value::<super::super::bg::BgInput>(serde_json::json!({
+            "action": "wait",
+            "return_on_progress": "false",
+            "notify": "true",
+            "wake": "0",
+            "session_only": "yes",
+            "include_output_preview": "1",
+        }))
+        .expect("BgInput: all stringified bools must parse");
+
+        // BashInput
+        serde_json::from_value::<super::super::bash::BashInput>(serde_json::json!({
+            "command": "echo ok",
+            "run_in_background": "true",
+        }))
+        .expect("BashInput: stringified bools must parse");
+
+        // BrowserInput
+        serde_json::from_value::<super::super::browser::BrowserInput>(serde_json::json!({
+            "action": "navigate",
+            "url": "https://example.com",
+            "new_tab": "true",
+            "wait": "false",
+            "focus": "1",
+            "all_frames": "yes",
+        }))
+        .expect("BrowserInput: stringified bools must parse");
+
+        // Native bools: regression guard.
+        serde_json::from_value::<super::super::bg::BgInput>(serde_json::json!({
+            "action": "wait",
+            "return_on_progress": false,
+            "notify": true,
+        }))
+        .expect("BgInput: native bools must still work");
+
+        // Absent bools: default to None, minimal payload.
+        serde_json::from_value::<super::super::bg::BgInput>(serde_json::json!({
+            "action": "list"
+        }))
+        .expect("BgInput: minimal payload with no bools");
+
+        // Null bools.
+        serde_json::from_value::<super::super::bg::BgInput>(serde_json::json!({
+            "action": "wait",
+            "return_on_progress": null,
+        }))
+        .expect("BgInput: explicit null bools");
+
+        // Garbage string: must still be rejected.
+        assert!(
+            serde_json::from_value::<super::super::bg::BgInput>(serde_json::json!({
+                "action": "wait",
+                "return_on_progress": "maybe",
+            }))
+            .is_err(),
+            "a non-boolean string must still be rejected"
+        );
+
+        // Array/object: must be rejected.
+        assert!(
+            serde_json::from_value::<super::super::bg::BgInput>(serde_json::json!({
+                "action": "wait",
+                "return_on_progress": [true],
+            }))
+            .is_err(),
+            "an array value must be rejected"
+        );
+    }
 }
 
 #[cfg(test)]

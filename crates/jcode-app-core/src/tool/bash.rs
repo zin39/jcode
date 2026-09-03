@@ -738,7 +738,7 @@ impl BashTool {
 }
 
 #[derive(Deserialize)]
-struct BashInput {
+pub(crate) struct BashInput {
     command: String,
     #[serde(default)]
     intent: Option<String>,

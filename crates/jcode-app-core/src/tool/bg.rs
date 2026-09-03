@@ -40,7 +40,7 @@ impl BgTool {
 }
 
 #[derive(Deserialize)]
-struct BgInput {
+pub(crate) struct BgInput {
     /// Action to perform: list, status, output, tail, cancel, cleanup, watch, delivery, subscribe, wait
     #[serde(default)]
     action: Option<String>,
