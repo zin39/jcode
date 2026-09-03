@@ -2594,8 +2594,13 @@ impl App {
                                 self.push_display_message(DisplayMessage::error(format!(
                                     "Invalid endpoint '{}'. Use host:port, http://host:port, or a \
                                      full http://host:port/v1 URL. Plain HTTP is allowed for \
-                                     localhost and private/LAN addresses; a public host needs https.",
-                                    endpoint
+                                     localhost and private/LAN addresses; a public host needs \
+                                     https.\n\nSelf-hosting on a public IP without TLS (e.g. a \
+                                     rented GPU box)? Plain HTTP sends your API key and prompts in \
+                                     cleartext, so it is refused by default. Set {}=1 to allow it \
+                                     anyway.",
+                                    endpoint,
+                                    crate::provider_catalog::ALLOW_INSECURE_HTTP_ENV
                                 )));
                                 self.pending_login =
                                     Some(PendingLogin::LocalEndpointApiBase { profile });

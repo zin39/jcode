@@ -927,8 +927,12 @@ fn login_openai_compatible_flow(
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Invalid endpoint '{}'. Use host:port or http://host:port/v1 (plain HTTP is \
-                     allowed for localhost and private/LAN addresses) or https://... for a public host.",
-                    endpoint_input
+                     allowed for localhost and private/LAN addresses) or https://... for a public \
+                     host.\n\nSelf-hosting on a public IP without TLS (e.g. a rented GPU box)? \
+                     Plain HTTP sends your API key and prompts in cleartext, so it is refused by \
+                     default. Set {}=1 to allow it anyway.",
+                    endpoint_input,
+                    crate::provider_catalog::ALLOW_INSECURE_HTTP_ENV
                 )
             })?;
             resolved.api_base = normalized;

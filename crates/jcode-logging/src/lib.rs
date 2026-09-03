@@ -179,6 +179,15 @@ fn context_prefix_for(ctx: &LogContext) -> String {
 
 pub struct Logger {
     file: File,
+    /// Date (`%Y-%m-%d`) the current `file` handle was opened for.
+    ///
+    /// The handle is opened once and then held for the life of the process. A
+    /// long-lived daemon therefore keeps writing into the file it started with,
+    /// so after midnight every session's output lands in the *previous* day's
+    /// log while a nearly empty file exists for today. That silently breaks any
+    /// "what happened today" investigation. Remembering the date lets `write`
+    /// notice the rollover and reopen.
+    opened_for: String,
 }
 
 fn log_dir() -> Option<PathBuf> {
@@ -191,7 +200,7 @@ impl Logger {
         jcode_storage::ensure_dir(&log_dir).ok()?;
 
         // Use date-based log file
-        let date = Local::now().format("%Y-%m-%d");
+        let date = Local::now().format("%Y-%m-%d").to_string();
         let path = log_dir.join(format!("jcode-{}.log", date));
 
         let file = OpenOptions::new()
@@ -200,10 +209,36 @@ impl Logger {
             .open(&path)
             .ok()?;
 
-        Some(Self { file })
+        Some(Self {
+            file,
+            opened_for: date,
+        })
+    }
+
+    /// Reopen the handle when the local date has moved past the one it was
+    /// opened for, so a process that outlives midnight starts a new daily file
+    /// instead of appending to yesterday's.
+    ///
+    /// Best-effort: if the new file cannot be opened we keep writing to the old
+    /// handle rather than dropping the line entirely, since losing the log is
+    /// worse than filing it under the wrong date.
+    fn roll_over_if_needed(&mut self) {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        if today == self.opened_for {
+            return;
+        }
+        let Some(log_dir) = log_dir() else {
+            return;
+        };
+        let path = log_dir.join(format!("jcode-{today}.log"));
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
+            self.file = file;
+            self.opened_for = today;
+        }
     }
 
     fn write(&mut self, level: &str, message: &str) {
+        self.roll_over_if_needed();
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let ctx = context_prefix();
         let line = format!("[{}] [{}] {}{}\n", timestamp, level, ctx, message);
@@ -738,6 +773,65 @@ mod tests {
                 "diagnostic field `{name}` should not be redacted",
             );
         }
+    }
+
+    /// A process that outlives midnight must start a new daily file.
+    ///
+    /// Regression: the handle was opened once in `Logger::new` and held for the
+    /// life of the process, so a long-lived daemon kept appending to its
+    /// startup date. Observed directly: sessions on 2026-09-03 were still
+    /// writing into `jcode-2026-09-02.log` (51MB) while `jcode-2026-09-03.log`
+    /// held under 1MB, which makes "what happened today" unanswerable from the
+    /// file that bears today's date.
+    ///
+    /// Drives the real `roll_over_if_needed` by backdating `opened_for`, so it
+    /// tests the production path without waiting for an actual midnight.
+    #[test]
+    fn logger_rolls_over_to_a_new_file_after_midnight() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-log-rollover-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // `logs_dir()` resolves under JCODE_HOME, so scope it to the tempdir.
+        let home = dir.join("home");
+        fs::create_dir_all(home.join("logs")).expect("create temp log dir");
+        let previous_home = std::env::var_os("JCODE_HOME");
+        // SAFETY: this test does not run concurrently with other env mutation
+        // in this crate; restored below.
+        unsafe { std::env::set_var("JCODE_HOME", &home) };
+
+        let log_dir = home.join("logs");
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let mut logger = Logger::new().expect("open logger");
+
+        // Simulate the handle having been opened yesterday.
+        logger.opened_for = "1999-12-31".to_string();
+        logger.write("INFO", "after midnight");
+
+        assert_eq!(
+            logger.opened_for, today,
+            "the logger must adopt today's date after rolling over"
+        );
+
+        let todays_file = log_dir.join(format!("jcode-{today}.log"));
+        let contents = fs::read_to_string(&todays_file)
+            .unwrap_or_else(|e| panic!("today's log {todays_file:?} should exist: {e}"));
+        assert!(
+            contents.contains("after midnight"),
+            "the line must land in today's file, got:\n{contents}"
+        );
+
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("JCODE_HOME", value) },
+            None => unsafe { std::env::remove_var("JCODE_HOME") },
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

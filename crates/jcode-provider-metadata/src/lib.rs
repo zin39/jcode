@@ -286,7 +286,33 @@ pub fn normalize_api_base(raw: &str) -> Option<String> {
     Some(trimmed.trim_end_matches('/').to_string())
 }
 
+/// Opt-in escape hatch for plain HTTP to a public host.
+///
+/// Plain HTTP is refused for public hosts because the API key (and every
+/// prompt) would cross the internet in cleartext. But self-hosted inference on
+/// a rented GPU box is a real, common setup: the server has a public IP, no
+/// TLS, and a high port, e.g. `http://203.0.113.10:20000`. Without a way to say
+/// "I know", that endpoint simply cannot be configured, and the rejection gives
+/// no hint that a knob exists.
+///
+/// Deliberately an explicit env var rather than a silent allowance: the user
+/// has to state the intent, and the name says what it costs.
+pub const ALLOW_INSECURE_HTTP_ENV: &str = "JCODE_ALLOW_INSECURE_HTTP";
+
+fn insecure_http_explicitly_allowed() -> bool {
+    std::env::var(ALLOW_INSECURE_HTTP_ENV)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 fn allows_insecure_http_host(host: &str) -> bool {
+    if insecure_http_explicitly_allowed() {
+        return true;
+    }
     let host = host.trim();
     let host = host
         .strip_prefix('[')
@@ -406,6 +432,53 @@ mod tests {
     fn normalize_api_base_rejects_public_http_hosts() {
         assert_eq!(normalize_api_base("http://example.com/v1"), None);
         assert_eq!(normalize_api_base("http://8.8.8.8/v1"), None);
+    }
+
+    /// Self-hosted inference on a rented GPU box has a public IP, no TLS, and a
+    /// high port. Plain HTTP there is refused by default because the API key
+    /// and prompts would cross the internet in cleartext, but the user must be
+    /// able to opt in, otherwise the endpoint is simply unconfigurable.
+    ///
+    /// Uses the shape a user actually reported (`http://<public-ip>:20000`).
+    #[test]
+    fn public_http_endpoint_is_configurable_only_with_an_explicit_opt_in() {
+        const ENDPOINT: &str = "http://45.115.219.90:20000/v1";
+        let previous = std::env::var_os(ALLOW_INSECURE_HTTP_ENV);
+        // SAFETY: restored below; this test does not run alongside other
+        // mutation of this variable.
+        unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
+
+        assert_eq!(
+            normalize_api_base(ENDPOINT),
+            None,
+            "plain HTTP to a public host must stay refused by default"
+        );
+
+        unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, "1") };
+        assert_eq!(
+            normalize_api_base(ENDPOINT),
+            Some(ENDPOINT.to_string()),
+            "an explicit opt-in must make the endpoint usable"
+        );
+
+        // Only affirmative values count; a stray value must not silently
+        // disable a security default.
+        unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, "0") };
+        assert_eq!(normalize_api_base(ENDPOINT), None);
+        unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, "") };
+        assert_eq!(normalize_api_base(ENDPOINT), None);
+
+        // https to the same host never needed the opt-in.
+        unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
+        assert_eq!(
+            normalize_api_base("https://45.115.219.90:20000/v1"),
+            Some("https://45.115.219.90:20000/v1".to_string())
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, value) },
+            None => unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) },
+        }
     }
 
     #[test]
