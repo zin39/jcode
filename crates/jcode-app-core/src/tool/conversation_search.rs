@@ -24,7 +24,10 @@ struct SearchInput {
     turns: Option<TurnRange>,
 
     /// Get stats about conversation
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     stats: Option<bool>,
 }
 

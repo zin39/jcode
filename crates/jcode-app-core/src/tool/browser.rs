@@ -38,7 +38,10 @@ struct BrowserInput {
     window_id: Option<i64>,
     #[serde(default)]
     frame_id: Option<i64>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     all_frames: Option<bool>,
     #[serde(default)]
     selector: Option<String>,
@@ -56,17 +59,35 @@ struct BrowserInput {
     y: Option<f64>,
     #[serde(default)]
     format: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     wait: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     new_tab: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     focus: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     clear: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     submit: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     page_world: Option<bool>,
     #[serde(default)]
     position: Option<String>,
@@ -90,7 +111,10 @@ struct BrowserField {
     selector: String,
     #[serde(default)]
     value: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     checked: Option<bool>,
 }
 

@@ -66,14 +66,23 @@ struct SearchInput {
     limit: Option<i64>,
     /// Include the active session in results. Defaults to false because this tool
     /// is meant for recalling past sessions and otherwise tends to find itself.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     include_current: Option<bool>,
     /// Include raw tool calls/results. Defaults to false because they usually
     /// crowd out the conclusions the agent is trying to recall.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     include_tools: Option<bool>,
     /// Include system/display messages and system reminders. Defaults to false.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     include_system: Option<bool>,
     /// Maximum number of hits from a single session. Defaults to 1 for diversity.
     #[serde(default)]
@@ -94,19 +103,31 @@ struct SearchInput {
     #[serde(default)]
     before: Option<String>,
     /// Restrict Jcode sessions by saved/bookmarked flag.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     saved: Option<bool>,
     /// Restrict Jcode sessions by debug flag.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     debug: Option<bool>,
     /// Restrict Jcode sessions by canary flag.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     canary: Option<bool>,
     /// Restrict source: jcode, claude, codex, pi, opencode, cursor, or all.
     #[serde(default)]
     source: Option<String>,
     /// Include external session sources discovered by the session picker. Defaults to true.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     include_external: Option<bool>,
     /// Number of preceding messages to include around each hit.
     #[serde(default)]
@@ -118,7 +139,10 @@ struct SearchInput {
     #[serde(default)]
     max_scan_sessions: Option<i64>,
     /// Scan every available Jcode session instead of the recent indexed subset.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     exhaustive: Option<bool>,
 }
 

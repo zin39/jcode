@@ -54,10 +54,16 @@ struct BgInput {
     #[serde(default)]
     task_ids: Option<Vec<String>>,
     /// Use the latest matching task when task_id is omitted
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     latest: Option<bool>,
     /// Restrict implicit selection/listing to this session. Defaults to false for list and true for implicit selection.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     session_only: Option<bool>,
     /// Status filter, either a string or array of strings: running/completed/failed/superseded/terminal/all
     #[serde(default)]
@@ -69,13 +75,22 @@ struct BgInput {
     )]
     max_age_hours: Option<u64>,
     /// Dry-run cleanup without deleting files
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     dry_run: Option<bool>,
     /// Whether to notify on completion when using watch/delivery (default: true)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     notify: Option<bool>,
     /// Whether to wake on completion when using watch/delivery (default: true)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     wake: Option<bool>,
     /// For watch/delivery: also arm a stall watchdog that wakes the agent after
     /// this many seconds with no new output or progress (resets on activity)
@@ -91,7 +106,10 @@ struct BgInput {
     )]
     max_wait_seconds: Option<u64>,
     /// Whether wait should return on progress/checkpoint events (default: true)
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     return_on_progress: Option<bool>,
     /// Multi-task wait mode: any, all, first_failure
     #[serde(default)]
@@ -109,7 +127,10 @@ struct BgInput {
     )]
     lines: Option<usize>,
     /// Include an output preview when wait returns; failed tasks preview by default
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     include_output_preview: Option<bool>,
     /// Optional grace period for detached cancellation before SIGKILL
     #[serde(
@@ -957,6 +978,31 @@ mod tests {
         let parsed: BgInput = serde_json::from_value(native).expect("native numbers still work");
         assert_eq!(parsed.max_wait_seconds, Some(600));
         assert_eq!(parsed.tail_lines, Some(40));
+
+        // Boolean fields also tolerate stringified values.
+        let stringy_bool = serde_json::json!({
+            "action": "wait",
+            "return_on_progress": "false",
+            "notify": "true",
+            "wake": "0",
+            "session_only": "1",
+            "include_output_preview": "yes",
+        });
+        let parsed: BgInput =
+            serde_json::from_value(stringy_bool).expect("stringified bools must be accepted");
+        assert_eq!(parsed.return_on_progress, Some(false));
+        assert_eq!(parsed.notify, Some(true));
+        assert_eq!(parsed.wake, Some(false));
+        assert_eq!(parsed.session_only, Some(true));
+        assert_eq!(parsed.include_output_preview, Some(true));
+
+        // Native bools still work.
+        let native_bool = serde_json::json!({
+            "action": "wait",
+            "return_on_progress": false,
+        });
+        let parsed: BgInput = serde_json::from_value(native_bool).expect("native bools still work");
+        assert_eq!(parsed.return_on_progress, Some(false));
 
         // Genuinely bad values must still be rejected rather than silently
         // coerced to a default, which would hide a real mistake.

@@ -49,7 +49,10 @@ struct AgentGrepInput {
     file: Option<String>,
     #[serde(default)]
     terms: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     regex: Option<bool>,
     #[serde(default)]
     path: Option<String>,
@@ -58,9 +61,15 @@ struct AgentGrepInput {
     glob: Option<String>,
     #[serde(rename = "type", default)]
     file_type: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     hidden: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     no_ignore: Option<bool>,
     #[serde(
         default,
@@ -74,11 +83,20 @@ struct AgentGrepInput {
     max_regions: Option<usize>,
     #[serde(default)]
     full_region: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     debug_plan: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     debug_score: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     paths_only: Option<bool>,
 }
 

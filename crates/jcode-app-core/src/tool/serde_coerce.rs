@@ -185,6 +185,45 @@ where
     deserializer.deserialize_any(BoolOrString)
 }
 
+/// Deserialize an `Option<bool>` from a JSON bool, a truthy/falsy string, or
+/// null/missing. Empty strings deserialize to `None`.
+///
+/// Same provider quirk as the numeric helpers: models emit `"true"` for a field
+/// whose schema says `boolean`, and strict serde rejects the entire tool call.
+pub fn opt_bool_from_string_or_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(b)),
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "" => Ok(None),
+                "true" | "1" | "yes" | "y" => Ok(Some(true)),
+                "false" | "0" | "no" | "n" => Ok(Some(false)),
+                other => Err(de::Error::custom(format!(
+                    "string {other:?} is not a valid bool"
+                ))),
+            }
+        }
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(v) = n.as_u64() {
+                Ok(Some(v != 0))
+            } else if let Some(v) = n.as_i64() {
+                Ok(Some(v != 0))
+            } else {
+                Err(de::Error::custom("number is not a valid bool"))
+            }
+        }
+        Some(other) => Err(de::Error::custom(format!(
+            "expected bool or truthy string, got {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +333,10 @@ mod coercion_coverage_tests {
                     || next.contains(": Option<usize>")
                     || next.contains(": Option<u32>")
                 {
-                    offenders.push(format!("{name}:{}: {next}", idx + 2));
+                    offenders.push(format!("{name}:{}: {next} (numeric)", idx + 2));
+                }
+                if next.contains(": Option<bool>") {
+                    offenders.push(format!("{name}:{}: {next} (bool)", idx + 2));
                 }
             }
         }
@@ -303,7 +345,8 @@ mod coercion_coverage_tests {
             offenders.is_empty(),
             "these optional numeric tool fields use strict serde, so a provider \
              sending \"600\" instead of 600 fails the whole tool call. Add \
-             #[serde(deserialize_with = \"super::serde_coerce::opt_*_from_string_or_number\")]:\n{}",
+             #[serde(deserialize_with = \"super::serde_coerce::opt_*_from_string_or_number\")]  \
+             or opt_bool_from_string_or_bool for bool fields:\n{}",
             offenders.join("\n")
         );
     }

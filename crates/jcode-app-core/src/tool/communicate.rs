@@ -1852,9 +1852,15 @@ struct CommunicateInput {
     limit: Option<usize>,
     #[serde(default)]
     task_id: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     spawn_if_needed: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     prefer_spawn: Option<bool>,
     #[serde(default)]
     plan_items: Option<Vec<PlanItem>>,
@@ -1879,11 +1885,20 @@ struct CommunicateInput {
         deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
     )]
     timeout_minutes: Option<u64>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     wake: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     background: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     notify: Option<bool>,
     #[serde(default)]
     delivery: Option<CommDeliveryMode>,
@@ -1892,9 +1907,15 @@ struct CommunicateInput {
         deserialize_with = "super::serde_coerce::opt_usize_from_string_or_number"
     )]
     concurrency_limit: Option<usize>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     force: Option<bool>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     retain_agents: Option<bool>,
     #[serde(default)]
     status: Option<String>,

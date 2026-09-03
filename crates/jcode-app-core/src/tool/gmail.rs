@@ -48,7 +48,10 @@ struct GmailInput {
     add_labels: Option<Vec<String>>,
     #[serde(default)]
     remove_labels: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     confirmed: Option<bool>,
     #[serde(default)]
     attachments: Option<Vec<String>>,

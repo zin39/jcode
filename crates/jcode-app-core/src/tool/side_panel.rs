@@ -27,7 +27,10 @@ struct SidePanelInput {
     title: Option<String>,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     focus: Option<bool>,
 }
 

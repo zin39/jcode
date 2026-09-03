@@ -149,7 +149,10 @@ struct ProgressMarker {
     eta_seconds: Option<u64>,
     #[serde(default)]
     kind: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     checkpoint: Option<bool>,
 }
 
@@ -744,7 +747,10 @@ struct BashInput {
         deserialize_with = "super::serde_coerce::opt_u64_from_string_or_number"
     )]
     timeout: Option<u64>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
+    )]
     run_in_background: Option<bool>,
     #[serde(default = "default_true")]
     notify: bool,
