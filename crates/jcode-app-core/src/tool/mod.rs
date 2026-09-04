@@ -14,7 +14,7 @@ mod conversation_search;
 mod debug_socket;
 mod discover;
 mod discover_secrets;
-mod edit;
+pub(crate) mod edit;
 mod feedback;
 mod gmail;
 mod goal;

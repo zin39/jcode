@@ -19,13 +19,16 @@ impl EditTool {
 }
 
 #[derive(Deserialize)]
-struct EditInput {
+pub(crate) struct EditInput {
     #[serde(default)]
     intent: Option<String>,
     file_path: String,
     old_string: String,
     new_string: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::bool_from_string_or_bool"
+    )]
     replace_all: bool,
 }
 

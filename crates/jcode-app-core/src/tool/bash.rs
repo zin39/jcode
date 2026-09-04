@@ -752,9 +752,15 @@ pub(crate) struct BashInput {
         deserialize_with = "super::serde_coerce::opt_bool_from_string_or_bool"
     )]
     run_in_background: Option<bool>,
-    #[serde(default = "default_true")]
+    #[serde(
+        default = "default_true",
+        deserialize_with = "super::serde_coerce::bool_from_string_or_bool"
+    )]
     notify: bool,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::serde_coerce::bool_from_string_or_bool"
+    )]
     wake: bool,
     /// For background runs: wake the agent after this many seconds with no
     /// new output and no progress events. Resets on activity.

@@ -320,7 +320,23 @@ mod coercion_coverage_tests {
             };
             let lines: Vec<&str> = text.lines().collect();
             for (idx, line) in lines.iter().enumerate() {
-                if line.trim() != "#[serde(default)]" {
+                let trimmed_attr = line.trim();
+                // Plain `bool` fields are just as exposed as `Option<bool>`:
+                // `#[serde(default)]` and `#[serde(default = "...")]` both still
+                // use strict serde for the value that IS present, so a provider
+                // sending "true" fails the whole call. `edit.replace_all` and
+                // `multiedit.replace_all` shipped broken because the original
+                // scan only looked at the bare `#[serde(default)]` spelling.
+                if trimmed_attr.starts_with("#[serde(default = ") {
+                    if let Some(next) = lines.get(idx + 1) {
+                        let next = next.trim();
+                        if next.contains(": bool,") && !next.contains("Option<bool>") {
+                            offenders.push(format!("{name}:{}: {next} (plain bool)", idx + 2));
+                        }
+                    }
+                    continue;
+                }
+                if trimmed_attr != "#[serde(default)]" {
                     continue;
                 }
                 let Some(next) = lines.get(idx + 1) else {
@@ -337,6 +353,8 @@ mod coercion_coverage_tests {
                 }
                 if next.contains(": Option<bool>") {
                     offenders.push(format!("{name}:{}: {next} (bool)", idx + 2));
+                } else if next.contains(": bool,") {
+                    offenders.push(format!("{name}:{}: {next} (plain bool)", idx + 2));
                 }
             }
         }
@@ -406,6 +424,25 @@ mod coercion_coverage_tests {
             "return_on_progress": null,
         }))
         .expect("BgInput: explicit null bools");
+
+        // Plain (non-Option) bool fields: the gap that shipped broken.
+        // Observed in production logs at 2026-09-03 12:54 as
+        // `invalid type: string "true", expected a boolean` AFTER the
+        // Option<bool> fix, because `edit.replace_all` is a plain `bool`.
+        serde_json::from_value::<super::super::edit::EditInput>(serde_json::json!({
+            "file_path": "a.rs",
+            "old_string": "x",
+            "new_string": "y",
+            "replace_all": "true",
+        }))
+        .expect("EditInput: stringified plain bool must parse");
+
+        serde_json::from_value::<super::super::bash::BashInput>(serde_json::json!({
+            "command": "echo ok",
+            "notify": "false",
+            "wake": "true",
+        }))
+        .expect("BashInput: stringified plain bools (notify/wake) must parse");
 
         // Garbage string: must still be rejected.
         assert!(
