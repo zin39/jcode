@@ -754,7 +754,7 @@ pub(crate) struct BashInput {
     run_in_background: Option<bool>,
     #[serde(
         default = "default_true",
-        deserialize_with = "super::serde_coerce::bool_from_string_or_bool"
+        deserialize_with = "super::serde_coerce::bool_from_string_or_bool_default_true"
     )]
     notify: bool,
     #[serde(
@@ -772,6 +772,19 @@ pub(crate) struct BashInput {
     /// Set only when re-issuing a call the gate refused (#604).
     #[serde(default)]
     justification: Option<String>,
+}
+
+#[cfg(test)]
+impl BashInput {
+    /// Read `notify` from coercion tests without widening field visibility.
+    pub(crate) fn notify_for_test(&self) -> bool {
+        self.notify
+    }
+
+    /// Read `wake` from coercion tests without widening field visibility.
+    pub(crate) fn wake_for_test(&self) -> bool {
+        self.wake
+    }
 }
 
 fn default_true() -> bool {

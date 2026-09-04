@@ -147,17 +147,34 @@ where
         .transpose()
 }
 
-struct BoolOrString;
+/// Visitor for plain `bool` fields.
+///
+/// `NULL_DEFAULT` is the value an explicit JSON `null` resolves to. It must
+/// match the field's own `#[serde(default = ...)]`, because `serde`'s `default`
+/// only covers a *missing* key: an explicit `null` still reaches the
+/// deserializer and would otherwise hard-fail the whole tool call with
+/// `invalid type: null, expected a boolean`.
+struct BoolOrString<const NULL_DEFAULT: bool>;
 
-impl<'de> de::Visitor<'de> for BoolOrString {
+impl<'de, const NULL_DEFAULT: bool> de::Visitor<'de> for BoolOrString<NULL_DEFAULT> {
     type Value = bool;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("a bool or a string representing a bool")
+        f.write_str("a bool, a string representing a bool, or null")
     }
 
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<bool, E> {
         Ok(v)
+    }
+
+    /// Explicit `null` means "unspecified" -> fall back to the field default.
+    fn visit_unit<E: de::Error>(self) -> Result<bool, E> {
+        Ok(NULL_DEFAULT)
+    }
+
+    /// Some formats surface a null as `None` rather than unit.
+    fn visit_none<E: de::Error>(self) -> Result<bool, E> {
+        Ok(NULL_DEFAULT)
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
@@ -177,12 +194,25 @@ impl<'de> de::Visitor<'de> for BoolOrString {
     }
 }
 
-/// Deserialize a `bool` from either a JSON bool or a string/number representation.
+/// Deserialize a `bool` from a JSON bool, a string/number representation, or
+/// `null`. An explicit `null` resolves to `false`; use
+/// [`bool_from_string_or_bool_default_true`] for fields that default to `true`.
 pub fn bool_from_string_or_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserializer.deserialize_any(BoolOrString)
+    deserializer.deserialize_any(BoolOrString::<false>)
+}
+
+/// Same as [`bool_from_string_or_bool`] but an explicit `null` resolves to
+/// `true`. Use this on fields declared `#[serde(default = "default_true")]` so
+/// that `{"notify": null}` keeps the documented default instead of silently
+/// flipping the behaviour off.
+pub fn bool_from_string_or_bool_default_true<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(BoolOrString::<true>)
 }
 
 /// Deserialize an `Option<bool>` from a JSON bool, a truthy/falsy string, or
@@ -369,6 +399,72 @@ mod coercion_coverage_tests {
         );
     }
 
+    /// A plain `bool` declared `#[serde(default = "default_true")]` must use the
+    /// `_default_true` coercion helper.
+    ///
+    /// `serde`'s `default` only fires for a *missing* key. An explicit
+    /// `{"notify": null}` still reaches the deserializer, so the helper itself
+    /// decides what null means. Pairing a `default_true` field with the plain
+    /// helper would silently resolve null to `false` and turn the behaviour off
+    /// -- a correctness bug far nastier than the hard error it replaced.
+    #[test]
+    fn default_true_bool_fields_use_the_default_true_coercer() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tool");
+        let mut offenders = Vec::new();
+
+        for entry in std::fs::read_dir(&dir).expect("tool dir").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name == "serde_coerce.rs" {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+
+            // Walk multi-line `#[serde( ... )]` blocks and inspect the field
+            // that follows, so both the one-line and wrapped spellings are seen.
+            let mut idx = 0usize;
+            while idx < lines.len() {
+                if lines[idx].trim().starts_with("#[serde(") {
+                    let start = idx;
+                    let mut attr = String::new();
+                    while idx < lines.len() {
+                        attr.push_str(lines[idx].trim());
+                        attr.push(' ');
+                        if lines[idx].contains(")]") {
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    let field = lines.get(idx + 1).map(|l| l.trim()).unwrap_or("");
+                    let is_plain_bool =
+                        field.contains(": bool,") && !field.contains("Option<bool>");
+                    if is_plain_bool
+                        && attr.contains("default = \"default_true\"")
+                        && !attr.contains("bool_from_string_or_bool_default_true")
+                    {
+                        offenders.push(format!("{name}:{}: {field}", start + 1));
+                    }
+                }
+                idx += 1;
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these fields default to true but use a coercer that maps an explicit \
+             JSON null to false, silently inverting the documented default. Use \
+             #[serde(deserialize_with = \
+             \"super::serde_coerce::bool_from_string_or_bool_default_true\")]:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// End-to-end acceptance: deserialise the actual tool Input structs with
     /// stringified bools, exactly as Fable 5.1 sends them.  We test that
     /// parsing succeeds (or fails for garbage) against the real struct rather
@@ -463,6 +559,43 @@ mod coercion_coverage_tests {
             .is_err(),
             "an array value must be rejected"
         );
+    }
+
+    /// Explicit JSON `null` on a plain `bool` must not fail the tool call, and
+    /// must resolve to that field's documented default.
+    ///
+    /// Observed in production logs at 2026-09-03 23:14 as
+    /// `invalid type: null, expected a boolean` on a `bash` call. `#[serde(default)]`
+    /// only covers a *missing* key, so `{"wake": null}` still reached the
+    /// deserializer, and `BoolOrString` had no `visit_unit`.
+    #[test]
+    fn explicit_null_falls_back_to_the_field_default() {
+        // bash.wake defaults to false, bash.notify defaults to true. Both must
+        // parse, and notify must stay true rather than silently flipping off.
+        let bash: super::super::bash::BashInput = serde_json::from_value(serde_json::json!({
+            "command": "echo ok",
+            "notify": null,
+            "wake": null,
+        }))
+        .expect("BashInput: explicit nulls must parse, not hard-fail");
+        assert!(
+            bash.notify_for_test(),
+            "notify is documented `default = default_true`, so an explicit null \
+             must resolve to true, not false"
+        );
+        assert!(
+            !bash.wake_for_test(),
+            "wake defaults to false, so an explicit null must resolve to false"
+        );
+
+        // Same for the edit tools, whose replace_all defaults to false.
+        serde_json::from_value::<super::super::edit::EditInput>(serde_json::json!({
+            "file_path": "a.rs",
+            "old_string": "x",
+            "new_string": "y",
+            "replace_all": null,
+        }))
+        .expect("EditInput: explicit null replace_all must parse");
     }
 }
 
