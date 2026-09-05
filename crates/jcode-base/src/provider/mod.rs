@@ -272,6 +272,38 @@ fn configured_standard_openrouter_profile_routes() -> Vec<ModelRoute> {
         .collect()
 }
 
+/// The user's configured `context_window` for `model`, searched across every
+/// configured provider profile.
+///
+/// Callers that only know a model *name* (notably the remote TUI's context
+/// gauge, which has no provider handle) still need the user's explicit value to
+/// win over name-based classification. Scanning every profile is safe because a
+/// `context_window` is keyed to a model id the user wrote down themselves; when
+/// two profiles configure the same id, the larger window is chosen so the gauge
+/// never under-reports a window the endpoint really serves.
+pub fn configured_context_window_for_model(model: &str) -> Option<usize> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    // Session/route specs can still carry a `<profile>:<model>` prefix here.
+    let bare = model
+        .rsplit_once(':')
+        .map_or(model, |(_, rest)| rest)
+        .trim();
+    crate::config::config()
+        .providers
+        .values()
+        .flat_map(|provider| provider.models.iter())
+        .filter(|configured| {
+            let id = configured.id.trim();
+            id.eq_ignore_ascii_case(model) || id.eq_ignore_ascii_case(bare)
+        })
+        .filter_map(|configured| configured.context_window)
+        .filter(|limit| *limit > 0)
+        .max()
+}
+
 pub fn restore_session_model_best_effort(
     provider: &dyn Provider,
     model: &str,
@@ -2137,7 +2169,31 @@ impl Provider for MultiProvider {
         // Routing-prefix policy lives once in RouteSelection::routed_model_spec
         // so this orchestrator and every single-runtime provider agree on the
         // spec string. set_model then dispatches it to the right sub-provider.
-        self.set_model(&selection.routed_model_spec())
+        let spec = selection.routed_model_spec();
+
+        // An OpenAI-compatible route with no `profile_id` renders as the *bare*
+        // model id, which carries no routing information at all. `set_model`
+        // then reaches its "unknown model, try the current provider" fallthrough
+        // and binds the id to whatever happens to be active -- reported as
+        // `Model 5.3-flash-un not supported by Anthropic provider` while Claude
+        // was active, even though the picker had just named a llama.cpp route.
+        //
+        // The selection still knows the transport is OpenAI-compatible, so
+        // resolve the owning profile from the live route catalog instead of
+        // letting a bare id be captured by an unrelated provider. This is the
+        // same recovery a hand-typed bare id already gets.
+        if matches!(
+            selection.runtime_key,
+            RuntimeKey::OpenAiCompatible { profile_id: None }
+        ) && let Some(profile_id) = self.openai_compatible_profile_id_owning_model(&spec)
+        {
+            return match crate::provider_catalog::openai_compatible_profile_by_id(&profile_id) {
+                Some(profile) => self.set_model_on_openai_compatible_profile(profile, &spec),
+                None => self.set_model_on_named_provider_profile(&profile_id, &spec),
+            };
+        }
+
+        self.set_model(&spec)
     }
 
     fn available_models(&self) -> Vec<&'static str> {

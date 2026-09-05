@@ -1129,3 +1129,104 @@ fn profile_catalog_cache_needs_refresh_for_missing_cache() {
         );
     });
 }
+
+/// A picker route that declares OpenAI-compatible transport but carries no
+/// `profile_id` must not be captured by whatever provider is active.
+///
+/// Regression for `Model 5.3-flash-un not supported by Anthropic provider`.
+/// The logs showed the same model succeeding as
+/// `requested_api_method=openai-compatible:llamacpp` and failing moments later
+/// as plain `requested_api_method=openai-compatible`: without the profile
+/// segment, `routed_model_spec()` renders the *bare* id, which then hits
+/// `set_model`'s "unknown model, try the current provider" fallthrough and
+/// binds to Claude.
+///
+/// This pins the spec-rendering asymmetry that makes the bare id ambiguous, so
+/// the profile-less form cannot silently regress back into a routable-looking
+/// string.
+#[test]
+fn openai_compatible_route_without_profile_renders_an_unroutable_bare_spec() {
+    use jcode_provider_core::{RouteSelection, RuntimeKey};
+
+    let with_profile = RouteSelection {
+        runtime_key: RuntimeKey::OpenAiCompatible {
+            profile_id: Some("llamacpp".to_string()),
+        },
+        model: "5.3-flash-un".to_string(),
+        api_method: "openai-compatible:llamacpp".to_string(),
+        provider_label: "llama.cpp".to_string(),
+        detail: String::new(),
+    };
+    assert_eq!(
+        with_profile.routed_model_spec(),
+        "llamacpp:5.3-flash-un",
+        "a profile-pinned route must keep its routing prefix"
+    );
+
+    let without_profile = RouteSelection {
+        runtime_key: RuntimeKey::OpenAiCompatible { profile_id: None },
+        model: "5.3-flash-un".to_string(),
+        api_method: "openai-compatible".to_string(),
+        provider_label: "OpenAI-compatible".to_string(),
+        detail: String::new(),
+    };
+    let spec = without_profile.routed_model_spec();
+    assert_eq!(
+        spec, "5.3-flash-un",
+        "a profile-less route renders bare, which is why set_route_selection \
+         must resolve the owning profile instead of forwarding it to set_model"
+    );
+    assert!(
+        !spec.contains(':'),
+        "the bare spec carries no routing information, so nothing downstream \
+         can tell which endpoint the user picked"
+    );
+}
+
+/// The remote TUI's context gauge resolves a limit from the model *name* only,
+/// so a configured `context_window` must be reachable without a provider handle.
+///
+/// Regression for a `llama-server` serving 1M tokens whose gauge read 200K.
+/// `context_limit_for_model_with_provider` classifies by name, `5.3-flash-un`
+/// matches no known family, and the chain ended at `DEFAULT_CONTEXT_LIMIT`.
+/// The override was present and correct the whole time; nothing on that path
+/// could see it.
+#[test]
+fn configured_context_window_lookup_matches_prefixed_and_bare_ids() {
+    // Mirrors `configured_context_window_for_model`'s matching rules.
+    fn lookup(configured: &[(&str, usize)], model: &str) -> Option<usize> {
+        let model = model.trim();
+        let bare = model
+            .rsplit_once(':')
+            .map_or(model, |(_, rest)| rest)
+            .trim();
+        configured
+            .iter()
+            .filter(|(id, _)| id.eq_ignore_ascii_case(model) || id.eq_ignore_ascii_case(bare))
+            .filter(|(_, limit)| *limit > 0)
+            .map(|(_, limit)| *limit)
+            .max()
+    }
+
+    let cfg = [("5.3-flash-un", 1_048_576usize)];
+
+    // The gauge sees a bare id; a session/route spec may still carry a prefix.
+    assert_eq!(lookup(&cfg, "5.3-flash-un"), Some(1_048_576));
+    assert_eq!(
+        lookup(&cfg, "llamacpp:5.3-flash-un"),
+        Some(1_048_576),
+        "a `<profile>:<model>` spec must resolve to the same configured window"
+    );
+
+    // Unconfigured models fall through to the existing classifier.
+    assert_eq!(lookup(&cfg, "glm-5.3"), None);
+
+    // Two profiles serving the same id (e.g. `llamacpp` and a named clone)
+    // must not under-report the window the endpoint really serves.
+    let dup = [("5.3-flash-un", 262_144usize), ("5.3-flash-un", 1_048_576)];
+    assert_eq!(lookup(&dup, "5.3-flash-un"), Some(1_048_576));
+
+    // A zero is not a valid override and must not shadow real evidence.
+    let zero = [("5.3-flash-un", 0usize)];
+    assert_eq!(lookup(&zero, "5.3-flash-un"), None);
+}

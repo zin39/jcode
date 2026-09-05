@@ -626,15 +626,28 @@ impl App {
     }
 
     pub(super) fn update_context_limit_for_model(&mut self, model: &str) {
-        let limit = if self.is_remote {
-            crate::provider::context_limit_for_model_with_provider(
-                model,
-                self.remote_provider_name.as_deref(),
-            )
-            .unwrap_or(self.provider.context_window())
-        } else {
-            self.provider.context_window()
-        };
+        // A user-configured `[[providers.<id>.models]] context_window` is an
+        // explicit statement about the endpoint actually running, so it wins
+        // over every name-based classifier.
+        //
+        // This matters most on the remote path below, which resolves the limit
+        // purely from the model *name* and a provider label and therefore has no
+        // access to provider config at all. A `llama-server` serving 1M tokens
+        // was reported as 200K (`DEFAULT_CONTEXT_LIMIT`) because the name
+        // `5.3-flash-un` matches no known family: the configured override was
+        // correct, loaded, and simply never consulted on this path.
+        let limit =
+            if let Some(configured) = crate::provider::configured_context_window_for_model(model) {
+                configured
+            } else if self.is_remote {
+                crate::provider::context_limit_for_model_with_provider(
+                    model,
+                    self.remote_provider_name.as_deref(),
+                )
+                .unwrap_or(self.provider.context_window())
+            } else {
+                self.provider.context_window()
+            };
         self.context_limit = limit as u64;
         self.context_warning_shown = false;
 
