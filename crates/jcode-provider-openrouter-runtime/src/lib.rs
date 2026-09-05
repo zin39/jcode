@@ -1447,6 +1447,32 @@ impl OpenRouterProvider {
         if matches_known_profile { rest } else { model }
     }
 
+    /// The user's configured `context_window` for `model_id`, if any.
+    ///
+    /// Read from `config.toml` on each call rather than captured at
+    /// construction: a provider can be built before the config is loaded (the
+    /// deferred-auth boot path), and re-reading is cheap next to an HTTP turn.
+    /// Matching is case-insensitive because model ids arrive from the wire, the
+    /// picker, and hand-written config, which disagree on case.
+    fn configured_context_window(&self, model_id: &str) -> Option<usize> {
+        let profile_id = self.profile_id.as_deref()?.trim();
+        if profile_id.is_empty() {
+            return None;
+        }
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return None;
+        }
+        jcode_base::config::config()
+            .providers
+            .get(profile_id)?
+            .models
+            .iter()
+            .find(|model| model.id.trim().eq_ignore_ascii_case(model_id))
+            .and_then(|model| model.context_window)
+            .filter(|limit| *limit > 0)
+    }
+
     /// Return true when this request targets Moonshot's dedicated Kimi coding
     /// endpoint (`https://api.kimi.com/coding/v1`, default model
     /// `kimi-for-coding`). That endpoint enables thinking server-side and

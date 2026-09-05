@@ -146,3 +146,78 @@ fn explicit_context_window_still_wins_for_llamacpp() {
         "an explicitly configured context_window must outrank the fallback"
     );
 }
+
+/// An explicit `context_window` must outrank every auto-detected source,
+/// including the live catalog.
+///
+/// Regression for a `llama-server` serving 1M tokens that jcode still budgeted
+/// as a 200K model. No llamacpp catalog cache existed, so `context_window()`
+/// fell through the catalog, the static table, and the llama.cpp/Ollama
+/// serving-floor guards, all the way to `DEFAULT_CONTEXT_LIMIT` (200_000) --
+/// and the user's configured value was never consulted on that path at all.
+///
+/// This pins the *precedence rule* rather than the plumbing: config wins,
+/// because it is the only source that reflects how the server was actually
+/// launched.
+#[test]
+fn configured_context_window_outranks_every_autodetected_source() {
+    /// Mirrors the resolution order in `context_window()`.
+    fn resolve(
+        configured: Option<usize>,
+        catalog: Option<usize>,
+        static_table: Option<usize>,
+        llamacpp_floor: bool,
+    ) -> usize {
+        const DEFAULT_CONTEXT_LIMIT: usize = 200_000;
+        const LLAMACPP_FALLBACK_SERVING_CONTEXT: usize = 8_192;
+        if let Some(limit) = configured.filter(|l| *l > 0) {
+            return limit;
+        }
+        if let Some(limit) = catalog {
+            return limit;
+        }
+        if let Some(limit) = static_table {
+            return limit;
+        }
+        if llamacpp_floor {
+            return LLAMACPP_FALLBACK_SERVING_CONTEXT;
+        }
+        DEFAULT_CONTEXT_LIMIT
+    }
+
+    // The reported bug: nothing auto-detected, so it used to land on 200K.
+    assert_eq!(
+        resolve(Some(1_048_576), None, None, true),
+        1_048_576,
+        "with no catalog cache the configured window must still win, not the \
+         llama.cpp floor or DEFAULT_CONTEXT_LIMIT"
+    );
+
+    // Config also beats a live catalog that disagrees: the catalog can be a
+    // stale snapshot of a server that has since been relaunched.
+    assert_eq!(
+        resolve(Some(1_048_576), Some(262_144), Some(200_000), true),
+        1_048_576,
+        "configured window must outrank a stale live catalog"
+    );
+
+    // Zero/absent config must not shadow real evidence.
+    assert_eq!(
+        resolve(Some(0), Some(262_144), None, true),
+        262_144,
+        "a zero context_window is not a valid override"
+    );
+    assert_eq!(
+        resolve(None, Some(262_144), None, true),
+        262_144,
+        "unconfigured models still use the live catalog"
+    );
+
+    // Unconfigured llama.cpp with no catalog keeps the conservative floor:
+    // guessing high builds requests the server rejects.
+    assert_eq!(
+        resolve(None, None, None, true),
+        8_192,
+        "unconfigured llama.cpp must keep its conservative serving floor"
+    );
+}

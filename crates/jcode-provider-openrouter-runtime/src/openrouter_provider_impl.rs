@@ -730,6 +730,24 @@ impl Provider for OpenRouterProvider {
         // the (large) provider default and over-budgeting the request. See #403.
         let raw_model = self.model();
         let model_id = self.strip_session_profile_prefix(&raw_model).to_string();
+
+        // The user's explicit `context_window` outranks every source below,
+        // including the live catalog.
+        //
+        // It is the only value that is a *statement* rather than a guess or a
+        // snapshot: the catalog can be stale, absent (no cache file yet), or
+        // report a figure that does not match what this endpoint will accept,
+        // and every remaining branch is a heuristic keyed off the model name.
+        // Someone who writes the number down has looked at their own server.
+        //
+        // Without this, a `llama-server` serving 1M tokens still budgeted as a
+        // 200K model: no llamacpp catalog cache existed, so the chain fell all
+        // the way through to `DEFAULT_CONTEXT_LIMIT`, and the configured
+        // override was never consulted at all.
+        if let Some(limit) = self.configured_context_window(&model_id) {
+            return limit;
+        }
+
         // Try cached model data from OpenRouter API
         let cache = self.models_cache.try_read();
         if let Ok(cache) = cache
