@@ -1477,3 +1477,55 @@ fn local_endpoint_env_var_names_are_consistent() {
         );
     }
 }
+
+/// A user's explicit `context_window` must beat the hardcoded family
+/// classifier for env-configured (catalog) profiles.
+///
+/// Regression for a local `llama-server` reporting `n_ctx = 1048576` while
+/// jcode kept compacting as if the model were 200K: the catalog path built its
+/// limits solely from `openai_compatible_profile_context_limit`, so
+/// `[[providers.llamacpp.models]] context_window = 1048576` was silently
+/// dropped. The classifier only guesses from the model *name*; an explicit
+/// config value describes the endpoint that is actually running, so it wins.
+#[test]
+fn configured_context_window_overrides_the_family_classifier() {
+    use std::collections::HashMap;
+
+    // Mirrors the merge in `openai_compatible_profile_static_context_limits`:
+    // classifier-derived defaults first, user config applied over the top.
+    fn merge(classifier: &[(&str, usize)], configured: &[(&str, usize)]) -> HashMap<String, usize> {
+        let mut limits: HashMap<String, usize> = classifier
+            .iter()
+            .map(|(id, limit)| ((*id).to_string(), *limit))
+            .collect();
+        for (id, limit) in configured {
+            limits.insert((*id).to_ascii_lowercase(), *limit);
+        }
+        limits
+    }
+
+    // The classifier's guess for a GLM-ish name loses to the user's value.
+    let merged = merge(&[("glm-5.3", 200_000)], &[("glm-5.3", 1_048_576)]);
+    assert_eq!(
+        merged.get("glm-5.3"),
+        Some(&1_048_576),
+        "an explicit context_window must override the family classifier"
+    );
+
+    // A locally served id the catalog never listed still gets its override:
+    // a local server can serve any model name.
+    let merged = merge(&[], &[("5.3-flash-un", 1_048_576)]);
+    assert_eq!(
+        merged.get("5.3-flash-un"),
+        Some(&1_048_576),
+        "an unlisted local model id must still honor its configured window"
+    );
+
+    // Models the user did not configure keep the classifier's value.
+    let merged = merge(&[("glm-5.3", 200_000)], &[("other", 4096)]);
+    assert_eq!(
+        merged.get("glm-5.3"),
+        Some(&200_000),
+        "unconfigured models must keep their classifier limit"
+    );
+}

@@ -687,13 +687,71 @@ pub fn openai_compatible_profile_model_supports_chat(_profile_id: &str, _model: 
     true
 }
 
+/// Static context limits for a catalog (env-configured) OpenAI-compatible
+/// profile, with the user's `config.toml` override winning.
+///
+/// Env-configured profiles (`llamacpp.env`, `ollama.env`, ...) are built from
+/// the bundled catalog, not from a `[providers.<id>]` config table, so this
+/// path used to consult only [`openai_compatible_profile_context_limit`]'s
+/// hardcoded family classifier. A user who wrote
+///
+/// ```toml
+/// [[providers.llamacpp.models]]
+/// id = "5.3-flash-un"
+/// context_window = 1048576
+/// ```
+///
+/// had it silently ignored: the classifier's guess (or the generic default)
+/// won, and jcode compacted at a fraction of the context the server actually
+/// allocated. Measured against a `llama-server` reporting `n_ctx = 1048576`,
+/// jcode still behaved as a 200K model.
+///
+/// The classifier is a guess about a model *family*; an explicit
+/// `context_window` is a statement about the endpoint actually running. The
+/// user's value therefore wins, and is also honored for model ids the catalog
+/// never listed, since a local server can serve any name.
 pub fn openai_compatible_profile_static_context_limits(
     profile: OpenAiCompatibleProfile,
 ) -> HashMap<String, usize> {
-    openai_compatible_profile_static_models(profile)
+    let mut limits: HashMap<String, usize> = openai_compatible_profile_static_models(profile)
         .into_iter()
         .filter_map(|model| {
             openai_compatible_profile_context_limit(profile.id, &model).map(|limit| (model, limit))
+        })
+        .collect();
+
+    for (id, limit) in configured_model_context_windows(profile.id) {
+        limits.insert(id, limit);
+    }
+
+    limits
+}
+
+/// Per-model `context_window` values the user configured under
+/// `[[providers.<profile_id>.models]]`, keyed by lowercased model id.
+///
+/// Returns empty when the profile has no config table, which is the normal
+/// case for a purely env-configured provider.
+fn configured_model_context_windows(profile_id: &str) -> HashMap<String, usize> {
+    let profile_id = profile_id.trim();
+    if profile_id.is_empty() {
+        return HashMap::new();
+    }
+    let config = crate::config::config();
+    let Some(provider) = config.providers.get(profile_id) else {
+        return HashMap::new();
+    };
+    provider
+        .models
+        .iter()
+        .filter_map(|model| {
+            let id = model.id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            model
+                .context_window
+                .map(|limit| (id.to_ascii_lowercase(), limit))
         })
         .collect()
 }
